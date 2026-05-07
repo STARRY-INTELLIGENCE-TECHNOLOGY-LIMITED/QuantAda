@@ -1558,6 +1558,83 @@ def test_ib_submit_order_blocks_when_multiple_accounts_without_config(monkeypatc
     assert "U2222222" in pushed[0]["content"]
 
 
+def test_ib_missing_order_account_warning_repeats_by_daily_schedule_slot(monkeypatch):
+    """
+    多账户阻断告警按 schedule slot 去重:
+    1d schedule 应同一天只报一次，跨天重新报警。
+    """
+    context = types.SimpleNamespace(
+        ib_instance=DummyIBForSubmit(managed_accounts=["U1111111", "U2222222"]),
+        schedule_rule="1d:15:45:00",
+        now=pd.Timestamp("2026-05-05 15:45:00"),
+    )
+    broker = IBBrokerAdapter(context=context)
+
+    pushed = []
+
+    class DummyAlarm:
+        def push_text(self, content, level='INFO'):
+            pushed.append({"content": content, "level": level})
+
+    import live_trader.adapters.ib_broker as ib_module
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "   ",
+        raising=False,
+    )
+    monkeypatch.setattr(ib_module, "AlarmManager", lambda: DummyAlarm())
+
+    data = SimpleNamespace(_name="AAPL.SMART")
+    assert broker._submit_order(data=data, volume=10, side="BUY", price=100.0) is None
+    assert broker._submit_order(data=data, volume=10, side="BUY", price=100.0) is None
+
+    context.now = pd.Timestamp("2026-05-06 15:45:00")
+    assert broker._submit_order(data=data, volume=10, side="BUY", price=100.0) is None
+
+    assert len(pushed) == 2, "1d schedule 应跨自然日重新报警。"
+    assert all(item["level"] == "ERROR" for item in pushed)
+
+
+def test_ib_missing_order_account_warning_repeats_by_interval_schedule_slot(monkeypatch):
+    """
+    多账户阻断告警按 schedule 前缀去重:
+    5m schedule 应同一 slot 只报一次，进入下一个 5m slot 后重新报警。
+    """
+    context = types.SimpleNamespace(
+        ib_instance=DummyIBForSubmit(managed_accounts=["U1111111", "U2222222"]),
+        schedule_rule="5m:09:30:00",
+        now=pd.Timestamp("2026-05-05 09:35:00"),
+    )
+    broker = IBBrokerAdapter(context=context)
+
+    pushed = []
+
+    class DummyAlarm:
+        def push_text(self, content, level='INFO'):
+            pushed.append({"content": content, "level": level})
+
+    import live_trader.adapters.ib_broker as ib_module
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "   ",
+        raising=False,
+    )
+    monkeypatch.setattr(ib_module, "AlarmManager", lambda: DummyAlarm())
+
+    data = SimpleNamespace(_name="AAPL.SMART")
+    assert broker._submit_order(data=data, volume=10, side="BUY", price=100.0) is None
+    context.now = pd.Timestamp("2026-05-05 09:35:04")
+    assert broker._submit_order(data=data, volume=10, side="BUY", price=100.0) is None
+
+    context.now = pd.Timestamp("2026-05-05 09:40:00")
+    assert broker._submit_order(data=data, volume=10, side="BUY", price=100.0) is None
+
+    assert len(pushed) == 2, "5m schedule 应在下一个 slot 重新报警。"
+    assert all(item["level"] == "ERROR" for item in pushed)
+
+
 def test_ib_submit_order_rejects_unknown_configured_order_account(monkeypatch):
     """
     子账户校验回归:

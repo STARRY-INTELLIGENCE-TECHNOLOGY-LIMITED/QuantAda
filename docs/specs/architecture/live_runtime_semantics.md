@@ -27,6 +27,8 @@
 1. 卖出受 `sellable` / `available_now` / `available` 等可卖字段约束。
 2. T+1 市场下，有持仓但不可卖时，直接跳过卖单，避免反复“仓位不足”拒单。
 3. 调仓执行遵循先卖后买。
+4. 若清仓/减仓卖单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警，且跳过本轮计划中的后续买入。
+5. 若买单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警，避免只有“实盘信号”日志而无实际委托。
 
 ## 4. Overnight Pending Order Cleanup
 1. 默认在每个自然日首次 `run()`、拉数前执行。
@@ -46,3 +48,4 @@
 6. GM / IB schedule 运行支持 prewarm；相关改动不得破坏 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 7. schedule 附近的 IM 报警推送支持时间窗限制；默认读取 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可覆盖全局默认值。
 8. `STARTED` / `STOPPED` / `DEAD` 等生命周期消息，以及显式标注为 `plan` 的执行计划消息，不受 schedule 报警时间窗限制。
+9. 实盘阻断类错误告警不得在长进程内永久静默；若按 schedule 去重，应以当前 schedule slot 为作用域（如 `1d` 每日、`5m` 每 5 分钟 slot）。

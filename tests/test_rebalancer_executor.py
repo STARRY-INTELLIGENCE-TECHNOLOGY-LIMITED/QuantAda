@@ -241,3 +241,76 @@ def test_order_executor_waits_local_pending_sells_even_if_remote_empty(monkeypat
     assert broker.calls == [("SPY.ARCA", 0.0), ("EWJ.ARCA", 100000.0)], "本地 pending_sells 未清空前不应放行买单。"
     assert clock["t"] >= 2.0, "应等待本地 pending_sells 进入终态。"
     assert broker.sync_calls == 1
+
+
+def test_order_executor_warns_and_skips_buys_when_sell_not_submitted(monkeypatch):
+    import common.rebalancer as rebalancer_module
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(rebalancer_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBroker:
+        def __init__(self):
+            self.calls = []
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            if data._name == "SPY.ARCA":
+                return None
+            return object()
+
+    broker = DummyBroker()
+    executor = rebalancer_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SPY.ARCA")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("SPY.ARCA", 0.0)], "卖单未提交时不应继续买入。"
+    assert len(pushed) == 2, "应分别推送卖单未提交与跳过买入告警。"
+    assert all(item["level"] == "ERROR" for item in pushed)
+    assert "SELL order not submitted" in pushed[0]["content"]
+    assert "Planned BUY orders are skipped" in pushed[1]["content"]
+
+
+def test_order_executor_warns_when_buy_not_submitted(monkeypatch):
+    import common.rebalancer as rebalancer_module
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(rebalancer_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBroker:
+        def __init__(self):
+            self.calls = []
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            return None
+
+    broker = DummyBroker()
+    executor = rebalancer_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("EWJ.ARCA", 100000.0)]
+    assert len(pushed) == 1
+    assert pushed[0]["level"] == "ERROR"
+    assert "BUY order not submitted" in pushed[0]["content"]

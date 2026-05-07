@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pandas as pd
+
 import common.optimizer as optimizer
 
 
@@ -140,6 +142,7 @@ def test_run_test_set_backtest_returns_structured_metrics(monkeypatch):
     job.test_datas = {"AAPL": object()}
     job.strategy_class = object()
     job.test_range = ("20250101", "20250331")
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
     job.args = SimpleNamespace(
         cash=100000.0,
         commission=0.0003,
@@ -159,6 +162,223 @@ def test_run_test_set_backtest_returns_structured_metrics(monkeypatch):
     assert DummyBacktester.last_kwargs["start_date"] == "20250101"
     assert DummyBacktester.last_kwargs["end_date"] == "20250331"
     assert not DummyBacktester.display_called
+
+
+def test_evaluate_trial_params_passes_cli_slippage_to_backtester(monkeypatch):
+    class DummyAnalyzer:
+        def get_analysis(self):
+            return {"total": {"total": 0}, "max": {"drawdown": 0.0}}
+
+    class DummyAnalyzers:
+        def getbyname(self, _name):
+            return DummyAnalyzer()
+
+    class DummyDataDatetime:
+        def datetime(self, idx):
+            return pd.Timestamp("2024-12-31").to_pydatetime() if idx == 0 else pd.Timestamp("2024-01-01").to_pydatetime()
+
+    class DummyData:
+        datetime = DummyDataDatetime()
+
+        def __len__(self):
+            return 2
+
+    class DummyStrat:
+        data = DummyData()
+        analyzers = DummyAnalyzers()
+
+    class DummyBacktester:
+        last_kwargs = None
+
+        def __init__(self, **kwargs):
+            DummyBacktester.last_kwargs = kwargs
+            self.results = []
+
+        def run(self):
+            self.results = [DummyStrat()]
+
+        def get_custom_metric(self, metric_name):
+            if metric_name == "return":
+                return 0.05
+            if metric_name == "sharpe":
+                return 1.0
+            if metric_name == "calmar":
+                return 1.0
+            return 0.0
+
+    monkeypatch.setattr(optimizer, "Backtester", DummyBacktester)
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.train_datas = {"AAPL": object()}
+    job.strategy_class = object()
+    job.train_range = ("20240101", "20241231")
+    job.args = SimpleNamespace(
+        cash=100000.0,
+        commission=0.0003,
+        slippage=0.0001,
+        timeframe="Days",
+        compression=1,
+        metric="return",
+    )
+    job.risk_control_classes = []
+    job.risk_params = {}
+
+    got = job._evaluate_trial_params(current_params={"lookback": 20})
+
+    assert got == 0.05
+    assert DummyBacktester.last_kwargs["slippage"] == 0.0001
+
+
+def test_slice_datas_keeps_fixed_warmup_rows_before_logical_start():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    idx = pd.date_range("2023-01-01", "2025-06-30", freq="D")
+    job.raw_datas = {
+        "AAPL": pd.DataFrame(
+            {
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 100.0,
+            },
+            index=idx,
+        )
+    }
+
+    got = job.slice_datas("20250101", "20250630")
+
+    assert job.warmup_days == 400
+    assert got["AAPL"].index.min() == pd.Timestamp("2023-11-28")
+    assert got["AAPL"].index.max() == pd.Timestamp("2025-06-30")
+
+
+def test_split_data_dynamic_refit_has_no_test_range():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    idx = pd.date_range("2019-01-01", "2025-01-31", freq="D")
+    job.raw_datas = {
+        "AAPL": pd.DataFrame(
+            {
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 100.0,
+            },
+            index=idx,
+        )
+    }
+    job.args = SimpleNamespace(
+        train_period=None,
+        test_period=None,
+        train_roll_period="5y",
+        test_roll_period=None,
+        train_ratio=None,
+        end_date="20250131",
+        start_date="20181127",
+    )
+
+    train_d, test_d, train_range, test_range = job._split_data()
+
+    assert train_range == ("20200131", "20250131")
+    assert test_d == {}
+    assert test_range == (None, None)
+    assert train_d["AAPL"].index.min() == pd.Timestamp("2019-01-01")
+    assert train_d["AAPL"].index.max() == pd.Timestamp("2025-01-31")
+
+
+def test_fetch_all_data_dynamic_roll_uses_fixed_warmup_start():
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            calls.append({"symbol": symbol, **kwargs})
+            return pd.DataFrame(
+                {
+                    "open": [1.0],
+                    "high": [1.0],
+                    "low": [1.0],
+                    "close": [1.0],
+                    "volume": [100.0],
+                },
+                index=[pd.Timestamp("2024-01-01")],
+            )
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    job.target_symbols = ["AAPL"]
+    job.data_manager = DummyDataManager()
+    job.args = SimpleNamespace(
+        start_date="20220101",
+        end_date="20250131",
+        train_roll_period="5y",
+        test_roll_period="6m",
+        train_period=None,
+        test_period=None,
+        data_source="dummy",
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    )
+
+    got = job._fetch_all_data()
+
+    expected_start = (
+        pd.Timestamp("2025-01-31")
+        - pd.DateOffset(months=6)
+        - pd.DateOffset(years=5)
+        - pd.DateOffset(days=optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS)
+    ).strftime("%Y%m%d")
+    assert list(got) == ["AAPL"]
+    assert calls[0]["start_date"] == expected_start
+    assert calls[0]["end_date"] == "20250131"
+
+
+def test_fetch_all_data_full_window_uses_fixed_warmup_start():
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            calls.append({"symbol": symbol, **kwargs})
+            return pd.DataFrame(
+                {
+                    "open": [1.0],
+                    "high": [1.0],
+                    "low": [1.0],
+                    "close": [1.0],
+                    "volume": [100.0],
+                },
+                index=[pd.Timestamp("2024-01-01")],
+            )
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    job.target_symbols = ["AAPL"]
+    job.data_manager = DummyDataManager()
+    job.args = SimpleNamespace(
+        start_date="20220101",
+        end_date="20250131",
+        train_roll_period=None,
+        test_roll_period=None,
+        train_period=None,
+        test_period=None,
+        train_ratio=None,
+        data_source="dummy",
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    )
+
+    got = job._fetch_all_data()
+
+    expected_start = (
+        pd.Timestamp("2022-01-01")
+        - pd.DateOffset(days=optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS)
+    ).strftime("%Y%m%d")
+    assert list(got) == ["AAPL"]
+    assert calls[0]["start_date"] == expected_start
+    assert calls[0]["end_date"] == "20250131"
 
 
 def test_request_elevation_skips_for_single_worker(monkeypatch):

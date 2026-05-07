@@ -133,6 +133,7 @@ class OrderExecutor:
         """执行调仓计划：利用 order_target_value 及其内部智能逻辑"""
 
         sell_submitted = False
+        sell_submit_failed = False
         submitted_sell_ids = set()
         has_untracked_sell = False
 
@@ -148,6 +149,9 @@ class OrderExecutor:
                     submitted_sell_ids.add(oid)
                 else:
                     has_untracked_sell = True
+            else:
+                sell_submit_failed = True
+                self._warn_order_not_submitted('SELL', data, 0.0, phase='clear')
 
         for data, target in plan['reduce']:
             self._log(f"执行减仓: {data._name} -> {target:.2f}")
@@ -159,6 +163,9 @@ class OrderExecutor:
                     submitted_sell_ids.add(oid)
                 else:
                     has_untracked_sell = True
+            else:
+                sell_submit_failed = True
+                self._warn_order_not_submitted('SELL', data, target, phase='reduce')
 
         # 第二步：若本轮有卖单，则持续等待直到卖单进入终态。
         # 等待过久只告警，不据此改变交易决策。
@@ -166,14 +173,45 @@ class OrderExecutor:
             self._log("等待卖单终态...")
             self._wait_sells_settled(submitted_sell_ids, has_untracked_sell)
 
+        if sell_submit_failed:
+            msg = (
+                "[Executor Warning] One or more SELL orders were not submitted. "
+                "Planned BUY orders are skipped for this rebalance run."
+            )
+            print(msg)
+            try:
+                AlarmManager().push_text(msg, level='ERROR')
+            except Exception:
+                pass
+            return
+
         # 第三步：处理所有买入动作 (补仓/开仓)
         for data, target in plan['increase']:
             self._log(f"执行补仓/开仓: {data._name} -> {target:.2f}")
-            self.broker.order_target_value(data=data, target=target)
+            buy_order = self.broker.order_target_value(data=data, target=target)
+            if not buy_order:
+                self._warn_order_not_submitted('BUY', data, target, phase='increase')
 
     def _log(self, txt):
         if self.debug:
             print(f"[Executor] {txt}")
+
+    @staticmethod
+    def _warn_order_not_submitted(side, data, target, phase):
+        symbol = getattr(data, '_name', str(data))
+        try:
+            target_text = f"{float(target):.2f}"
+        except Exception:
+            target_text = str(target)
+        msg = (
+            f"[Executor Warning] {side} order not submitted: "
+            f"phase={phase}, symbol={symbol}, target={target_text}."
+        )
+        print(msg)
+        try:
+            AlarmManager().push_text(msg, level='ERROR')
+        except Exception:
+            pass
 
     def _wait_sells_settled(self, submitted_sell_ids=None, has_untracked_sell=False):
         tracked_ids = {str(x).strip() for x in (submitted_sell_ids or set()) if str(x).strip()}

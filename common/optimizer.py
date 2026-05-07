@@ -626,6 +626,7 @@ class OptimizationJob:
     CN_EXCHANGE_PREFIXES = {"SHSE", "SZSE", "SH", "SZ"}
     HK_EXCHANGE_PREFIXES = {"SEHK", "HK"}
     US_EXCHANGE_PREFIXES = {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "ISLAND", "SMART", "PINK", "US"}
+    DEFAULT_WARMUP_DAYS = 400
 
     def __init__(self, args, fixed_params, opt_params_def, risk_params, shared_context=None):
         self.args = args
@@ -633,6 +634,7 @@ class OptimizationJob:
         self.opt_params_def = opt_params_def
         self.risk_params = risk_params
         self._reset_trial_dedupe_cache()
+        self.warmup_days = self.DEFAULT_WARMUP_DAYS
 
         # 共享上下文模式：复用选股、数据抓取与切分结果，确保多指标/基准对比在同一数据宇宙下进行
         if shared_context is not None:
@@ -645,6 +647,7 @@ class OptimizationJob:
             self.test_datas = shared_context["test_datas"]
             self.train_range = shared_context["train_range"]
             self.test_range = shared_context["test_range"]
+            self.warmup_days = shared_context.get("warmup_days", self.warmup_days)
             self._window_data_cache = shared_context.get("window_data_cache", {})
 
             # 在复用数据上下文的前提下，仅重建本次 metric 对应的 study_name
@@ -709,6 +712,7 @@ class OptimizationJob:
             "test_datas": self.test_datas,
             "train_range": self.train_range,
             "test_range": self.test_range,
+            "warmup_days": self.warmup_days,
             "window_data_cache": self._window_data_cache,
         }
 
@@ -722,6 +726,14 @@ class OptimizationJob:
     @staticmethod
     def _get_total_cpu_cores():
         return max(1, os.cpu_count() or 1)
+
+    def _warmup_start_date(self, start_date):
+        if not start_date:
+            return start_date
+
+        ts = pd.to_datetime(str(start_date)) - pd.DateOffset(days=self.warmup_days)
+        text = str(start_date)
+        return ts.strftime('%Y-%m-%d %H:%M:%S') if ':' in text else ts.strftime('%Y%m%d')
 
     @classmethod
     def _resolve_worker_count(cls, requested_jobs):
@@ -763,6 +775,7 @@ class OptimizationJob:
             "risk_params": self.risk_params,
             "train_datas": self.train_datas,
             "train_range": self.train_range,
+            "warmup_days": self.warmup_days,
             # spawn 子进程不会继承主进程运行期改写的 config，显式透传日志开关。
             "log_enabled": bool(getattr(config, "LOG", False)),
         }
@@ -949,6 +962,7 @@ class OptimizationJob:
         obj.risk_params = payload["risk_params"]
         obj.train_datas = payload["train_datas"]
         obj.train_range = payload["train_range"]
+        obj.warmup_days = payload.get("warmup_days", cls.DEFAULT_WARMUP_DAYS)
 
         obj.strategy_class = get_class_from_name(obj.args.strategy, ['strategies'])
         obj.risk_control_classes = []
@@ -1095,8 +1109,8 @@ class OptimizationJob:
             if train_duration:
                 anchor_dt = pd.to_datetime(str(req_end))
 
-                # 依次扣除：测试期 -> 训练期 -> 14天缓冲区
-                fetch_start_dt = anchor_dt - test_duration - train_duration - pd.DateOffset(days=14)
+                # 依次扣除：测试期 -> 训练期 -> 指标预热期
+                fetch_start_dt = anchor_dt - test_duration - train_duration - pd.DateOffset(days=self.warmup_days)
 
                 req_start = fetch_start_dt.strftime('%Y%m%d')
 
@@ -1106,7 +1120,22 @@ class OptimizationJob:
                 print(f"[Auto-Fetch] Dynamic Rolling Detected:")
                 print(f"  Train Roll: {self.args.train_roll_period}")
                 print(f"  Test Roll:  {getattr(self.args, 'test_roll_period', 'None (Refit Mode)')}")
+                print(f"  Warm-up:    {self.warmup_days} calendar days")
                 print(f"  => Fetching data from {req_start} to {req_end}")
+
+        elif getattr(self.args, 'train_period', None) and getattr(self.args, 'test_period', None):
+            tr_s, _ = self.args.train_period.split('-')
+            te_s, _ = self.args.test_period.split('-')
+            req_start = self._warmup_start_date(min(tr_s, te_s))
+            print(f"[Auto-Fetch] Explicit Split Detected:")
+            print(f"  Warm-up:    {self.warmup_days} calendar days")
+            print(f"  => Fetching data from {req_start} to {req_end}")
+
+        elif getattr(self.args, 'train_ratio', None) is None and req_start:
+            req_start = self._warmup_start_date(req_start)
+            print(f"[Auto-Fetch] Full Window Detected:")
+            print(f"  Warm-up:    {self.warmup_days} calendar days")
+            print(f"  => Fetching data from {req_start} to {req_end}")
 
         # 3. 统一抓取窗口：训练需求 vs Recent3Y 需求取更早起点，确保后续多指标/基准完全可比
         req_fetch_start = req_start
@@ -1182,8 +1211,8 @@ class OptimizationJob:
 
             tr_s = train_start_dt.strftime('%Y%m%d')
             tr_e = train_end_dt.strftime('%Y%m%d')
-            te_s = split_dt.strftime('%Y%m%d')
-            te_e = anchor_dt.strftime('%Y%m%d')
+            te_s = split_dt.strftime('%Y%m%d') if test_roll else None
+            te_e = anchor_dt.strftime('%Y%m%d') if test_roll else None
 
             print(f"  [Auto-Inferred] Train Set: {tr_s} -> {tr_e} ({train_roll})")
 
@@ -1634,6 +1663,7 @@ class OptimizationJob:
                 end_date=self.train_range[1],
                 cash=self.args.cash,
                 commission=self.args.commission,
+                slippage=self.args.slippage,
                 risk_control_classes=self.risk_control_classes,
                 risk_control_params=self.risk_params,
                 timeframe=self.args.timeframe,
@@ -1793,12 +1823,12 @@ class OptimizationJob:
         return df
 
     def slice_datas(self, start_date: str, end_date: str):
-        """根据日期切分数据字典"""
+        """根据日期切分数据字典，并保留逻辑起点前的指标预热数据。"""
         sliced = {}
         if not start_date and not end_date:
             return self.raw_datas
 
-        s = pd.to_datetime(start_date) if start_date else pd.Timestamp.min
+        s = pd.to_datetime(self._warmup_start_date(start_date)) if start_date else pd.Timestamp.min
         e = pd.to_datetime(end_date) if end_date else pd.Timestamp.max
 
         for symbol, df in self.raw_datas.items():
@@ -1831,13 +1861,14 @@ class OptimizationJob:
         2) 对覆盖不足的标的才向 provider 补拉
         3) 结果做窗口级缓存，供多指标/基准复用
         """
-        cache_key = f"{start_date}:{end_date}"
+        cache_key = f"{start_date}:{end_date}:warmup{self.warmup_days}"
         if cache_key in self._window_data_cache:
             print(f"[Optimizer] Reusing cached window data: {start_date} to {end_date}")
             return self._window_data_cache[cache_key]
 
         datas = {}
-        s = pd.to_datetime(start_date) if start_date else pd.Timestamp.min
+        physical_start_date = self._warmup_start_date(start_date)
+        s = pd.to_datetime(physical_start_date) if physical_start_date else pd.Timestamp.min
         e = pd.to_datetime(end_date) if end_date else pd.Timestamp.max
 
         for symbol in self.target_symbols:
@@ -1865,7 +1896,7 @@ class OptimizationJob:
 
             df = self.data_manager.get_data(
                 symbol,
-                start_date=start_date,
+                start_date=physical_start_date,
                 end_date=end_date,
                 specified_sources=self.args.data_source,
                 timeframe=self.args.timeframe,

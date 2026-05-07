@@ -35,6 +35,18 @@ class _TwoSymbolPercentBuyStrategy(BaseStrategy):
         self.statuses.append(order.getstatusname())
 
 
+class _WarmupProbeStrategy(BaseStrategy):
+    seen_dates = []
+    dataname_first = None
+
+    def init(self):
+        df = self.broker.datas[0].p.dataname
+        self.__class__.dataname_first = df.index.min()
+
+    def next(self):
+        self.__class__.seen_dates.append(self.broker.datas[0].datetime.datetime(0))
+
+
 def test_order_target_percent_tracks_virtual_spent_cash_with_multi_symbol_buy(monkeypatch):
     """
     回归：同一 Bar 多标的连续 order_target_percent 买入时，必须扣减本轮已花费现金。
@@ -64,3 +76,42 @@ def test_order_target_percent_tracks_virtual_spent_cash_with_multi_symbol_buy(mo
 
     final_sizes = {d._name: wrapper.getposition(d).size for d in wrapper.datas}
     assert final_sizes == {'AAA': 6, 'BBB': 4}, "第二笔买单应按剩余现金自动缩量成交，而非被拒单。"
+
+
+def test_backtester_keeps_full_dataname_while_feed_starts_at_start_date():
+    idx = pd.date_range("2024-01-01", periods=10, freq="D")
+    df = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 100.0,
+            "low": 100.0,
+            "close": 100.0,
+            "volume": 1.0,
+        },
+        index=idx,
+    )
+    _WarmupProbeStrategy.seen_dates = []
+    _WarmupProbeStrategy.dataname_first = None
+
+    bt = Backtester(
+        datas={"AAA": df},
+        strategy_class=_WarmupProbeStrategy,
+        start_date="20240106",
+        end_date="20240110",
+        cash=1000.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+    )
+    bt.run()
+
+    assert _WarmupProbeStrategy.dataname_first == pd.Timestamp("2024-01-01")
+    assert [d.strftime("%Y%m%d") for d in _WarmupProbeStrategy.seen_dates] == [
+        "20240106",
+        "20240107",
+        "20240108",
+        "20240109",
+        "20240110",
+    ]
+    assert bt.get_performance_metrics()["start_date"] == pd.Timestamp("2024-01-06").to_pydatetime()

@@ -43,6 +43,8 @@
 14. GM/IB 的 schedule 运行支持 prewarm；相关生成/修复应保留 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 15. schedule 附近的 IM 报警支持时间窗；默认用 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可按连接覆盖。
 16. `STARTED` / `STOPPED` / `DEAD` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。
+17. 实盘阻断类错误告警不得在长进程内永久静默；按 schedule 去重时应以当前 schedule slot 为作用域（例如 `1d` 每日、`5m` 每个 5 分钟 slot）。
+18. 调仓执行器若遇到订单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警；卖单失败时跳过本轮后续买入，避免“实盘信号”误导为实际委托。
 
 ## 推荐阅读顺序
 1. 先读 `docs/specs/*` 中与你任务最相关的正式规范。

@@ -12,6 +12,7 @@ except ImportError:
     Crypto = None
 
 from alarms.manager import AlarmManager
+from alarms.live_alarm import LiveAlarmDeduper
 from common.log import coerce_dt
 from common.ib_symbol_parser import resolve_ib_contract_spec
 import config
@@ -141,18 +142,10 @@ class IBBrokerAdapter(BaseLiveBroker):
         # 跨 client 的 open orders 拉取节流，避免高频路径反复 reqAllOpenOrders。
         self._req_all_open_orders_last_ts = 0.0
         self._req_all_open_orders_interval_s = 2.0
-        # “手工单需 clientId=0 才可撤”告警去重，避免 cleanup 重试阶段刷屏。
-        self._manual_bind_alarm_keys = set()
-        # 账户资金为 0 的告警去重，避免高频路径重复推送。
-        self._zero_cash_alarm_accounts = set()
-        # 账户探测诊断日志去重，避免重复刷屏。
-        self._account_probe_debug_logged_accounts = set()
+        self._live_alarm = LiveAlarmDeduper()
         self._last_account_snapshot_debug = {}
-        # 多账户但未指定下单账户的告警去重
-        self._missing_order_account_warned = False
         # 无实时价兜底与告警去重
         self._price_data_manager = None
-        self._price_alarm_keys = set()
         self._delayed_market_data_enabled = False
         super().__init__(context, cash_override, commission_override, slippage_override)
 
@@ -279,10 +272,15 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         return (accounts, debug) if with_debug else accounts
 
-    def _warn_missing_order_account_once(self, known_accounts):
-        if self._missing_order_account_warned:
+    def _warn_missing_order_account_for_schedule_scope(self, known_accounts):
+        alarm_key = self._live_alarm.schedule_key(
+            'missing_order_account',
+            schedule_rule=getattr(self._context, 'schedule_rule', ''),
+            now=getattr(self, '_datetime', None) or getattr(self._context, 'now', None),
+        )
+        if self._live_alarm.seen(alarm_key):
             return
-        self._missing_order_account_warned = True
+
         accounts = sorted([a for a in (known_accounts or []) if a])
         msg = (
             "[IBBroker] Multiple accounts detected but IBKR_ORDER_ACCOUNT not set. "
@@ -356,8 +354,9 @@ class IBBrokerAdapter(BaseLiveBroker):
         except Exception:
             cash_num = 0.0
 
+        dedupe_key = f"zero_cash_account:{account}"
         if cash_num > 0 and math.isfinite(cash_num):
-            self._zero_cash_alarm_accounts.discard(account)
+            self._live_alarm.forget(dedupe_key)
             return
 
         known_accounts, accounts_debug = self._collect_known_accounts(with_debug=True)
@@ -366,9 +365,8 @@ class IBBrokerAdapter(BaseLiveBroker):
         if known_accounts and account in known_accounts:
             return
 
-        if account in self._zero_cash_alarm_accounts:
+        if self._live_alarm.seen(dedupe_key):
             return
-        self._zero_cash_alarm_accounts.add(account)
 
         reason = (
             "账户快照为空（过滤后无匹配记录）"
@@ -401,9 +399,8 @@ class IBBrokerAdapter(BaseLiveBroker):
         acct = self._normalize_account(account)
         if not acct:
             return
-        if acct in self._account_probe_debug_logged_accounts:
+        if self._live_alarm.seen(f"account_probe_debug:{acct}"):
             return
-        self._account_probe_debug_logged_accounts.add(acct)
 
         snapshot_debug = getattr(self, '_last_account_snapshot_debug', {}) or {}
         managed_raw = accounts_debug.get('managed_accounts_raw')
@@ -840,10 +837,9 @@ class IBBrokerAdapter(BaseLiveBroker):
         return None
 
     def _push_manual_bind_alarm_once(self, pending_id: str, perm_id: str, client_id: int, reason: str):
-        key = f"{client_id}:{perm_id or pending_id}"
-        if key in self._manual_bind_alarm_keys:
+        key = f"manual_bind:{client_id}:{perm_id or pending_id}"
+        if self._live_alarm.seen(key):
             return
-        self._manual_bind_alarm_keys.add(key)
 
         if client_id != 0:
             hint = "Manual TWS order cleanup may require IBKR_CLIENT_ID=0."
@@ -1530,11 +1526,12 @@ class IBBrokerAdapter(BaseLiveBroker):
             now = pd.Timestamp(now)
         except Exception:
             now = pd.Timestamp(datetime.datetime.now())
+        if pd.isna(now):
+            now = pd.Timestamp(datetime.datetime.now())
         day_key = now.strftime('%Y-%m-%d')
-        alarm_key = f"{symbol}:{day_key}"
-        if alarm_key in self._price_alarm_keys:
+        alarm_key = f"no_price:{symbol}:{day_key}"
+        if self._live_alarm.seen(alarm_key):
             return
-        self._price_alarm_keys.add(alarm_key)
 
         tried_str = ",".join(tried_sources) if tried_sources else "N/A"
         msg = (
@@ -1598,7 +1595,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             if known_accounts and all(self._is_aggregate_account_marker(a) for a in known_accounts):
                 known_accounts = set()
             if len(known_accounts) > 1:
-                self._warn_missing_order_account_once(known_accounts)
+                self._warn_missing_order_account_for_schedule_scope(known_accounts)
                 return None
 
         # 使用市价单 (MarketOrder) 或 限价单 (LimitOrder)
@@ -1741,6 +1738,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             strategy_instance = None
 
         ctx = Context()
+        ctx.schedule_rule = schedule_rule
         init_now = datetime.datetime.now(target_tz) if target_tz else datetime.datetime.now()
         ctx.now = pd.Timestamp(init_now)
 
