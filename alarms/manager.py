@@ -59,6 +59,7 @@ class AlarmManager:
         self._schedule_alarm_window_before_seconds = 0.0
         self._schedule_alarm_window_after_seconds = 0.0
         self._terminal_lifecycle_status = None
+        self._schedule_api_unavailable_alarm_keys = set()
 
         # 异常报警聚合: 默认开启，固定 60 秒窗口内合并相同(context, error)
         self._exception_aggregation_window_seconds = self._EXCEPTION_AGGREGATION_WINDOW_SECONDS
@@ -205,6 +206,7 @@ class AlarmManager:
         self._parsed_schedule_alarm_rule = None
         self._schedule_alarm_window_before_seconds = 0.0
         self._schedule_alarm_window_after_seconds = 0.0
+        self._schedule_api_unavailable_alarm_keys.clear()
 
         try:
             before_seconds, after_seconds = self._parse_schedule_alarm_window(
@@ -295,6 +297,96 @@ class AlarmManager:
 
     def push_plan(self, content, level='INFO'):
         self.push_text(content, level=level, alarm_tag=BaseAlarm.TAG_PLAN)
+
+    def push_schedule_api_unavailable(self, broker_name, reason, now=None, prewarm_lead_seconds=None,
+                                      schedule_tolerance_seconds=60.0):
+        if not self.alarms:
+            return []
+        if not self._schedule_alarm_rule or not self._parsed_schedule_alarm_rule:
+            return []
+
+        from live_trader.data_bridge.data_warm import SchedulePlanner
+
+        now_ts = pd.Timestamp(now or self._current_schedule_alarm_time())
+        try:
+            lead_seconds = (
+                SchedulePlanner.parse_schedule_prewarm_lead(
+                    getattr(config, 'LIVE_SCHEDULE_PREWARM_LEAD', 0)
+                )
+                if prewarm_lead_seconds is None
+                else SchedulePlanner.parse_schedule_prewarm_lead(prewarm_lead_seconds)
+            )
+        except Exception:
+            lead_seconds = 0.0
+
+        sent = []
+
+        def _push(event_name, slot_key, impact):
+            if not slot_key:
+                return
+            alarm_key = f"schedule_api_unavailable:{broker_name}:{event_name}:{self._schedule_alarm_rule}:{slot_key}"
+            if alarm_key in self._schedule_api_unavailable_alarm_keys:
+                return
+            self._schedule_api_unavailable_alarm_keys.add(alarm_key)
+            if len(self._schedule_api_unavailable_alarm_keys) > 5000:
+                self._schedule_api_unavailable_alarm_keys.clear()
+                self._schedule_api_unavailable_alarm_keys.add(alarm_key)
+
+            msg = (
+                f"[{broker_name} Error] Broker API unavailable during schedule {event_name}. "
+                f"schedule={self._schedule_alarm_rule}, slot={slot_key}, "
+                f"now={now_ts.strftime('%Y-%m-%d %H:%M:%S')}, reason={reason}. "
+                f"{impact}; process will keep reconnecting."
+            )
+            print(msg)
+            content = msg
+            if self.context_tag:
+                content = f"""### {self.context_tag}
+{msg}         
+"""
+            self._dispatch_text(content, 'ERROR')
+            sent.append({"event": event_name, "slot_key": slot_key, "message": msg})
+
+        parsed_schedule = self._parsed_schedule_alarm_rule
+        if lead_seconds > 0:
+            try:
+                should_prewarm, _, prewarm_slot_key = SchedulePlanner.should_trigger_schedule_prewarm_for_rule(
+                    now=now_ts,
+                    parsed_schedule=parsed_schedule,
+                    lead_seconds=lead_seconds,
+                    last_prewarm_run_key=None,
+                    last_schedule_run_key=None,
+                )
+                if should_prewarm:
+                    _push("prewarm", prewarm_slot_key, "schedule prewarm may be missed")
+            except Exception as exc:
+                print(f"[AlarmManager] failed to evaluate schedule prewarm API alarm: {exc}")
+
+        try:
+            tolerance = max(0.0, float(schedule_tolerance_seconds or 0.0))
+        except Exception:
+            tolerance = 60.0
+        if parsed_schedule.get('kind') == 'interval':
+            try:
+                tolerance = max(tolerance, float(parsed_schedule.get('interval_seconds') or 0.0))
+            except Exception:
+                pass
+        else:
+            tolerance = max(tolerance, 60.0)
+
+        try:
+            should_run, _, run_slot_key = SchedulePlanner.should_trigger_schedule(
+                now=now_ts,
+                parsed_schedule=parsed_schedule,
+                last_schedule_run_key=None,
+                tolerance_window=tolerance,
+            )
+            if should_run:
+                _push("run", run_slot_key, "strategy run may be missed")
+        except Exception as exc:
+            print(f"[AlarmManager] failed to evaluate schedule run API alarm: {exc}")
+
+        return sent
 
     def push_exception(self, context, error, alarm_tag=None):
         if not self.alarms:

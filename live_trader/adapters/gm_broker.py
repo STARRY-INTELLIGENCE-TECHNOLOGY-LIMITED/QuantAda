@@ -808,6 +808,10 @@ class GmBrokerAdapter(BaseLiveBroker):
                 status = gmi_init()
                 if status != 0:
                     print(f"[Phoenix] Init failed (Code: {status}). Retrying in 10s...")
+                    AlarmManager().push_schedule_api_unavailable(
+                        "GmBroker",
+                        f"GM terminal init failed (Code: {status})",
+                    )
                     return True  # 初始化失败，要求重试
 
                 check_gm_status(status)

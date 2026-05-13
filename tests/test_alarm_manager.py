@@ -355,6 +355,81 @@ def test_schedule_alarm_window_still_blocks_non_lifecycle_status_outside_window(
     assert fake.status_calls == [], "普通 INFO 状态不应因为 status 接口而自动绕过报警窗口。"
 
 
+def test_schedule_api_unavailable_alarm_covers_prewarm_and_run_slots(monkeypatch, fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+    monkeypatch.setattr(manager_module.config, "LIVE_SCHEDULE_PREWARM_LEAD", "60s")
+
+    mgr.set_runtime_context(
+        broker="ib_broker",
+        conn_id="7497",
+        strategy="my_strategy",
+        params={},
+        market_scope="symbols=QQQ",
+        schedule_rule="1d:15:45:00",
+        alarm_window="5m:5m",
+    )
+
+    prewarm_sent = mgr.push_schedule_api_unavailable(
+        "IBBroker",
+        "connect failed",
+        now=datetime.datetime(2026, 5, 5, 15, 44, 30),
+    )
+    prewarm_repeat = mgr.push_schedule_api_unavailable(
+        "IBBroker",
+        "connect failed again",
+        now=datetime.datetime(2026, 5, 5, 15, 44, 35),
+    )
+    run_sent = mgr.push_schedule_api_unavailable(
+        "IBBroker",
+        "connect failed",
+        now=datetime.datetime(2026, 5, 5, 15, 45, 5),
+    )
+    run_repeat = mgr.push_schedule_api_unavailable(
+        "IBBroker",
+        "connect failed again",
+        now=datetime.datetime(2026, 5, 5, 15, 45, 10),
+    )
+
+    assert [item["event"] for item in prewarm_sent] == ["prewarm"]
+    assert prewarm_repeat == []
+    assert [item["event"] for item in run_sent] == ["run"]
+    assert run_repeat == []
+    assert _wait_until(lambda: len(fake.text_calls) == 2)
+    assert all(item[1] == "ERROR" for item in fake.text_calls)
+    assert "schedule prewarm may be missed" in fake.text_calls[0][0]
+    assert "strategy run may be missed" in fake.text_calls[1][0]
+
+
+def test_schedule_api_unavailable_alarm_covers_interval_slot_body(monkeypatch, fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+    monkeypatch.setattr(manager_module.config, "LIVE_SCHEDULE_PREWARM_LEAD", "60s")
+
+    mgr.set_runtime_context(
+        broker="gm_broker",
+        conn_id="demo",
+        strategy="my_strategy",
+        params={},
+        market_scope="symbols=SHSE.600000",
+        schedule_rule="5m:09:30:00",
+        alarm_window="0:0",
+    )
+
+    sent = mgr.push_schedule_api_unavailable(
+        "GmBroker",
+        "terminal not started",
+        now=datetime.datetime(2026, 5, 5, 9, 33, 0),
+    )
+
+    assert [item["event"] for item in sent] == ["run"]
+    assert sent[0]["slot_key"] == "2026-05-05 09:30:00"
+    assert _wait_until(lambda: len(fake.text_calls) == 1)
+    assert "GmBroker Error" in fake.text_calls[0][0]
+
+
 def test_dead_signal_does_not_emit_stopped_again_on_exit(monkeypatch, fresh_alarm_manager):
     mgr = fresh_alarm_manager
     fake = FakeAlarmChannel()

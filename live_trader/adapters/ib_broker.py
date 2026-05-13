@@ -1848,6 +1848,10 @@ class IBBrokerAdapter(BaseLiveBroker):
                         # 🔴 关键修复：使用 repr(e) 捕获空字面量异常
                         err_msg = repr(e)
                         print(f"[System] ⏳ Connection failed: {err_msg}")
+                        AlarmManager().push_schedule_api_unavailable(
+                            "IBBroker",
+                            f"IB Gateway/TWS connect failed: {err_msg}",
+                        )
 
                         # 幽灵占用与超时自愈逻辑
                         if "already in use" in err_msg or "326" in err_msg:
@@ -1970,6 +1974,10 @@ class IBBrokerAdapter(BaseLiveBroker):
                 # 捕获这些明确的网络层异常
                 print(f"\n[⚠️ Disconnect] Network Error: {e}")
                 print("[System] Entering Recovery Mode. Waiting for TWS/Gateway...")
+                AlarmManager().push_schedule_api_unavailable(
+                    "IBBroker",
+                    f"IB Gateway/TWS network error: {e}",
+                )
 
                 try:
                     ib.disconnect()

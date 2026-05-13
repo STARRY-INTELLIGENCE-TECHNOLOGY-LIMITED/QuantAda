@@ -63,6 +63,7 @@
 - `get_pending_orders` 中 `id` 可用于撤单
 - `cancel_pending_order` 幂等、异常安全（失败返回 False，不抛出致命异常）
 5. 当前拒单重试语义为“无状态 + 当场重提”: 前 5 次按 `LOT_SIZE` 线性降级，后 5 次按几何倍数降级；适配器侧必须提供真实现金口径，避免重试阶段出现系统性偏差。
+6. 当实盘 schedule 期间券商平台未启动、API 不可用或连接失败时，需在 prewarm 与实际 run 时刻分别推送 slot 级 ERROR 告警，但不得把该 slot 误记为已执行。
 
 ---
 
