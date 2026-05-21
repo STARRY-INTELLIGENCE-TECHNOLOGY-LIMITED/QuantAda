@@ -443,6 +443,20 @@ def test_sell_rejected_does_not_replay_or_enqueue_buy():
     assert len(broker.submitted_orders) == 0, "拒单回调阶段不应补发买单"
 
 
+def test_sell_expired_clears_pending_without_replay():
+    """
+    非在途终态回归:
+    卖单进入 Expired 等非 pending 终态时，必须清理 pending_sells，不得补发买单。
+    """
+    broker = MockBroker(initial_cash=100.0)
+
+    broker._pending_sells.add("SELL_1")
+    broker.on_order_status(MockOrderProxy("SELL_1", is_buy_order=False, status="Expired"))
+
+    assert "SELL_1" not in broker._pending_sells, "Expired 卖单应移除 pending sell 监控"
+    assert len(broker.submitted_orders) == 0, "Expired 卖单回调阶段不应补发买单"
+
+
 def test_expected_size_with_pending_orders():
     """
     在途穿透防重下单:
@@ -492,6 +506,33 @@ def test_intraday_long_gap_reset():
     assert len(broker._pending_sells) == 0, "日内长中断后 _pending_sells 必须被强制清空"
     assert len(broker._active_buys) == 0, "日内长中断后 _active_buys 必须被强制清空"
     assert broker._virtual_spent_cash == pytest.approx(0.0), "日内长中断后虚拟占资必须清空"
+
+
+def test_scheduled_intraday_gap_does_not_reset_stale_state():
+    """
+    schedule 兼容:
+    30m/1h 这类调度间隔天然超过 10 分钟，不能按长中断清理日内在途状态。
+    """
+    broker = MockBroker(initial_cash=10000.0)
+    broker._context.schedule_rule = "1h:09:30:00"
+    data = _make_data()
+
+    broker._pending_sells.add("SELL_STALE_1")
+    broker._active_buys["BUY_STALE_1"] = {
+        "data": data,
+        "shares": 100,
+        "price": 10.0,
+        "lot_size": 100,
+        "retries": 0,
+    }
+    broker._virtual_spent_cash = 1000.0
+
+    broker.set_datetime(datetime(2026, 2, 17, 10, 0, 0))
+    broker.set_datetime(datetime(2026, 2, 17, 11, 0, 0))
+
+    assert len(broker._pending_sells) == 1, "schedule 正常间隔不应清理 _pending_sells"
+    assert len(broker._active_buys) == 1, "schedule 正常间隔不应清理 _active_buys"
+    assert broker._virtual_spent_cash == pytest.approx(1000.0), "schedule 正常间隔不应清理虚拟占资"
 
 
 def test_virtual_ledger_not_cleared_by_intraday_bar_progress():
@@ -634,6 +675,25 @@ def test_buy_order_filled_releases_virtual_cash():
     assert broker.get_cash() == pytest.approx(90000.0), (
         "买单成交后 get_cash 应与柜台实扣现金对齐，不能继续被虚拟账本二次扣减。"
     )
+
+
+def test_buy_order_expired_releases_virtual_cash_without_retry():
+    """
+    非在途终态回归:
+    买单进入非 pending 终态(如 Expired)时，必须回退虚拟占资，但不能继续重试。
+    """
+    broker = MockBroker(initial_cash=100000.0)
+    data = _make_data()
+
+    first = broker.order_target_value(data, target=10000.0)
+    assert first is not None
+    assert "ORDER_1" in broker._active_buys
+
+    broker.on_order_status(MockOrderProxy("ORDER_1", is_buy_order=True, status="Expired"))
+
+    assert "ORDER_1" not in broker._active_buys, "Expired 买单应从 _active_buys 清理"
+    assert broker._virtual_spent_cash == pytest.approx(0.0), "Expired 买单应回退虚拟占资"
+    assert len(broker.submitted_orders) == 1, "Expired 买单不应触发重试"
 
 
 def test_manual_force_reset_recovery():

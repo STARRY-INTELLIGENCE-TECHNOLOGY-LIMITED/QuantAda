@@ -348,7 +348,8 @@ class BaseStrategy(ABC):
             return None
 
         # 延迟导入以防止循环依赖
-        from common.rebalancer import PortfolioRebalancer, OrderExecutor
+        from common.order_executor import OrderExecutor
+        from common.rebalancer import PortfolioRebalancer
 
         symbol_map = {}
         for data in getattr(self.broker, 'datas', []) or []:

@@ -202,6 +202,7 @@ def test_execute_rebalance_skips_plan_when_weekly_gate_not_due(monkeypatch):
     非调仓周内不应生成计划，也不应进入执行器。
     """
     import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
 
     calculate_calls = []
     execute_calls = []
@@ -222,7 +223,7 @@ def test_execute_rebalance_skips_plan_when_weekly_gate_not_due(monkeypatch):
         "calculate_plan",
         staticmethod(fake_calculate_plan),
     )
-    monkeypatch.setattr(rebalancer_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
 
     data = DummyData(
         "AAPL.SMART",
@@ -246,6 +247,7 @@ def test_execute_rebalance_runs_plan_when_weekly_gate_due(monkeypatch):
     到达新交易周时，应正常生成计划并交给执行器。
     """
     import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
 
     calculate_calls = []
     execute_calls = []
@@ -266,7 +268,7 @@ def test_execute_rebalance_runs_plan_when_weekly_gate_due(monkeypatch):
         "calculate_plan",
         staticmethod(fake_calculate_plan),
     )
-    monkeypatch.setattr(rebalancer_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
 
     data = DummyData(
         "AAPL.SMART",
@@ -325,6 +327,7 @@ def test_execute_rebalance_skips_plan_when_rebalance_when_skip(monkeypatch):
     rebalance_when='skip' 时，即使默认频率是 bar，也不应生成计划。
     """
     import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
 
     calculate_calls = []
     execute_calls = []
@@ -345,7 +348,7 @@ def test_execute_rebalance_skips_plan_when_rebalance_when_skip(monkeypatch):
         "calculate_plan",
         staticmethod(fake_calculate_plan),
     )
-    monkeypatch.setattr(rebalancer_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
 
     data = DummyData("AAPL.SMART")
     broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
@@ -368,6 +371,7 @@ def test_execute_rebalance_runs_plan_when_rebalance_when_next(monkeypatch):
     rebalance_when='next' 时，应按本次正式调仓生成计划并执行。
     """
     import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
 
     calculate_calls = []
     execute_calls = []
@@ -388,7 +392,7 @@ def test_execute_rebalance_runs_plan_when_rebalance_when_next(monkeypatch):
         "calculate_plan",
         staticmethod(fake_calculate_plan),
     )
-    monkeypatch.setattr(rebalancer_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
 
     data = DummyData(
         "AAPL.SMART",
@@ -428,6 +432,7 @@ def test_should_execute_rebalance_rejects_invalid_rebalance_when(monkeypatch):
 
 def test_execute_rebalance_skips_unknown_targets_and_pushes_warning(monkeypatch):
     import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
 
     pushed = []
     calculate_calls = []
@@ -448,7 +453,7 @@ def test_execute_rebalance_skips_unknown_targets_and_pushes_warning(monkeypatch)
             return None
 
     monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "calculate_plan", staticmethod(fake_calculate_plan))
-    monkeypatch.setattr(rebalancer_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
     monkeypatch.setattr("strategies.base_strategy.AlarmManager", lambda: DummyAlarmManager())
 
     data = DummyData("AAPL.SMART")
@@ -470,6 +475,7 @@ def test_execute_rebalance_skips_unknown_targets_and_pushes_warning(monkeypatch)
 
 def test_execute_rebalance_resolves_same_symbol_target_to_managed_data(monkeypatch):
     import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
 
     calculate_calls = []
 
@@ -485,7 +491,7 @@ def test_execute_rebalance_resolves_same_symbol_target_to_managed_data(monkeypat
             return None
 
     monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "calculate_plan", staticmethod(fake_calculate_plan))
-    monkeypatch.setattr(rebalancer_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
 
     managed = DummyData("AAPL.SMART")
     broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[managed])

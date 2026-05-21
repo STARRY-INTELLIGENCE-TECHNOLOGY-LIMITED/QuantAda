@@ -347,6 +347,7 @@ def test_ib_status_translation_accuracy():
     """
     pre_submitted = IBOrderProxy(DummyIBTrade(status="PreSubmitted"), data=None)
     submitted = IBOrderProxy(DummyIBTrade(status="Submitted"), data=None)
+    api_pending = IBOrderProxy(DummyIBTrade(status="ApiPending"), data=None)
     filled = IBOrderProxy(DummyIBTrade(status="Filled"), data=None)
     cancelled = IBOrderProxy(DummyIBTrade(status="Cancelled"), data=None)
     api_cancelled = IBOrderProxy(DummyIBTrade(status="ApiCancelled"), data=None)
@@ -356,9 +357,13 @@ def test_ib_status_translation_accuracy():
     assert not pre_submitted.is_completed(), "状态映射错误：PreSubmitted 不能被视为 completed！"
     assert submitted.is_pending(), "状态映射错误：Submitted 必须是 pending，订单仍在排队！"
     assert not submitted.is_completed(), "状态映射错误：Submitted 不能被视为 completed！"
+    assert api_pending.is_pending(), "状态映射错误：ApiPending 必须是 pending，订单仍在 API 侧等待提交！"
+    assert not api_pending.is_completed(), "状态映射错误：ApiPending 不能被视为 completed！"
+    assert api_pending.is_accepted(), "状态映射错误：ApiPending 必须被视为活跃订单，避免风控重复发单！"
 
     assert filled.is_completed(), "状态映射错误：Filled 必须映射为 completed！"
     assert not filled.is_pending(), "状态映射错误：Filled 不应继续处于 pending！"
+    assert not filled.is_accepted(), "状态映射错误：Filled 已是终态，不能继续被视为 accepted！"
 
     assert cancelled.is_canceled(), "状态映射错误：Cancelled 必须映射为 canceled！"
     assert not cancelled.is_pending(), "状态映射错误：Cancelled 不应继续 pending，避免死锁！"

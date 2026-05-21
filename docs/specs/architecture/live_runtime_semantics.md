@@ -27,8 +27,15 @@
 1. 卖出受 `sellable` / `available_now` / `available` 等可卖字段约束。
 2. T+1 市场下，有持仓但不可卖时，直接跳过卖单，避免反复“仓位不足”拒单。
 3. 调仓执行遵循先卖后买。
-4. 若清仓/减仓卖单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警，且跳过本轮计划中的后续买入。
-5. 若买单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警，避免只有“实盘信号”日志而无实际委托。
+4. `common.rebalancer` 只负责调仓计划与仓位平衡计算；实盘发单、卖单等待和滚动买入逻辑属于 `common.order_executor`。
+5. 卖单等待以柜台在途单和本地 `_pending_sells` 为主；若终态回调缺失但实时持仓已达到本轮卖出目标，可清理本轮本地 pending 标记并同步资金。
+6. 卖单等待期间允许用实时可用现金滚动释放后续买单，已经释放但尚未被持仓/在途买单确认的部分不得重复提交。
+7. 未确认卖出的剩余资金必须继续保守；只有 SELL 在途状态清空后，才允许对计划内剩余买单做最终补齐。
+8. 卖单等待必须有硬上限，硬等待后必须返回当前 `run()`，不得无限阻塞 live schedule 后续触发。
+9. 若硬等待后仍存在 SELL 在途，必须打印并推送 ERROR 告警；本轮只保留已经由实时现金确认并滚动释放的买单，不得全量放行。
+10. 上述持仓/现金一致性兜底只用于当前调仓等待流程，不得保存或重放历史买入意图。
+11. 若清仓/减仓卖单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警，且跳过本轮计划中的后续买入。
+12. 若买单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警，避免只有“实盘信号”日志而无实际委托。
 
 ## 4. Overnight Pending Order Cleanup
 1. 默认在每个自然日首次 `run()`、拉数前执行。
@@ -47,6 +54,7 @@
 5. 风控支持多模块链式挂载。
 6. GM / IB schedule 运行支持 prewarm；相关改动不得破坏 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 7. schedule 附近的 IM 报警推送支持时间窗限制；默认读取 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可覆盖全局默认值。
-8. `STARTED` / `STOPPED` / `DEAD` 等生命周期消息，以及显式标注为 `plan` 的执行计划消息，不受 schedule 报警时间窗限制。
-9. 实盘阻断类错误告警不得在长进程内永久静默；若按 schedule 去重，应以当前 schedule slot 为作用域（如 `1d` 每日、`5m` 每 5 分钟 slot）。
-10. 若在 schedule prewarm 或实际 run 时刻券商平台未启动、API 不可用或连接失败，应推送 slot 级 ERROR 报警，但不得把该 slot 误记为已执行。
+8. 使用实盘 schedule 回调的 adapter 必须在 context 上暴露 `schedule_rule` 或 `use_schedule`，使基础 broker 能区分正常调度间隔和异常长中断。
+9. `STARTED` / `STOPPED` / `DEAD` 等生命周期消息，以及显式标注为 `plan` 的执行计划消息，不受 schedule 报警时间窗限制。
+10. 实盘阻断类错误告警不得在长进程内永久静默；若按 schedule 去重，应以当前 schedule slot 为作用域（如 `1d` 每日、`5m` 每 5 分钟 slot）。
+11. 若在 schedule prewarm 或实际 run 时刻券商平台未启动、API 不可用或连接失败，应推送 slot 级 ERROR 报警，但不得把该 slot 误记为已执行。

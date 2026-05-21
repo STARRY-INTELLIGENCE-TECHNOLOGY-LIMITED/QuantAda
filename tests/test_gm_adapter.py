@@ -17,6 +17,8 @@ mock_gm_api.OrderStatus_Filled = 3
 mock_gm_api.OrderStatus_Canceled = 4
 mock_gm_api.OrderStatus_Rejected = 5
 mock_gm_api.OrderStatus_PendingNew = 6
+mock_gm_api.OrderStatus_PendingCancel = 7
+mock_gm_api.OrderStatus_Expired = 8
 mock_gm_api.OrderSide_Buy = 1
 mock_gm_api.OrderSide_Sell = 2
 mock_gm_api.OrderType_Market = 11
@@ -65,6 +67,18 @@ def test_gm_status_translation_accuracy():
     canceled_proxy = GmOrderProxy(canceled_order, is_live=True)
     assert canceled_proxy.is_canceled(), "状态翻译错误：撤单必须触发 is_canceled()=True！"
     assert not canceled_proxy.is_pending(), "状态翻译错误：撤单不应继续处于 pending！"
+
+    # 4) 废单/过期 (Expired): 应明确离开 pending，避免本地卖单监控永久等待。
+    expired_order = DummyGMOrder(status=mock_gm_api.OrderStatus_Expired)
+    expired_proxy = GmOrderProxy(expired_order, is_live=True)
+    assert not expired_proxy.is_completed(), "过期单不能被误判为成交。"
+    assert not expired_proxy.is_pending(), "过期单必须离开 pending，避免无限等待。"
+    assert not expired_proxy.is_accepted(), "过期单不能继续被视为 accepted。"
+
+    # 5) 撤单中 (PendingCancel): 仍是柜台在途态，必须继续等待最终撤单/成交回报。
+    pending_cancel_order = DummyGMOrder(status=mock_gm_api.OrderStatus_PendingCancel)
+    pending_cancel_proxy = GmOrderProxy(pending_cancel_order, is_live=True)
+    assert pending_cancel_proxy.is_pending(), "撤单中仍属于在途态，应继续等待最终回报。"
 
 
 def test_gm_executed_stats_fallback():
@@ -139,6 +153,14 @@ def test_gm_is_accepted_only_for_active_status():
     assert not terminal_filled.is_accepted(), "OrderStatus_Filled 不应被视为 accepted。"
     assert not terminal_canceled.is_accepted(), "OrderStatus_Canceled 不应被视为 accepted。"
     assert not terminal_rejected.is_accepted(), "OrderStatus_Rejected 不应被视为 accepted。"
+
+
+def test_gm_expired_is_not_pending_and_not_accepted():
+    expired_order = DummyGMOrder(status=mock_gm_api.OrderStatus_Expired)
+    proxy = GmOrderProxy(expired_order, is_live=True)
+
+    assert not proxy.is_pending(), "Expired 单必须离开 pending。"
+    assert not proxy.is_accepted(), "Expired 单不能被视为 accepted。"
 
 
 def test_gm_submit_order_live_limit_with_auto_downsize(monkeypatch):

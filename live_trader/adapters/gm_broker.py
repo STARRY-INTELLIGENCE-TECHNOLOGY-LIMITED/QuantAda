@@ -1,4 +1,5 @@
 import datetime
+import sys
 
 import pandas as pd
 
@@ -15,18 +16,48 @@ try:
         OrderStatus_New, OrderStatus_PartiallyFilled, OrderStatus_Filled, \
         OrderStatus_Canceled, OrderStatus_Rejected, OrderStatus_PendingNew, \
         OrderSide_Buy, OrderSide_Sell
+    gm_api = sys.modules.get('gm.api')
+    OrderStatus_PendingCancel = getattr(gm_api, 'OrderStatus_PendingCancel', object())
+    OrderStatus_Expired = getattr(gm_api, 'OrderStatus_Expired', object())
+except ImportError:
+    print("Warning: 'gm' module not found. GmAdapter core API will not be available.")
+    order_target_percent = order_target_value = get_cash = subscribe = history = OrderType_Market = OrderType_Limit = None
+    MODE_LIVE = MODE_BACKTEST = None
+    OrderStatus_New = OrderStatus_PartiallyFilled = OrderStatus_Filled = None
+    OrderStatus_Canceled = OrderStatus_Rejected = OrderStatus_PendingNew = None
+    OrderStatus_PendingCancel = OrderStatus_Expired = None
+    OrderSide_Buy = OrderSide_Sell = None
+
+try:
     from gm.api import set_serv_addr, set_token, ADJUST_PREV
+except ImportError:
+    set_serv_addr = set_token = ADJUST_PREV = None
+
+try:
     from gm.csdk.c_sdk import (
         py_gmi_set_strategy_id, gmi_set_mode, py_gmi_set_data_callback,
         py_gmi_set_backtest_config, py_gmi_run, gmi_init, gmi_poll,
         py_gmi_set_backtest_intraday
     )
+except ImportError:
+    py_gmi_set_strategy_id = gmi_set_mode = py_gmi_set_data_callback = None
+    py_gmi_set_backtest_config = py_gmi_run = gmi_init = gmi_poll = None
+    py_gmi_set_backtest_intraday = None
+
+try:
     from gm.model.storage import context  # 掘金全局上下文
+except ImportError:
+    context = None
+
+try:
     from gm.callback import callback_controller  # 掘金回调控制器
+except ImportError:
+    callback_controller = None
+
+try:
     from gm.api._errors import check_gm_status
 except ImportError:
-    print("Warning: 'gm' module not found. GmAdapter will not be available.")
-    order_target_percent = order_target_value = get_cash = subscribe = history = OrderType_Market = MODE_BACKTEST = None
+    check_gm_status = None
 
 
 class GmOrderProxy(BaseOrderProxy):
@@ -111,16 +142,26 @@ class GmOrderProxy(BaseOrderProxy):
         # 回测兼容：PendingNew 被上层视为 completed
         if not self.is_live and status == OrderStatus_PendingNew:
             return False
-        terminal_states = [OrderStatus_Filled, OrderStatus_Canceled, OrderStatus_Rejected]
-        return status not in terminal_states
+        active_states = {
+            OrderStatus_New,
+            OrderStatus_PartiallyFilled,
+            OrderStatus_PendingNew,
+            OrderStatus_PendingCancel,
+        }
+        return status in active_states
 
     def is_accepted(self) -> bool:
         status = self.platform_order.status
         # 回测兼容：PendingNew 被上层视为 completed
         if not self.is_live and status == OrderStatus_PendingNew:
             return False
-        terminal_states = [OrderStatus_Filled, OrderStatus_Canceled, OrderStatus_Rejected]
-        return status not in terminal_states
+        active_states = {
+            OrderStatus_New,
+            OrderStatus_PartiallyFilled,
+            OrderStatus_PendingNew,
+            OrderStatus_PendingCancel,
+        }
+        return status in active_states
 
     def is_buy(self) -> bool:
         return hasattr(self.platform_order, 'side') and self.platform_order.side == OrderSide_Buy

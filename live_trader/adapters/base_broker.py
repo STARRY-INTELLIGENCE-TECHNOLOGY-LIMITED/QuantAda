@@ -640,6 +640,19 @@ class BaseLiveBroker(ABC):
                         else:
                             symbol = getattr(buy_info.get('data'), '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
                             print(f"❌ [Broker] 降级终止: {symbol} 已达到最大重试次数 {max_retries}，放弃本K。")
+                elif not proxy.is_pending():
+                    buy_info = self._active_buys.pop(oid, None)
+                    if buy_info:
+                        refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
+                        symbol = getattr(buy_info.get('data'), '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
+                        self._virtual_spent_cash = max(
+                            0.0,
+                            getattr(self, '_virtual_spent_cash', 0.0) - refund_amount
+                        )
+                        print(
+                            f"[Broker] ⚠️ 买单 {symbol} 进入非在途终态({getattr(proxy, 'status', 'Unknown')})。"
+                            f"已回退虚拟扣款: {refund_amount:.2f}"
+                        )
                 return
 
             # ==========================================
@@ -654,6 +667,8 @@ class BaseLiveBroker(ABC):
                 self._pending_sells.discard(oid)
             elif proxy.is_pending():
                 self._pending_sells.add(oid)
+            else:
+                self._pending_sells.discard(oid)
 
     def get_expected_size(self, data):
         """获取包含在途订单的【预期仓位】，防止底层下单方法出现认知撕裂"""
@@ -744,7 +759,12 @@ class BaseLiveBroker(ABC):
 
             # 计算时间差 (秒)
             time_delta = (dt - self._datetime).total_seconds()
-            is_long_gap = time_delta > 600  # 10分钟无心跳视为异常
+            context_attrs = getattr(self._context, '__dict__', {}) or {}
+            has_schedule = bool(
+                isinstance(context_attrs, dict)
+                and (context_attrs.get('schedule_rule') or context_attrs.get('use_schedule'))
+            )
+            is_long_gap = (time_delta > 600) and not has_schedule  # schedule 间隔可能天然超过 10 分钟
 
             if is_new_day or is_long_gap:
                 has_stale_state = bool(

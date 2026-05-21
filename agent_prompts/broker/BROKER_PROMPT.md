@@ -47,10 +47,12 @@
   - `data`: 匹配到的框架 data 对象（匹配失败时可为 `None`）
 - `id` 必须稳定且可用于后续撤单；若券商原生 `orderId` 可能缺失，应提供可区分的兜底标识。
 - `convert_order_proxy(self, raw_order) -> BaseOrderProxy`: 引擎回调入口。将目标券商特有的 Trade/Order 回调对象，解析并转换为上述自定义的 `BaseOrderProxy` 对象。**注意：匹配归属的 data 对象时，严禁使用 `in` 进行模糊匹配，必须使用精确的字符串等于判定。**
+- `is_pending()` / `is_accepted()` 只能对真实在途态返回 `True`。过期、挂起/无效、撤单、拒单等不会继续成交的状态必须离开 pending，避免 `_pending_sells` 或 `_active_buys` 永久残留。
 
 ### 4. 运行环境适配
 - `@staticmethod` `is_live_mode(context) -> bool`: 判断当前上下文是否为实盘模式。
 - `@classmethod` `launch(cls, conn_cfg: dict, strategy_path: str, params: dict, **kwargs)`: [可选实现] 命令行实盘启动入口，负责初始化券商 SDK、建立连接并挂载事件循环。
+- 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
 - `DataProvider` 子类: 必须让引擎能通过当前 adapter 模块直接发现；如果历史数据能力来自现有 provider，也请在本文件中提供桥接类，而不是只写说明文字。
 
 ---
@@ -58,7 +60,7 @@
 ## ⚙️ 与当前框架一致的执行语义 (必须遵守)
 1. 买单拒绝后的降级重提由 `BaseLiveBroker.on_order_status` 统一处理（默认最多 10 次：前 5 次 `LOT_SIZE` 阶梯降级 + 后 5 次几何降级）；适配器不要额外叠加自己的“拒单队列”。
 2. 禁止实现或依赖以下旧机制: `process_deferred_orders`、`reconcile_buffered_retries`、`_deferred_orders`、`_buffered_rejected_retries`。
-3. 若券商返回 `Inactive/Cancelled/Rejected` 语义有差异，必须在 `BaseOrderProxy` 中准确映射，否则会破坏统一降级流程。
+3. 若券商返回 `Inactive/Cancelled/Rejected/Expired/Suspended` 等语义有差异，必须在 `BaseOrderProxy` 中准确映射，否则会破坏统一降级流程或造成本地 pending 永久等待。
 4. 引擎会在实盘每个自然日首次 `run`、拉数据前尝试清理隔夜在途单（由 `config.KEEP_OVERNIGHT_ORDERS` 控制）。适配器必须保证:
 - `get_pending_orders` 中 `id` 可用于撤单
 - `cancel_pending_order` 幂等、异常安全（失败返回 False，不抛出致命异常）

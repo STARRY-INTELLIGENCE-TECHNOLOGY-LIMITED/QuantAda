@@ -86,11 +86,11 @@ class IBOrderProxy(BaseOrderProxy):
         return self.trade.orderStatus.status == 'Inactive'  # 或者是 Rejected
 
     def is_pending(self) -> bool:
-        return self.trade.orderStatus.status in ['Submitted', 'PreSubmitted', 'PendingSubmit', 'PendingCancel']
+        return self.trade.orderStatus.status in ['Submitted', 'PreSubmitted', 'PendingSubmit', 'ApiPending', 'PendingCancel']
 
     def is_accepted(self) -> bool:
         # PreSubmitted 意味着已经被 IB 系统接收
-        return self.trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'Filled']
+        return self.trade.orderStatus.status in ['PreSubmitted', 'Submitted', 'PendingSubmit', 'ApiPending', 'PendingCancel']
 
     def is_buy(self) -> bool:
         return self.trade.order.action == 'BUY'
