@@ -18,6 +18,8 @@
 2. 保持无状态与自愈语义
 3. 不引入旧 deferred / buffered 队列设计
 4. 所有行为变更都应补 focused tests 或更新断言
+5. 涉及执行链路时必须同时校验 live/backtest 分离：实盘以 broker 现实和短生命周期健康标记自愈；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
+6. 新增规则或实现若影响执行流程，优先补到 `docs/specs/*` 的正式契约，再同步到 `agent_prompts/*`，避免只在模板层增加约束。
 
 ## 4. Divergence Handling
 1. 若 prompt 与代码不一致:
@@ -33,4 +35,6 @@
 3. 是否读了 base contract / loader / runtime code
 4. 是否遵守当前 live runtime semantics
 5. 是否补了针对性测试
-6. 是否在最终说明里区分“已验证”和“未验证”
+6. 是否验证回测仍按计划同步执行且快速完成
+7. 是否在最终说明里区分“已验证”和“未验证”
+8. 是否把新增约束写回正式 spec，而不是只写在 prompt 或代码注释中

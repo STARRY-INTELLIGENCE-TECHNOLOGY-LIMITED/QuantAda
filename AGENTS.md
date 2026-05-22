@@ -19,6 +19,7 @@ If a proposed change conflicts with these rules, reject or redesign it.
 
 2. Stateless First
 - Broker reality is source of truth.
+- Live correctness must come from broker reality plus short-lived reconciliation/health flags only; do not persist trade intent as state.
 - Do NOT introduce cross-K intent memory queues for buy retry or deferred execution.
 - Do NOT reintroduce old deferred/buffered mechanisms.
 
@@ -30,6 +31,8 @@ If a proposed change conflicts with these rules, reject or redesign it.
 4. Execution Discipline
 - Keep behavior deterministic and auditable.
 - Follow existing execution semantics consistently (sellability guard, immediate downgrade retry, daily cleanup policy).
+- Live-only execution guards such as pending-order waits, rolling buys, cash settlement waits, broker sync, and realtime pending-order queries must not run in backtests. Backtests must assume planned orders execute synchronously and remain fast.
+- Any new execution-path logic must preserve this split at the call boundary: live may poll, reconcile, or wait only within a bounded current-run scope; backtests and optimizations must remain in-memory, synchronous, and non-blocking.
 
 5. Anti-Abstraction Discipline
 - Do not introduce a new helper method, wrapper, mixin, bridge, or base-class API unless it clearly pays rent now.
@@ -65,6 +68,7 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Pending orders contract includes `id` in `get_pending_orders`.
 - Implement `cancel_pending_order(order_id)` with safe failure behavior (False instead of crash).
 - No local fake cash/position as long-lived source of truth.
+- If a live adapter cannot trust the current pending-order snapshot, it must expose that as a transient health flag rather than returning a silent empty truth. Backtest adapters must not rely on live pending-order state.
 
 5. Order-state semantics:
 - Rejected BUY: immediate same-bar downgrade retry path is preferred.
@@ -95,8 +99,9 @@ When user asks for rapid code generation or new module scaffolding, agents must 
 
 ## 5) Testing and Verification Discipline
 1. Every behavioral change must include focused tests or updated assertions.
-2. Always run targeted tests first, then run broader regression when feasible.
-3. Report what was validated and what was not validated.
+2. Changes touching execution, pending orders, cash/position reconciliation, or scheduling must include both live-path assertions and backtest/optimization fast-path assertions when feasible.
+3. Always run targeted tests first, then run broader regression when feasible.
+4. Report what was validated and what was not validated.
 
 ## 6) Communication Style for Agents
 - Be concise, direct, and pragmatic.

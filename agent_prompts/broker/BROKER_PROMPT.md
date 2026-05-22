@@ -36,6 +36,8 @@
 ### 2. 订单系统
 - `get_pending_orders(self) -> list`: 获取所有未完成的在途订单。**必须返回以下严格格式的字典列表**：
   `[{'id': '123', 'symbol': 'AAPL', 'direction': 'BUY' 或 'SELL', 'size': 100}, ...]`
+  若实时查询失败、断连或快照不完整，可安全返回 `[]`，但必须设置 `self._last_pending_orders_fetch_failed = True` 和 `self._last_pending_orders_fetch_error = error`；成功查询必须清零，避免框架把“查不到”误判为“无在途”。
+  该失败标记只能表示当前快照可信度，不得保存交易意图、不得驱动跨 K 重试、不得用于回测路径；回测应保持订单同步成交语义。
 - `cancel_pending_order(self, order_id: str) -> bool`: 按订单ID发起撤单。返回是否成功发起撤单请求（True/False）。该接口用于引擎在交易日首轮前清理隔夜在途单。
 - `_submit_order(self, data, volume: int, side: str, price: float)`: 核心发单路由。`side` 为 `'BUY'` 或 `'SELL'`。将其翻译为目标券商的结构体并发起发单请求，发单成功后返回自定义的 `BaseOrderProxy` 子类实例，失败返回 `None`。
 
@@ -66,6 +68,7 @@
 - `cancel_pending_order` 幂等、异常安全（失败返回 False，不抛出致命异常）
 5. 当前拒单重试语义为“无状态 + 当场重提”: 前 5 次按 `LOT_SIZE` 线性降级，后 5 次按几何倍数降级；适配器侧必须提供真实现金口径，避免重试阶段出现系统性偏差。
 6. 当实盘 schedule 期间券商平台未启动、API 不可用或连接失败时，需在 prewarm 与实际 run 时刻分别推送 slot 级 ERROR 告警，但不得把该 slot 误记为已执行。
+7. 适配器和执行器必须区分 live/backtest：实盘以柜台现实、持仓/现金对账和短生命周期健康标记恢复；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
 
 ---
 

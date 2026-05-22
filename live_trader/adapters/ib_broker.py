@@ -925,10 +925,13 @@ class IBBrokerAdapter(BaseLiveBroker):
         - trades(): 本地缓存兜底（默认关闭，避免引入终态陈旧单）
         """
         if not hasattr(self, 'ib') or not self.ib or not self.ib.isConnected():
+            self._last_open_trades_fetch_failed = True
+            self._last_open_trades_fetch_error = 'ib not connected'
             return []
 
         collected = []
         seen = set()
+        source_errors = []
 
         def _append(items):
             for t in items or []:
@@ -942,6 +945,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         try:
             _append(self.ib.openTrades())
         except Exception as e:
+            source_errors.append(f"openTrades: {e}")
             print(f"[IBBroker] openTrades 拉取失败: {e}")
 
         can_refresh_all = hasattr(self.ib, 'reqAllOpenOrders')
@@ -960,13 +964,18 @@ class IBBrokerAdapter(BaseLiveBroker):
                 try:
                     _append(self.ib.reqAllOpenOrders())
                 except Exception as e:
+                    source_errors.append(f"reqAllOpenOrders: {e}")
                     print(f"[IBBroker] reqAllOpenOrders 拉取失败: {e}")
 
         if include_trade_cache and hasattr(self.ib, 'trades'):
             try:
                 _append(self.ib.trades())
             except Exception as e:
+                source_errors.append(f"trades: {e}")
                 print(f"[IBBroker] trades 缓存读取失败: {e}")
+
+        self._last_open_trades_fetch_failed = bool(source_errors)
+        self._last_open_trades_fetch_error = "; ".join(source_errors) if self._last_open_trades_fetch_failed else None
 
         return self._filter_account_scoped_items(
             collected,
@@ -976,11 +985,14 @@ class IBBrokerAdapter(BaseLiveBroker):
     def get_pending_orders(self) -> list:
         """盈透：获取在途订单（含跨 client 兜底视角）"""
         if not hasattr(self, 'ib') or not self.ib or not self.ib.isConnected():
+            self._last_pending_orders_fetch_failed = True
+            self._last_pending_orders_fetch_error = 'ib not connected'
             return []
 
         res = []
         try:
             open_trades = self._collect_open_trades(force_refresh_all=False, include_trade_cache=False)
+            open_trades_fetch_failed = bool(getattr(self, '_last_open_trades_fetch_failed', False))
             for t in open_trades:
                 order = getattr(t, 'order', None)
                 status = getattr(t, 'orderStatus', None)
@@ -1019,7 +1031,17 @@ class IBBrokerAdapter(BaseLiveBroker):
                     'direction': 'BUY' if action == 'BUY' else 'SELL',
                     'size': rem
                 })
+            if open_trades_fetch_failed:
+                self._last_pending_orders_fetch_failed = True
+                self._last_pending_orders_fetch_error = getattr(
+                    self, '_last_open_trades_fetch_error', 'open trades fetch failed'
+                )
+            else:
+                self._last_pending_orders_fetch_failed = False
+                self._last_pending_orders_fetch_error = None
         except Exception as e:
+            self._last_pending_orders_fetch_failed = True
+            self._last_pending_orders_fetch_error = e
             print(f"[IBBroker] 获取在途订单失败: {e}")
         return res
 

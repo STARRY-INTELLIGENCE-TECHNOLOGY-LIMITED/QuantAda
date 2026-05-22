@@ -453,6 +453,60 @@ def test_gm_pending_order_contract_includes_id(monkeypatch):
     assert got[0]["size"] == 800
 
 
+def test_gm_pending_order_fetch_failure_is_marked(monkeypatch):
+    """
+    空列表语义回归:
+    get_pending_orders 查询失败时仍可安全返回 []，但必须标记结果不可信。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    def _raise_pending_error():
+        raise RuntimeError("gm pending unavailable")
+
+    monkeypatch.setattr(mock_gm_api, "get_unfinished_orders", _raise_pending_error, raising=False)
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+
+    got = broker.get_pending_orders()
+
+    assert got == []
+    assert broker._last_pending_orders_fetch_failed is True
+    assert "gm pending unavailable" in str(broker._last_pending_orders_fetch_error)
+
+
+def test_gm_pending_order_fetch_success_clears_failure_flag(monkeypatch):
+    """
+    成功语义回归:
+    当 get_pending_orders 正常返回时，应清除上一轮失败标记。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    pending = SimpleNamespace(
+        cl_ord_id="GM_OID_010",
+        symbol="SHSE.600000",
+        side=mock_gm_api.OrderSide_Sell,
+        volume=1000,
+        filled_volume=0,
+    )
+    monkeypatch.setattr(mock_gm_api, "get_unfinished_orders", lambda: [pending], raising=False)
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    broker._last_pending_orders_fetch_failed = True
+    broker._last_pending_orders_fetch_error = "old error"
+
+    got = broker.get_pending_orders()
+
+    assert len(got) == 1
+    assert broker._last_pending_orders_fetch_failed is False
+    assert broker._last_pending_orders_fetch_error is None
+
+
 def test_gm_cancel_pending_order_by_id(monkeypatch):
     """
     最小契约:

@@ -1691,6 +1691,45 @@ def test_ib_pending_order_contract_includes_id():
     assert got[0]["size"] == 282
 
 
+def test_ib_pending_order_fetch_failure_is_marked():
+    """
+    空列表语义回归:
+    当 IB 不可连接时，get_pending_orders 可安全返回 []，但必须标记结果不可信。
+    """
+    context = types.SimpleNamespace(ib_instance=SimpleNamespace(isConnected=lambda: False))
+    broker = IBBrokerAdapter(context=context)
+
+    got = broker.get_pending_orders()
+
+    assert got == []
+    assert broker._last_pending_orders_fetch_failed is True
+    assert "not connected" in str(broker._last_pending_orders_fetch_error)
+
+
+def test_ib_pending_order_fetch_success_clears_failure_flag():
+    """
+    成功语义回归:
+    当 IB open order 快照正常返回时，应清除上一轮失败标记。
+    """
+    open_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=140, action="SELL"),
+        contract=SimpleNamespace(symbol="EWJ"),
+        orderStatus=SimpleNamespace(status="Submitted", remaining=10),
+    )
+    context = types.SimpleNamespace(
+        ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10000.0, open_trades=[open_trade])
+    )
+    broker = IBBrokerAdapter(context=context)
+    broker._last_pending_orders_fetch_failed = True
+    broker._last_pending_orders_fetch_error = "old error"
+
+    got = broker.get_pending_orders()
+
+    assert len(got) == 1
+    assert broker._last_pending_orders_fetch_failed is False
+    assert broker._last_pending_orders_fetch_error is None
+
+
 def test_ib_get_pending_orders_filters_by_configured_order_account(monkeypatch):
     """
     账户隔离回归:

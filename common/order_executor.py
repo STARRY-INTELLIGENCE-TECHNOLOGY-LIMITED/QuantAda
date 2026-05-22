@@ -92,6 +92,11 @@ class OrderExecutor:
                     self._warn_order_not_submitted('BUY', data, target, phase='increase')
             return
 
+        is_live_broker = getattr(self.broker, 'is_live', True) is True
+        if not is_live_broker:
+            self._execute_final_buys(plan['increase'], check_pending=False)
+            return
+
         # 第二步：等待卖单回报的同时，按已确认现金滚动释放买单。
         self._log("等待卖单终态并滚动买入...")
         sells_settled = self._wait_sells_settled(
@@ -285,10 +290,10 @@ class OrderExecutor:
 
         return submitted
 
-    def _execute_final_buys(self, increase_plan):
+    def _execute_final_buys(self, increase_plan, check_pending=True):
         submitted = 0
         for data, target in increase_plan or []:
-            if self._has_pending_buy(data):
+            if check_pending and self._has_pending_buy(data):
                 continue
             self._log(f"执行补仓/开仓: {data._name} -> {target:.2f}")
             buy_order = self.broker.order_target_value(data=data, target=target)
@@ -367,6 +372,7 @@ class OrderExecutor:
         warn_sent = False
         pending_fetch_failures = 0
         synced_balance_once = False
+        remote_sell_clear_polls = 0
 
         while True:
             local_pending_ids = set()
@@ -381,15 +387,24 @@ class OrderExecutor:
 
             pending_orders = []
             pending_orders_loaded = False
+            pending_orders_trusted = False
             if hasattr(self.broker, 'get_pending_orders'):
                 try:
                     pending_orders = self.broker.get_pending_orders() or []
                     pending_orders_loaded = True
-                    pending_fetch_failures = 0
                 except Exception as e:
                     pending_fetch_failures += 1
                     print(f"[Executor] 获取在途订单失败，继续基于本地 pending_sells 等待: {e}")
                     pending_orders = []
+
+            pending_fetch_failed = bool(getattr(self.broker, '_last_pending_orders_fetch_failed', False))
+            if pending_orders_loaded and not pending_fetch_failed:
+                pending_orders_trusted = True
+                pending_fetch_failures = 0
+            elif pending_orders_loaded and pending_fetch_failed:
+                pending_fetch_failures += 1
+                err = getattr(self.broker, '_last_pending_orders_fetch_error', None)
+                print(f"[Executor] 在途订单查询结果不可信，继续基于本地 pending_sells 等待: {err}")
 
             remote_pending_sell_ids = set()
             remote_has_pending_sell = False
@@ -404,11 +419,16 @@ class OrderExecutor:
                 if poid:
                     remote_pending_sell_ids.add(poid)
 
+            if pending_orders_trusted and not remote_has_pending_sell:
+                remote_sell_clear_polls += 1
+            else:
+                remote_sell_clear_polls = 0
+
             combined_pending_sell_ids = local_pending_ids | remote_pending_sell_ids
 
             if tracked_ids:
                 unresolved = {oid for oid in tracked_ids if oid in combined_pending_sell_ids}
-                if unresolved and pending_orders_loaded and reconcile_targets:
+                if unresolved and pending_orders_trusted and reconcile_targets:
                     reconciled_ids = set()
                     for oid in unresolved:
                         target_info = reconcile_targets.get(oid)
@@ -443,11 +463,36 @@ class OrderExecutor:
                             except Exception as e:
                                 print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
 
+                stale_local_ids = {oid for oid in tracked_ids if oid in local_pending_ids}
+                if (
+                    stale_local_ids
+                    and pending_orders_trusted
+                    and not remote_has_pending_sell
+                    and remote_sell_clear_polls >= 2
+                ):
+                    if hasattr(self.broker, '_pending_sells'):
+                        try:
+                            pending_sells = getattr(self.broker, '_pending_sells', set())
+                            for oid in stale_local_ids:
+                                pending_sells.discard(oid)
+                        except Exception:
+                            pass
+                    local_pending_ids -= stale_local_ids
+                    combined_pending_sell_ids -= stale_local_ids
+                    ids_text = ", ".join(sorted(stale_local_ids))
+                    print(f"[Executor] 卖单终态回调延迟，已通过柜台在途单连续为空确认本地 pending 过期: {ids_text}")
+                    if hasattr(self.broker, 'sync_balance'):
+                        try:
+                            self.broker.sync_balance()
+                            synced_balance_once = True
+                        except Exception as e:
+                            print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
+
             if increase_plan:
                 self._rolling_buy_pass(increase_plan, released_target_by_symbol)
 
             sell_state_clear = not (remote_has_pending_sell or bool(local_pending_ids))
-            if (tracked_ids or has_untracked_sell) and not pending_orders_loaded:
+            if (tracked_ids or has_untracked_sell) and not pending_orders_trusted:
                 sell_state_clear = False
             if sell_state_clear:
                 if hasattr(self.broker, 'sync_balance') and not synced_balance_once:

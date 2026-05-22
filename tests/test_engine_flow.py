@@ -1832,6 +1832,91 @@ def test_live_run_continues_after_overnight_cleanup_barrier_clears(monkeypatch):
     assert engine.broker.cancel_calls == ["OVN_1"], "同日二次 run 不应重复执行隔夜撤单。"
 
 
+def test_pending_order_barrier_rejects_untrusted_empty_snapshot(monkeypatch):
+    """
+    空 pending 快照语义:
+    若 broker 标记本次在途查询失败，即使返回 []，屏障也不能视为已清空。
+    """
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    cfg = {
+        "strategy_name": "CounterStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "params": {},
+    }
+    engine = LiveTrader(cfg)
+    context = MockContext(now=datetime(2026, 3, 3, 9, 30, 0))
+    engine.init(context)
+
+    def _untrusted_empty_pending():
+        engine.broker._last_pending_orders_fetch_failed = True
+        engine.broker._last_pending_orders_fetch_error = "pending snapshot unavailable"
+        return []
+
+    engine.broker.get_pending_orders = _untrusted_empty_pending
+
+    assert engine._confirm_pending_orders_cleared(max_checks=1, sleep_seconds=0.0) is False
+
+
+def test_stale_strategy_order_not_cleared_when_pending_snapshot_untrusted(monkeypatch):
+    """
+    僵尸 order 自愈边界:
+    pending 查询失败时不能把空列表当作柜台无在途，否则可能误清 strategy.order。
+    """
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    cfg = {
+        "strategy_name": "CounterStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "params": {},
+        "KEEP_OVERNIGHT_ORDERS": True,
+    }
+    engine = LiveTrader(cfg)
+    context = MockContext(now=datetime(2026, 3, 3, 9, 30, 0))
+    engine.init(context)
+    engine._refresh_live_data = lambda _ctx: {"total_feeds": 1, "updated_feeds": 1, "failed_feeds": 0}
+
+    stale_order = MockOrderProxy("STALE_1", is_buy_order=True, status="Submitted")
+    engine.strategy.order = stale_order
+
+    def _untrusted_empty_pending():
+        engine.broker._last_pending_orders_fetch_failed = True
+        engine.broker._last_pending_orders_fetch_error = "pending snapshot unavailable"
+        return []
+
+    engine.broker.get_pending_orders = _untrusted_empty_pending
+    engine.run(context)
+
+    assert engine.strategy.order is stale_order
+    assert engine.strategy.next_calls == 0
+
+
 def test_live_run_skips_overnight_cleanup_when_keep_overnight_orders_true(monkeypatch):
     """
     KEEP_OVERNIGHT_ORDERS=True:

@@ -87,6 +87,29 @@ def test_strategy_isolated_capital_fallbacks_to_get_cash_on_rebalance_error(monk
     assert allocatable == pytest.approx(1300.0), "rebalance 口径异常时应回退到 get_cash 口径。"
 
 
+def test_strategy_isolated_capital_backtest_ignores_pending_orders(monkeypatch):
+    """
+    回测路径回归:
+    回测假定订单按计划执行，不应读取实盘 pending 订单修正仓位。
+    """
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0)
+    broker.is_live = False
+    pending_calls = []
+
+    def _raise_if_called():
+        pending_calls.append(True)
+        raise AssertionError("回测路径不应查询实盘在途订单。")
+
+    broker.get_pending_orders = _raise_if_called
+    strategy = DummyStrategy(broker=broker, params={})
+
+    allocatable, current_positions = strategy.get_strategy_isolated_capital()
+
+    assert pending_calls == []
+    assert allocatable == pytest.approx(1300.0)
+    assert len(current_positions) == 1
+
+
 def test_notify_order_prefers_execution_dt_for_logs(monkeypatch):
     """
     成交日志时间回归:

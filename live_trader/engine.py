@@ -423,6 +423,8 @@ class LiveTrader:
                 if hasattr(self.broker, 'get_pending_orders'):
                     try:
                         has_real_pending = bool(self.broker.get_pending_orders())
+                        if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+                            has_real_pending = True
                     except Exception:
                         has_real_pending = True
 
@@ -658,6 +660,11 @@ class LiveTrader:
                 pending = self.broker.get_pending_orders() or []
             except Exception as e:
                 print(f"[Engine Warning] pending-order barrier check failed: {e}")
+                return False
+
+            if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+                err = getattr(self.broker, '_last_pending_orders_fetch_error', None)
+                print(f"[Engine Warning] pending-order barrier check untrusted: {err}")
                 return False
 
             if len(pending) == 0:

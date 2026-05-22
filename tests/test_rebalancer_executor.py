@@ -192,7 +192,7 @@ def test_order_executor_warns_after_5m_but_keeps_waiting_until_sell_settles(monk
     assert "继续等待并按已确认现金滚动买入" in pushed[0]["content"]
 
 
-def test_order_executor_waits_local_pending_sells_even_if_remote_empty(monkeypatch):
+def test_order_executor_clears_local_pending_sell_when_remote_sell_empty(monkeypatch):
     import common.order_executor as executor_module
 
     clock = {"t": 0.0}
@@ -202,11 +202,17 @@ def test_order_executor_waits_local_pending_sells_even_if_remote_empty(monkeypat
 
     def _fake_sleep(seconds):
         clock["t"] += float(seconds)
-        if clock["t"] >= 2.0:
-            broker._pending_sells.clear()
 
     monkeypatch.setattr(executor_module.time, "time", _fake_time)
     monkeypatch.setattr(executor_module.time, "sleep", _fake_sleep)
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
 
     class DummyBroker:
         def __init__(self):
@@ -222,7 +228,7 @@ def test_order_executor_waits_local_pending_sells_even_if_remote_empty(monkeypat
             return object()
 
         def get_pending_orders(self):
-            # 模拟券商 open orders 可见性延迟：短时间内返回空。
+            # 模拟终态回调被当前调度阻塞，但柜台在途单已无本轮 SELL。
             return []
 
         def sync_balance(self):
@@ -238,9 +244,62 @@ def test_order_executor_waits_local_pending_sells_even_if_remote_empty(monkeypat
 
     executor.execute_plan(plan)
 
-    assert broker.calls == [("SPY.ARCA", 0.0), ("EWJ.ARCA", 100000.0)], "本地 pending_sells 未清空前不应放行买单。"
-    assert clock["t"] >= 2.0, "应等待本地 pending_sells 进入终态。"
+    assert broker.calls == [("SPY.ARCA", 0.0), ("EWJ.ARCA", 100000.0)], "远端 SELL 在途连续为空时，应清理本轮本地滞后 pending 并继续买入。"
+    assert clock["t"] < 300.0, "不应因为本地回调滞后等待到 300 秒并误报警。"
     assert broker.sync_calls == 1
+    assert pushed == []
+    assert "SELL_LOCAL_1" not in broker._pending_sells
+
+
+def test_order_executor_backtest_executes_plan_without_waiting(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+    sleep_calls = []
+
+    def _fake_time():
+        return clock["t"]
+
+    def _fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        clock["t"] += float(seconds)
+
+    monkeypatch.setattr(executor_module.time, "time", _fake_time)
+    monkeypatch.setattr(executor_module.time, "sleep", _fake_sleep)
+
+    class DummyBacktestBroker:
+        is_live = False
+
+        def __init__(self):
+            self.calls = []
+            self.pending_calls = 0
+            self.sync_calls = 0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            return object()
+
+        def get_pending_orders(self):
+            self.pending_calls += 1
+            raise AssertionError("回测路径不应查询在途订单。")
+
+        def sync_balance(self):
+            self.sync_calls += 1
+
+    broker = DummyBacktestBroker()
+    executor = executor_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SPY.ARCA")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("SPY.ARCA", 0.0), ("EWJ.ARCA", 100000.0)]
+    assert broker.pending_calls == 0, "回测必须按计划执行，不应走实盘 pending 确认。"
+    assert broker.sync_calls == 0, "回测不应触发实盘资金同步。"
+    assert sleep_calls == [], "回测不应进入任何等待循环。"
 
 
 def test_order_executor_reconciles_missing_sell_terminal_by_live_position(monkeypatch):
@@ -341,7 +400,7 @@ def test_order_executor_stops_when_sell_timeout_and_position_not_reached(monkeyp
             return object()
 
         def get_pending_orders(self):
-            return []
+            return [{"id": "SELL_STUCK_1", "symbol": "SPY.ARCA", "direction": "SELL", "size": 100}]
 
         def get_rebalance_cash(self):
             return 0.0
@@ -365,6 +424,79 @@ def test_order_executor_stops_when_sell_timeout_and_position_not_reached(monkeyp
     assert broker.calls == [("SPY.ARCA", 0.0)], "卖单超时且无已确认现金时不应继续买入。"
     assert broker.sync_calls == 1, "硬等待结束后应尝试同步资金，但不得全量放行买入。"
     assert len(pushed) >= 1, "超时失败应至少推送一次错误告警。"
+    assert any(item["level"] == "ERROR" for item in pushed)
+
+
+def test_order_executor_does_not_clear_sell_when_empty_pending_snapshot_untrusted(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+
+    def _fake_time():
+        return clock["t"]
+
+    def _fake_sleep(seconds):
+        clock["t"] += float(seconds)
+
+    monkeypatch.setattr(executor_module.time, "time", _fake_time)
+    monkeypatch.setattr(executor_module.time, "sleep", _fake_sleep)
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBroker:
+        def __init__(self):
+            self.calls = []
+            self.sync_calls = 0
+            self._pending_sells = {"SELL_UNTRUSTED_1"}
+            self._last_pending_orders_fetch_failed = False
+            self._last_pending_orders_fetch_error = None
+
+        def get_position(self, data):
+            return SimpleNamespace(size=100, price=1.0)
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            if float(target) == 0.0:
+                return SimpleNamespace(
+                    id="SELL_UNTRUSTED_1",
+                    platform_order=SimpleNamespace(volume=100),
+                )
+            return object()
+
+        def get_pending_orders(self):
+            self._last_pending_orders_fetch_failed = True
+            self._last_pending_orders_fetch_error = "broker pending query failed"
+            return []
+
+        def get_rebalance_cash(self):
+            return 0.0
+
+        def get_current_price(self, data):
+            return 1.0
+
+        def sync_balance(self):
+            self.sync_calls += 1
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_WARN_SECONDS = 1.0
+    executor._SELL_SETTLE_HARD_SECONDS = 3.0
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SPY.ARCA")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("SPY.ARCA", 0.0)], "查询结果不可信时，不应把空 pending 快照当作卖单完成。"
+    assert "SELL_UNTRUSTED_1" in broker._pending_sells
     assert any(item["level"] == "ERROR" for item in pushed)
 
 

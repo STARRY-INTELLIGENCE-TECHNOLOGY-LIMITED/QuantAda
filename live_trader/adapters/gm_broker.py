@@ -248,6 +248,8 @@ class GmBrokerAdapter(BaseLiveBroker):
     def get_pending_orders(self) -> list:
         """掘金：获取在途订单"""
         if not self.is_live:
+            self._last_pending_orders_fetch_failed = False
+            self._last_pending_orders_fetch_error = None
             return []  # 回测模式下引擎自带瞬间成交，无视在途
 
         res = []
@@ -262,7 +264,11 @@ class GmBrokerAdapter(BaseLiveBroker):
                     # 未成交数量 = 委托总数 - 已成交数
                     'size': o.volume - o.filled_volume
                 })
+            self._last_pending_orders_fetch_failed = False
+            self._last_pending_orders_fetch_error = None
         except Exception as e:
+            self._last_pending_orders_fetch_failed = True
+            self._last_pending_orders_fetch_error = e
             print(f"[GmBroker] 获取在途订单失败: {e}")
         return res
 

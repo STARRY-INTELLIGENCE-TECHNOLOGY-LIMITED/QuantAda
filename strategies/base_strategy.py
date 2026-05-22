@@ -152,7 +152,7 @@ class BaseStrategy(ABC):
 
         # 1. 抓取券商真实在途订单 (降维成大写的字典，方便极速查表)
         pending_map = {}
-        if hasattr(self.broker, 'get_pending_orders'):
+        if getattr(self.broker, 'is_live', False) and hasattr(self.broker, 'get_pending_orders'):
             try:
                 for po in self.broker.get_pending_orders():
                     sym = str(po['symbol']).upper()

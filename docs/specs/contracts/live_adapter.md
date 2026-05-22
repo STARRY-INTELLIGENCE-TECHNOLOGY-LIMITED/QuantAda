@@ -31,6 +31,8 @@
 2. `id` 必须可用于后续撤单。
 3. `cancel_pending_order(order_id)` 失败时返回 `False`，不要把撤单失败变成致命异常。
 4. 若原生 `orderId` 不稳定或缺失，必须提供可区分、可回查的兜底标识。
+5. 若实时在途查询失败、断连或快照不完整，adapter 可安全返回 `[]`，但必须设置 `_last_pending_orders_fetch_failed=True` 与 `_last_pending_orders_fetch_error`；成功查询必须清零，避免 engine/executor 将“查不到”误判为“无在途”。
+6. 上述失败标记仅用于 live runtime 判断快照可信度；它不是订单意图、不是重试队列，也不得被用于回测路径。回测 broker 应保持同步成交语义，不依赖 live pending-order 状态。
 
 ## 4. Stateless Constraints
 1. 不维护长期本地 fake cash / fake position 作为事实来源。

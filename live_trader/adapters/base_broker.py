@@ -65,6 +65,8 @@ class BaseLiveBroker(ABC):
         # 内部状态机
         self._cash = self._init_cash()
         self._pending_sells = set()
+        self._last_pending_orders_fetch_failed = False
+        self._last_pending_orders_fetch_error = None
         # 虚拟账本，类似backtester能快速回笼资金
         self._virtual_spent_cash = 0.0
         # 活跃买单追踪器，用于被拒单时的降级重试
@@ -201,8 +203,14 @@ class BaseLiveBroker(ABC):
         try:
             pending_orders = self.get_pending_orders() or []
         except Exception as e:
+            summary['failed'] = 1
             print(f"[Broker] cleanup_overnight_orders skipped: failed to fetch pending orders ({e})")
             return summary
+
+        if getattr(self, '_last_pending_orders_fetch_failed', False):
+            summary['failed'] = 1
+            err = getattr(self, '_last_pending_orders_fetch_error', None)
+            print(f"[Broker] cleanup_overnight_orders pending fetch untrusted: {err}")
 
         summary['total'] = len(pending_orders)
         if not pending_orders:
