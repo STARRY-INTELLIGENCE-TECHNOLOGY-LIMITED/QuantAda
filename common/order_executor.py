@@ -170,6 +170,9 @@ class OrderExecutor:
             except Exception:
                 pass
 
+        return self._has_remote_pending_buy(data)
+
+    def _has_remote_pending_buy(self, data):
         if hasattr(self.broker, 'get_pending_orders'):
             try:
                 for po in self.broker.get_pending_orders() or []:
@@ -290,11 +293,25 @@ class OrderExecutor:
 
         return submitted
 
-    def _execute_final_buys(self, increase_plan, check_pending=True):
+    def _execute_final_buys(self, increase_plan, check_pending=True, released_target_by_symbol=None):
+        released_target_by_symbol = released_target_by_symbol or {}
         submitted = 0
         for data, target in increase_plan or []:
             if check_pending and self._has_pending_buy(data):
-                continue
+                allow_top_up = False
+                symbol_key = self._symbol_key(data)
+                if symbol_key in released_target_by_symbol:
+                    try:
+                        released_target = float(released_target_by_symbol.get(symbol_key, 0.0) or 0.0)
+                        target_value = float(target)
+                        allow_top_up = (
+                            released_target < target_value * 0.995
+                            and self._has_remote_pending_buy(data)
+                        )
+                    except Exception:
+                        allow_top_up = False
+                if not allow_top_up:
+                    continue
             self._log(f"执行补仓/开仓: {data._name} -> {target:.2f}")
             buy_order = self.broker.order_target_value(data=data, target=target)
             if buy_order:
@@ -373,6 +390,7 @@ class OrderExecutor:
         pending_fetch_failures = 0
         synced_balance_once = False
         remote_sell_clear_polls = 0
+        rolling_buy_attempted = False
 
         while True:
             local_pending_ids = set()
@@ -488,9 +506,6 @@ class OrderExecutor:
                         except Exception as e:
                             print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
 
-            if increase_plan:
-                self._rolling_buy_pass(increase_plan, released_target_by_symbol)
-
             sell_state_clear = not (remote_has_pending_sell or bool(local_pending_ids))
             if (tracked_ids or has_untracked_sell) and not pending_orders_trusted:
                 sell_state_clear = False
@@ -502,7 +517,10 @@ class OrderExecutor:
                     except Exception as e:
                         print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
                 if increase_plan:
-                    self._execute_final_buys(increase_plan)
+                    self._execute_final_buys(
+                        increase_plan,
+                        released_target_by_symbol=released_target_by_symbol,
+                    )
                 return True
 
             elapsed = time.time() - start_ts
@@ -518,6 +536,11 @@ class OrderExecutor:
                 except Exception:
                     pass
                 warn_sent = True
+
+            can_roll_buy = (warn_after <= 0 or elapsed >= warn_after) and remote_has_pending_sell
+            if increase_plan and can_roll_buy and not rolling_buy_attempted:
+                if self._rolling_buy_pass(increase_plan, released_target_by_symbol) > 0:
+                    rolling_buy_attempted = True
 
             if elapsed >= hard_after:
                 if not sell_state_clear:

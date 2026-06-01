@@ -724,8 +724,103 @@ def test_order_executor_rolls_buys_with_confirmed_cash_without_full_release(monk
 
     assert ("EWJ.ARCA", 30000.0) in broker.calls, "应在现金部分确认后先滚动买入一部分。"
     assert ("EWJ.ARCA", 100000.0) not in broker.calls, "卖出未被持仓确认时不应全量释放目标买入。"
-    assert broker.calls.count(("EWJ.ARCA", 30000.0)) == 1, "同一段已释放买入不应在等待期间重复提交。"
+    buy_calls = [call for call in broker.calls if call[0] == "EWJ.ARCA"]
+    assert buy_calls == [("EWJ.ARCA", 30000.0)], "卖单长时间未清空时，本轮等待内只做一次低频滚动买入。"
     assert any(item["level"] == "ERROR" for item in pushed), "硬等待结束仍未确认卖出时应告警。"
+
+
+def test_order_executor_delays_rolling_buy_and_tops_up_after_sell_clear(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+
+    def _fake_time():
+        return clock["t"]
+
+    def _fake_sleep(seconds):
+        clock["t"] += float(seconds)
+
+    monkeypatch.setattr(executor_module.time, "time", _fake_time)
+    monkeypatch.setattr(executor_module.time, "sleep", _fake_sleep)
+
+    buy_data = SimpleNamespace(_name="EWJ.ARCA")
+    sell_data = SimpleNamespace(_name="SPY.ARCA")
+
+    class DummyBroker:
+        safety_multiplier = 1.0
+
+        def __init__(self, sell_clear_after, show_buy_pending=True):
+            self.sell_clear_after = sell_clear_after
+            self.show_buy_pending = show_buy_pending
+            self.calls = []
+            self.sync_calls = 0
+            self._pending_sells = set()
+            self._active_buys = {}
+            self.positions = {"SPY.ARCA": 100, "EWJ.ARCA": 0}
+
+        def get_position(self, data):
+            return SimpleNamespace(size=self.positions.get(data._name, 0), price=1.0)
+
+        def get_current_price(self, data):
+            return 1.0
+
+        def get_rebalance_cash(self):
+            return 1000.0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            if data._name == "SPY.ARCA":
+                self._pending_sells.add("SELL_LOCAL_1")
+                return SimpleNamespace(id="SELL_LOCAL_1", platform_order=SimpleNamespace(volume=100))
+            self._active_buys[f"BUY_{len(self._active_buys) + 1}"] = {"data": data}
+            return object()
+
+        def get_pending_orders(self):
+            orders = []
+            if clock["t"] < self.sell_clear_after:
+                orders.append({"id": "SELL_LOCAL_1", "symbol": "SPY.ARCA", "direction": "SELL", "size": 100})
+            if self._active_buys and self.show_buy_pending:
+                orders.append({"id": "BUY_1", "symbol": "EWJ", "direction": "BUY", "size": 1000})
+            return orders
+
+        def sync_balance(self):
+            self.sync_calls += 1
+
+    def run_case(sell_clear_after, warn_after, show_buy_pending=True):
+        clock["t"] = 0.0
+        broker = DummyBroker(sell_clear_after=sell_clear_after, show_buy_pending=show_buy_pending)
+        executor = executor_module.OrderExecutor(broker)
+        executor._SELL_SETTLE_WARN_SECONDS = warn_after
+        executor._SELL_SETTLE_HARD_SECONDS = max(5.0, warn_after * 2.0)
+        executor.execute_plan({
+            "sell_clear": [sell_data],
+            "reduce": [],
+            "increase": [(buy_data, 100000.0)],
+        })
+        return broker, clock["t"]
+
+    fast_broker, fast_elapsed = run_case(sell_clear_after=0.0, warn_after=10.0)
+    assert fast_broker.calls == [
+        ("SPY.ARCA", 0.0),
+        ("EWJ.ARCA", 100000.0),
+    ], "卖单能快速确认清空时，不应先滚动买入一小笔。"
+    assert fast_elapsed < 10.0
+
+    slow_broker, _ = run_case(sell_clear_after=2.0, warn_after=1.0)
+    assert slow_broker.calls == [
+        ("SPY.ARCA", 0.0),
+        ("EWJ.ARCA", 1000.0),
+        ("EWJ.ARCA", 100000.0),
+    ], "卖单确认清空后，即使本轮滚动买入仍在途，也应继续提交目标补齐。"
+    assert fast_broker.sync_calls == 1
+    assert slow_broker.sync_calls == 1
+    assert "SELL_LOCAL_1" not in slow_broker._pending_sells
+
+    hidden_buy_broker, _ = run_case(sell_clear_after=2.0, warn_after=1.0, show_buy_pending=False)
+    assert hidden_buy_broker.calls == [
+        ("SPY.ARCA", 0.0),
+        ("EWJ.ARCA", 1000.0),
+    ], "滚动 BUY 只有本地 active 但未出现在柜台 pending 快照时，不应继续补齐以免重复计算仓位。"
 
 
 def test_order_executor_warns_and_skips_buys_when_sell_not_submitted(monkeypatch):
