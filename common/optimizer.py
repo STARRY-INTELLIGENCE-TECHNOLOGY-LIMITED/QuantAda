@@ -35,7 +35,6 @@ import multiprocessing as mp
 import os
 import re
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -54,6 +53,13 @@ import config
 from backtest.backtester import Backtester
 from common.formatters import format_float, format_recent_backtest_metrics
 from common.loader import get_class_from_name, parse_period_string
+from common import process_elevation
+from common.terminal_log import (
+    build_optimizer_terminal_log_path,
+    get_optimizer_terminal_log_path,
+    install_optimizer_terminal_log,
+    set_optimizer_terminal_log_path,
+)
 from data_providers.manager import DataManager
 
 try:
@@ -138,136 +144,84 @@ def is_port_in_use(port):
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 
-def _is_process_elevated():
-    """
-    跨平台检测是否已具备管理员权限。
-    - Windows: UAC 管理员令牌
-    - macOS/Linux: UID=0
-    """
-    if sys.platform.startswith("win"):
-        try:
-            import ctypes
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            return False
+def _infer_optimizer_terminal_log_ranges(args):
+    start_date = getattr(args, "start_date", None)
+    end_date = getattr(args, "end_date", None) or pd.Timestamp.now().strftime("%Y%m%d")
 
-    geteuid = getattr(os, "geteuid", None)
-    if callable(geteuid):
-        try:
-            return int(geteuid()) == 0
-        except Exception:
-            return False
-    return False
-
-
-def _should_try_auto_elevation(args):
-    """
-    仅在优化并行模式（worker > 1）下触发自动提权请求。
-    """
-    disable_flag = str(os.environ.get("QUANTADA_DISABLE_AUTO_ELEVATE", "")).strip().lower()
-    if disable_flag in {"1", "true", "yes", "on"}:
-        return False
-
-    requested_jobs = getattr(args, "n_jobs", 1)
     try:
-        workers = OptimizationJob._resolve_worker_count(requested_jobs)
+        if getattr(args, "train_period", None) and getattr(args, "test_period", None):
+            tr_s, tr_e = str(args.train_period).split("-", 1)
+            te_s, te_e = str(args.test_period).split("-", 1)
+            return (tr_s, tr_e), (te_s, te_e)
+
+        if getattr(args, "train_roll_period", None):
+            anchor_dt = pd.to_datetime(str(end_date))
+            test_roll = getattr(args, "test_roll_period", None)
+            if test_roll:
+                test_offset = parse_period_string(test_roll)
+                if test_offset is None:
+                    raise ValueError(f"Invalid test_roll_period: {test_roll}")
+                split_dt = anchor_dt - test_offset
+                train_end_dt = split_dt - pd.DateOffset(days=1)
+                test_range = (split_dt.strftime("%Y%m%d"), anchor_dt.strftime("%Y%m%d"))
+            else:
+                split_dt = anchor_dt
+                train_end_dt = split_dt
+                test_range = (None, None)
+
+            train_offset = parse_period_string(args.train_roll_period)
+            if train_offset is None:
+                raise ValueError(f"Invalid train_roll_period: {args.train_roll_period}")
+            train_start_dt = split_dt - train_offset
+            train_range = (train_start_dt.strftime("%Y%m%d"), train_end_dt.strftime("%Y%m%d"))
+            return train_range, test_range
     except Exception:
-        workers = 1
+        pass
 
-    return workers > 1 and (not _is_process_elevated())
+    return (start_date, end_date), (None, None)
 
 
-def _print_elevation_banner(args):
-    requested_jobs = getattr(args, "n_jobs", 1)
-    try:
-        workers = OptimizationJob._resolve_worker_count(requested_jobs)
-    except Exception:
-        workers = 1
-
-    print("\n" + "=" * 72)
-    print("[Optimizer] Authorization Request for Maximum Training Performance")
-    print(
-        f"[Optimizer] Target parallel workers: {workers}. "
-        "Requesting administrator privileges before optimization."
+def _build_optimizer_terminal_log_path_for_args(args, symbol_list, run_dt=None, run_pid=None):
+    train_range, test_range = _infer_optimizer_terminal_log_ranges(args)
+    name_symbols = None if getattr(args, "selection", None) else symbol_list
+    name_tag = OptimizationJob.build_optuna_name_tag(
+        metric=getattr(args, "metric", "metric"),
+        train_period=getattr(args, "train_roll_period", None),
+        test_period=getattr(args, "test_roll_period", None),
+        train_range=train_range,
+        test_range=test_range,
+        data_source=getattr(args, "data_source", None),
+        symbols=name_symbols,
+        selection=getattr(args, "selection", None),
+        run_dt=run_dt,
+        run_pid=run_pid,
     )
-    print(
-        "[Optimizer] The command will relaunch with elevated rights, "
-        "then continue with the same CLI arguments."
-    )
-    print("=" * 72)
-
-
-def _relaunch_windows_as_admin():
-    try:
-        import ctypes
-    except Exception as e:
-        print(f"[Optimizer] Warning: unable to load Windows elevation API: {e}")
-        return False
-
-    try:
-        script_argv = [os.path.abspath(sys.argv[0])] + list(sys.argv[1:])
-        params = subprocess.list2cmdline(script_argv)
-        result = ctypes.windll.shell32.ShellExecuteW(
-            None,
-            "runas",
-            sys.executable,
-            params,
-            None,
-            1,
-        )
-        if int(result) <= 32:
-            print(f"[Optimizer] Warning: elevation request was not granted (ShellExecute code={result}).")
-            return False
-        return True
-    except Exception as e:
-        print(f"[Optimizer] Warning: failed to request administrator relaunch on Windows: {e}")
-        return False
-
-
-def _relaunch_unix_with_sudo():
-    stdin_obj = getattr(sys, "stdin", None)
-    if stdin_obj is None or not getattr(stdin_obj, "isatty", lambda: False)():
-        print("[Optimizer] Warning: non-interactive terminal detected, skip sudo elevation request.")
-        return False
-
-    cmd = ["sudo", "-E", sys.executable] + list(sys.argv)
-    print(f"[Optimizer] Elevation command: {' '.join(cmd)}")
-    try:
-        os.execvp("sudo", cmd)
-    except FileNotFoundError:
-        print("[Optimizer] Warning: 'sudo' not found, skip automatic elevation.")
-        return False
-    except Exception as e:
-        print(f"[Optimizer] Warning: failed to request sudo relaunch: {e}")
-        return False
-    return True
-
-
-def _request_elevation_if_needed(args):
-    """
-    尝试在优化前申请管理员权限。
-    返回 True 表示已触发提权重启（当前进程应直接结束）。
-    """
-    if not _should_try_auto_elevation(args):
-        return False
-
-    _print_elevation_banner(args)
-
-    if sys.platform.startswith("win"):
-        if _relaunch_windows_as_admin():
-            print("[Optimizer] Elevation request accepted. Relaunching elevated optimizer process...")
-            return True
-        print("[Optimizer] Continuing without elevation.")
-        return False
-
-    if sys.platform == "darwin" or sys.platform.startswith("linux"):
-        return _relaunch_unix_with_sudo()
-
-    print(f"[Optimizer] Warning: unsupported platform for auto-elevation: {sys.platform}")
-    return False
+    return build_optimizer_terminal_log_path(name_tag)
 
 
 def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
+    terminal_log_path = get_optimizer_terminal_log_path()
+    if not terminal_log_path:
+        terminal_log_path = _build_optimizer_terminal_log_path_for_args(args, symbol_list)
+        set_optimizer_terminal_log_path(terminal_log_path)
+
+    terminal_tee = install_optimizer_terminal_log(terminal_log_path)
+    try:
+        return _run_optimizer_mode_impl(
+            args=args,
+            fixed_params=fixed_params,
+            risk_params=risk_params,
+            symbol_list=symbol_list,
+        )
+    except Exception:
+        print("\n[Optimizer] Fatal exception captured in optimizer mode:")
+        traceback.print_exc()
+        return 1
+    finally:
+        terminal_tee.close()
+
+
+def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
     """
     运行优化模式主流程（从 run.py 下沉的编排逻辑）。
 
@@ -289,7 +243,8 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
         print("Error: --metric contains no valid metric after filtering empty entries.")
         return 1
 
-    if _request_elevation_if_needed(args):
+    resolve_worker_count = getattr(OptimizationJob, "_resolve_worker_count", lambda _requested_jobs: 1)
+    if process_elevation.request_optimizer_elevation_if_needed(args, resolve_worker_count):
         return 0
 
     config.LOG = False
@@ -310,6 +265,7 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
     )
     baseline_report = None
     baseline_test_report = None
+    baseline_yearly_reports = None
     baseline_elapsed_hours = None
     shared_context = None
     bootstrap_job = None
@@ -359,6 +315,56 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
             f"{t_str:<8} | {b_str:<22} | {db_str}"
         )
 
+    def window_key(metrics_payload):
+        metrics_payload = metrics_payload or {}
+        return (
+            normalize_metric_date(metrics_payload.get('start_date')),
+            normalize_metric_date(metrics_payload.get('end_date')),
+        )
+
+    def print_yearly_validation_rows(baseline_payloads, report_payloads):
+        rows_by_window = {}
+
+        for payload in baseline_payloads or []:
+            key = window_key(payload)
+            if all(key):
+                rows_by_window.setdefault(key, []).append(("当前基准", payload))
+
+        for report in report_payloads or []:
+            label = format_metric_label(report)
+            for payload in report.get('yearly_backtests') or []:
+                key = window_key(payload)
+                if all(key):
+                    rows_by_window.setdefault(key, []).append((label, payload))
+
+        if not rows_by_window:
+            return False
+
+        header_yearly = (
+            f"| {'窗口 (Window)':<21} | {'指标 (Metric)':<30} | {'年化收益':<10} | {'回撤':<10} | "
+            f"{'Calmar':<8} | {'Sharpe':<8} | {'交易数':<8} | {'胜率':<10} | {'PF':<8} |"
+        )
+        yearly_width = len(header_yearly)
+        print("-" * yearly_width)
+        print("年度固定窗口回测结果 (Yearly Fixed-Window Validation, Reused In-Memory Data)")
+        print("-" * yearly_width)
+        print(header_yearly)
+        print("-" * yearly_width)
+
+        for key in sorted(rows_by_window):
+            window_text = f"{key[0]}->{key[1]}"
+            for label, payload in rows_by_window[key]:
+                fmt = format_recent_backtest_metrics(payload or {})
+                print(
+                    f"| {window_text:<21} | {str(label)[:30]:<30} | "
+                    f"{fmt['annual_return']:<10} | {fmt['max_drawdown']:<10} | "
+                    f"{fmt['calmar_ratio']:<8} | {fmt['sharpe_ratio']:<8} | "
+                    f"{fmt['total_trades']:<8} | {fmt['win_rate']:<10} | {fmt['profit_factor']:<8} |"
+                )
+            print("-" * yearly_width)
+
+        return True
+
     if is_multi_metric:
         log_dir = os.path.join(os.getcwd(), config.DATA_PATH, 'optuna')
         os.makedirs(log_dir, exist_ok=True)
@@ -368,7 +374,7 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
             return None
 
         name_tag = OptimizationJob.build_optuna_name_tag(
-            metric="mix_score_origin,mix_score_defender,mix_score_sniper,mix_score_turbo",
+            metric=args.metric,
             train_period=args.train_roll_period,
             test_period=args.test_roll_period,
             train_range=train_range,
@@ -419,6 +425,7 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                 if test_set_requested:
                     baseline_test_report = bootstrap_job._run_test_set_backtest(copy.deepcopy(fixed_params), verbose=False)
                 baseline_report = bootstrap_job._run_recent_3y_backtest(copy.deepcopy(fixed_params))
+                baseline_yearly_reports = bootstrap_job._run_yearly_validation_backtests(copy.deepcopy(fixed_params))
             else:
                 baseline_args = copy.deepcopy(args)
                 baseline_args.metric = metrics_list[0]
@@ -434,6 +441,7 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                 if test_set_requested:
                     baseline_test_report = baseline_job._run_test_set_backtest(copy.deepcopy(fixed_params), verbose=False)
                 baseline_report = baseline_job._run_recent_3y_backtest(copy.deepcopy(fixed_params))
+                baseline_yearly_reports = baseline_job._run_yearly_validation_backtests(copy.deepcopy(fixed_params))
         except Exception as e:
             print(f"[警告] 当前基准回测失败: {e}")
         finally:
@@ -584,7 +592,9 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                 )
 
             print("-" * table_width + "\n")
-            print("=== 请将上文提供给AI辅助分析 ===")
+
+        print_yearly_validation_rows(baseline_yearly_reports, final_reports)
+        print("=== 请将上文提供给AI辅助分析 ===")
 
         if final_reports:
             print("请在 Dashboard 中回放并排查孤点: ")
@@ -634,6 +644,7 @@ class OptimizationJob:
         self.opt_params_def = opt_params_def
         self.risk_params = risk_params
         self._reset_trial_dedupe_cache()
+        self._indicator_cache = {}
         self.warmup_days = self.DEFAULT_WARMUP_DAYS
 
         # 共享上下文模式：复用选股、数据抓取与切分结果，确保多指标/基准对比在同一数据宇宙下进行
@@ -649,6 +660,7 @@ class OptimizationJob:
             self.test_range = shared_context["test_range"]
             self.warmup_days = shared_context.get("warmup_days", self.warmup_days)
             self._window_data_cache = shared_context.get("window_data_cache", {})
+            self._indicator_cache = shared_context.get("indicator_cache", {})
 
             # 在复用数据上下文的前提下，仅重建本次 metric 对应的 study_name
             self._auto_refine_study_name()
@@ -714,6 +726,7 @@ class OptimizationJob:
             "test_range": self.test_range,
             "warmup_days": self.warmup_days,
             "window_data_cache": self._window_data_cache,
+            "indicator_cache": self._indicator_cache,
         }
 
     def _reset_trial_dedupe_cache(self):
@@ -776,6 +789,7 @@ class OptimizationJob:
             "train_datas": self.train_datas,
             "train_range": self.train_range,
             "warmup_days": self.warmup_days,
+            "terminal_log_path": get_optimizer_terminal_log_path(),
             # spawn 子进程不会继承主进程运行期改写的 config，显式透传日志开关。
             "log_enabled": bool(getattr(config, "LOG", False)),
         }
@@ -963,6 +977,7 @@ class OptimizationJob:
         obj.train_datas = payload["train_datas"]
         obj.train_range = payload["train_range"]
         obj.warmup_days = payload.get("warmup_days", cls.DEFAULT_WARMUP_DAYS)
+        obj._indicator_cache = {}
 
         obj.strategy_class = get_class_from_name(obj.args.strategy, ['strategies'])
         obj.risk_control_classes = []
@@ -1669,7 +1684,8 @@ class OptimizationJob:
                 timeframe=self.args.timeframe,
                 compression=self.args.compression,
                 enable_plot=False,
-                verbose=False
+                verbose=False,
+                indicator_cache=getattr(self, "_indicator_cache", None),
             )
 
             bt_instance.run()
@@ -1713,6 +1729,26 @@ class OptimizationJob:
                 else:
                     years = 1.0
 
+                # 月度胜率用于一致性评分。过滤零收益月份，避免现金空转月污染。
+                monthly_win_rate = 0.0
+                try:
+                    monthly_returns = strat.analyzers.getbyname('timereturn_monthly').get_analysis()
+                    active_monthly_returns = []
+                    for monthly_return in monthly_returns.values():
+                        try:
+                            monthly_return = float(monthly_return)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(monthly_return) and abs(monthly_return) > 1e-12:
+                            active_monthly_returns.append(monthly_return)
+                    if active_monthly_returns:
+                        monthly_win_rate = (
+                            sum(1 for monthly_return in active_monthly_returns if monthly_return > 0)
+                            / len(active_monthly_returns)
+                        )
+                except Exception:
+                    monthly_win_rate = 0.0
+
             except Exception as e:
                 # Analyzer 解析失败，通常意味着参数导致了无法交易，直接判死刑
                 return -100.0
@@ -1727,7 +1763,8 @@ class OptimizationJob:
                 'profit_factor': profit_factor,
                 'mdd': mdd,
                 'safe_mdd': safe_mdd,
-                'years': years
+                'years': years,
+                'monthly_win_rate': monthly_win_rate,
             }
 
             if self.args.metric in ['sharpe', 'calmar', 'return']:
@@ -1854,6 +1891,100 @@ class OptimizationJob:
         start_dt = end_dt - pd.DateOffset(years=3)
         return start_dt.strftime('%Y%m%d'), end_dt.strftime('%Y%m%d')
 
+    def _infer_yearly_validation_windows(self):
+        """
+        Build natural-year validation windows from already loaded raw data.
+
+        This intentionally does not fetch provider data. It is a diagnostic
+        report for the optimizer summary, so it must preserve Tiingo quota.
+        """
+        indexes = []
+        for df in getattr(self, "raw_datas", {}).values():
+            if df is None or getattr(df, "empty", True):
+                continue
+            prepared = self.prepare_data_index(df)
+            if isinstance(prepared.index, pd.DatetimeIndex) and len(prepared.index) > 0:
+                indexes.append(prepared.index)
+
+        if not indexes:
+            return []
+
+        all_index = indexes[0]
+        for idx in indexes[1:]:
+            all_index = all_index.union(idx)
+        if len(all_index) == 0:
+            return []
+
+        min_dt = pd.to_datetime(all_index.min()).normalize()
+        max_dt = pd.to_datetime(all_index.max()).normalize()
+        logical_min_dt = max_dt - pd.DateOffset(years=5)
+        if getattr(self, "train_range", None) and self.train_range[0]:
+            try:
+                logical_min_dt = min(logical_min_dt, pd.to_datetime(self.train_range[0]).normalize())
+            except Exception:
+                pass
+
+        windows = []
+        for year in range(int(logical_min_dt.year), int(max_dt.year) + 1):
+            start_dt = pd.Timestamp(year=year, month=1, day=1)
+            end_dt = pd.Timestamp(year=year, month=12, day=31)
+            start_dt = max(start_dt, logical_min_dt)
+            end_dt = min(end_dt, max_dt)
+            if start_dt > end_dt:
+                continue
+
+            # Skip tiny edge windows; they add noise and burn CPU for little value.
+            available_dates = all_index[(all_index >= start_dt) & (all_index <= end_dt)]
+            if len(available_dates) < 60:
+                continue
+
+            windows.append((start_dt.strftime('%Y%m%d'), end_dt.strftime('%Y%m%d')))
+
+        return windows
+
+    def _collect_backtest_metrics(self, perf, start_date, end_date):
+        return {
+            "start_date": start_date or perf.get("start_date"),
+            "end_date": end_date or perf.get("end_date"),
+            "total_return": perf.get("total_return"),
+            "annual_return": perf.get("annual_return"),
+            "sharpe_ratio": perf.get("sharpe_ratio"),
+            "max_drawdown": perf.get("max_drawdown"),
+            "calmar_ratio": perf.get("calmar_ratio"),
+            "total_trades": perf.get("total_trades"),
+            "win_rate": perf.get("win_rate"),
+            "monthly_win_rate": perf.get("monthly_win_rate"),
+            "profit_factor": perf.get("profit_factor"),
+            "final_portfolio": perf.get("final_portfolio"),
+        }
+
+    def _run_backtest_on_datas(self, datas, final_params, start_date, end_date, verbose=False):
+        bt_instance = Backtester(
+            datas=datas,
+            strategy_class=self.strategy_class,
+            params=final_params,
+            start_date=start_date,
+            end_date=end_date,
+            cash=self.args.cash,
+            commission=self.args.commission,
+            slippage=self.args.slippage,
+            risk_control_classes=self.risk_control_classes,
+            risk_control_params=self.risk_params,
+            timeframe=self.args.timeframe,
+            compression=self.args.compression,
+            enable_plot=False,
+            verbose=False,
+            indicator_cache=getattr(self, "_indicator_cache", None),
+        )
+        bt_instance.run()
+        if verbose:
+            bt_instance.display_results()
+
+        perf = bt_instance.get_performance_metrics()
+        if not perf:
+            return None
+        return self._collect_backtest_metrics(perf, start_date, end_date)
+
     def _fetch_datas_for_window(self, start_date: str, end_date: str):
         """
         按指定窗口获取数据：
@@ -1927,46 +2058,21 @@ class OptimizationJob:
             return None
 
         try:
-            bt_recent = Backtester(
-                datas=recent_datas,
-                strategy_class=self.strategy_class,
-                params=final_params,
-                start_date=recent_start,
-                end_date=recent_end,
-                cash=self.args.cash,
-                commission=self.args.commission,
-                slippage=self.args.slippage,
-                risk_control_classes=self.risk_control_classes,
-                risk_control_params=self.risk_params,
-                timeframe=self.args.timeframe,
-                compression=self.args.compression,
-                enable_plot=False,
-                verbose=False,
+            metrics = self._run_backtest_on_datas(
+                recent_datas,
+                final_params,
+                recent_start,
+                recent_end,
+                verbose=True,
             )
-            bt_recent.run()
-            bt_recent.display_results()
-
-            perf = bt_recent.get_performance_metrics()
-            if not perf:
+            if not metrics:
                 print("[Optimizer] Warning: Recent 3Y backtest finished but metrics are unavailable.")
                 return None
         except Exception as e:
             print(f"[Optimizer] Warning: Recent 3Y backtest failed: {e}")
             return None
 
-        return {
-            "start_date": recent_start,
-            "end_date": recent_end,
-            "total_return": perf.get("total_return"),
-            "annual_return": perf.get("annual_return"),
-            "sharpe_ratio": perf.get("sharpe_ratio"),
-            "max_drawdown": perf.get("max_drawdown"),
-            "calmar_ratio": perf.get("calmar_ratio"),
-            "total_trades": perf.get("total_trades"),
-            "win_rate": perf.get("win_rate"),
-            "profit_factor": perf.get("profit_factor"),
-            "final_portfolio": perf.get("final_portfolio"),
-        }
+        return metrics
 
     def _run_test_set_backtest(self, final_params, verbose=False):
         """
@@ -1983,47 +2089,62 @@ class OptimizationJob:
         print("-" * 60)
 
         try:
-            bt_test = Backtester(
-                datas=self.test_datas,
-                strategy_class=self.strategy_class,
-                params=final_params,
-                start_date=test_start,
-                end_date=test_end,
-                cash=self.args.cash,
-                commission=self.args.commission,
-                slippage=self.args.slippage,
-                risk_control_classes=self.risk_control_classes,
-                risk_control_params=self.risk_params,
-                timeframe=self.args.timeframe,
-                compression=self.args.compression,
-                enable_plot=False,
-                verbose=False,
+            metrics = self._run_backtest_on_datas(
+                self.test_datas,
+                final_params,
+                test_start,
+                test_end,
+                verbose=verbose,
             )
-            bt_test.run()
-            if verbose:
-                bt_test.display_results()
-
-            perf = bt_test.get_performance_metrics()
-            if not perf:
+            if not metrics:
                 print("[Optimizer] Warning: Test-set backtest finished but metrics are unavailable.")
                 return None
         except Exception as e:
             print(f"[Optimizer] Warning: Test-set backtest failed: {e}")
             return None
 
-        return {
-            "start_date": test_start or perf.get("start_date"),
-            "end_date": test_end or perf.get("end_date"),
-            "total_return": perf.get("total_return"),
-            "annual_return": perf.get("annual_return"),
-            "sharpe_ratio": perf.get("sharpe_ratio"),
-            "max_drawdown": perf.get("max_drawdown"),
-            "calmar_ratio": perf.get("calmar_ratio"),
-            "total_trades": perf.get("total_trades"),
-            "win_rate": perf.get("win_rate"),
-            "profit_factor": perf.get("profit_factor"),
-            "final_portfolio": perf.get("final_portfolio"),
-        }
+        return metrics
+
+    def _run_yearly_validation_backtests(self, final_params):
+        windows = self._infer_yearly_validation_windows()
+        if not windows:
+            return []
+
+        test_start, test_end = self.test_range or (None, None)
+        test_key = (
+            self._normalize_date_tag(test_start) if test_start else None,
+            self._normalize_date_tag(test_end) if test_end else None,
+        )
+
+        print("-" * 60)
+        print("Running Yearly Fixed-Window Validation (reusing in-memory raw data)")
+        print("-" * 60)
+
+        reports = []
+        for start_date, end_date in windows:
+            window_key = (self._normalize_date_tag(start_date), self._normalize_date_tag(end_date))
+            if all(test_key) and window_key == test_key:
+                continue
+
+            datas = self.slice_datas(start_date, end_date)
+            if not datas:
+                print(f"[Optimizer] Warning: Yearly validation skipped (no data): {start_date} to {end_date}")
+                continue
+
+            try:
+                metrics = self._run_backtest_on_datas(
+                    datas,
+                    final_params,
+                    start_date,
+                    end_date,
+                    verbose=False,
+                )
+                if metrics:
+                    reports.append(metrics)
+            except Exception as e:
+                print(f"[Optimizer] Warning: Yearly validation failed {start_date} to {end_date}: {e}")
+
+        return reports
 
     def run(self):
         # 1. 配置存储 (支持多核)
@@ -2213,6 +2334,7 @@ class OptimizationJob:
             print("\n(No Test Set Configured)")
 
         recent_3y_metrics = self._run_recent_3y_backtest(final_params)
+        yearly_metrics = self._run_yearly_validation_backtests(final_params)
 
         print("\n" + "=" * 60)
         print(" SUMMARY OF BEST CONFIGURATION")
@@ -2239,6 +2361,8 @@ class OptimizationJob:
             print(f" Trades:   {test_fmt['total_trades']}")
             print(f" WinRate:  {test_fmt['win_rate']}")
             print(f" PF:       {test_fmt['profit_factor']}")
+        if yearly_metrics:
+            print(f" YearlyWindows: {len(yearly_metrics)}")
         print("=" * 60 + "\n")
 
         return {
@@ -2248,6 +2372,7 @@ class OptimizationJob:
             "log_file": log_file,
             "recent_backtest": recent_3y_metrics,
             "test_backtest": test_metrics,
+            "yearly_backtests": yearly_metrics,
         }
 
 
@@ -2266,29 +2391,35 @@ def _optimize_worker_entry(worker_payload, study_name, log_file, n_trials, worke
 
     # 在 worker 内同步主进程日志开关；缺省按训练静音处理。
     config.LOG = bool(worker_payload.get("log_enabled", False))
+    worker_tee = None
+    terminal_log_path = worker_payload.get("terminal_log_path") or get_optimizer_terminal_log_path()
+    if terminal_log_path:
+        worker_tee = install_optimizer_terminal_log(terminal_log_path, announce=False)
 
     worker_shm_handles = []
-    if worker_payload.get("train_datas") is None and worker_payload.get("train_datas_shared"):
-        restored_train_datas, worker_shm_handles = OptimizationJob._restore_train_datas_from_shared(
-            worker_payload["train_datas_shared"]
-        )
-        worker_payload = dict(worker_payload)
-        worker_payload["train_datas"] = restored_train_datas
-
-    storage = JournalStorage(JournalFileBackendCls(log_file))
-    sampler = TPESampler(constant_liar=True, seed=sampler_seed)
-
-    study = optuna.create_study(
-        direction='maximize',
-        study_name=study_name,
-        storage=storage,
-        load_if_exists=True,
-        sampler=sampler,
-    )
-
     try:
+        if worker_payload.get("train_datas") is None and worker_payload.get("train_datas_shared"):
+            restored_train_datas, worker_shm_handles = OptimizationJob._restore_train_datas_from_shared(
+                worker_payload["train_datas_shared"]
+            )
+            worker_payload = dict(worker_payload)
+            worker_payload["train_datas"] = restored_train_datas
+
+        storage = JournalStorage(JournalFileBackendCls(log_file))
+        sampler = TPESampler(constant_liar=True, seed=sampler_seed)
+
+        study = optuna.create_study(
+            direction='maximize',
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            sampler=sampler,
+        )
+
         job = OptimizationJob.from_worker_payload(worker_payload)
         study.optimize(job.objective, n_trials=n_trials, n_jobs=1)
         return {"worker_idx": worker_idx, "n_trials": n_trials}
     finally:
         OptimizationJob._cleanup_shared_segments(worker_shm_handles, unlink=False)
+        if worker_tee is not None:
+            worker_tee.close()

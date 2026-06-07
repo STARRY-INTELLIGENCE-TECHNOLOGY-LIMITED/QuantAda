@@ -33,6 +33,38 @@ def test_calculate_plan_pushes_plan_via_semantic_tag(monkeypatch):
     assert "调仓计划生成" in pushed[0]["content"]
 
 
+def test_calculate_plan_uses_data_identity_not_overloaded_equality(monkeypatch):
+    import common.rebalancer as rebalancer_module
+
+    monkeypatch.setattr(rebalancer_module.config, "PRINT_PLAN", False)
+
+    class WeirdComparableData:
+        def __init__(self, name):
+            self._name = name
+
+        def __eq__(self, other):
+            return True
+
+        def __hash__(self):
+            return 1
+
+    held = WeirdComparableData("AAA")
+    target_a = WeirdComparableData("BBB")
+    target_b = WeirdComparableData("CCC")
+
+    plan = rebalancer_module.PortfolioRebalancer.calculate_plan(
+        current_positions={held: 1000.0},
+        target_symbols=[target_a, target_b],
+        total_capital=1000.0,
+        select_top_k=2,
+        rebalance_threshold=0.0,
+    )
+
+    assert plan["sell_clear"] == [held]
+    assert plan["reduce"] == []
+    assert plan["increase"] == [(target_a, 500.0), (target_b, 500.0)]
+
+
 def test_order_executor_waits_for_sell_settlement_then_buys(monkeypatch):
     import common.order_executor as executor_module
 
@@ -894,3 +926,150 @@ def test_order_executor_warns_when_buy_not_submitted(monkeypatch):
     assert len(pushed) == 1
     assert pushed[0]["level"] == "ERROR"
     assert "BUY order not submitted" in pushed[0]["content"]
+
+
+def test_order_executor_keeps_unknown_buy_failure_visible_in_quiet_backtest(monkeypatch, capsys):
+    import common.order_executor as executor_module
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBacktestBroker:
+        is_live = False
+        verbose = False
+
+        def order_target_value(self, data, target):
+            return None
+
+    broker = DummyBacktestBroker()
+    executor = executor_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    out = capsys.readouterr().out
+    assert "BUY order not submitted" in out
+    assert len(pushed) == 1
+    assert pushed[0]["level"] == "ERROR"
+
+
+def test_order_executor_keeps_buy_not_submitted_visible_in_verbose_backtest(monkeypatch, capsys):
+    import common.order_executor as executor_module
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBacktestBroker:
+        is_live = False
+        verbose = True
+
+        def order_target_value(self, data, target):
+            return None
+
+    broker = DummyBacktestBroker()
+    executor = executor_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    out = capsys.readouterr().out
+    assert "BUY order not submitted" in out
+    assert len(pushed) == 1
+    assert pushed[0]["level"] == "ERROR"
+
+
+def test_order_executor_treats_backtest_min_lot_buy_skip_as_noop(monkeypatch, capsys):
+    import common.order_executor as executor_module
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBacktestBroker:
+        is_live = False
+        verbose = True
+        _last_order_target_skip_reason = None
+
+        def order_target_value(self, data, target):
+            self._last_order_target_skip_reason = 'insufficient_cash_for_min_lot'
+            return None
+
+    broker = DummyBacktestBroker()
+    executor = executor_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    out = capsys.readouterr().out
+    assert "BUY order not submitted" not in out
+    assert pushed == []
+
+
+def test_order_executor_treats_backtest_benign_sell_skip_as_noop_and_continues_buys(monkeypatch, capsys):
+    import common.order_executor as executor_module
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBacktestBroker:
+        is_live = False
+        verbose = True
+        _last_order_target_skip_reason = None
+
+        def __init__(self):
+            self.calls = []
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            if data._name == "SPY.ARCA":
+                self._last_order_target_skip_reason = 'target_already_met'
+                return None
+            self._last_order_target_skip_reason = None
+            return object()
+
+    broker = DummyBacktestBroker()
+    executor = executor_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SPY.ARCA")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 100000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    out = capsys.readouterr().out
+    assert broker.calls == [("SPY.ARCA", 0.0), ("EWJ.ARCA", 100000.0)]
+    assert "SELL order not submitted" not in out
+    assert "Planned BUY orders are skipped" not in out
+    assert pushed == []

@@ -59,10 +59,22 @@ class BacktraderStrategyWrapper(bt.Strategy):
     唯一职责是加载我们的纯策略，并将Backtrader的环境传递给它
     """
 
-    def __init__(self, strategy_class, params=None, risk_control_classes=None, risk_control_params=None, recorder=None, verbose=True):
+    def __init__(
+        self,
+        strategy_class,
+        params=None,
+        risk_control_classes=None,
+        risk_control_params=None,
+        recorder=None,
+        verbose=True,
+        slippage=0.0,
+        indicator_cache=None,
+    ):
         self.is_live = False
         self.recorder = recorder
         self.verbose = verbose
+        self.slippage = max(0.0, float(slippage or 0.0))
+        self.indicator_cache = indicator_cache if isinstance(indicator_cache, dict) else {}
         # 增加一个属性用于存储实际开始日期，面向解决多标的数据就绪问题
         self.actual_start_date = None
         # 用于记录单次 next 循环中，卖单预计释放的资金
@@ -207,9 +219,10 @@ class BacktraderStrategyWrapper(bt.Strategy):
             current_cash = self.broker.getcash()
             total_purchasing_power = current_cash + self.expected_freed_cash - self.virtual_spent_cash
 
-            # 估算包含手续费的最大购买量 (假设 commission 是比例，如 0.0003)
+            # 估算包含手续费/滑点的最大购买量 (假设 commission 是比例，如 0.0003)
             commission_ratio = self.broker.getcommissioninfo(data).p.commission
-            max_buy_by_cash = total_purchasing_power / (price * (1 + commission_ratio))
+            execution_cost_multiplier = (1 + self.slippage) * (1 + commission_ratio)
+            max_buy_by_cash = total_purchasing_power / (price * execution_cost_multiplier)
 
             # 取 目标买入量 和 现金最大买入量 的较小值
             shares_to_buy = min(delta_shares, max_buy_by_cash)
@@ -222,20 +235,17 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
             if shares_to_buy > 0:
                 # 与 order_target_value 保持一致：同 Bar 内先记账，防止多标的连续买入穿透现金。
-                estimated_cost = shares_to_buy * price * (1 + commission_ratio)
+                estimated_cost = shares_to_buy * price * execution_cost_multiplier
                 self.virtual_spent_cash += estimated_cost
                 return self.buy(data=data, size=shares_to_buy)
 
         elif delta_shares < 0:  # 卖出
             shares_to_sell = abs(delta_shares)
 
-            # 无论是否清仓，都要先计算预计释放的资金
-            if shares_to_sell > 0:
-                estimated_value = shares_to_sell * price
-                self.expected_freed_cash += estimated_value
-
             # 如果目标是 0，通常意味着清仓
             if target == 0.0:
+                if pos_size > 0:
+                    self.expected_freed_cash += pos_size * price
                 # 如果是清仓，直接使用 close()，它会处理所有持仓
                 # 注意：self.close() 内部逻辑可能不保证 100 整手，但在清仓时通常需要卖出所有零股
                 # 如果需要严格整手卖出，可以使用下面的逻辑，但会残留零股
@@ -248,6 +258,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 shares_to_sell = int(shares_to_sell)
 
             if shares_to_sell > 0:
+                estimated_value = shares_to_sell * price
+                self.expected_freed_cash += estimated_value
                 return self.sell(data=data, size=shares_to_sell)
 
         return None
@@ -261,12 +273,14 @@ class BacktraderStrategyWrapper(bt.Strategy):
         """
         data = data or self.datas[0]
         lot_size = kwargs.get('lot_size', config.LOT_SIZE)
+        self._last_order_target_skip_reason = None
 
         # 0. 风控拦截：如果该标的正在被风控接管，且策略试图买入/持有，则拦截
         if hasattr(self.strategy, 'risk_handled_symbols'):
             # 如果目标金额 > 0，视为买入或维持持仓意图，予以拦截
             if data._name in self.strategy.risk_handled_symbols and target > 0:
                 self.log(f"IGNORED order_target_value({target}) for {data._name} due to Risk Control Lock.")
+                self._last_order_target_skip_reason = 'risk_control_lock'
                 return None
 
         # 1. 获取当前持仓和价格
@@ -274,6 +288,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         price = data.close[0]
 
         if price <= 0:
+            self._last_order_target_skip_reason = 'invalid_price'
             return None
 
         # 2. 计算目标股数 (核心区别：直接用 target_value / price)
@@ -292,20 +307,19 @@ class BacktraderStrategyWrapper(bt.Strategy):
             # 公式: 静态现金 + 卖出回笼 - [新增]本轮已花掉的钱
             total_purchasing_power = current_cash + self.expected_freed_cash - self.virtual_spent_cash
 
-            # 估算最大购买力 (含手续费)
+            # 估算最大购买力 (含手续费和回测滑点)。
+            # 回测是同步成交模型，不能固定砍 5% 买力；否则 LOT_SIZE=1 时，现金足够买 1 股也可能被压成 0 股。
             commission_ratio = self.broker.getcommissioninfo(data).p.commission
+            execution_cost_multiplier = (1 + self.slippage) * (1 + commission_ratio)
 
-            # 增加 0.95 的安全折扣 (Safety Buffer)
-            # 防止隔日开盘跳空高开 (Gap Up) 导致资金不足被拒单，尽管会有几个因为双重高开导致拒单，但此时不买/买失败也是一种避免高开低走的风控。
-            safe_purchasing_power = total_purchasing_power * 0.95
+            if total_purchasing_power < 0:
+                total_purchasing_power = 0
 
-            # 防止算力穿透 (比如 safe_purchasing_power 为负时)
-            if safe_purchasing_power < 0: safe_purchasing_power = 0
-
-            max_buy_by_cash = safe_purchasing_power / (price * (1 + commission_ratio))
+            max_buy_by_cash = total_purchasing_power / (price * execution_cost_multiplier)
 
             # 取 目标量 和 现金上限 的较小值
             shares_to_buy = min(delta_shares, max_buy_by_cash)
+            raw_shares_to_buy = shares_to_buy
 
             # 向下取整到 lot_size
             if lot_size > 1:
@@ -316,20 +330,22 @@ class BacktraderStrategyWrapper(bt.Strategy):
             if shares_to_buy > 0:
                 # 记账：这笔钱已经花出去了！
                 # 估算花费 = 股数 * 价格 * (1+手续费)
-                estimated_cost = shares_to_buy * price * (1 + commission_ratio)
+                estimated_cost = shares_to_buy * price * execution_cost_multiplier
                 self.virtual_spent_cash += estimated_cost
                 return self.buy(data=data, size=shares_to_buy)
+
+            if delta_shares < max(1, lot_size):
+                self._last_order_target_skip_reason = 'below_min_lot_delta'
+            elif raw_shares_to_buy < max(1, lot_size):
+                self._last_order_target_skip_reason = 'insufficient_cash_for_min_lot'
 
         elif delta_shares < 0:  # 卖出
             shares_to_sell = abs(delta_shares)
 
-            # 记录预计释放的资金 (用于同Bar买入)
-            if shares_to_sell > 0:
-                estimated_freed_value = shares_to_sell * price
-                self.expected_freed_cash += estimated_freed_value
-
             # 如果目标价值是 0 或极小，视为清仓
             if target <= 1.0:  # 容忍浮点误差，小于1块钱视同清仓
+                if pos_size > 0:
+                    self.expected_freed_cash += pos_size * price
                 return self.close(data=data)
 
             # [关键] 向下取整到 lot_size
@@ -339,7 +355,13 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 shares_to_sell = int(shares_to_sell)
 
             if shares_to_sell > 0:
+                estimated_freed_value = shares_to_sell * price
+                self.expected_freed_cash += estimated_freed_value
                 return self.sell(data=data, size=shares_to_sell)
+
+            self._last_order_target_skip_reason = 'below_min_lot_delta'
+        else:
+            self._last_order_target_skip_reason = 'target_already_met'
 
         return None
 
@@ -456,7 +478,7 @@ class Backtester:
                  commission=0.0, slippage=0.001, sizer_class=None, sizer_params=None,
                  risk_control_classes=None, risk_control_params=None,
                  timeframe: str = 'Days', compression: int = 1,
-                 recorder = None, enable_plot = True, verbose=True):
+                 recorder = None, enable_plot = True, verbose=True, indicator_cache=None):
         self.cerebro = bt.Cerebro()
         self.cerebro.broker = SignalLoggingBroker()
         self.datas = datas
@@ -476,6 +498,7 @@ class Backtester:
         self.recorder = recorder
         self.enable_plot = enable_plot
         self.verbose = verbose
+        self.indicator_cache = indicator_cache if isinstance(indicator_cache, dict) else {}
         self.timeframe = self._get_bt_timeframe(timeframe)
 
         self._init_analyzers()
@@ -534,7 +557,9 @@ class Backtester:
             risk_control_classes=self.risk_control_classes,
             risk_control_params=self.risk_control_params,
             recorder=self.recorder,
-            verbose=self.verbose  # 将静音标志传递给 wrapper
+            verbose=self.verbose,  # 将静音标志传递给 wrapper
+            slippage=self.slippage,
+            indicator_cache=self.indicator_cache,
         )
 
     def _init_broker(self):
@@ -566,6 +591,11 @@ class Backtester:
         self.cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
         self.cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         self.cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='tradeanalyzer')
+        self.cerebro.addanalyzer(
+            bt.analyzers.TimeReturn,
+            _name='timereturn_monthly',
+            timeframe=bt.TimeFrame.Months,
+        )
 
         # 2. 详细指标 (仅 Verbose 模式挂载，节省内存)
         if self.verbose:
@@ -683,6 +713,7 @@ class Backtester:
         drawdown_analyzer = strat.analyzers.getbyname('drawdown')
         sharpe_analyzer = strat.analyzers.getbyname('sharpe')
         trade_analyzer = strat.analyzers.getbyname('tradeanalyzer')
+        timereturn_monthly_analyzer = strat.analyzers.getbyname('timereturn_monthly')
 
         # 优先使用策略真实启动时间，避免 warm-up 污染统计区间
         start_date = None
@@ -756,6 +787,16 @@ class Backtester:
         profit_factor = total_win_pnl / abs(total_loss_pnl) if total_loss_pnl != 0 else float('inf')
         pnl_ratio = avg_win_pnl / abs(avg_loss_pnl) if avg_loss_pnl != 0 else float('inf')
 
+        monthly_returns = timereturn_monthly_analyzer.get_analysis()
+        active_monthly_returns = [
+            monthly_return for monthly_return in monthly_returns.values()
+            if monthly_return is not None and abs(monthly_return) > 1e-12
+        ]
+        monthly_win_rate = (
+            sum(1 for monthly_return in active_monthly_returns if monthly_return > 0) / len(active_monthly_returns)
+            if active_monthly_returns else 0.0
+        )
+
         return {
             "start_date": start_date,
             "end_date": end_date,
@@ -768,6 +809,7 @@ class Backtester:
             "calmar_ratio": calmar_ratio,
             "total_trades": total_trades,
             "win_rate": win_rate,
+            "monthly_win_rate": monthly_win_rate,
             "profit_factor": profit_factor,
             "pnl_ratio": pnl_ratio,
         }

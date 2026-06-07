@@ -37,6 +37,7 @@
 7. 当 `mode=live` 需要显式控制“隔夜委托是否保留”时，优先通过 `--config` 传入:
    - `{'KEEP_OVERNIGHT_ORDERS': False}`: 交易日首轮前清理隔夜在途委托（默认推荐）
    - `{'KEEP_OVERNIGHT_ORDERS': True}`: 保留隔夜在途委托
+8. 当 `mode=optimize` 时，框架会自动将终端滚动输出异步归档到 `.data/optimizer`；不要要求用户手动传任何内部日志路径参数。
 
 ## 输出格式
 请严格按以下结构输出:

@@ -10,6 +10,11 @@ class OrderExecutor:
     _SELL_SETTLE_WARN_SECONDS = 300.0
     _SELL_SETTLE_HARD_SECONDS = 600.0
     _SELL_SETTLE_POLL_SECONDS = 1.0
+    _BENIGN_BACKTEST_SKIP_REASONS = {
+        'below_min_lot_delta',
+        'insufficient_cash_for_min_lot',
+        'target_already_met',
+    }
 
     def __init__(self, broker, debug=False):
         self.broker = broker
@@ -46,7 +51,8 @@ class OrderExecutor:
                 else:
                     has_untracked_sell = True
             else:
-                sell_submit_failed = True
+                if not self._is_benign_backtest_skip():
+                    sell_submit_failed = True
                 self._warn_order_not_submitted('SELL', data, 0.0, phase='clear')
 
         for data, target in plan['reduce']:
@@ -69,7 +75,8 @@ class OrderExecutor:
                 else:
                     has_untracked_sell = True
             else:
-                sell_submit_failed = True
+                if not self._is_benign_backtest_skip():
+                    sell_submit_failed = True
                 self._warn_order_not_submitted('SELL', data, target, phase='reduce')
 
         if sell_submit_failed:
@@ -77,11 +84,7 @@ class OrderExecutor:
                 "[Executor Warning] One or more SELL orders were not submitted. "
                 "Planned BUY orders are skipped for this rebalance run."
             )
-            print(msg)
-            try:
-                AlarmManager().push_text(msg, level='ERROR')
-            except Exception:
-                pass
+            self._emit_warning(msg, level='ERROR')
             return
 
         if not sell_submitted:
@@ -110,32 +113,52 @@ class OrderExecutor:
                 "[Executor Warning] SELL orders remain pending after hard wait. "
                 "Confirmed cash has already been rolled into buy orders conservatively."
             )
-            print(msg)
-            try:
-                AlarmManager().push_text(msg, level='ERROR')
-            except Exception:
-                pass
+            self._emit_warning(msg, level='ERROR')
 
     def _log(self, txt):
         if self.debug:
             print(f"[Executor] {txt}")
 
-    @staticmethod
-    def _warn_order_not_submitted(side, data, target, phase):
+    def _should_emit_order_warning(self):
+        return True
+
+    def _emit_warning(self, msg, level='ERROR'):
+        if not self._should_emit_order_warning():
+            return
+
+        print(msg)
+        try:
+            AlarmManager().push_text(msg, level=level)
+        except Exception:
+            pass
+
+    def _is_benign_backtest_skip(self):
+        if getattr(self.broker, 'is_live', True) is True:
+            return False
+        reason = getattr(self.broker, '_last_order_target_skip_reason', None)
+        return reason in self._BENIGN_BACKTEST_SKIP_REASONS
+
+    def _warn_order_not_submitted(self, side, data, target, phase):
+        if self._is_benign_backtest_skip():
+            self._log(
+                f"{side} order skipped as backtest no-op: "
+                f"phase={phase}, symbol={getattr(data, '_name', str(data))}, "
+                f"reason={getattr(self.broker, '_last_order_target_skip_reason', None)}"
+            )
+            return
+
         symbol = getattr(data, '_name', str(data))
         try:
             target_text = f"{float(target):.2f}"
         except Exception:
             target_text = str(target)
+        reason = getattr(self.broker, '_last_order_target_skip_reason', None)
+        reason_text = f", reason={reason}" if reason else ""
         msg = (
             f"[Executor Warning] {side} order not submitted: "
-            f"phase={phase}, symbol={symbol}, target={target_text}."
+            f"phase={phase}, symbol={symbol}, target={target_text}{reason_text}."
         )
-        print(msg)
-        try:
-            AlarmManager().push_text(msg, level='ERROR')
-        except Exception:
-            pass
+        self._emit_warning(msg, level='ERROR')
 
     @staticmethod
     def _symbol_key(value):

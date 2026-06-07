@@ -28,13 +28,21 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Avoid adding new switches/knobs unless required by clear operational need.
 - Prefer local, targeted edits over broad refactors.
 
-4. Execution Discipline
+4. File Responsibility / Cohesion First
+- Keep each file centered on its primary runtime responsibility.
+- Large orchestration modules must not absorb cross-cutting utilities such as terminal tee, log path persistence, command formatting, or file IO helpers when a focused module can own them.
+- Optimizer code should own search orchestration, objective evaluation, study lifecycle, and training/reporting flow; runtime logging utilities belong in dedicated modules.
+- Base classes should expose contracts and stable public entrypoints only; implementation mechanics such as caches, terminal tee, command construction, or report formatting belong in focused common/runtime modules.
+- If a base class needs a thin public method for strategy/broker authors, keep the method as an API adapter and move the mechanical implementation behind that API into the focused module.
+- When a change adds non-core behavior to an already broad file, first look for a small focused extraction instead of adding more incidental logic.
+
+5. Execution Discipline
 - Keep behavior deterministic and auditable.
 - Follow existing execution semantics consistently (sellability guard, immediate downgrade retry, daily cleanup policy).
 - Live-only execution guards such as pending-order waits, rolling buys, cash settlement waits, broker sync, and realtime pending-order queries must not run in backtests. Backtests must assume planned orders execute synchronously and remain fast.
 - Any new execution-path logic must preserve this split at the call boundary: live may poll, reconcile, or wait only within a bounded current-run scope; backtests and optimizations must remain in-memory, synchronous, and non-blocking.
 
-5. Anti-Abstraction Discipline
+6. Anti-Abstraction Discipline
 - Do not introduce a new helper method, wrapper, mixin, bridge, or base-class API unless it clearly pays rent now.
 - If logic has only one call site, prefer keeping it local unless extraction materially improves correctness, testability, or readability.
 - Do not add thin pass-through wrappers that merely rename or forward a single call without reducing real complexity.

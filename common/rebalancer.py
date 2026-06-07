@@ -36,10 +36,12 @@ class PortfolioRebalancer:
             'increase': [],  # 需要加仓的 (data, target_value)
             'target_per_stock': target_value
         }
+        target_data_ids = {id(data) for data in target_symbols}
+        current_data_ids = {id(data) for data in current_positions}
 
         # 2. 识别清仓与减仓
         for data, current_val in current_positions.items():
-            if data not in target_symbols:
+            if id(data) not in target_data_ids:
                 plan['sell_clear'].append(data)
             else:
                 # 目标价值为 0 的防御
@@ -57,7 +59,7 @@ class PortfolioRebalancer:
 
         # 3. 识别新开仓
         for data in target_symbols:
-            if data not in current_positions and target_value > 0:
+            if id(data) not in current_data_ids and target_value > 0:
                 plan['increase'].append((data, target_value))
 
         if config.PRINT_PLAN:

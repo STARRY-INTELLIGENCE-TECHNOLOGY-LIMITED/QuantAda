@@ -32,3 +32,4 @@
 3. Broker / Strategy 契约: `contracts/live_adapter.md`, `contracts/strategy.md`
 4. 其他扩展点: `contracts/extensions.md`
 5. 代码生成流程: `workflows/agent_codegen.md`
+6. 优化器运行期日志: `workflows/optimizer_runtime.md`

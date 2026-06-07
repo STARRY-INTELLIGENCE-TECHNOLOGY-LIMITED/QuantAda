@@ -3,6 +3,8 @@ from types import SimpleNamespace
 import pandas as pd
 
 import common.optimizer as optimizer
+import common.process_elevation as process_elevation
+import common.terminal_log as terminal_log
 
 
 def _build_args(**overrides):
@@ -32,6 +34,7 @@ def _sample_metrics(start="20250101", end="20250331"):
         "calmar_ratio": 1.50,
         "total_trades": 20,
         "win_rate": 55.0,
+        "monthly_win_rate": 0.58,
         "profit_factor": 1.90,
         "final_portfolio": 110000.0,
     }
@@ -44,6 +47,10 @@ class _DummyOptimizationJob:
         self.train_range = ("20240101", "20241231")
         self.test_range = ("20250101", "20250331")
         self.target_symbols = ["AAPL"]
+        self.yearly_backtests = [
+            _sample_metrics(start="20240101", end="20241231"),
+            _sample_metrics(start="20250101", end="20251231"),
+        ]
 
     def export_shared_context(self):
         return {
@@ -65,6 +72,9 @@ class _DummyOptimizationJob:
     def _run_test_set_backtest(self, params, verbose=False):
         return _sample_metrics(start="20250101", end="20250331")
 
+    def _run_yearly_validation_backtests(self, params):
+        return self.yearly_backtests
+
     def run(self):
         return {
             "best_score": "1.2345",
@@ -73,6 +83,7 @@ class _DummyOptimizationJob:
             "log_file": "dummy.log",
             "recent_backtest": _sample_metrics(start="20230101", end="20251231"),
             "test_backtest": _sample_metrics(start="20250101", end="20250331"),
+            "yearly_backtests": self.yearly_backtests,
         }
 
     @classmethod
@@ -84,6 +95,7 @@ class _DummyOptimizationJob:
 
 
 def test_run_optimizer_mode_prints_test_backtest_section(monkeypatch, capsys):
+    monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
     monkeypatch.setattr(optimizer, "OptimizationJob", _DummyOptimizationJob)
     monkeypatch.setattr(optimizer.sys, "argv", ["run.py", "--params", "{\"lookback\": 20}"])
 
@@ -98,11 +110,14 @@ def test_run_optimizer_mode_prints_test_backtest_section(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert code == 0
     assert "测试集回测结果" in out
+    assert "年度固定窗口回测结果" in out
+    assert "20240101->20241231" in out
     assert "20250101 -> 20250331" in out
     assert "当前基准" in out
 
 
 def test_run_optimizer_mode_skips_test_backtest_section_without_test_config(monkeypatch, capsys):
+    monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
     monkeypatch.setattr(optimizer, "OptimizationJob", _DummyOptimizationJob)
     monkeypatch.setattr(optimizer.sys, "argv", ["run.py", "--params", "{\"lookback\": 20}"])
 
@@ -159,6 +174,7 @@ def test_run_test_set_backtest_returns_structured_metrics(monkeypatch):
     assert got["start_date"] == "20250101"
     assert got["end_date"] == "20250331"
     assert got["annual_return"] == 0.12
+    assert got["monthly_win_rate"] == 0.58
     assert DummyBacktester.last_kwargs["start_date"] == "20250101"
     assert DummyBacktester.last_kwargs["end_date"] == "20250331"
     assert not DummyBacktester.display_called
@@ -222,11 +238,105 @@ def test_evaluate_trial_params_passes_cli_slippage_to_backtester(monkeypatch):
     )
     job.risk_control_classes = []
     job.risk_params = {}
+    indicator_cache = {}
+    job._indicator_cache = indicator_cache
 
     got = job._evaluate_trial_params(current_params={"lookback": 20})
 
     assert got == 0.05
     assert DummyBacktester.last_kwargs["slippage"] == 0.0001
+    assert DummyBacktester.last_kwargs["indicator_cache"] is indicator_cache
+
+
+def test_evaluate_trial_params_passes_monthly_win_rate_to_metric(monkeypatch):
+    captured = {}
+
+    class DummyAnalyzer:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def get_analysis(self):
+            return self.payload
+
+    class DummyAnalyzers:
+        def getbyname(self, name):
+            if name == "tradeanalyzer":
+                return DummyAnalyzer(
+                    {
+                        "total": {"total": 30},
+                        "won": {"total": 18, "pnl": {"total": 1200.0}},
+                        "lost": {"pnl": {"total": -600.0}},
+                    }
+                )
+            if name == "drawdown":
+                return DummyAnalyzer({"max": {"drawdown": 10.0}})
+            if name == "timereturn_monthly":
+                return DummyAnalyzer(
+                    {
+                        "2024-01": 0.05,
+                        "2024-02": -0.02,
+                        "2024-03": 0.0,
+                        "2024-04": 0.03,
+                    }
+                )
+            return DummyAnalyzer({})
+
+    class DummyDataDatetime:
+        def datetime(self, idx):
+            return pd.Timestamp("2024-12-31").to_pydatetime() if idx == 0 else pd.Timestamp("2024-01-01").to_pydatetime()
+
+    class DummyData:
+        datetime = DummyDataDatetime()
+
+        def __len__(self):
+            return 2
+
+    class DummyStrat:
+        data = DummyData()
+        analyzers = DummyAnalyzers()
+
+    class DummyBacktester:
+        def __init__(self, **kwargs):
+            self.results = []
+
+        def run(self):
+            self.results = [DummyStrat()]
+
+        def get_custom_metric(self, metric_name):
+            if metric_name == "return":
+                return 0.05
+            if metric_name == "sharpe":
+                return 1.0
+            if metric_name == "calmar":
+                return 1.0
+            return 0.0
+
+    def fake_metric(stats, strat=None, args=None):
+        captured.update(stats)
+        return 123.0
+
+    monkeypatch.setattr(optimizer, "Backtester", DummyBacktester)
+    monkeypatch.setattr(optimizer, "get_metric_function", lambda metric: fake_metric)
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.train_datas = {"AAPL": object()}
+    job.strategy_class = object()
+    job.train_range = ("20240101", "20241231")
+    job.args = SimpleNamespace(
+        cash=100000.0,
+        commission=0.0003,
+        slippage=0.0001,
+        timeframe="Days",
+        compression=1,
+        metric="mix_score_us_turbo",
+    )
+    job.risk_control_classes = []
+    job.risk_params = {}
+
+    got = job._evaluate_trial_params(current_params={"lookback": 20})
+
+    assert got == 123.0
+    assert captured["monthly_win_rate"] == 2.0 / 3.0
 
 
 def test_slice_datas_keeps_fixed_warmup_rows_before_logical_start():
@@ -381,19 +491,88 @@ def test_fetch_all_data_full_window_uses_fixed_warmup_start():
     assert calls[0]["end_date"] == "20250131"
 
 
+def test_yearly_validation_reuses_raw_datas_without_provider_fetch(monkeypatch):
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("provider fetch should not be used for yearly validation")
+
+    class DummyBacktester:
+        seen_windows = []
+
+        def __init__(self, **kwargs):
+            DummyBacktester.seen_windows.append((kwargs["start_date"], kwargs["end_date"], kwargs["datas"]))
+
+        def run(self):
+            return None
+
+        def get_performance_metrics(self):
+            return _sample_metrics(
+                start=DummyBacktester.seen_windows[-1][0],
+                end=DummyBacktester.seen_windows[-1][1],
+            )
+
+    monkeypatch.setattr(optimizer, "Backtester", DummyBacktester)
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    idx = pd.date_range("2020-01-01", "2022-12-31", freq="D")
+    job.raw_datas = {
+        "AAPL": pd.DataFrame(
+            {
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 100.0,
+            },
+            index=idx,
+        )
+    }
+    job.target_symbols = ["AAPL"]
+    job.data_manager = DummyDataManager()
+    job.train_range = ("20200101", "20221231")
+    job.test_range = (None, None)
+    job.strategy_class = object()
+    job.risk_control_classes = []
+    job.risk_params = {}
+    job._indicator_cache = {}
+    job.args = SimpleNamespace(
+        cash=100000.0,
+        commission=0.0003,
+        slippage=0.0,
+        timeframe="Days",
+        compression=1,
+        data_source="dummy",
+        refresh=False,
+    )
+
+    got = job._run_yearly_validation_backtests(final_params={"lookback": 20})
+
+    assert calls == []
+    assert len(got) == 3
+    assert [item["start_date"] for item in got] == ["20200101", "20210101", "20220101"]
+    assert all("AAPL" in datas for _, _, datas in DummyBacktester.seen_windows)
+
+
 def test_request_elevation_skips_for_single_worker(monkeypatch):
     args = SimpleNamespace(n_jobs=1)
     monkeypatch.delenv("QUANTADA_DISABLE_AUTO_ELEVATE", raising=False)
-    monkeypatch.setattr(optimizer, "_is_process_elevated", lambda: False)
+    monkeypatch.setattr(process_elevation, "is_process_elevated", lambda: False)
 
     called = {"banner": 0}
 
     def _mark_banner(_):
         called["banner"] += 1
 
-    monkeypatch.setattr(optimizer, "_print_elevation_banner", _mark_banner)
+    monkeypatch.setattr(process_elevation, "print_elevation_banner", _mark_banner)
 
-    got = optimizer._request_elevation_if_needed(args)
+    got = process_elevation.request_optimizer_elevation_if_needed(
+        args,
+        optimizer.OptimizationJob._resolve_worker_count,
+    )
 
     assert got is False
     assert called["banner"] == 0
@@ -402,24 +581,109 @@ def test_request_elevation_skips_for_single_worker(monkeypatch):
 def test_request_elevation_windows_branch(monkeypatch):
     args = SimpleNamespace(n_jobs=4)
     monkeypatch.delenv("QUANTADA_DISABLE_AUTO_ELEVATE", raising=False)
-    monkeypatch.setattr(optimizer.sys, "platform", "win32", raising=False)
-    monkeypatch.setattr(optimizer, "_is_process_elevated", lambda: False)
-    monkeypatch.setattr(optimizer, "_print_elevation_banner", lambda _: None)
-    monkeypatch.setattr(optimizer, "_relaunch_windows_as_admin", lambda: True)
+    monkeypatch.setattr(process_elevation.sys, "platform", "win32", raising=False)
+    monkeypatch.setattr(process_elevation, "is_process_elevated", lambda: False)
+    monkeypatch.setattr(process_elevation, "print_elevation_banner", lambda *_: None)
+    monkeypatch.setattr(process_elevation, "relaunch_windows_as_admin", lambda: True)
 
-    got = optimizer._request_elevation_if_needed(args)
+    got = process_elevation.request_optimizer_elevation_if_needed(
+        args,
+        optimizer.OptimizationJob._resolve_worker_count,
+    )
 
     assert got is True
+
+
+def test_windows_elevation_command_keeps_console_open(monkeypatch):
+    monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
+    monkeypatch.setattr(process_elevation.sys, "argv", ["run.py", "--opt_params", "{'x': 1}"])
+    monkeypatch.setattr(process_elevation.sys, "executable", r"C:\Python\python.exe")
+    monkeypatch.setattr(process_elevation.os.path, "abspath", lambda path: rf"E:\Lin\Github\QuantAda\{path}")
+    monkeypatch.setattr(process_elevation.os, "getcwd", lambda: r"E:\Lin\Github\QuantAda")
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+
+    target_exe, params = process_elevation.build_windows_elevated_console_command()
+
+    assert target_exe == r"C:\Windows\System32\cmd.exe"
+    assert params.startswith('/k "')
+    assert 'cd /d "E:\\Lin\\Github\\QuantAda"' in params
+    assert r"C:\Python\python.exe" in params
+    assert "run.py" in params
+    assert "Elevated run finished" in params
+    assert params.index('cd /d "E:\\Lin\\Github\\QuantAda"') < params.index(r"C:\Python\python.exe")
+
+
+def test_optimizer_terminal_log_path_uses_optuna_style_name(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = _build_args(
+        metric="mix_score_us_turbo,mix_score_origin",
+        train_roll_period="5y",
+        test_roll_period="6m",
+        end_date="20260606",
+        data_source="tiingo",
+        selection=None,
+    )
+
+    got = optimizer._build_optimizer_terminal_log_path_for_args(
+        args,
+        symbol_list=[],
+        run_dt=pd.Timestamp("2026-06-07 12:34:56").to_pydatetime(),
+        run_pid=12345,
+    )
+
+    assert str(tmp_path / ".data" / "optimizer") in got
+    assert (
+        "optimizer_terminal_5Y_6M_mix_score_us_turbo_mix_score_origin_US_"
+        "TR20201206-20251205_TE20251206-20260606_RUN20260607-123456_12345.log"
+    ) in got
+
+
+def test_optimizer_terminal_log_tee_writes_console_and_file(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
+    monkeypatch.setattr(terminal_log, "_TERMINAL_LOG_TEE", None)
+    log_file = tmp_path / "optimizer_terminal.log"
+
+    tee = terminal_log.install_optimizer_terminal_log(str(log_file))
+    print("hello optimizer tee")
+    tee.close()
+
+    out = capsys.readouterr().out
+    assert "Terminal output tee" in out
+    assert "hello optimizer tee" in out
+    assert "hello optimizer tee" in log_file.read_text(encoding="utf-8")
+    assert terminal_log.get_optimizer_terminal_log_path() == str(log_file)
+
+
+def test_elevation_command_carries_terminal_log_env(monkeypatch):
+    log_file = r"E:\Lin\Github\QuantAda\.data\optimizer\optimizer terminal.log"
+    monkeypatch.setattr(process_elevation.sys, "argv", ["run.py", "--opt_params", "{'x': 1}"])
+    monkeypatch.setattr(process_elevation.sys, "executable", r"C:\Python\python.exe")
+    monkeypatch.setattr(process_elevation.os.path, "abspath", lambda path: rf"E:\Lin\Github\QuantAda\{path}")
+    monkeypatch.setattr(process_elevation.os, "getcwd", lambda: r"E:\Lin\Github\QuantAda")
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, log_file)
+
+    _, params = process_elevation.build_windows_elevated_console_command()
+
+    assert "--terminal_log_file" not in params
+    assert terminal_log.OPTIMIZER_TERMINAL_LOG_ENV in params
+    assert log_file in params
+    assert f"set {terminal_log.OPTIMIZER_TERMINAL_LOG_ENV}={log_file}&& " in params
+    assert params.index('cd /d "E:\\Lin\\Github\\QuantAda"') < params.index(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV)
+    assert params.index(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV) < params.index(r"C:\Python\python.exe")
 
 
 def test_request_elevation_linux_branch(monkeypatch):
     args = SimpleNamespace(n_jobs=4)
     monkeypatch.delenv("QUANTADA_DISABLE_AUTO_ELEVATE", raising=False)
-    monkeypatch.setattr(optimizer.sys, "platform", "linux", raising=False)
-    monkeypatch.setattr(optimizer, "_is_process_elevated", lambda: False)
-    monkeypatch.setattr(optimizer, "_print_elevation_banner", lambda _: None)
-    monkeypatch.setattr(optimizer, "_relaunch_unix_with_sudo", lambda: True)
+    monkeypatch.setattr(process_elevation.sys, "platform", "linux", raising=False)
+    monkeypatch.setattr(process_elevation, "is_process_elevated", lambda: False)
+    monkeypatch.setattr(process_elevation, "print_elevation_banner", lambda *_: None)
+    monkeypatch.setattr(process_elevation, "relaunch_unix_with_sudo", lambda: True)
 
-    got = optimizer._request_elevation_if_needed(args)
+    got = process_elevation.request_optimizer_elevation_if_needed(
+        args,
+        optimizer.OptimizationJob._resolve_worker_count,
+    )
 
     assert got is True
