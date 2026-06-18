@@ -418,13 +418,13 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
             )
 
     if explicit_params_passed:
-        print("\n--- Running Baseline Backtest from --params (Recent 3Y) ---")
+        print("\n--- Running Baseline Backtest from --params (MainEval) ---")
         baseline_start = time.time()
         try:
             if bootstrap_job is not None:
                 if test_set_requested:
                     baseline_test_report = bootstrap_job._run_test_set_backtest(copy.deepcopy(fixed_params), verbose=False)
-                baseline_report = bootstrap_job._run_recent_3y_backtest(copy.deepcopy(fixed_params))
+                baseline_report = bootstrap_job._run_main_eval_backtest(copy.deepcopy(fixed_params))
                 baseline_yearly_reports = bootstrap_job._run_yearly_validation_backtests(copy.deepcopy(fixed_params))
             else:
                 baseline_args = copy.deepcopy(args)
@@ -440,7 +440,7 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
                 )
                 if test_set_requested:
                     baseline_test_report = baseline_job._run_test_set_backtest(copy.deepcopy(fixed_params), verbose=False)
-                baseline_report = baseline_job._run_recent_3y_backtest(copy.deepcopy(fixed_params))
+                baseline_report = baseline_job._run_main_eval_backtest(copy.deepcopy(fixed_params))
                 baseline_yearly_reports = baseline_job._run_yearly_validation_backtests(copy.deepcopy(fixed_params))
         except Exception as e:
             print(f"[警告] 当前基准回测失败: {e}")
@@ -519,7 +519,7 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
         for r in final_reports:
             print_metric_row(
                 metric_label=format_metric_label(r),
-                metrics_payload=r.get('recent_backtest') or {},
+                metrics_payload=r.get('main_eval_backtest') or r.get('recent_backtest') or {},
                 elapsed_hours=r.get('elapsed_hours', 0),
                 params_payload=r.get('best_params', 'N/A'),
                 log_payload=r.get('log_file', 'N/A'),
@@ -661,6 +661,7 @@ class OptimizationJob:
             self.warmup_days = shared_context.get("warmup_days", self.warmup_days)
             self._window_data_cache = shared_context.get("window_data_cache", {})
             self._indicator_cache = shared_context.get("indicator_cache", {})
+            self._raw_data_fetch_range = shared_context.get("raw_data_fetch_range", (None, None))
 
             # 在复用数据上下文的前提下，仅重建本次 metric 对应的 study_name
             self._auto_refine_study_name()
@@ -706,6 +707,8 @@ class OptimizationJob:
         self.raw_datas = self._fetch_all_data()
         self.train_datas, self.test_datas, self.train_range, self.test_range = self._split_data()
         self._window_data_cache = {}
+        if not hasattr(self, "_raw_data_fetch_range"):
+            self._raw_data_fetch_range = (None, None)
 
         # 根据实际日期和市场类型自动精细化 study_name
         self._auto_refine_study_name()
@@ -727,6 +730,7 @@ class OptimizationJob:
             "warmup_days": self.warmup_days,
             "window_data_cache": self._window_data_cache,
             "indicator_cache": self._indicator_cache,
+            "raw_data_fetch_range": self._raw_data_fetch_range,
         }
 
     def _reset_trial_dedupe_cache(self):
@@ -1152,15 +1156,18 @@ class OptimizationJob:
             print(f"  Warm-up:    {self.warmup_days} calendar days")
             print(f"  => Fetching data from {req_start} to {req_end}")
 
-        # 3. 统一抓取窗口：训练需求 vs Recent3Y 需求取更早起点，确保后续多指标/基准完全可比
+        # 3. 统一抓取窗口：训练需求 vs MainEval 需求取更早起点，确保后续多指标/基准完全可比
         req_fetch_start = req_start
         recent_start, _ = self._infer_recent_3y_window()
         if recent_start:
-            if not req_fetch_start or pd.to_datetime(recent_start) < pd.to_datetime(req_fetch_start):
-                req_fetch_start = recent_start
-                print(f"[Auto-Fetch] Extended fetch window for Recent3Y consistency:")
-                print(f"  Recent3Y Start: {recent_start}")
+            recent_fetch_start = self._warmup_start_date(recent_start)
+            if not req_fetch_start or pd.to_datetime(recent_fetch_start) < pd.to_datetime(req_fetch_start):
+                req_fetch_start = recent_fetch_start
+                print(f"[Auto-Fetch] Extended fetch window for MainEval consistency:")
+                print(f"  MainEval Minimum Warm-up Start: {recent_fetch_start}")
                 print(f"  => Fetching data from {req_fetch_start} to {req_end}")
+
+        self._raw_data_fetch_range = (req_fetch_start, req_end)
 
         datas = {}
         for symbol in self.target_symbols:
@@ -1891,6 +1898,29 @@ class OptimizationJob:
         start_dt = end_dt - pd.DateOffset(years=3)
         return start_dt.strftime('%Y%m%d'), end_dt.strftime('%Y%m%d')
 
+    def _infer_main_eval_window(self):
+        """
+        推断训练后主回测窗口：至少最近三年，最长覆盖训练+测试逻辑窗口。
+        该窗口不包含 warm-up 起点；warm-up 只在数据切片时补入。
+        """
+        _, recent_end = self._infer_recent_3y_window()
+        end_str = recent_end
+        if getattr(self, "test_range", None) and self.test_range[1]:
+            end_str = self.test_range[1]
+        elif self.args.end_date:
+            end_str = self.args.end_date
+
+        end_dt = pd.to_datetime(str(end_str))
+        recent_start = (end_dt - pd.DateOffset(years=3)).strftime('%Y%m%d')
+        start_candidates = [recent_start]
+        if getattr(self, "train_range", None) and self.train_range[0]:
+            start_candidates.append(self.train_range[0])
+        elif self.args.start_date:
+            start_candidates.append(self.args.start_date)
+
+        start_dt = min(pd.to_datetime(str(value)) for value in start_candidates if value)
+        return start_dt.strftime('%Y%m%d'), end_dt.strftime('%Y%m%d')
+
     def _infer_yearly_validation_windows(self):
         """
         Build natural-year validation windows from already loaded raw data.
@@ -2001,6 +2031,16 @@ class OptimizationJob:
         physical_start_date = self._warmup_start_date(start_date)
         s = pd.to_datetime(physical_start_date) if physical_start_date else pd.Timestamp.min
         e = pd.to_datetime(end_date) if end_date else pd.Timestamp.max
+        raw_fetch_start, raw_fetch_end = getattr(self, "_raw_data_fetch_range", (None, None))
+        try:
+            preloaded_request_covers_window = (
+                bool(raw_fetch_start)
+                and bool(raw_fetch_end)
+                and pd.to_datetime(str(raw_fetch_start)) <= s
+                and pd.to_datetime(str(raw_fetch_end)) >= e
+            )
+        except Exception:
+            preloaded_request_covers_window = False
 
         for symbol in self.target_symbols:
             used_preloaded = False
@@ -2008,10 +2048,11 @@ class OptimizationJob:
             if raw_df is not None and not raw_df.empty:
                 prepared_df = self.prepare_data_index(raw_df)
                 try:
+                    raw_end = prepared_df.index.max()
                     has_window = (
                         len(prepared_df) > 0
-                        and prepared_df.index.min() <= s
-                        and prepared_df.index.max() >= e
+                        and (prepared_df.index.min() <= s or preloaded_request_covers_window)
+                        and (raw_end >= e or preloaded_request_covers_window)
                     )
                     if has_window:
                         mask = (prepared_df.index >= s) & (prepared_df.index <= e)
@@ -2019,6 +2060,12 @@ class OptimizationJob:
                         if not sliced_df.empty:
                             datas[symbol] = sliced_df
                             used_preloaded = True
+                            if raw_end < e and preloaded_request_covers_window:
+                                print(
+                                    f"[Optimizer] Reusing preloaded data for {symbol} through "
+                                    f"{pd.to_datetime(raw_end).strftime('%Y%m%d')}; "
+                                    f"requested end is {end_date}."
+                                )
                 except Exception:
                     pass
 
@@ -2037,42 +2084,48 @@ class OptimizationJob:
             if df is not None and not df.empty:
                 datas[symbol] = df
             else:
-                print(f"[Optimizer] Warning: No recent 3Y data for {symbol}, skipping.")
+                print(f"[Optimizer] Warning: No evaluation data for {symbol}, skipping.")
 
         self._window_data_cache[cache_key] = datas
         return datas
 
-    def _run_recent_3y_backtest(self, final_params):
+    def _run_main_eval_backtest(self, final_params):
         """
-        优化结束后自动执行最近三年回测，并返回核心指标用于最终汇总。
+        优化结束后自动执行主回测，并返回核心指标用于最终汇总。
         """
-        recent_start, recent_end = self._infer_recent_3y_window()
+        eval_start, eval_end = self._infer_main_eval_window()
 
         print("-" * 60)
-        print(f"Running Auto Backtest on Recent 3 Years: {recent_start} to {recent_end}")
+        print(f"Running Main Evaluation Backtest: {eval_start} to {eval_end}")
         print("-" * 60)
 
-        recent_datas = self._fetch_datas_for_window(recent_start, recent_end)
-        if not recent_datas:
-            print("[Optimizer] Warning: Recent 3Y backtest skipped (no valid data).")
+        eval_datas = self._fetch_datas_for_window(eval_start, eval_end)
+        if not eval_datas:
+            print("[Optimizer] Warning: Main evaluation backtest skipped (no valid data).")
             return None
 
         try:
             metrics = self._run_backtest_on_datas(
-                recent_datas,
+                eval_datas,
                 final_params,
-                recent_start,
-                recent_end,
+                eval_start,
+                eval_end,
                 verbose=True,
             )
             if not metrics:
-                print("[Optimizer] Warning: Recent 3Y backtest finished but metrics are unavailable.")
+                print("[Optimizer] Warning: Main evaluation backtest finished but metrics are unavailable.")
                 return None
         except Exception as e:
-            print(f"[Optimizer] Warning: Recent 3Y backtest failed: {e}")
+            print(f"[Optimizer] Warning: Main evaluation backtest failed: {e}")
             return None
 
         return metrics
+
+    def _run_recent_3y_backtest(self, final_params):
+        """
+        Backward-compatible alias for callers still using the old method name.
+        """
+        return self._run_main_eval_backtest(final_params)
 
     def _run_test_set_backtest(self, final_params, verbose=False):
         """
@@ -2333,7 +2386,7 @@ class OptimizationJob:
             test_metrics = None
             print("\n(No Test Set Configured)")
 
-        recent_3y_metrics = self._run_recent_3y_backtest(final_params)
+        main_eval_metrics = self._run_main_eval_backtest(final_params)
         yearly_metrics = self._run_yearly_validation_backtests(final_params)
 
         print("\n" + "=" * 60)
@@ -2341,9 +2394,9 @@ class OptimizationJob:
         print("=" * 60)
         print(f" Strategy: {self.args.strategy}")
         print(f" Params:   {final_params}")
-        if recent_3y_metrics:
-            recent_fmt = format_recent_backtest_metrics(recent_3y_metrics)
-            print(f" Recent3Y: {recent_3y_metrics.get('start_date')} -> {recent_3y_metrics.get('end_date')}")
+        if main_eval_metrics:
+            recent_fmt = format_recent_backtest_metrics(main_eval_metrics)
+            print(f" MainEval: {main_eval_metrics.get('start_date')} -> {main_eval_metrics.get('end_date')}")
             print(f" Annual:   {recent_fmt['annual_return']}")
             print(f" Drawdown: {recent_fmt['max_drawdown']}")
             print(f" Calmar:   {recent_fmt['calmar_ratio']}")
@@ -2370,7 +2423,8 @@ class OptimizationJob:
             "best_params": best_params,
             "trials_completed": len(study.trials),
             "log_file": log_file,
-            "recent_backtest": recent_3y_metrics,
+            "main_eval_backtest": main_eval_metrics,
+            "recent_backtest": main_eval_metrics,
             "test_backtest": test_metrics,
             "yearly_backtests": yearly_metrics,
         }

@@ -66,8 +66,11 @@ class _DummyOptimizationJob:
             "window_data_cache": {},
         }
 
-    def _run_recent_3y_backtest(self, params):
+    def _run_main_eval_backtest(self, params):
         return _sample_metrics(start="20230101", end="20251231")
+
+    def _run_recent_3y_backtest(self, params):
+        return self._run_main_eval_backtest(params)
 
     def _run_test_set_backtest(self, params, verbose=False):
         return _sample_metrics(start="20250101", end="20250331")
@@ -81,6 +84,7 @@ class _DummyOptimizationJob:
             "best_params": {"lookback": 20},
             "trials_completed": 5,
             "log_file": "dummy.log",
+            "main_eval_backtest": _sample_metrics(start="20230101", end="20251231"),
             "recent_backtest": _sample_metrics(start="20230101", end="20251231"),
             "test_backtest": _sample_metrics(start="20250101", end="20250331"),
             "yearly_backtests": self.yearly_backtests,
@@ -398,6 +402,39 @@ def test_split_data_dynamic_refit_has_no_test_range():
     assert train_d["AAPL"].index.max() == pd.Timestamp("2025-01-31")
 
 
+def test_infer_main_eval_window_covers_train_test_when_longer_than_recent_3y():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(end_date="20260616", start_date="20191112")
+    job.train_range = ("20201216", "20251215")
+    job.test_range = ("20251216", "20260616")
+
+    got = job._infer_main_eval_window()
+
+    assert got == ("20201216", "20260616")
+
+
+def test_infer_main_eval_window_uses_recent_3y_when_train_test_is_shorter():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(end_date="20260616", start_date="20250101")
+    job.train_range = ("20250101", "20251215")
+    job.test_range = ("20251216", "20260616")
+
+    got = job._infer_main_eval_window()
+
+    assert got == ("20230616", "20260616")
+
+
+def test_infer_main_eval_window_anchors_recent_3y_to_test_end():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(end_date="20260616", start_date="20250101")
+    job.train_range = ("20250101", "20251215")
+    job.test_range = ("20251216", "20260331")
+
+    got = job._infer_main_eval_window()
+
+    assert got == ("20230331", "20260331")
+
+
 def test_fetch_all_data_dynamic_roll_uses_fixed_warmup_start():
     calls = []
 
@@ -443,6 +480,53 @@ def test_fetch_all_data_dynamic_roll_uses_fixed_warmup_start():
     assert list(got) == ["AAPL"]
     assert calls[0]["start_date"] == expected_start
     assert calls[0]["end_date"] == "20250131"
+
+
+def test_fetch_all_data_extends_to_recent_3y_warmup_start_when_earlier():
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            calls.append({"symbol": symbol, **kwargs})
+            return pd.DataFrame(
+                {
+                    "open": [1.0],
+                    "high": [1.0],
+                    "low": [1.0],
+                    "close": [1.0],
+                    "volume": [100.0],
+                },
+                index=[pd.Timestamp("2024-01-01")],
+            )
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    job.target_symbols = ["AAPL"]
+    job.data_manager = DummyDataManager()
+    job.args = SimpleNamespace(
+        start_date="20250101",
+        end_date="20260616",
+        train_roll_period=None,
+        test_roll_period=None,
+        train_period=None,
+        test_period=None,
+        train_ratio=None,
+        data_source="dummy",
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    )
+
+    got = job._fetch_all_data()
+
+    expected_start = (
+        pd.Timestamp("2026-06-16")
+        - pd.DateOffset(years=3)
+        - pd.DateOffset(days=optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS)
+    ).strftime("%Y%m%d")
+    assert list(got) == ["AAPL"]
+    assert calls[0]["start_date"] == expected_start
+    assert job._raw_data_fetch_range == (expected_start, "20260616")
 
 
 def test_fetch_all_data_full_window_uses_fixed_warmup_start():
@@ -555,6 +639,85 @@ def test_yearly_validation_reuses_raw_datas_without_provider_fetch(monkeypatch):
     assert len(got) == 3
     assert [item["start_date"] for item in got] == ["20200101", "20210101", "20220101"]
     assert all("AAPL" in datas for _, _, datas in DummyBacktester.seen_windows)
+
+
+def test_main_eval_backtest_reuses_preloaded_raw_datas_without_provider_fetch(monkeypatch):
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("provider fetch should not be used for MainEval backtest")
+
+    class DummyBacktester:
+        last_kwargs = None
+
+        def __init__(self, **kwargs):
+            DummyBacktester.last_kwargs = kwargs
+
+        def run(self):
+            return None
+
+        def display_results(self):
+            return None
+
+        def get_performance_metrics(self):
+            return _sample_metrics(start="20201216", end="20260616")
+
+    monkeypatch.setattr(optimizer, "Backtester", DummyBacktester)
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    idx = pd.date_range("2019-11-12", "2026-06-15", freq="D")
+    job.raw_datas = {
+        "AAPL": pd.DataFrame(
+            {
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 100.0,
+            },
+            index=idx,
+        )
+    }
+    job.target_symbols = ["AAPL"]
+    job.data_manager = DummyDataManager()
+    job._window_data_cache = {}
+    job._raw_data_fetch_range = ("20191112", "20260616")
+    job.strategy_class = object()
+    job.risk_control_classes = []
+    job.risk_params = {}
+    job._indicator_cache = {}
+    job.args = SimpleNamespace(
+        cash=100000.0,
+        commission=0.0003,
+        slippage=0.0,
+        timeframe="Days",
+        compression=1,
+        data_source="dummy",
+        refresh=False,
+        end_date="20260616",
+        start_date="20191112",
+        train_roll_period="5y",
+        test_roll_period="6m",
+        metric="mix_score_us_turbo",
+    )
+
+    job.train_range = ("20201216", "20251215")
+    job.test_range = ("20251216", "20260616")
+
+    got = job._run_main_eval_backtest(final_params={"lookback": 20})
+
+    assert calls == []
+    assert got is not None
+    expected_warmup_start = (
+        pd.Timestamp("2020-12-16") - pd.DateOffset(days=optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS)
+    )
+    assert DummyBacktester.last_kwargs["datas"]["AAPL"].index.min() == expected_warmup_start
+    assert DummyBacktester.last_kwargs["datas"]["AAPL"].index.max() == pd.Timestamp("2026-06-15")
+    assert DummyBacktester.last_kwargs["start_date"] == "20201216"
+    assert DummyBacktester.last_kwargs["end_date"] == "20260616"
 
 
 def test_request_elevation_skips_for_single_worker(monkeypatch):
