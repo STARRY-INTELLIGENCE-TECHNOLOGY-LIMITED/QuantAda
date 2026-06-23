@@ -19,6 +19,7 @@
 - `recorder/RECORDER_PROMPT.md`: 新 Recorder 生成（交易与绩效落库/落消息）
 - `sdk_plugin/SDK_PLUGIN_PROMPT.md`: 外部项目插件化接入与命令生成
 - `debug_fix/DEBUG_FIX_PROMPT.md`: 基于命令+日志的定位修复模板
+- `research_report/PROFESSIONAL_RESEARCH_REPORT_PROMPT.md`: 专业研报、技术白皮书、合作备忘录生成模板
 
 ## 使用建议
 1. 先选最贴近任务的子目录和 Prompt 文件。

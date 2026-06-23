@@ -618,3 +618,157 @@ def test_gm_run_schedule_prewarm_is_non_blocking_and_pushes_warning(monkeypatch)
     assert pushed[0]["level"] == "WARNING"
     assert "Schedule prewarm finished with errors before 1d:14:45:00" in pushed[0]["content"]
     assert "Normal schedule will continue." in pushed[0]["content"]
+
+
+def test_gm_launch_restarts_when_shutdown_callback_fires(monkeypatch, capsys):
+    """
+    GM 实盘 session 自愈:
+    SDK 触发 on_shutdown 后，应退出当前 session 并交给 Phoenix 外层重启，
+    不能把进程当作正常结束。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    statuses = []
+    fake_context = SimpleNamespace()
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            statuses.append((status, detail))
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    def _poll_once_then_shutdown():
+        fake_context.on_shutdown_fun(fake_context)
+        return 0
+
+    def _sleep(seconds):
+        if seconds >= 10:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_once_then_shutdown, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", _sleep)
+
+    GmBrokerAdapter.launch(
+        {"token": "token", "strategy_id": "strategy-id"},
+        strategy_path="sample_strategy",
+        params={},
+    )
+
+    captured = capsys.readouterr()
+    assert "[System] Strategy Shutdown" in captured.out
+    assert "GM shutdown callback received. Restarting session" in captured.out
+    assert "[Phoenix] Waiting 10s before restart" in captured.out
+    assert ("INFO", "GM Session Shutdown (Preparing to Restart)") in statuses
+
+
+def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
+    """
+    GM SDK 可能在底层 shutdown 时抛 SystemExit。launch 必须拦截并重启
+    当前 session，避免策略进程被 SDK 直接带退出。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    def _poll_raises_system_exit():
+        fake_context.on_shutdown_fun(fake_context)
+        raise SystemExit(0)
+
+    def _sleep(seconds):
+        if seconds >= 10:
+            raise KeyboardInterrupt()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_raises_system_exit, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", _sleep)
+
+    GmBrokerAdapter.launch(
+        {"token": "token", "strategy_id": "strategy-id"},
+        strategy_path="sample_strategy",
+        params={},
+    )
+
+    captured = capsys.readouterr()
+    assert "GM SDK requested process exit" in captured.out
+    assert "[Phoenix] Waiting 10s before restart" in captured.out
+
+
+def test_gm_launch_does_not_swallow_plain_system_exit(monkeypatch):
+    """
+    普通 SystemExit 可能来自进程信号处理或上层主动退出；没有 GM shutdown
+    回调证据时，不能被 Phoenix 误判为 SDK 断线并重启。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    def _poll_raises_system_exit():
+        raise SystemExit(0)
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_raises_system_exit, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+
+    with pytest.raises(SystemExit):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )

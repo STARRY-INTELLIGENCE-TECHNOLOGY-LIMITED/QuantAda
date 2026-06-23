@@ -655,6 +655,8 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         # --- 2. 核心运行逻辑 ---
         def run_session():
+            session_state = {'shutdown_requested': False}
+
             # 每次启动前重置 context 身份
             py_gmi_set_strategy_id(strategy_id)
             gmi_set_mode(mode)
@@ -781,6 +783,11 @@ class GmBrokerAdapter(BaseLiveBroker):
                 AlarmManager().push_exception("GM Kernel Error", msg)
 
             def on_shutdown(ctx):
+                session_state['shutdown_requested'] = True
+                try:
+                    setattr(ctx, '_quantada_gm_shutdown_requested', True)
+                except Exception:
+                    pass
                 print("[System] Strategy Shutdown")
 
                 # 【报警接入】停止推送
@@ -869,7 +876,38 @@ class GmBrokerAdapter(BaseLiveBroker):
                     # 这是一个阻塞循环，通常 gmi_poll 会一直运行
                     # 如果 gmi_poll 返回，说明连接断开或 shutdown 触发
                     while True:
-                        gmi_poll()
+                        try:
+                            poll_status = gmi_poll()
+                        except SystemExit as e:
+                            if session_state.get('shutdown_requested') or getattr(
+                                context, '_quantada_gm_shutdown_requested', False
+                            ):
+                                print(f"[Phoenix] GM SDK requested process exit ({e}). Restarting session instead...")
+                                try:
+                                    setattr(context, '_quantada_gm_shutdown_requested', False)
+                                except Exception:
+                                    pass
+                                return True
+                            raise
+
+                        if poll_status not in (None, 0):
+                            print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
+                            try:
+                                check_gm_status(poll_status)
+                            except Exception as e:
+                                print(f"[Phoenix] gmi_poll status detail: {e}")
+                            return True
+
+                        if session_state.get('shutdown_requested') or getattr(
+                            context, '_quantada_gm_shutdown_requested', False
+                        ):
+                            print("[Phoenix] GM shutdown callback received. Restarting session...")
+                            try:
+                                setattr(context, '_quantada_gm_shutdown_requested', False)
+                            except Exception:
+                                pass
+                            return True
+
                         # 稍微休眠，释放 CPU，同时检测外部中断
                         time.sleep(1)
 

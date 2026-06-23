@@ -85,6 +85,23 @@ def test_single_portfolio_plot_scopes_use_one_observer(plot_scope, expected_obse
     assert observer_classes == expected_observers
 
 
+def test_monthly_heatmap_plot_scope_is_valid_without_portfolio_observers():
+    bt = Backtester(
+        datas={"AAA": _make_df(), "BBB": _make_df()},
+        strategy_class=_NoopStrategy,
+        enable_plot=True,
+        verbose=False,
+        plot_scope="monthly_heatmap",
+    )
+
+    bt._init_data_feeds()
+
+    assert bt.plot_scope == ("monthly_heatmap",)
+    assert [data.plotinfo.plot for data in bt.cerebro.datas] == [True, True]
+    assert bt.cerebro.p.stdstats is True
+    assert bt.cerebro.observers == []
+
+
 def test_multiple_portfolio_plot_scopes_share_one_backtester_result():
     bt = Backtester(
         datas={"AAA": _make_df(), "BBB": _make_df()},
@@ -125,6 +142,39 @@ def test_plot_cerebro_opens_multiple_portfolio_windows_from_same_cerebro(monkeyp
     assert calls == [
         (cerebro, "portfolio_equity", True, 0),
         (cerebro, "portfolio_drawdown", True, 1000),
+        ("show", None, None),
+    ]
+
+
+def test_plot_cerebro_opens_monthly_heatmap_with_other_scopes(monkeypatch):
+    calls = []
+    cerebro = object()
+
+    monkeypatch.setattr(plotting, "_configure_matplotlib_window", lambda: None)
+    monkeypatch.setattr(
+        plotting,
+        "_plot_portfolio_scope",
+        lambda cerebro_arg, scope, defer_show, figid_offset=0: calls.append(
+            ("portfolio", cerebro_arg, scope, defer_show, figid_offset)
+        ),
+    )
+    monkeypatch.setattr(
+        plotting,
+        "_plot_monthly_heatmap_scope",
+        lambda cerebro_arg, defer_show, figid_offset=0: calls.append(
+            ("monthly_heatmap", cerebro_arg, defer_show, figid_offset)
+        ),
+    )
+
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setattr(plt, "show", lambda: calls.append(("show", None, None)))
+
+    plotting.plot_cerebro(cerebro, "portfolio_equity,monthly_heatmap")
+
+    assert calls == [
+        ("portfolio", cerebro, "portfolio_equity", True, 0),
+        ("monthly_heatmap", cerebro, True, 1000),
         ("show", None, None),
     ]
 

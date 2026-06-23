@@ -49,3 +49,9 @@
 - `log_trade(...)`
 - `finish_execution(...)`
 3. 单个 recorder 失败不应中断主流程
+
+## 6. Backtest Plot Scope
+1. `plot_scope` 是回测图表展示范围的统一入口。
+2. 可用范围包括 `full`、`portfolio`、`portfolio_equity`、`portfolio_drawdown`、`monthly_heatmap`。
+3. `full` 不能与其他范围混用；其余范围可用逗号组合，并复用同一次回测结果打开多个窗口。
+4. 新增图表范围不得改变策略决策、撮合、优化目标或实盘路径。

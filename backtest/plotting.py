@@ -2,7 +2,7 @@ import backtrader as bt
 import backtrader.plot as btplot
 
 
-VALID_PLOT_SCOPES = {'full', 'portfolio', 'portfolio_equity', 'portfolio_drawdown'}
+VALID_PLOT_SCOPES = {'full', 'portfolio', 'portfolio_equity', 'portfolio_drawdown', 'monthly_heatmap'}
 PORTFOLIO_PLOT_SCOPES = {'portfolio', 'portfolio_equity', 'portfolio_drawdown'}
 
 
@@ -141,6 +141,41 @@ def _plot_portfolio_scope(cerebro, scope: str, defer_show: bool, figid_offset: i
     cerebro.plot(plotter=plotter)
 
 
+def _get_first_strategy(cerebro):
+    for stratlist in getattr(cerebro, 'runstrats', []) or []:
+        for strat in stratlist:
+            return strat
+    return None
+
+
+def _plot_monthly_heatmap_scope(cerebro, defer_show: bool, figid_offset: int = 0) -> None:
+    import matplotlib.pyplot as plt
+    from backtest.report_figures import render_monthly_return_heatmap
+
+    strat = _get_first_strategy(cerebro)
+    monthly_returns = {}
+    title = "Monthly Return Heatmap"
+
+    if strat is not None:
+        try:
+            monthly_returns = strat.analyzers.getbyname('timereturn_monthly').get_analysis()
+        except Exception:
+            monthly_returns = {}
+
+        strategy = getattr(strat, 'strategy', None)
+        if strategy is not None:
+            title = f"{title} - {strategy.__class__.__name__}"
+
+    render_monthly_return_heatmap(
+        monthly_returns,
+        title=title,
+        fig_num=50000 + figid_offset,
+    )
+
+    if not defer_show:
+        plt.show()
+
+
 def plot_cerebro(cerebro, plot_scope: str) -> None:
     _configure_matplotlib_window()
     scopes = parse_plot_scopes(plot_scope)
@@ -150,7 +185,11 @@ def plot_cerebro(cerebro, plot_scope: str) -> None:
 
     defer_show = len(scopes) > 1
     for index, scope in enumerate(scopes):
-        _plot_portfolio_scope(cerebro, scope, defer_show=defer_show, figid_offset=index * 1000)
+        figid_offset = index * 1000
+        if scope in PORTFOLIO_PLOT_SCOPES:
+            _plot_portfolio_scope(cerebro, scope, defer_show=defer_show, figid_offset=figid_offset)
+        elif scope == 'monthly_heatmap':
+            _plot_monthly_heatmap_scope(cerebro, defer_show=defer_show, figid_offset=figid_offset)
 
     if defer_show:
         import matplotlib.pyplot as plt

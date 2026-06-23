@@ -1990,6 +1990,10 @@ class IBBrokerAdapter(BaseLiveBroker):
                         except Exception as e:
                             print(f"[Schedule Error] Check failed: {e}")
 
+                if not ib.isConnected():
+                    print("[System] IB connection ended. Re-entering recovery mode.")
+                    is_first_connect = True
+
             # --- D. 异常处理 ---
             except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError, TimeoutError, ConnectionError,
                     asyncio.TimeoutError) as e:
@@ -2006,6 +2010,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 except:
                     pass
 
+                is_first_connect = True
                 time.sleep(10)  # 稍微长一点的冷却
                 continue
 
@@ -2022,6 +2027,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                     ib.disconnect()
                 except:
                     pass
+                is_first_connect = True
                 continue
 
             except KeyboardInterrupt:

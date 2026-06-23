@@ -157,6 +157,7 @@ if __name__ == '__main__':
             "portfolio=组合资金和回撤合并视图；"
             "portfolio_equity=仅组合资金视图；"
             "portfolio_drawdown=仅组合回撤视图。"
+            "monthly_heatmap=月度收益热力图。"
             "组合视图均隐藏各标的价格、买卖点和 DataTrades 等交易子图。"
             "支持逗号分隔并基于同一次回测结果打开多个窗口，例如 portfolio_equity,portfolio_drawdown；"
             "full 不能与其他范围混用。"

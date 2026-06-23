@@ -33,3 +33,4 @@
 4. 其他扩展点: `contracts/extensions.md`
 5. 代码生成流程: `workflows/agent_codegen.md`
 6. 优化器运行期日志: `workflows/optimizer_runtime.md`
+7. 专业研报生成: `workflows/professional_research_report.md`

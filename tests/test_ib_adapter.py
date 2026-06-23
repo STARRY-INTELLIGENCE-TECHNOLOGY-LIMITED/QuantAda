@@ -2180,3 +2180,169 @@ def test_ib_collect_open_trades_skip_req_all_open_orders_in_async_task(monkeypat
     _ = broker.get_pending_orders()
 
     assert ib.req_all_calls == 0, "异步任务中不应触发 reqAllOpenOrders。"
+
+
+def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch, capsys):
+    """
+    IBKR 自愈回归:
+    断线后 ib_insync 可能仍保留旧 ticker 对象；重连后必须强制重新订阅，
+    不能仅凭 ib.tickers() 非空跳过行情恢复。
+    """
+    import config
+    import live_trader.engine as engine_module
+
+    class DummyEvent:
+        def __init__(self):
+            self.handlers = []
+
+        def __iadd__(self, handler):
+            self.handlers.append(handler)
+            return self
+
+    class DummyIB:
+        def __init__(self):
+            self.connected = False
+            self.connect_calls = 0
+            self.sleep_calls = 0
+            self.req_mkt_data_calls = []
+            self.orderStatusEvent = DummyEvent()
+            self._tickers = [SimpleNamespace(symbol="stale")]
+
+        def isConnected(self):
+            return self.connected
+
+        def connect(self, host, port, clientId):
+            self.connect_calls += 1
+            self.connected = True
+
+        def tickers(self):
+            return list(self._tickers)
+
+        def qualifyContracts(self, contract):
+            return [contract]
+
+        def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False):
+            self.req_mkt_data_calls.append(contract)
+            ticker = SimpleNamespace(symbol=getattr(contract, "symbol", "unknown"))
+            self._tickers.append(ticker)
+            return ticker
+
+        def sleep(self, seconds):
+            self.sleep_calls += 1
+            if self.sleep_calls == 1:
+                self.connected = False
+                return
+            raise KeyboardInterrupt()
+
+        def disconnect(self):
+            self.connected = False
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.data_provider = SimpleNamespace()
+            self.broker = SimpleNamespace(
+                datas=[SimpleNamespace(_name="AAPL.SMART")],
+                _tickers={},
+            )
+
+        def init(self, ctx):
+            return None
+
+        def run(self, ctx):
+            return None
+
+    dummy_ib = DummyIB()
+
+    monkeypatch.setattr(config, "IBKR_HOST", "127.0.0.1", raising=False)
+    monkeypatch.setattr(config, "IBKR_PORT", 7497, raising=False)
+    monkeypatch.setattr(config, "IBKR_CLIENT_ID", 7, raising=False)
+    monkeypatch.setattr(mock_ib_insync, "IB", lambda: dummy_ib)
+    monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
+    monkeypatch.setattr(
+        IBBrokerAdapter,
+        "parse_contract",
+        staticmethod(lambda symbol: SimpleNamespace(symbol=symbol)),
+    )
+
+    IBBrokerAdapter.launch(
+        {"schedule": None},
+        strategy_path="sample_strategy",
+        params={},
+        symbols=["AAPL.SMART"],
+    )
+
+    captured = capsys.readouterr()
+    assert dummy_ib.connect_calls == 2
+    assert len(dummy_ib.req_mkt_data_calls) == 2, "断线重连后即使旧 ticker 非空，也必须重新订阅行情。"
+    assert "IB connection ended. Re-entering recovery mode." in captured.out
+
+
+def test_ib_launch_does_not_swallow_plain_system_exit(monkeypatch):
+    """
+    普通 SystemExit 可能来自进程信号处理或上层主动退出；IBKR Phoenix loop
+    不应捕获 BaseException 并误重启。
+    """
+    import config
+    import live_trader.engine as engine_module
+
+    class DummyEvent:
+        def __iadd__(self, handler):
+            return self
+
+    class DummyIB:
+        def __init__(self):
+            self.connected = False
+            self.orderStatusEvent = DummyEvent()
+
+        def isConnected(self):
+            return self.connected
+
+        def connect(self, host, port, clientId):
+            self.connected = True
+
+        def tickers(self):
+            return []
+
+        def qualifyContracts(self, contract):
+            return [contract]
+
+        def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False):
+            return SimpleNamespace()
+
+        def sleep(self, seconds):
+            raise SystemExit(0)
+
+        def disconnect(self):
+            self.connected = False
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.data_provider = SimpleNamespace()
+            self.broker = SimpleNamespace(
+                datas=[SimpleNamespace(_name="AAPL.SMART")],
+                _tickers={},
+            )
+
+        def init(self, ctx):
+            return None
+
+    monkeypatch.setattr(config, "IBKR_HOST", "127.0.0.1", raising=False)
+    monkeypatch.setattr(config, "IBKR_PORT", 7497, raising=False)
+    monkeypatch.setattr(config, "IBKR_CLIENT_ID", 7, raising=False)
+    monkeypatch.setattr(mock_ib_insync, "IB", DummyIB)
+    monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
+    monkeypatch.setattr(
+        IBBrokerAdapter,
+        "parse_contract",
+        staticmethod(lambda symbol: SimpleNamespace(symbol=symbol)),
+    )
+
+    with pytest.raises(SystemExit):
+        IBBrokerAdapter.launch(
+            {"schedule": None},
+            strategy_path="sample_strategy",
+            params={},
+            symbols=["AAPL.SMART"],
+        )
