@@ -5,6 +5,13 @@ import backtrader as bt
 import pandas as pd
 
 import config
+from backtest.plotting import (
+    apply_data_feed_plot_scope,
+    configure_plot_observers,
+    create_cerebro,
+    normalize_plot_scope,
+    plot_cerebro,
+)
 from common.formatters import format_with_spec
 from common import log
 
@@ -478,8 +485,10 @@ class Backtester:
                  commission=0.0, slippage=0.001, sizer_class=None, sizer_params=None,
                  risk_control_classes=None, risk_control_params=None,
                  timeframe: str = 'Days', compression: int = 1,
-                 recorder = None, enable_plot = True, verbose=True, indicator_cache=None):
-        self.cerebro = bt.Cerebro()
+                 recorder = None, enable_plot = True, verbose=True, indicator_cache=None,
+                 plot_scope: str = 'full'):
+        self.plot_scope = normalize_plot_scope(plot_scope)
+        self.cerebro = create_cerebro(self.plot_scope)
         self.cerebro.broker = SignalLoggingBroker()
         self.datas = datas
         self.strategy_class = strategy_class
@@ -502,6 +511,7 @@ class Backtester:
         self.timeframe = self._get_bt_timeframe(timeframe)
 
         self._init_analyzers()
+        configure_plot_observers(self.cerebro, self.plot_scope)
 
     def _get_bt_timeframe(self, timeframe_str: str) -> int:
         """将字符串时间维度映射到backtrader的TimeFrame枚举值"""
@@ -546,6 +556,7 @@ class Backtester:
                 timeframe=self.timeframe,
                 compression=self.compression
             )
+            apply_data_feed_plot_scope(feed, self.plot_scope)
             self.cerebro.adddata(feed)
             self.log(f"  Data feed for '{symbol}' added.")
 
@@ -645,7 +656,7 @@ class Backtester:
         if self.enable_plot:
             self.log("Generating plot...")
             try:
-                self.cerebro.plot()
+                plot_cerebro(self.cerebro, self.plot_scope)
             except Exception as e:
                 err = str(e).lower()
                 if "tkinter" in err or "tkagg" in err:

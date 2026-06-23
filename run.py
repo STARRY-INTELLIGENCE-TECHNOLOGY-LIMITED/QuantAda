@@ -17,7 +17,8 @@ from recorders.manager import RecorderManager
 
 
 def run_backtest(selection_filename, strategy_filename, symbols, cash, commission, slippage, data_source, start_date, end_date,
-                 risk_filename, risk_params, params, timeframe, compression, recorder=None, enable_plot=True, refresh=False):
+                 risk_filename, risk_params, params, timeframe, compression, recorder=None, enable_plot=True, refresh=False,
+                 plot_scope='full'):
     """执行回测"""
     # --- 1. 自动发现并加载所有数据提供者 ---
     data_manager = DataManager()
@@ -106,6 +107,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
         compression=compression,
         recorder=recorder,
         enable_plot=enable_plot,
+        plot_scope=plot_scope,
     )
     backtester.run()
 
@@ -145,6 +147,17 @@ if __name__ == '__main__':
                         help="本次回测的描述信息 (默认为不带 .py 的策略文件名)")
 
     parser.add_argument('--no_plot', action='store_true', help="在服务器环境下禁用绘图")
+    parser.add_argument(
+        '--plot_scope',
+        type=str,
+        default='full',
+        choices=['full', 'portfolio'],
+        help=(
+            "绘图范围 (默认: full)。"
+            "full=绘制全部标的价格、买卖点和组合总览；"
+            "portfolio=使用 Backtrader 原生样式，仅保留组合资金和回撤视图，隐藏各标的价格、买卖点和 DataTrades 等交易子图。"
+        ),
+    )
     parser.add_argument('--refresh', action='store_true', help="强制刷新CACHE_DATA数据")
     parser.add_argument('--config', type=str, default='{}',
                         help="覆盖config.py配置 (JSON字符串, 例如: \"{'GM_TOKEN':'xxx','LOG':False}\")")
@@ -299,5 +312,6 @@ if __name__ == '__main__':
         recorder=recorder_manager,
         enable_plot=not args.no_plot,
         refresh=args.refresh,
+        plot_scope=args.plot_scope,
     )
     print("\n--- Backtest Finished ---")
