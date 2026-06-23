@@ -9,7 +9,7 @@ from backtest.plotting import (
     apply_data_feed_plot_scope,
     configure_plot_observers,
     create_cerebro,
-    normalize_plot_scope,
+    parse_plot_scopes,
     plot_cerebro,
 )
 from common.formatters import format_with_spec
@@ -487,7 +487,7 @@ class Backtester:
                  timeframe: str = 'Days', compression: int = 1,
                  recorder = None, enable_plot = True, verbose=True, indicator_cache=None,
                  plot_scope: str = 'full'):
-        self.plot_scope = normalize_plot_scope(plot_scope)
+        self.plot_scope = parse_plot_scopes(plot_scope)
         self.cerebro = create_cerebro(self.plot_scope)
         self.cerebro.broker = SignalLoggingBroker()
         self.datas = datas

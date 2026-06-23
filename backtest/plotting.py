@@ -2,18 +2,25 @@ import backtrader as bt
 import backtrader.plot as btplot
 
 
-VALID_PLOT_SCOPES = {'full', 'portfolio'}
+VALID_PLOT_SCOPES = {'full', 'portfolio', 'portfolio_equity', 'portfolio_drawdown'}
+PORTFOLIO_PLOT_SCOPES = {'portfolio', 'portfolio_equity', 'portfolio_drawdown'}
 
 
 class _PlotWithBottomMargin(btplot.Plot):
     """Backtrader-native plotter with extra bottom space for x-axis dates."""
 
-    def __init__(self, bottom_margin=None, force_bottom_xaxis=False, **kwargs):
+    def __init__(self, bottom_margin=None, force_bottom_xaxis=False, defer_show=False,
+                 figid_offset=0, **kwargs):
         self._bottom_margin = bottom_margin
         self._force_bottom_xaxis = force_bottom_xaxis
+        self._defer_show = defer_show
+        self._figid_offset = figid_offset
         super().__init__(**kwargs)
 
     def plot(self, *args, **kwargs):
+        if self._figid_offset and 'figid' in kwargs:
+            kwargs = dict(kwargs)
+            kwargs['figid'] += self._figid_offset
         figs = super().plot(*args, **kwargs)
         if self._bottom_margin is not None:
             for fig in figs or []:
@@ -22,6 +29,11 @@ class _PlotWithBottomMargin(btplot.Plot):
             for fig in figs or []:
                 self._force_bottom_xaxis_visible(fig)
         return figs
+
+    def show(self):
+        if self._defer_show:
+            return
+        return super().show()
 
     @staticmethod
     def _force_bottom_xaxis_visible(fig):
@@ -48,20 +60,46 @@ def normalize_plot_scope(plot_scope: str) -> str:
     return scope
 
 
+def parse_plot_scopes(plot_scope) -> tuple[str, ...]:
+    if isinstance(plot_scope, (list, tuple)):
+        raw_scopes = plot_scope
+    else:
+        raw_scopes = str(plot_scope or 'full').split(',')
+
+    scopes = tuple(
+        normalize_plot_scope(raw_scope)
+        for raw_scope in raw_scopes
+        if str(raw_scope).strip()
+    ) or ('full',)
+
+    if 'full' in scopes and len(scopes) > 1:
+        raise ValueError("plot_scope='full' cannot be combined with other plot scopes.")
+
+    return scopes
+
+
+def _uses_portfolio_plotting(plot_scope) -> bool:
+    scopes = parse_plot_scopes(plot_scope)
+    return any(scope in PORTFOLIO_PLOT_SCOPES for scope in scopes)
+
+
 def create_cerebro(plot_scope: str):
-    scope = normalize_plot_scope(plot_scope)
-    return bt.Cerebro(stdstats=scope != 'portfolio')
+    return bt.Cerebro(stdstats=not _uses_portfolio_plotting(plot_scope))
 
 
 def configure_plot_observers(cerebro, plot_scope: str) -> None:
-    if normalize_plot_scope(plot_scope) != 'portfolio':
+    scopes = parse_plot_scopes(plot_scope)
+    if not any(scope in PORTFOLIO_PLOT_SCOPES for scope in scopes):
         return
-    cerebro.addobserver(bt.observers.Broker)
-    cerebro.addobserver(bt.observers.DrawDown)
+
+    if any(scope in {'portfolio', 'portfolio_equity'} for scope in scopes):
+        cerebro.addobserver(bt.observers.Broker)
+    if any(scope in {'portfolio', 'portfolio_drawdown'} for scope in scopes):
+        cerebro.addobserver(bt.observers.DrawDown)
 
 
 def apply_data_feed_plot_scope(feed, plot_scope: str) -> None:
-    if normalize_plot_scope(plot_scope) == 'portfolio':
+    if _uses_portfolio_plotting(plot_scope):
         feed.plotinfo.plot = False
 
 
@@ -75,19 +113,46 @@ def _configure_matplotlib_window() -> None:
         pass
 
 
-def plot_cerebro(cerebro, plot_scope: str) -> None:
-    _configure_matplotlib_window()
-    scope = normalize_plot_scope(plot_scope)
-    if scope != 'portfolio':
-        cerebro.plot()
-        return
+def _set_portfolio_observer_visibility(cerebro, scope: str) -> None:
+    show_broker = scope in {'portfolio', 'portfolio_equity'}
+    show_drawdown = scope in {'portfolio', 'portfolio_drawdown'}
 
+    for stratlist in getattr(cerebro, 'runstrats', []) or []:
+        for strat in stratlist:
+            for observer in strat.getobservers():
+                if isinstance(observer, bt.observers.Broker):
+                    observer.plotinfo.plot = show_broker
+                elif isinstance(observer, bt.observers.DrawDown):
+                    observer.plotinfo.plot = show_drawdown
+
+
+def _plot_portfolio_scope(cerebro, scope: str, defer_show: bool, figid_offset: int = 0) -> None:
+    _set_portfolio_observer_visibility(cerebro, scope)
     plotter = _PlotWithBottomMargin(
-        bottom_margin=0.20,
+        bottom_margin=0.20 if scope == 'portfolio' else 0.18,
         force_bottom_xaxis=True,
+        defer_show=defer_show,
+        figid_offset=figid_offset,
         linevalues=False,
         valuetags=False,
         fmt_x_ticks='%Y-%m-%d',
         tickrotation=15,
     )
     cerebro.plot(plotter=plotter)
+
+
+def plot_cerebro(cerebro, plot_scope: str) -> None:
+    _configure_matplotlib_window()
+    scopes = parse_plot_scopes(plot_scope)
+    if scopes == ('full',):
+        cerebro.plot()
+        return
+
+    defer_show = len(scopes) > 1
+    for index, scope in enumerate(scopes):
+        _plot_portfolio_scope(cerebro, scope, defer_show=defer_show, figid_offset=index * 1000)
+
+    if defer_show:
+        import matplotlib.pyplot as plt
+
+        plt.show()

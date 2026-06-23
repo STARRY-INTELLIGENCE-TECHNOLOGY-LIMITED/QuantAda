@@ -151,11 +151,15 @@ if __name__ == '__main__':
         '--plot_scope',
         type=str,
         default='full',
-        choices=['full', 'portfolio'],
         help=(
             "绘图范围 (默认: full)。"
             "full=绘制全部标的价格、买卖点和组合总览；"
-            "portfolio=使用 Backtrader 原生样式，仅保留组合资金和回撤视图，隐藏各标的价格、买卖点和 DataTrades 等交易子图。"
+            "portfolio=组合资金和回撤合并视图；"
+            "portfolio_equity=仅组合资金视图；"
+            "portfolio_drawdown=仅组合回撤视图。"
+            "组合视图均隐藏各标的价格、买卖点和 DataTrades 等交易子图。"
+            "支持逗号分隔并基于同一次回测结果打开多个窗口，例如 portfolio_equity,portfolio_drawdown；"
+            "full 不能与其他范围混用。"
         ),
     )
     parser.add_argument('--refresh', action='store_true', help="强制刷新CACHE_DATA数据")
