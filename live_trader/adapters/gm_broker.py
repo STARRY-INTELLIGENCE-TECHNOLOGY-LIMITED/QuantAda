@@ -689,6 +689,10 @@ class GmBrokerAdapter(BaseLiveBroker):
 
 
             def init(ctx):
+                if session_state.get('init_completed') and getattr(ctx, 'strategy_instance', None) is not None:
+                    print("[GmBroker] Duplicate init callback ignored for current GM session.")
+                    return
+
                 print(f"[Phoenix] Initializing Strategy '{strategy_path}'...")
                 engine_config = config.__dict__.copy()
                 engine_config['strategy_name'] = strategy_path
@@ -788,6 +792,8 @@ class GmBrokerAdapter(BaseLiveBroker):
 
                     except Exception as e:
                         print(f"[GmBroker Error] 定时任务注册失败: {e}")
+
+                session_state['init_completed'] = True
 
             def on_bar(ctx, bars):
                 if getattr(ctx, 'use_schedule', False):
