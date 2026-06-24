@@ -21,6 +21,24 @@ OPTIMIZER_TERMINAL_LOG_ENV = "QUANTADA_OPTIMIZER_TERMINAL_LOG"
 _TERMINAL_LOG_TEE = None
 
 
+def configure_text_stream_error_handling(streams=None, errors="backslashreplace"):
+    """
+    Keep console output from crashing on Windows legacy encodings.
+
+    UTF-8 log files still receive the original text. This only changes how
+    stdout/stderr degrade when the active terminal cannot encode a character.
+    """
+    target_streams = streams if streams is not None else (sys.stdout, sys.stderr)
+    for stream in target_streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(errors=errors)
+        except Exception:
+            pass
+
+
 def _safe_log_token(value, max_len=180):
     token = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value or "NA")).strip("_.-")
     if not token:
@@ -156,7 +174,12 @@ class _TeeStream:
         self._owner = owner
 
     def write(self, text):
-        written = self._original_stream.write(text)
+        try:
+            written = self._original_stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self._original_stream, "encoding", None) or sys.getdefaultencoding()
+            fallback = str(text).encode(encoding, errors="backslashreplace").decode(encoding, errors="strict")
+            written = self._original_stream.write(fallback)
         self._owner.enqueue(text)
         return written if written is not None else len(str(text))
 
@@ -180,6 +203,8 @@ class _TeeStream:
 
 def install_optimizer_terminal_log(log_file=None, announce=True):
     global _TERMINAL_LOG_TEE
+
+    configure_text_stream_error_handling()
 
     log_file = str(log_file or get_optimizer_terminal_log_path() or build_optimizer_terminal_log_path())
     set_optimizer_terminal_log_path(log_file)

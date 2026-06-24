@@ -5,8 +5,8 @@ The optimizer provides the worker-count policy; this module owns platform
 checks, relaunch commands, and environment propagation.
 """
 
+import base64
 import os
-import subprocess
 import sys
 
 from common.terminal_log import OPTIMIZER_TERMINAL_LOG_ENV, get_optimizer_terminal_log_path
@@ -22,6 +22,34 @@ def _escape_cmd_value(value):
         else:
             safe_chars.append(ch)
     return "".join(safe_chars)
+
+
+def _ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _build_windows_powershell_start_info():
+    script_argv = [os.path.abspath(sys.argv[0])] + list(sys.argv[1:])
+    python_args = ["-X", "utf8"] + script_argv
+    python_cmd = "& " + _ps_quote(sys.executable) + " " + " ".join(_ps_quote(arg) for arg in python_args)
+    terminal_log_path = get_optimizer_terminal_log_path()
+
+    env_cmds = [
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+        f"Set-Location -LiteralPath {_ps_quote(os.getcwd())}",
+        "chcp 65001 >$null",
+        "$env:PYTHONIOENCODING='utf-8'",
+        "$env:PYTHONUTF8='1'",
+        "$env:QUANTADA_DISABLE_AUTO_ELEVATE='1'",
+    ]
+    if terminal_log_path:
+        safe_log_path = str(terminal_log_path).replace("'", "''")
+        env_cmds.append(f"$env:{OPTIMIZER_TERMINAL_LOG_ENV}='{safe_log_path}'")
+
+    inner = "; ".join(env_cmds + [python_cmd, "Write-Host ''; Write-Host '[Optimizer] Elevated run finished. This window is kept open. Close it manually when done.'"])
+    encoded = inner.encode("utf-16le")
+    b64 = base64.b64encode(encoded).decode("ascii")
+    return b64
 
 
 def is_process_elevated():
@@ -79,21 +107,10 @@ def print_elevation_banner(args, resolve_worker_count):
 
 
 def build_windows_elevated_console_command():
-    script_argv = [os.path.abspath(sys.argv[0])] + list(sys.argv[1:])
-    python_cmd = subprocess.list2cmdline([sys.executable] + script_argv)
-    cmd_exe = os.environ.get("COMSPEC") or "cmd.exe"
-    cwd_prefix = f'cd /d "{_escape_cmd_value(os.getcwd())}" && '
-    env_prefix = ""
-    terminal_log_path = get_optimizer_terminal_log_path()
-    if terminal_log_path:
-        safe_log_path = _escape_cmd_value(terminal_log_path)
-        env_prefix = f"set {OPTIMIZER_TERMINAL_LOG_ENV}={safe_log_path}&& "
-    cmd_params = (
-        f'/k "{cwd_prefix}{env_prefix}{python_cmd} '
-        '& echo. '
-        '& echo [Optimizer] Elevated run finished. This window is kept open. Close it manually when done."'
-    )
-    return cmd_exe, cmd_params
+    powershell_exe = os.environ.get("POWERSHELL") or "powershell.exe"
+    script_b64 = _build_windows_powershell_start_info()
+    params = f"-NoExit -NoProfile -ExecutionPolicy Bypass -EncodedCommand {script_b64}"
+    return powershell_exe, params
 
 
 def relaunch_windows_as_admin():
@@ -128,7 +145,17 @@ def relaunch_unix_with_sudo():
         print("[Optimizer] Warning: non-interactive terminal detected, skip sudo elevation request.")
         return False
 
-    cmd = ["sudo", "-E", sys.executable] + list(sys.argv)
+    cmd = [
+        "sudo",
+        "-E",
+        "env",
+        "PYTHONIOENCODING=utf-8",
+        "PYTHONUTF8=1",
+        "QUANTADA_DISABLE_AUTO_ELEVATE=1",
+        sys.executable,
+        "-X",
+        "utf8",
+    ] + list(sys.argv)
     print(f"[Optimizer] Elevation command: {' '.join(cmd)}")
     try:
         os.execvp("sudo", cmd)

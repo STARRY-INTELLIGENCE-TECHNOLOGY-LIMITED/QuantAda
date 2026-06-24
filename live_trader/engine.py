@@ -305,7 +305,10 @@ class LiveTrader:
 
         # 发送带有市场标签的启动死信/通知
         start_msg = f"{self.config['strategy_name']} [{market_tag}]"
-        self.alarm_manager.push_start(start_msg)
+        if self.config.get('_suppress_start_alarm'):
+            print("[Engine] STARTED alarm suppressed for broker session restart.")
+        else:
+            self.alarm_manager.push_start(start_msg)
 
         # 5. 加载风控模块 ---
         self.risk_control = None

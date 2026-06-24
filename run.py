@@ -10,10 +10,13 @@ import config
 from backtest.backtester import Backtester
 from common import optimizer
 from common.loader import get_class_from_name, pascal_to_snake
+from common.terminal_log import configure_text_stream_error_handling
 from data_providers.manager import DataManager
 from recorders.db_recorder import DBRecorder
 from recorders.http_recorder import HttpRecorder
 from recorders.manager import RecorderManager
+
+configure_text_stream_error_handling()
 
 
 def run_backtest(selection_filename, strategy_filename, symbols, cash, commission, slippage, data_source, start_date, end_date,
@@ -208,7 +211,7 @@ if __name__ == '__main__':
         end_dt = pd.to_datetime(args.end_date)
         start_dt = end_dt - pandas.DateOffset(years=3)
         args.start_date = start_dt.strftime('%Y%m%d')
-        print(f"\n[System] 💡 start_date omitted. Auto-inferred to: {args.start_date} (3 years lookback).")
+        print(f"\n[System] start_date omitted. Auto-inferred to: {args.start_date} (3 years lookback).")
 
     # 覆盖config.py
     if args.config:

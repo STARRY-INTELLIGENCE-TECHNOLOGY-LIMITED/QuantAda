@@ -1,3 +1,4 @@
+import base64
 from types import SimpleNamespace
 
 import pandas as pd
@@ -5,6 +6,14 @@ import pandas as pd
 import common.optimizer as optimizer
 import common.process_elevation as process_elevation
 import common.terminal_log as terminal_log
+from common.terminal_log import configure_text_stream_error_handling
+
+
+def _decode_encoded_command(params):
+    marker = "-EncodedCommand "
+    idx = params.index(marker) + len(marker)
+    encoded = params[idx:].split()[0].rstrip('"')
+    return base64.b64decode(encoded).decode("utf-16le")
 
 
 def _build_args(**overrides):
@@ -763,17 +772,21 @@ def test_windows_elevation_command_keeps_console_open(monkeypatch):
     monkeypatch.setattr(process_elevation.sys, "executable", r"C:\Python\python.exe")
     monkeypatch.setattr(process_elevation.os.path, "abspath", lambda path: rf"E:\Lin\Github\QuantAda\{path}")
     monkeypatch.setattr(process_elevation.os, "getcwd", lambda: r"E:\Lin\Github\QuantAda")
-    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("POWERSHELL", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 
     target_exe, params = process_elevation.build_windows_elevated_console_command()
 
-    assert target_exe == r"C:\Windows\System32\cmd.exe"
-    assert params.startswith('/k "')
-    assert 'cd /d "E:\\Lin\\Github\\QuantAda"' in params
-    assert r"C:\Python\python.exe" in params
-    assert "run.py" in params
-    assert "Elevated run finished" in params
-    assert params.index('cd /d "E:\\Lin\\Github\\QuantAda"') < params.index(r"C:\Python\python.exe")
+    assert target_exe == r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    assert params.startswith("-NoExit -NoProfile")
+    decoded = _decode_encoded_command(params)
+    assert "Set-Location -LiteralPath 'E:\\Lin\\Github\\QuantAda'" in decoded
+    assert "chcp 65001 >$null" in decoded
+    assert "$env:PYTHONIOENCODING='utf-8'" in decoded
+    assert "$env:PYTHONUTF8='1'" in decoded
+    assert "$env:QUANTADA_DISABLE_AUTO_ELEVATE='1'" in decoded
+    assert r"& 'C:\Python\python.exe' '-X' 'utf8'" in decoded
+    assert r"'E:\Lin\Github\QuantAda\run.py'" in decoded
+    assert "Elevated run finished" in decoded
 
 
 def test_optimizer_terminal_log_path_uses_optuna_style_name(tmp_path, monkeypatch):
@@ -823,17 +836,44 @@ def test_elevation_command_carries_terminal_log_env(monkeypatch):
     monkeypatch.setattr(process_elevation.sys, "executable", r"C:\Python\python.exe")
     monkeypatch.setattr(process_elevation.os.path, "abspath", lambda path: rf"E:\Lin\Github\QuantAda\{path}")
     monkeypatch.setattr(process_elevation.os, "getcwd", lambda: r"E:\Lin\Github\QuantAda")
-    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setenv("POWERSHELL", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
     monkeypatch.setenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, log_file)
 
     _, params = process_elevation.build_windows_elevated_console_command()
 
     assert "--terminal_log_file" not in params
-    assert terminal_log.OPTIMIZER_TERMINAL_LOG_ENV in params
-    assert log_file in params
-    assert f"set {terminal_log.OPTIMIZER_TERMINAL_LOG_ENV}={log_file}&& " in params
-    assert params.index('cd /d "E:\\Lin\\Github\\QuantAda"') < params.index(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV)
-    assert params.index(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV) < params.index(r"C:\Python\python.exe")
+    decoded = _decode_encoded_command(params)
+    assert log_file in decoded
+    assert terminal_log.OPTIMIZER_TERMINAL_LOG_ENV in decoded
+    assert f"$env:{terminal_log.OPTIMIZER_TERMINAL_LOG_ENV}='{log_file}'" in decoded
+    assert "chcp 65001 >$null" in decoded
+    assert "$env:QUANTADA_DISABLE_AUTO_ELEVATE='1'" in decoded
+    assert decoded.index("$env:PYTHONIOENCODING='utf-8'") < decoded.index(r"& 'C:\Python\python.exe'")
+
+
+def test_configure_text_stream_error_handling_downgrades_unicode_encode_error():
+    class DummyStream:
+        def __init__(self):
+            self.encoding = "gbk"
+            self.errors = "strict"
+            self.buffer = []
+
+        def write(self, text):
+            encoded = str(text).encode(self.encoding, errors=self.errors)
+            self.buffer.append(encoded.decode(self.encoding))
+            return len(text)
+
+        def reconfigure(self, **kwargs):
+            if "errors" in kwargs:
+                self.errors = kwargs["errors"]
+
+    stream = DummyStream()
+    configure_text_stream_error_handling((stream,))
+
+    stream.write("hello 💡 world")
+
+    assert stream.errors == "backslashreplace"
+    assert stream.buffer == [r"hello \U0001f4a1 world"]
 
 
 def test_request_elevation_linux_branch(monkeypatch):
@@ -850,3 +890,80 @@ def test_request_elevation_linux_branch(monkeypatch):
     )
 
     assert got is True
+
+
+def test_request_elevation_macos_uses_unix_branch(monkeypatch):
+    args = SimpleNamespace(n_jobs=4)
+    monkeypatch.delenv("QUANTADA_DISABLE_AUTO_ELEVATE", raising=False)
+    monkeypatch.setattr(process_elevation.sys, "platform", "darwin", raising=False)
+    monkeypatch.setattr(process_elevation, "is_process_elevated", lambda: False)
+    monkeypatch.setattr(process_elevation, "print_elevation_banner", lambda *_: None)
+    monkeypatch.setattr(process_elevation, "relaunch_unix_with_sudo", lambda: True)
+
+    got = process_elevation.request_optimizer_elevation_if_needed(
+        args,
+        optimizer.OptimizationJob._resolve_worker_count,
+    )
+
+    assert got is True
+
+
+def test_request_elevation_respects_disable_flag_on_unix(monkeypatch):
+    args = SimpleNamespace(n_jobs=4)
+    monkeypatch.setenv("QUANTADA_DISABLE_AUTO_ELEVATE", "1")
+    monkeypatch.setattr(process_elevation.sys, "platform", "linux", raising=False)
+    monkeypatch.setattr(process_elevation, "is_process_elevated", lambda: False)
+
+    called = {"unix": 0}
+    monkeypatch.setattr(process_elevation, "relaunch_unix_with_sudo", lambda: called.__setitem__("unix", 1))
+
+    got = process_elevation.request_optimizer_elevation_if_needed(
+        args,
+        optimizer.OptimizationJob._resolve_worker_count,
+    )
+
+    assert got is False
+    assert called["unix"] == 0
+
+
+def test_relaunch_unix_skips_noninteractive_terminal(monkeypatch, capsys):
+    class DummyStdin:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(process_elevation.sys, "stdin", DummyStdin())
+
+    got = process_elevation.relaunch_unix_with_sudo()
+
+    assert got is False
+    assert "non-interactive terminal" in capsys.readouterr().out
+
+
+def test_relaunch_unix_uses_utf8_env_and_disables_recursive_elevation(monkeypatch):
+    class DummyStdin:
+        def isatty(self):
+            return True
+
+    captured = {}
+
+    def fake_execvp(exe, cmd):
+        captured["exe"] = exe
+        captured["cmd"] = cmd
+        raise RuntimeError("stop before exec")
+
+    monkeypatch.setattr(process_elevation.sys, "stdin", DummyStdin())
+    monkeypatch.setattr(process_elevation.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(process_elevation.sys, "argv", ["run.py", "--opt_params", "{'x': 1}"])
+    monkeypatch.setattr(process_elevation.os, "execvp", fake_execvp)
+
+    got = process_elevation.relaunch_unix_with_sudo()
+
+    assert got is False
+    assert captured["exe"] == "sudo"
+    assert captured["cmd"][:3] == ["sudo", "-E", "env"]
+    assert "PYTHONIOENCODING=utf-8" in captured["cmd"]
+    assert "PYTHONUTF8=1" in captured["cmd"]
+    assert "QUANTADA_DISABLE_AUTO_ELEVATE=1" in captured["cmd"]
+    assert "/usr/bin/python3" in captured["cmd"]
+    assert "-X" in captured["cmd"]
+    assert "utf8" in captured["cmd"]

@@ -853,6 +853,85 @@ def test_gm_duplicate_init_callback_is_ignored_in_same_session(monkeypatch, caps
     assert "Duplicate init callback ignored for current GM session" in captured.out
 
 
+def test_gm_start_alarm_is_sent_once_across_phoenix_restarts(monkeypatch, capsys):
+    """
+    GM 夜间重连可能反复创建新的 run_session；同一 Python 进程内只应首次
+    LiveTrader 初始化推 STARTED，后续 Phoenix 重启不再重复推启动消息。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    init_configs = []
+    poll_count = {"value": 0}
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.broker = SimpleNamespace(datas=[SimpleNamespace(_name="SHSE.600000")])
+            init_configs.append(engine_config.copy())
+
+        def init(self, ctx):
+            return None
+
+        def run(self, ctx):
+            return None
+
+    def _poll_restart_then_stop():
+        poll_count["value"] += 1
+        fake_context.init_fun(fake_context)
+        if poll_count["value"] == 1:
+            fake_context.on_shutdown_fun(fake_context)
+            return 0
+        raise StopPhoenix()
+
+    def _sleep(seconds):
+        if seconds >= 10:
+            return None
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_restart_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+    monkeypatch.setattr("time.sleep", _sleep)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert len(init_configs) == 2
+    assert init_configs[0].get('_suppress_start_alarm') is False
+    assert init_configs[1].get('_suppress_start_alarm') is True
+    assert "GM shutdown callback received. Restarting session" in captured.out
+
+
 def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception(monkeypatch, capsys):
     """
     GM 夜间非交易时段的实时行情连接失败应降噪:

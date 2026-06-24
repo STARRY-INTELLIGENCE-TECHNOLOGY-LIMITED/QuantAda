@@ -653,6 +653,8 @@ class GmBrokerAdapter(BaseLiveBroker):
             gm_start_time = dt_start.strftime('%Y-%m-%d 08:00:00')
             gm_end_time = dt_end.strftime('%Y-%m-%d %H:%M:%S')
 
+        launch_state = {'start_alarm_sent': False}
+
         # --- 2. 核心运行逻辑 ---
         def run_session():
             session_state = {'shutdown_requested': False}
@@ -661,14 +663,15 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             def _log_temporary_market_data_error(code, info):
                 nonlocal last_market_data_error_log_at
+                info_text = str(info or "").strip()
                 try:
                     code_int = int(code)
                 except Exception:
-                    return False
-                info_text = str(info or "").strip()
-                if code_int != 1200 or (
-                    info_text and "实时行情服务连接失败" not in info_text and "行情服务连接失败" not in info_text
-                ):
+                    code_int = 1200 if "1200" in info_text else None
+                is_market_data_failure = (
+                    "实时行情服务连接失败" in info_text or "行情服务连接失败" in info_text
+                )
+                if code_int != 1200 or (info_text and not is_market_data_failure):
                     return False
 
                 now_ts = time.time()
@@ -698,6 +701,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 engine_config['strategy_name'] = strategy_path
                 engine_config['params'] = params
                 engine_config['platform'] = 'gm'
+                engine_config['_suppress_start_alarm'] = launch_state.get('start_alarm_sent', False)
                 ctx.use_schedule = False
 
                 # 将资金和费率头传到 LiveTrader 引擎
@@ -724,7 +728,9 @@ class GmBrokerAdapter(BaseLiveBroker):
                 # 实例化引擎
                 trader = LiveTrader(engine_config)
                 trader.init(ctx)
+                launch_state['start_alarm_sent'] = True
                 ctx.strategy_instance = trader
+                session_state['init_completed'] = True
 
                 # 订阅行情
                 current_symbols = [d._name for d in ctx.strategy_instance.broker.datas]
@@ -735,7 +741,17 @@ class GmBrokerAdapter(BaseLiveBroker):
                     sub_cp = int(ctx.strategy_instance.config.get('compression', 1) or 1)
                     sub_freq = f"{sub_cp * 60}s" if sub_tf == 'Minutes' else '1d'
                     print(f"[GmBroker] Subscribing to {len(current_symbols)} symbols...")
-                    subscribe(symbols=current_symbols, frequency=sub_freq, count=1, wait_group=True)
+                    try:
+                        subscribe(symbols=current_symbols, frequency=sub_freq, count=1, wait_group=True)
+                    except Exception as e:
+                        err_code = getattr(e, 'code', None)
+                        if _log_temporary_market_data_error(err_code, str(e)):
+                            print(
+                                "[GmBroker Warning] Realtime market subscription unavailable; "
+                                "schedule registration will continue."
+                            )
+                        else:
+                            raise
 
                 # 实盘定时任务配置
                 if mode == MODE_LIVE and schedule_rule:
@@ -792,8 +808,6 @@ class GmBrokerAdapter(BaseLiveBroker):
 
                     except Exception as e:
                         print(f"[GmBroker Error] 定时任务注册失败: {e}")
-
-                session_state['init_completed'] = True
 
             def on_bar(ctx, bars):
                 if getattr(ctx, 'use_schedule', False):

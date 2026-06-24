@@ -449,7 +449,7 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
 
     for idx, current_metric in enumerate(metrics_list, 1):
         print(f"\n\n{'=' * 65}")
-        print(f"🚀 [指标 {idx}/{total_metrics} 正在训练]: {current_metric}")
+        print(f"[指标 {idx}/{total_metrics} 正在训练]: {current_metric}")
         print(f"{'=' * 65}")
 
         # 深拷贝 args，确保物理隔离
