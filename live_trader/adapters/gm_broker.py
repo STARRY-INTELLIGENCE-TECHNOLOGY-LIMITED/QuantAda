@@ -656,6 +656,30 @@ class GmBrokerAdapter(BaseLiveBroker):
         # --- 2. 核心运行逻辑 ---
         def run_session():
             session_state = {'shutdown_requested': False}
+            last_market_data_error_log_at = None
+            market_data_error_log_interval_seconds = 600.0
+
+            def _log_temporary_market_data_error(code, info):
+                nonlocal last_market_data_error_log_at
+                try:
+                    code_int = int(code)
+                except Exception:
+                    return False
+                info_text = str(info or "").strip()
+                if code_int != 1200 or (
+                    info_text and "实时行情服务连接失败" not in info_text and "行情服务连接失败" not in info_text
+                ):
+                    return False
+
+                now_ts = time.time()
+                if (
+                    last_market_data_error_log_at is None
+                    or now_ts - last_market_data_error_log_at >= market_data_error_log_interval_seconds
+                ):
+                    info_text = info_text or "实时行情服务连接失败"
+                    print(f"[GM Warning] Code: {code}, Msg: {info_text}")
+                    last_market_data_error_log_at = now_ts
+                return True
 
             # 每次启动前重置 context 身份
             py_gmi_set_strategy_id(strategy_id)
@@ -776,6 +800,9 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             def on_error(ctx, code, info):
                 msg = f"Code: {code}, Msg: {info}"
+                if _log_temporary_market_data_error(code, info):
+                    return
+
                 print(f"[GM Error] {msg}")
 
                 # 【报警接入】异常推送
@@ -891,11 +918,21 @@ class GmBrokerAdapter(BaseLiveBroker):
                             raise
 
                         if poll_status not in (None, 0):
-                            print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
                             try:
                                 check_gm_status(poll_status)
                             except Exception as e:
+                                err_code = getattr(e, 'code', poll_status)
+                                err_info = str(e)
+                                if _log_temporary_market_data_error(err_code, err_info):
+                                    time.sleep(1)
+                                    continue
                                 print(f"[Phoenix] gmi_poll status detail: {e}")
+                                print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
+                                return True
+                            if _log_temporary_market_data_error(poll_status, ""):
+                                time.sleep(1)
+                                continue
+                            print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
                             return True
 
                         if session_state.get('shutdown_requested') or getattr(

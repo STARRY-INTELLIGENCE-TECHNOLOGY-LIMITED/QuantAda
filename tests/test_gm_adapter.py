@@ -631,6 +631,9 @@ def test_gm_launch_restarts_when_shutdown_callback_fires(monkeypatch, capsys):
     statuses = []
     fake_context = SimpleNamespace()
 
+    class StopPhoenix(BaseException):
+        pass
+
     class DummyAlarm:
         def push_status(self, status, detail=''):
             statuses.append((status, detail))
@@ -647,7 +650,7 @@ def test_gm_launch_restarts_when_shutdown_callback_fires(monkeypatch, capsys):
 
     def _sleep(seconds):
         if seconds >= 10:
-            raise KeyboardInterrupt()
+            raise StopPhoenix()
 
     monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
     monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
@@ -664,11 +667,12 @@ def test_gm_launch_restarts_when_shutdown_callback_fires(monkeypatch, capsys):
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
     monkeypatch.setattr("time.sleep", _sleep)
 
-    GmBrokerAdapter.launch(
-        {"token": "token", "strategy_id": "strategy-id"},
-        strategy_path="sample_strategy",
-        params={},
-    )
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
 
     captured = capsys.readouterr()
     assert "[System] Strategy Shutdown" in captured.out
@@ -686,6 +690,9 @@ def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
 
     fake_context = SimpleNamespace()
 
+    class StopPhoenix(BaseException):
+        pass
+
     class DummyAlarm:
         def push_status(self, status, detail=''):
             return None
@@ -702,7 +709,7 @@ def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
 
     def _sleep(seconds):
         if seconds >= 10:
-            raise KeyboardInterrupt()
+            raise StopPhoenix()
 
     monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
     monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
@@ -719,11 +726,12 @@ def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
     monkeypatch.setattr("time.sleep", _sleep)
 
-    GmBrokerAdapter.launch(
-        {"token": "token", "strategy_id": "strategy-id"},
-        strategy_path="sample_strategy",
-        params={},
-    )
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
 
     captured = capsys.readouterr()
     assert "GM SDK requested process exit" in captured.out
@@ -772,3 +780,69 @@ def test_gm_launch_does_not_swallow_plain_system_exit(monkeypatch):
             strategy_path="sample_strategy",
             params={},
         )
+
+
+def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception(monkeypatch, capsys):
+    """
+    GM 夜间非交易时段的实时行情连接失败应降噪:
+    - 允许打印有限 warning
+    - 不推 GM Kernel Error 异常
+    - 重复错误不刷屏、不触发 Phoenix 重启
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    poll_count = {"value": 0}
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_text(self, content, level='INFO'):
+            raise AssertionError("temporary GM market data error should not push text alarm")
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            raise AssertionError("temporary GM market data error should not push exception")
+
+    def _poll_market_data_errors_then_stop():
+        poll_count["value"] += 1
+        if poll_count["value"] == 1:
+            return 1200
+        fake_context.on_error_fun(fake_context, 1200, "实时行情服务连接失败")
+        fake_context.on_error_fun(fake_context, 1200, "实时行情服务连接失败")
+        raise StopPhoenix()
+
+    def _sleep(seconds):
+        return None
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_market_data_errors_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", _sleep)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert captured.out.count("[GM Warning] Code: 1200, Msg: 实时行情服务连接失败") == 1
+    assert "Waiting 10s before restart" not in captured.out
