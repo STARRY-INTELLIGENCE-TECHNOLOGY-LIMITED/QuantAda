@@ -25,7 +25,7 @@ QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并�
 2. **向量化计算优先 (Vectorized Computation)**
    - 策略层可以通过 `data.p.dataname` 获取包含完整历史 K 线的 Pandas DataFrame。
    - 强烈建议在 `next()` 周期或自定义方法中，使用 Pandas 的向量化操作（或框架提供的 `indicators.py` / `mytt.py`）进行全量计算，避免低效的 `for` 循环单行迭代。
-   - 若需要加速优化器重复 trial，可只缓存由行情数据和参数决定的只读指标序列；不要缓存现金、持仓、订单、目标标的、拒单重试或跨 K 交易意图。
+   - 若需要加速优化器重复 trial，可只缓存由行情数据和参数决定的只读指标序列；优化器缓存有上限且允许淘汰，策略正确性不能依赖缓存命中。不要缓存现金、持仓、订单、目标标的、拒单重试或跨 K 交易意图。
    - 策略只调用 `register_indicator()` / `get_indicator()` 等公开 API；不要直接操作底层缓存字典或在 `BaseStrategy` 中追加缓存实现。
 
 3. **动态参数注入 (Dynamic Parameters)**

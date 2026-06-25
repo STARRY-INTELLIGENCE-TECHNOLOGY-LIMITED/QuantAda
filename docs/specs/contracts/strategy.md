@@ -25,7 +25,8 @@
 3. 只允许缓存由行情数据和参数决定的指标结果，例如 MA、ROC、趋势分、布尔信号序列。
 4. 不允许缓存现金、持仓、订单、目标标的、拒单重试、跨 K 买入意图或任何 broker 现实状态。
 5. 实盘不得依赖该缓存维持正确性；缺少缓存时策略行为必须保持一致。
-6. 缓存实现细节属于 `common/indicator_cache.py`；`BaseStrategy` 只保留 `register_indicator()`、`get_indicator()` 等稳定策略 API 入口。
+6. 优化器指标缓存是有界缓存，允许按 LRU 淘汰旧序列；策略正确性不得依赖缓存命中。
+7. 缓存实现细节属于 `common/indicator_cache.py`；`BaseStrategy` 只保留 `register_indicator()`、`get_indicator()` 等稳定策略 API 入口。
 
 ## 5. Supported Trading Paradigms
 1. Arbitrary target / signal-driven:

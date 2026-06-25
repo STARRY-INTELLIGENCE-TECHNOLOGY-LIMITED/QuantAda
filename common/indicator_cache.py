@@ -6,7 +6,45 @@ normalizing indicator series, building fast backtest lookup dictionaries, and
 sharing immutable indicator series across optimizer trials.
 """
 
+from collections import OrderedDict
+
 import pandas as pd
+
+
+class BoundedIndicatorCache(OrderedDict):
+    """
+    Small LRU cache for optimizer-only indicator series and lookup dictionaries.
+
+    Optimizer trials can generate many parameter-specific series. A plain dict
+    grows with trial count, so long training runs can exhaust memory even when
+    the source OHLCV data is small.
+    """
+
+    DEFAULT_MAX_ENTRIES = 512
+
+    def __init__(self, max_entries=None):
+        super().__init__()
+        try:
+            max_entries = int(max_entries or self.DEFAULT_MAX_ENTRIES)
+        except (TypeError, ValueError):
+            max_entries = self.DEFAULT_MAX_ENTRIES
+        self.max_entries = max(1, max_entries)
+
+    def get(self, key, default=None):
+        try:
+            value = super().__getitem__(key)
+        except KeyError:
+            return default
+        self.move_to_end(key)
+        return value
+
+    def __setitem__(self, key, value):
+        exists = key in self
+        super().__setitem__(key, value)
+        if exists:
+            self.move_to_end(key)
+        while len(self) > self.max_entries:
+            self.popitem(last=False)
 
 
 def _ensure_registries(strategy):

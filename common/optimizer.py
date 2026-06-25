@@ -28,6 +28,7 @@ QuantAda 启发式并行贝叶斯优化器
 import ast
 import copy
 import datetime
+import gc
 import importlib
 import logging
 import math
@@ -41,6 +42,7 @@ import time
 import traceback
 import webbrowser
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -52,6 +54,7 @@ from optuna.samplers import TPESampler
 import config
 from backtest.backtester import Backtester
 from common.formatters import format_float, format_recent_backtest_metrics
+from common.indicator_cache import BoundedIndicatorCache
 from common.loader import get_class_from_name, parse_period_string
 from common import process_elevation
 from common.terminal_log import (
@@ -637,6 +640,10 @@ class OptimizationJob:
     HK_EXCHANGE_PREFIXES = {"SEHK", "HK"}
     US_EXCHANGE_PREFIXES = {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "ISLAND", "SMART", "PINK", "US"}
     DEFAULT_WARMUP_DAYS = 400
+    OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES = 512
+    TPE_DEFAULT_N_EI_CANDIDATES = 24
+    TPE_LONG_RUN_N_EI_CANDIDATES = 12
+    TPE_LONG_RUN_TRIAL_THRESHOLD = 10000
 
     def __init__(self, args, fixed_params, opt_params_def, risk_params, shared_context=None):
         self.args = args
@@ -644,7 +651,7 @@ class OptimizationJob:
         self.opt_params_def = opt_params_def
         self.risk_params = risk_params
         self._reset_trial_dedupe_cache()
-        self._indicator_cache = {}
+        self._indicator_cache = BoundedIndicatorCache(self.OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES)
         self.warmup_days = self.DEFAULT_WARMUP_DAYS
 
         # 共享上下文模式：复用选股、数据抓取与切分结果，确保多指标/基准对比在同一数据宇宙下进行
@@ -660,7 +667,9 @@ class OptimizationJob:
             self.test_range = shared_context["test_range"]
             self.warmup_days = shared_context.get("warmup_days", self.warmup_days)
             self._window_data_cache = shared_context.get("window_data_cache", {})
-            self._indicator_cache = shared_context.get("indicator_cache", {})
+            self._indicator_cache = shared_context.get("indicator_cache", self._indicator_cache)
+            if not isinstance(self._indicator_cache, BoundedIndicatorCache):
+                self._indicator_cache = BoundedIndicatorCache(self.OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES)
             self._raw_data_fetch_range = shared_context.get("raw_data_fetch_range", (None, None))
 
             # 在复用数据上下文的前提下，仅重建本次 metric 对应的 study_name
@@ -739,6 +748,26 @@ class OptimizationJob:
         仅用于避免同一 worker 重复评估相同参数。
         """
         self._completed_trial_cache = {}
+
+    def _release_memory_pressure(self):
+        cache = getattr(self, "_indicator_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()
+        dedupe_cache = getattr(self, "_completed_trial_cache", None)
+        if isinstance(dedupe_cache, dict):
+            dedupe_cache.clear()
+        gc.collect()
+
+    @classmethod
+    def _resolve_tpe_n_ei_candidates(cls, n_trials):
+        try:
+            n_trials = int(n_trials)
+        except (TypeError, ValueError):
+            n_trials = 0
+
+        if n_trials >= cls.TPE_LONG_RUN_TRIAL_THRESHOLD:
+            return cls.TPE_LONG_RUN_N_EI_CANDIDATES
+        return cls.TPE_DEFAULT_N_EI_CANDIDATES
 
     @staticmethod
     def _get_total_cpu_cores():
@@ -981,7 +1010,7 @@ class OptimizationJob:
         obj.train_datas = payload["train_datas"]
         obj.train_range = payload["train_range"]
         obj.warmup_days = payload.get("warmup_days", cls.DEFAULT_WARMUP_DAYS)
-        obj._indicator_cache = {}
+        obj._indicator_cache = BoundedIndicatorCache(cls.OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES)
 
         obj.strategy_class = get_class_from_name(obj.args.strategy, ['strategies'])
         obj.risk_control_classes = []
@@ -1023,7 +1052,14 @@ class OptimizationJob:
 
         self._completed_trial_cache[params_key] = score_val
 
-    def _run_multiprocess_optimization(self, n_jobs, n_trials, log_file, prefer_fork_cow=False):
+    def _run_multiprocess_optimization(
+        self,
+        n_jobs,
+        n_trials,
+        log_file,
+        prefer_fork_cow=False,
+        tpe_n_ei_candidates=None,
+    ):
         if not log_file:
             raise RuntimeError("Multi-process mode requires a shared JournalStorage log file.")
         if int(n_trials) <= 0:
@@ -1071,6 +1107,7 @@ class OptimizationJob:
 
         executor = None
         interrupted = False
+        stopped_early = False
         try:
             executor = ProcessPoolExecutor(max_workers=len(worker_trials), mp_context=ctx)
             for worker_idx, local_trials in enumerate(worker_trials, start=1):
@@ -1083,18 +1120,41 @@ class OptimizationJob:
                         local_trials,
                         worker_idx,
                         seed_base + worker_idx,
+                        tpe_n_ei_candidates,
                     )
                 )
 
             for fut in as_completed(futures):
-                fut.result()
+                result = fut.result()
+                if isinstance(result, dict) and result.get("stopped_early"):
+                    stopped_early = True
+                    print(
+                        f"[Optimizer] Worker {result.get('worker_idx')} reported memory pressure; "
+                        "stopping remaining workers for this metric."
+                    )
+                    self._force_shutdown_process_pool(executor, futures)
+                    print("[Optimizer] Completed trials will be used for the final report if available.")
+                    break
         except KeyboardInterrupt:
             interrupted = True
             print("\n[Optimizer] Ctrl-C detected. Forcing worker shutdown...")
             self._force_shutdown_process_pool(executor, futures)
             raise
+        except MemoryError as exc:
+            stopped_early = True
+            print(f"\n[Optimizer] Multi-process optimization stopped due to memory pressure: {exc}")
+            self._force_shutdown_process_pool(executor, futures)
+            print("[Optimizer] Completed trials will be used for the final report if available.")
+            return
+        except BrokenProcessPool as exc:
+            stopped_early = True
+            print(f"\n[Optimizer] Worker process exited unexpectedly: {exc}")
+            print("[Optimizer] Treating this as recoverable worker pressure for the current metric.")
+            self._force_shutdown_process_pool(executor, futures)
+            print("[Optimizer] Completed trials will be used for the final report if available.")
+            return
         finally:
-            if executor is not None and not interrupted:
+            if executor is not None and not interrupted and not stopped_early:
                 executor.shutdown(wait=True, cancel_futures=False)
             if start_method == "fork":
                 _FORK_SHARED_WORKER_PAYLOAD = None
@@ -1676,6 +1736,8 @@ class OptimizationJob:
         if not self.train_datas:
             return -9999.0
 
+        bt_instance = None
+        strat = None
         try:
             bt_instance = Backtester(
                 datas=self.train_datas,
@@ -1753,9 +1815,15 @@ class OptimizationJob:
                             sum(1 for monthly_return in active_monthly_returns if monthly_return > 0)
                             / len(active_monthly_returns)
                         )
+                except MemoryError:
+                    self._release_memory_pressure()
+                    raise
                 except Exception:
                     monthly_win_rate = 0.0
 
+            except MemoryError:
+                self._release_memory_pressure()
+                raise
             except Exception as e:
                 # Analyzer 解析失败，通常意味着参数导致了无法交易，直接判死刑
                 return -100.0
@@ -1797,55 +1865,68 @@ class OptimizationJob:
 
                     return float(final_score)
 
+                except MemoryError:
+                    self._release_memory_pressure()
+                    raise
                 except Exception as e:
                     # 捕获外部插件抛出的异常，防止某一次试错导致整个 Optuna Study 崩溃退出
                     return -100.0
 
+        except MemoryError:
+            self._release_memory_pressure()
+            raise
         except Exception as e:
             import traceback
             print(f"Trial failed: {e}")
             traceback.print_exc()
             return -9999.0
+        finally:
+            strat = None
+            bt_instance = None
 
     def objective(self, trial):
-        current_params = copy.deepcopy(self.fixed_params)
-        trial_params_dict = {}
+        try:
+            current_params = copy.deepcopy(self.fixed_params)
+            trial_params_dict = {}
 
-        for param_name, config in self.opt_params_def.items():
-            p_type = config.get('type')
-            if p_type == 'int':
-                step = config.get('step', 1)
-                high = config['high']
-                low = config['low']
-                corrected_high = low + int((high - low) // step) * step
-                val = trial.suggest_int(param_name, low, corrected_high, step=step)
-            elif p_type == 'float':
-                step = config.get('step', None)
-                low = config['low']
-                high = config['high']
-                if step is not None:
-                    steps = math.floor((high - low) / step + 1e-10)
-                    corrected_high = low + steps * step
-                    if abs(corrected_high - high) > 1e-10:
-                        high = corrected_high
-                val = trial.suggest_float(param_name, low, high, step=step)
-            elif p_type == 'categorical':
-                val = trial.suggest_categorical(param_name, config['choices'])
-            else:
-                val = config.get('value')
+            for param_name, config in self.opt_params_def.items():
+                p_type = config.get('type')
+                if p_type == 'int':
+                    step = config.get('step', 1)
+                    high = config['high']
+                    low = config['low']
+                    corrected_high = low + int((high - low) // step) * step
+                    val = trial.suggest_int(param_name, low, corrected_high, step=step)
+                elif p_type == 'float':
+                    step = config.get('step', None)
+                    low = config['low']
+                    high = config['high']
+                    if step is not None:
+                        steps = math.floor((high - low) / step + 1e-10)
+                        corrected_high = low + steps * step
+                        if abs(corrected_high - high) > 1e-10:
+                            high = corrected_high
+                    val = trial.suggest_float(param_name, low, high, step=step)
+                elif p_type == 'categorical':
+                    val = trial.suggest_categorical(param_name, config['choices'])
+                else:
+                    val = config.get('value')
 
-            current_params[param_name] = val
-            trial_params_dict[param_name] = val
+                current_params[param_name] = val
+                trial_params_dict[param_name] = val
 
-        params_key = self._params_to_key(trial_params_dict)
+            params_key = self._params_to_key(trial_params_dict)
 
-        cached_value = self._get_cached_trial_value(params_key)
-        if cached_value is not None:
-            return cached_value
+            cached_value = self._get_cached_trial_value(params_key)
+            if cached_value is not None:
+                return cached_value
 
-        score = self._evaluate_trial_params(current_params)
-        self._cache_completed_trial(params_key, score)
-        return score
+            score = self._evaluate_trial_params(current_params)
+            self._cache_completed_trial(params_key, score)
+            return score
+        except MemoryError:
+            self._release_memory_pressure()
+            raise
 
     def prepare_data_index(self, df: pd.DataFrame) -> pd.DataFrame:
         """确保 DataFrame 的索引是 DatetimeIndex"""
@@ -2261,9 +2342,30 @@ class OptimizationJob:
                 elif shared_journal_log_file:
                     print("\n[Warning] JournalStorage unavailable. Dashboard persistence disabled for this run.")
 
+        # 2. 确定 n_trials；TPE 采样器需要基于训练规模选择候选数。
+        n_trials = self.args.n_trials
+        if n_trials is None:
+            n_trials = self._estimate_n_trials()
+            print(f"[Optimizer] Auto-inferred n_trials: {n_trials} (entropy-complexity model)")
+        else:
+            n_trials = int(n_trials)
+            if n_trials <= 0:
+                raise ValueError(f"n_trials must be a positive integer, got: {n_trials}")
+
+        tpe_n_ei_candidates = self._resolve_tpe_n_ei_candidates(n_trials)
+        if tpe_n_ei_candidates != self.TPE_DEFAULT_N_EI_CANDIDATES:
+            print(
+                "[Optimizer] Long-run TPE memory guard enabled: "
+                f"n_ei_candidates={tpe_n_ei_candidates} "
+                f"(n_trials={n_trials}, default={self.TPE_DEFAULT_N_EI_CANDIDATES})"
+            )
+
         # 使用 TPESampler(constant_liar=True)
         # 这会防止多个 Worker 同时采样到同一个点（并发踩踏）
-        sampler = TPESampler(constant_liar=True)
+        sampler = TPESampler(
+            constant_liar=True,
+            n_ei_candidates=tpe_n_ei_candidates,
+        )
 
         # 2. 创建 Study (包裹 try-except 以捕获 Windows 权限错误)
         try:
@@ -2310,16 +2412,6 @@ class OptimizationJob:
                 # 其他错误照常抛出
                 raise e
 
-        # 2. 确定 n_trials
-        n_trials = self.args.n_trials
-        if n_trials is None:
-            n_trials = self._estimate_n_trials()
-            print(f"[Optimizer] Auto-inferred n_trials: {n_trials} (entropy-complexity model)")
-        else:
-            n_trials = int(n_trials)
-            if n_trials <= 0:
-                raise ValueError(f"n_trials must be a positive integer, got: {n_trials}")
-
         resolved_workers = self._resolve_worker_count(n_jobs)
         effective_parallel_jobs = min(resolved_workers, max(1, int(n_trials)))
 
@@ -2348,6 +2440,7 @@ class OptimizationJob:
                     n_trials=n_trials,
                     log_file=log_file,
                     prefer_fork_cow=(not auto_launch_dashboard),
+                    tpe_n_ei_candidates=tpe_n_ei_candidates,
                 )
             else:
                 # 单核/单并行场景回退为单进程线程模式（与历史版本一致）
@@ -2355,11 +2448,24 @@ class OptimizationJob:
                 thread_jobs = max(1, min(int(n_trials), self._resolve_worker_count(n_jobs)))
                 if thread_jobs != 1:
                     print(f"[Optimizer] Fallback to single-process threaded mode (n_jobs={thread_jobs}).")
-                study.optimize(self.objective, n_trials=n_trials, n_jobs=thread_jobs)
+                study.optimize(
+                    self.objective,
+                    n_trials=n_trials,
+                    n_jobs=thread_jobs,
+                    gc_after_trial=True,
+                )
         except KeyboardInterrupt:
             print("\n[Optimizer] Optimization stopped by user.")
+        except MemoryError as exc:
+            self._release_memory_pressure()
+            print(f"\n[Optimizer] Optimization stopped early due to memory pressure: {exc}")
+            print("[Optimizer] Completed trials will be used for the final report if available.")
 
-        if len(study.trials) == 0:
+        completed_trials = [
+            trial for trial in study.trials
+            if trial.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if not completed_trials:
             print("No trials finished.")
             return
 
@@ -2430,7 +2536,15 @@ class OptimizationJob:
         }
 
 
-def _optimize_worker_entry(worker_payload, study_name, log_file, n_trials, worker_idx, sampler_seed):
+def _optimize_worker_entry(
+    worker_payload,
+    study_name,
+    log_file,
+    n_trials,
+    worker_idx,
+    sampler_seed,
+    tpe_n_ei_candidates=None,
+):
     """
     多进程子进程入口：每个 worker 连接同一个 Study，执行固定 trial 配额。
     """
@@ -2451,6 +2565,7 @@ def _optimize_worker_entry(worker_payload, study_name, log_file, n_trials, worke
         worker_tee = install_optimizer_terminal_log(terminal_log_path, announce=False)
 
     worker_shm_handles = []
+    job = None
     try:
         if worker_payload.get("train_datas") is None and worker_payload.get("train_datas_shared"):
             restored_train_datas, worker_shm_handles = OptimizationJob._restore_train_datas_from_shared(
@@ -2460,7 +2575,13 @@ def _optimize_worker_entry(worker_payload, study_name, log_file, n_trials, worke
             worker_payload["train_datas"] = restored_train_datas
 
         storage = JournalStorage(JournalFileBackendCls(log_file))
-        sampler = TPESampler(constant_liar=True, seed=sampler_seed)
+        if tpe_n_ei_candidates is None:
+            tpe_n_ei_candidates = OptimizationJob._resolve_tpe_n_ei_candidates(n_trials)
+        sampler = TPESampler(
+            constant_liar=True,
+            seed=sampler_seed,
+            n_ei_candidates=tpe_n_ei_candidates,
+        )
 
         study = optuna.create_study(
             direction='maximize',
@@ -2471,8 +2592,39 @@ def _optimize_worker_entry(worker_payload, study_name, log_file, n_trials, worke
         )
 
         job = OptimizationJob.from_worker_payload(worker_payload)
-        study.optimize(job.objective, n_trials=n_trials, n_jobs=1)
-        return {"worker_idx": worker_idx, "n_trials": n_trials}
+        try:
+            study.optimize(
+                job.objective,
+                n_trials=n_trials,
+                n_jobs=1,
+                gc_after_trial=True,
+            )
+        except MemoryError as exc:
+            job._release_memory_pressure()
+            print(
+                f"[Optimizer] Worker {worker_idx} stopped early due to memory pressure: {exc}. "
+                "Completed trials are kept in JournalStorage."
+            )
+            return {
+                "worker_idx": worker_idx,
+                "n_trials": n_trials,
+                "stopped_early": True,
+                "reason": "memory_pressure",
+            }
+        return {"worker_idx": worker_idx, "n_trials": n_trials, "stopped_early": False}
+    except MemoryError as exc:
+        if job is not None:
+            job._release_memory_pressure()
+        print(
+            f"[Optimizer] Worker {worker_idx} stopped early due to setup memory pressure: {exc}. "
+            "Completed trials are kept in JournalStorage."
+        )
+        return {
+            "worker_idx": worker_idx,
+            "n_trials": n_trials,
+            "stopped_early": True,
+            "reason": "memory_pressure",
+        }
     finally:
         OptimizationJob._cleanup_shared_segments(worker_shm_handles, unlink=False)
         if worker_tee is not None:

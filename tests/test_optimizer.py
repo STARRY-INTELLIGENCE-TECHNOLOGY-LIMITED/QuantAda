@@ -967,3 +967,268 @@ def test_relaunch_unix_uses_utf8_env_and_disables_recursive_elevation(monkeypatc
     assert "/usr/bin/python3" in captured["cmd"]
     assert "-X" in captured["cmd"]
     assert "utf8" in captured["cmd"]
+
+
+def test_optimizer_run_passes_gc_after_trial_to_single_process_optimize(monkeypatch):
+    captured = {}
+
+    class DummyTrialState:
+        COMPLETE = "complete"
+
+    class DummyTrial:
+        state = "complete"
+
+    class DummyStudy:
+        trials = [DummyTrial()]
+        best_params = {"lookback": 20}
+        best_value = 1.23
+
+        def set_user_attr(self, key, value):
+            return None
+
+        def optimize(self, objective, n_trials=None, n_jobs=1, gc_after_trial=False, **kwargs):
+            captured["n_trials"] = n_trials
+            captured["n_jobs"] = n_jobs
+            captured["gc_after_trial"] = gc_after_trial
+
+    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
+    monkeypatch.setattr(optimizer.optuna.trial, "TrialState", DummyTrialState)
+    monkeypatch.setattr(optimizer, "TPESampler", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(
+        n_jobs=1,
+        n_trials=3,
+        auto_launch_dashboard=False,
+        shared_journal_log_file=None,
+        study_name="dummy-study",
+        strategy="dummy.strategy",
+        metric="sharpe",
+        cash=100000.0,
+        commission=0.0003,
+        slippage=0.0,
+        timeframe="Days",
+        compression=1,
+    )
+    job.fixed_params = {}
+    job.opt_params_def = {}
+    job.risk_params = {}
+    job._indicator_cache = {}
+    job.test_datas = {}
+    job.test_range = (None, None)
+    job.objective = lambda trial: 1.0
+    job._run_main_eval_backtest = lambda params: _sample_metrics(start="20240101", end="20241231")
+    job._run_test_set_backtest = lambda params, verbose=False: None
+    job._run_yearly_validation_backtests = lambda params: []
+
+    result = job.run()
+
+    assert result["best_params"] == {"lookback": 20}
+    assert captured["gc_after_trial"] is True
+    assert captured["n_trials"] == 3
+    assert captured["n_jobs"] == 1
+
+
+def test_optimizer_run_uses_default_tpe_candidates_for_short_runs(monkeypatch):
+    sampler_kwargs = {}
+
+    class DummyTrialState:
+        COMPLETE = "complete"
+
+    class DummyTrial:
+        state = "complete"
+
+    class DummyStudy:
+        trials = [DummyTrial()]
+        best_params = {"lookback": 20}
+        best_value = 1.23
+
+        def set_user_attr(self, key, value):
+            return None
+
+        def optimize(self, *args, **kwargs):
+            return None
+
+    def fake_sampler(**kwargs):
+        sampler_kwargs.update(kwargs)
+        return SimpleNamespace(kwargs=kwargs)
+
+    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
+    monkeypatch.setattr(optimizer.optuna.trial, "TrialState", DummyTrialState)
+    monkeypatch.setattr(optimizer, "TPESampler", fake_sampler)
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(
+        n_jobs=1,
+        n_trials=50,
+        auto_launch_dashboard=False,
+        shared_journal_log_file=None,
+        study_name="dummy-study",
+        strategy="dummy.strategy",
+        metric="sharpe",
+        cash=100000.0,
+        commission=0.0003,
+        slippage=0.0,
+        timeframe="Days",
+        compression=1,
+    )
+    job.fixed_params = {}
+    job.opt_params_def = {}
+    job.risk_params = {}
+    job._indicator_cache = {}
+    job.test_datas = {}
+    job.test_range = (None, None)
+    job.objective = lambda trial: 1.0
+    job._run_main_eval_backtest = lambda params: _sample_metrics(start="20240101", end="20241231")
+    job._run_test_set_backtest = lambda params, verbose=False: None
+    job._run_yearly_validation_backtests = lambda params: []
+
+    job.run()
+
+    assert sampler_kwargs["n_ei_candidates"] == optimizer.OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
+
+
+def test_tpe_candidates_drop_only_for_long_runs():
+    assert (
+        optimizer.OptimizationJob._resolve_tpe_n_ei_candidates(
+            optimizer.OptimizationJob.TPE_LONG_RUN_TRIAL_THRESHOLD - 1
+        )
+        == optimizer.OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
+    )
+    assert (
+        optimizer.OptimizationJob._resolve_tpe_n_ei_candidates(
+            optimizer.OptimizationJob.TPE_LONG_RUN_TRIAL_THRESHOLD
+        )
+        == optimizer.OptimizationJob.TPE_LONG_RUN_N_EI_CANDIDATES
+    )
+
+
+def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, capsys):
+    class DummyStudy:
+        def optimize(self, *args, **kwargs):
+            raise MemoryError("simulated sampler pressure")
+
+    class DummyJob:
+        released = False
+
+        def _release_memory_pressure(self):
+            DummyJob.released = True
+
+        @staticmethod
+        def objective(trial):
+            return 1.0
+
+    monkeypatch.setattr(optimizer, "HAS_JOURNAL", True)
+    monkeypatch.setattr(optimizer, "JournalStorage", lambda backend: object())
+    monkeypatch.setattr(optimizer, "JournalFileBackendCls", lambda log_file: object())
+    monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
+    monkeypatch.setattr(optimizer, "TPESampler", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
+    monkeypatch.setattr(optimizer.OptimizationJob, "from_worker_payload", lambda payload: DummyJob())
+    monkeypatch.setattr(optimizer.OptimizationJob, "_cleanup_shared_segments", lambda handles, unlink=False: None)
+
+    payload = {
+        "args": _build_args(strategy="dummy.strategy", risk=None),
+        "train_datas": {},
+        "log_enabled": False,
+    }
+
+    result = optimizer._optimize_worker_entry(
+        payload,
+        study_name="dummy-study",
+        log_file="dummy.log",
+        n_trials=10,
+        worker_idx=2,
+        sampler_seed=123,
+    )
+
+    out = capsys.readouterr().out
+    assert result["stopped_early"] is True
+    assert result["reason"] == "memory_pressure"
+    assert DummyJob.released is True
+    assert "memory pressure" in out
+
+
+def test_multiprocess_optimization_absorbs_remote_memory_error(monkeypatch, capsys):
+    class DummyFuture:
+        cancelled = False
+
+        def result(self):
+            raise MemoryError("remote worker oom")
+
+        def cancel(self):
+            self.cancelled = True
+
+    class DummyExecutor:
+        _processes = {}
+        shutdown_called = False
+
+        def __init__(self, max_workers=None, mp_context=None):
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+
+        def submit(self, *args, **kwargs):
+            return future
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            DummyExecutor.shutdown_called = True
+
+    future = DummyFuture()
+    monkeypatch.setattr(optimizer, "ProcessPoolExecutor", DummyExecutor)
+    monkeypatch.setattr(optimizer, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(optimizer.mp, "get_context", lambda method: object())
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(study_name="dummy-study")
+    job._build_worker_payload = lambda: {"train_datas": {}}
+    job._build_spawn_shared_payload = lambda payload: (payload, [])
+
+    job._run_multiprocess_optimization(n_jobs=1, n_trials=1, log_file="dummy.log")
+
+    out = capsys.readouterr().out
+    assert "memory pressure" in out
+    assert "Completed trials" in out
+    assert future.cancelled is True
+    assert DummyExecutor.shutdown_called is True
+
+
+def test_multiprocess_optimization_absorbs_broken_worker_pool(monkeypatch, capsys):
+    class DummyFuture:
+        cancelled = False
+
+        def result(self):
+            raise optimizer.BrokenProcessPool("worker died")
+
+        def cancel(self):
+            self.cancelled = True
+
+    class DummyExecutor:
+        _processes = {}
+        shutdown_called = False
+
+        def __init__(self, max_workers=None, mp_context=None):
+            self.max_workers = max_workers
+            self.mp_context = mp_context
+
+        def submit(self, *args, **kwargs):
+            return future
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            DummyExecutor.shutdown_called = True
+
+    future = DummyFuture()
+    monkeypatch.setattr(optimizer, "ProcessPoolExecutor", DummyExecutor)
+    monkeypatch.setattr(optimizer, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(optimizer.mp, "get_context", lambda method: object())
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(study_name="dummy-study")
+    job._build_worker_payload = lambda: {"train_datas": {}}
+    job._build_spawn_shared_payload = lambda payload: (payload, [])
+
+    job._run_multiprocess_optimization(n_jobs=1, n_trials=1, log_file="dummy.log")
+
+    out = capsys.readouterr().out
+    assert "Worker process exited unexpectedly" in out
+    assert "Completed trials" in out
+    assert future.cancelled is True
+    assert DummyExecutor.shutdown_called is True

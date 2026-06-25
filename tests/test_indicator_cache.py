@@ -93,3 +93,16 @@ def test_get_cached_indicator_series_recomputes_in_live_mode():
     indicator_cache.get_cached_indicator_series(strategy, data, "score", (5,), compute)
 
     assert calls["count"] == 2
+
+
+def test_bounded_indicator_cache_evicts_oldest_entry():
+    cache = indicator_cache.BoundedIndicatorCache(max_entries=2)
+
+    cache["a"] = 1
+    cache["b"] = 2
+    assert cache.get("a") == 1
+    cache["c"] = 3
+
+    assert "a" in cache
+    assert "b" not in cache
+    assert "c" in cache
