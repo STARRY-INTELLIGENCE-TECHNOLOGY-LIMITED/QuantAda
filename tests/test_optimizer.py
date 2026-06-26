@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-import common.optimizer as optimizer
+import optimizer.runtime as optimizer
 import common.process_elevation as process_elevation
 import common.terminal_log as terminal_log
 from common.terminal_log import configure_text_stream_error_handling
@@ -127,6 +127,14 @@ def test_run_optimizer_mode_prints_test_backtest_section(monkeypatch, capsys):
     assert "20240101->20241231" in out
     assert "20250101 -> 20250331" in out
     assert "当前基准" in out
+    assert "运行概要 (RUN SUMMARY)" in out
+    assert "Metrics requested:  1" in out
+    assert "Metrics completed:  1" in out
+    assert "Completed trials:   5" in out
+    assert "MainEval reports:   2" in out
+    assert "TestSet reports:    2" in out
+    assert "Yearly reports:     4" in out
+    assert "Optuna log files:   1" in out
 
 
 def test_run_optimizer_mode_skips_test_backtest_section_without_test_config(monkeypatch, capsys):
@@ -1088,18 +1096,41 @@ def test_optimizer_run_uses_default_tpe_candidates_for_short_runs(monkeypatch):
     assert sampler_kwargs["n_ei_candidates"] == optimizer.OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
 
 
-def test_tpe_candidates_drop_only_for_long_runs():
+def test_tpe_candidates_drop_only_for_spawn_payload_copy_long_runs():
     assert (
-        optimizer.OptimizationJob._resolve_tpe_n_ei_candidates(
-            optimizer.OptimizationJob.TPE_LONG_RUN_TRIAL_THRESHOLD - 1
+        optimizer.OptimizationJob._resolve_spawn_tpe_n_ei_candidates(
+            optimizer.OptimizationJob.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD,
+            shared_memory_enabled=True,
         )
         == optimizer.OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
     )
     assert (
-        optimizer.OptimizationJob._resolve_tpe_n_ei_candidates(
-            optimizer.OptimizationJob.TPE_LONG_RUN_TRIAL_THRESHOLD
+        optimizer.OptimizationJob._resolve_spawn_tpe_n_ei_candidates(
+            optimizer.OptimizationJob.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD - 1,
+            shared_memory_enabled=False,
         )
-        == optimizer.OptimizationJob.TPE_LONG_RUN_N_EI_CANDIDATES
+        == optimizer.OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
+    )
+    assert (
+        optimizer.OptimizationJob._resolve_spawn_tpe_n_ei_candidates(
+            optimizer.OptimizationJob.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD,
+            shared_memory_enabled=False,
+        )
+        == optimizer.OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
+    )
+    assert (
+        optimizer.OptimizationJob._resolve_spawn_tpe_n_ei_candidates(
+            optimizer.OptimizationJob.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD * 2,
+            shared_memory_enabled=False,
+        )
+        == 12
+    )
+    assert (
+        optimizer.OptimizationJob._resolve_spawn_tpe_n_ei_candidates(
+            optimizer.OptimizationJob.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD * 4,
+            shared_memory_enabled=False,
+        )
+        == optimizer.OptimizationJob.TPE_PAYLOAD_COPY_MIN_N_EI_CANDIDATES
     )
 
 
@@ -1232,3 +1263,79 @@ def test_multiprocess_optimization_absorbs_broken_worker_pool(monkeypatch, capsy
     assert "Completed trials" in out
     assert future.cancelled is True
     assert DummyExecutor.shutdown_called is True
+
+
+def test_multiprocess_optimization_keeps_default_tpe_candidates_when_spawn_shared(monkeypatch):
+    captured = {}
+
+    class DummyFuture:
+        def result(self):
+            return {"worker_idx": 1, "stopped_early": False}
+
+    class DummyExecutor:
+        _processes = {}
+
+        def __init__(self, max_workers=None, mp_context=None):
+            return None
+
+        def submit(self, *args, **kwargs):
+            captured["tpe_n_ei_candidates"] = args[-1]
+            return DummyFuture()
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    monkeypatch.setattr(optimizer, "ProcessPoolExecutor", DummyExecutor)
+    monkeypatch.setattr(optimizer, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(optimizer.mp, "get_context", lambda method: object())
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(study_name="dummy-study")
+    job._build_worker_payload = lambda: {"train_datas": {"AAPL": object()}}
+    job._build_spawn_shared_payload = lambda payload: ({"train_datas": None, "train_datas_shared": {}}, [object()])
+
+    job._run_multiprocess_optimization(
+        n_jobs=1,
+        n_trials=optimizer.OptimizationJob.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD,
+        log_file="dummy.log",
+    )
+
+    assert captured["tpe_n_ei_candidates"] == optimizer.OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
+
+
+def test_multiprocess_optimization_drops_tpe_candidates_only_when_spawn_payload_copies(monkeypatch):
+    captured = {}
+
+    class DummyFuture:
+        def result(self):
+            return {"worker_idx": 1, "stopped_early": False}
+
+    class DummyExecutor:
+        _processes = {}
+
+        def __init__(self, max_workers=None, mp_context=None):
+            return None
+
+        def submit(self, *args, **kwargs):
+            captured["tpe_n_ei_candidates"] = args[-1]
+            return DummyFuture()
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            return None
+
+    monkeypatch.setattr(optimizer, "ProcessPoolExecutor", DummyExecutor)
+    monkeypatch.setattr(optimizer, "as_completed", lambda futures: futures)
+    monkeypatch.setattr(optimizer.mp, "get_context", lambda method: object())
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(study_name="dummy-study")
+    job._build_worker_payload = lambda: {"train_datas": {"AAPL": object()}}
+    job._build_spawn_shared_payload = lambda payload: (payload, [])
+
+    job._run_multiprocess_optimization(
+        n_jobs=1,
+        n_trials=optimizer.OptimizationJob.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD * 2,
+        log_file="dummy.log",
+    )
+
+    assert captured["tpe_n_ei_candidates"] == 12

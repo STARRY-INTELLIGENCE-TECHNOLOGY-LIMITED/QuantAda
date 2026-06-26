@@ -368,6 +368,44 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
 
         return True
 
+    def print_run_summary():
+        completed_metrics = len(final_reports)
+        failed_metrics = max(0, total_metrics - completed_metrics)
+        completed_trials = 0
+        for report in final_reports:
+            try:
+                completed_trials += int(report.get('trials_completed') or 0)
+            except (TypeError, ValueError):
+                pass
+
+        main_eval_count = sum(1 for report in final_reports if report.get('main_eval_backtest') or report.get('recent_backtest'))
+        test_count = sum(1 for report in final_reports if report.get('test_backtest'))
+        yearly_count = sum(len(report.get('yearly_backtests') or []) for report in final_reports)
+        if baseline_report:
+            main_eval_count += 1
+        if baseline_test_report:
+            test_count += 1
+        yearly_count += len(baseline_yearly_reports or [])
+
+        dashboard_logs = []
+        for report in final_reports:
+            log_file = report.get('log_file')
+            if log_file and log_file not in dashboard_logs:
+                dashboard_logs.append(log_file)
+
+        print("\n>>> 运行概要 (RUN SUMMARY) <<<")
+        print(f"Metrics requested:  {total_metrics}")
+        print(f"Metrics completed:  {completed_metrics}")
+        print(f"Metrics failed:     {failed_metrics}")
+        print(f"Completed trials:   {completed_trials}")
+        print(f"MainEval reports:   {main_eval_count}")
+        print(f"TestSet reports:    {test_count}")
+        print(f"Yearly reports:     {yearly_count}")
+        print(f"Baseline included:  {'yes' if explicit_params_passed else 'no'}")
+        print(f"Optuna log files:   {len(dashboard_logs)}")
+        for log_file in dashboard_logs:
+            print(f"  - {log_file}")
+
     if is_multi_metric:
         log_dir = os.path.join(os.getcwd(), config.DATA_PATH, 'optuna')
         os.makedirs(log_dir, exist_ok=True)
@@ -609,6 +647,8 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
             for log_file in dashboard_logs:
                 print(f"optuna-dashboard {log_file}")
 
+            print_run_summary()
+
             # 多 metric 场景只在末尾弹一次 Dashboard（共享 Journal 可聚合全部 metric）
             if is_multi_metric and dashboard_launcher_job and dashboard_logs:
                 final_log = shared_dashboard_log_file or dashboard_logs[0]
@@ -629,9 +669,10 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
                     print(f"[Warning] Aggregated dashboard log file not found: {final_log}")
         else:
             print("[警告] 当前仅有基准回测结果，训练指标未返回结果。")
+            print_run_summary()
     else:
         print("\n[警告] 所有指标均未返回结果")
-
+        print_run_summary()
     return 0
 
 
@@ -642,8 +683,8 @@ class OptimizationJob:
     DEFAULT_WARMUP_DAYS = 400
     OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES = 512
     TPE_DEFAULT_N_EI_CANDIDATES = 24
-    TPE_LONG_RUN_N_EI_CANDIDATES = 12
-    TPE_LONG_RUN_TRIAL_THRESHOLD = 10000
+    TPE_PAYLOAD_COPY_MIN_N_EI_CANDIDATES = 8
+    TPE_PAYLOAD_COPY_TRIAL_THRESHOLD = 10000
 
     def __init__(self, args, fixed_params, opt_params_def, risk_params, shared_context=None):
         self.args = args
@@ -759,15 +800,18 @@ class OptimizationJob:
         gc.collect()
 
     @classmethod
-    def _resolve_tpe_n_ei_candidates(cls, n_trials):
+    def _resolve_spawn_tpe_n_ei_candidates(cls, n_trials, shared_memory_enabled):
         try:
             n_trials = int(n_trials)
         except (TypeError, ValueError):
             n_trials = 0
 
-        if n_trials >= cls.TPE_LONG_RUN_TRIAL_THRESHOLD:
-            return cls.TPE_LONG_RUN_N_EI_CANDIDATES
-        return cls.TPE_DEFAULT_N_EI_CANDIDATES
+        if shared_memory_enabled or n_trials < cls.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD:
+            return cls.TPE_DEFAULT_N_EI_CANDIDATES
+
+        scale = max(1.0, n_trials / float(cls.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD))
+        candidates = int(round(cls.TPE_DEFAULT_N_EI_CANDIDATES / max(1.0, math.log2(scale) + 1.0)))
+        return max(cls.TPE_PAYLOAD_COPY_MIN_N_EI_CANDIDATES, candidates)
 
     @staticmethod
     def _get_total_cpu_cores():
@@ -1058,7 +1102,6 @@ class OptimizationJob:
         n_trials,
         log_file,
         prefer_fork_cow=False,
-        tpe_n_ei_candidates=None,
     ):
         if not log_file:
             raise RuntimeError("Multi-process mode requires a shared JournalStorage log file.")
@@ -1103,7 +1146,22 @@ class OptimizationJob:
             if shared_parent_handles:
                 print("[Optimizer] Spawn mode: train_datas shared via multiprocessing.shared_memory.")
             else:
-                print("[Optimizer] Spawn mode: fallback to payload copy (non-sharable dtype detected).")
+                print(
+                    "[Optimizer] Spawn mode: shared_memory unavailable; "
+                    "falling back to payload copy so training can continue."
+                )
+
+        spawn_shared_memory_enabled = start_method != "spawn" or bool(shared_parent_handles)
+        tpe_n_ei_candidates = self._resolve_spawn_tpe_n_ei_candidates(
+            n_trials,
+            shared_memory_enabled=spawn_shared_memory_enabled,
+        )
+        if tpe_n_ei_candidates != self.TPE_DEFAULT_N_EI_CANDIDATES:
+            print(
+                "[Optimizer] Payload-copy memory guard enabled: "
+                f"n_ei_candidates={tpe_n_ei_candidates} "
+                f"(n_trials={n_trials}, default={self.TPE_DEFAULT_N_EI_CANDIDATES})"
+            )
 
         executor = None
         interrupted = False
@@ -2352,19 +2410,11 @@ class OptimizationJob:
             if n_trials <= 0:
                 raise ValueError(f"n_trials must be a positive integer, got: {n_trials}")
 
-        tpe_n_ei_candidates = self._resolve_tpe_n_ei_candidates(n_trials)
-        if tpe_n_ei_candidates != self.TPE_DEFAULT_N_EI_CANDIDATES:
-            print(
-                "[Optimizer] Long-run TPE memory guard enabled: "
-                f"n_ei_candidates={tpe_n_ei_candidates} "
-                f"(n_trials={n_trials}, default={self.TPE_DEFAULT_N_EI_CANDIDATES})"
-            )
-
         # 使用 TPESampler(constant_liar=True)
         # 这会防止多个 Worker 同时采样到同一个点（并发踩踏）
         sampler = TPESampler(
             constant_liar=True,
-            n_ei_candidates=tpe_n_ei_candidates,
+            n_ei_candidates=self.TPE_DEFAULT_N_EI_CANDIDATES,
         )
 
         # 2. 创建 Study (包裹 try-except 以捕获 Windows 权限错误)
@@ -2440,7 +2490,6 @@ class OptimizationJob:
                     n_trials=n_trials,
                     log_file=log_file,
                     prefer_fork_cow=(not auto_launch_dashboard),
-                    tpe_n_ei_candidates=tpe_n_ei_candidates,
                 )
             else:
                 # 单核/单并行场景回退为单进程线程模式（与历史版本一致）
@@ -2576,7 +2625,7 @@ def _optimize_worker_entry(
 
         storage = JournalStorage(JournalFileBackendCls(log_file))
         if tpe_n_ei_candidates is None:
-            tpe_n_ei_candidates = OptimizationJob._resolve_tpe_n_ei_candidates(n_trials)
+            tpe_n_ei_candidates = OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
         sampler = TPESampler(
             constant_liar=True,
             seed=sampler_seed,

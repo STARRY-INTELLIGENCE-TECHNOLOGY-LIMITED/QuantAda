@@ -21,7 +21,7 @@
 2. worker 的日志 tee 同样必须异步，不能引入跨进程锁等待作为训练主路径依赖。
 3. worker 遇到内存压力时应停止本轮 worker 并保留已写入 JournalStorage 的 completed trials；父进程可用已完成结果继续生成报告，不应把已有训练成果丢弃。
 4. worker 因内存压力导致进程池破裂或异常退出时，父进程应停止当前 metric 的剩余 worker，并继续使用 JournalStorage 中已完成的 trials；不应把该 metric 直接判为致命崩溃。
-5. TPE `n_ei_candidates` 应保守动态调整：普通训练保持 Optuna 默认候选数，仅在长跑 trial 规模下启用较低候选数以降低历史采样内存峰值。
+5. TPE `n_ei_candidates` 应保守动态调整：普通训练与共享内存可用的多进程训练保持 Optuna 默认候选数；仅在长跑 trial 规模且 spawn 数据共享不可用、需要回退 payload copy 时，按 trial 规模做对数降档以降低内存峰值。
 
 ## 4. Validation Reports
 1. 优化器最终摘要应同时输出训练后主回测（MainEval）、测试集回测和年度固定窗口回测，方便人工或 AI 直接分析参数稳定性。

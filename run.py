@@ -8,7 +8,7 @@ import pandas as pd
 
 import config
 from backtest.backtester import Backtester
-from common import optimizer
+import optimizer
 from common.loader import get_class_from_name, pascal_to_snake
 from common.terminal_log import configure_text_stream_error_handling
 from data_providers.manager import DataManager
