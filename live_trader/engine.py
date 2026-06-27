@@ -13,6 +13,7 @@ from common.log import extract_order_execution_dt, format_dt
 from data_providers.base_provider import BaseDataProvider
 from data_providers.manager import DataManager
 from live_trader.adapters.base_broker import BaseLiveBroker
+from live_trader.data_bridge.data_warm import SchedulePlanner
 from live_trader.data_bridge.provider_bridge import _DataManagerProvider, _DataManagerProxy
 from run import get_class_from_name
 
@@ -481,7 +482,14 @@ class LiveTrader:
 
         try:
             import pandas as pd
-            if timeframe == 'Minutes':
+            schedule_rule = self.config.get('schedule_rule')
+            parsed_schedule = SchedulePlanner.parse_schedule_rule(schedule_rule) if schedule_rule else None
+            if parsed_schedule:
+                anchor_now = pd.Timestamp(context.now) + pd.Timedelta(seconds=1)
+                next_expected = SchedulePlanner.resolve_next_schedule_slot(anchor_now, parsed_schedule)
+                if next_expected is not None:
+                    next_expected_str = pd.Timestamp(next_expected).strftime('%Y-%m-%d %H:%M:%S')
+            elif timeframe == 'Minutes':
                 next_expected = context.now + pd.Timedelta(minutes=compression)
                 next_expected_str = next_expected.strftime('%Y-%m-%d %H:%M:%S')
             elif timeframe == 'Days':

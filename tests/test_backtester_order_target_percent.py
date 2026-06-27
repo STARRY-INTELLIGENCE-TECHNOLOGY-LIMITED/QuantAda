@@ -61,6 +61,22 @@ class _WarmupProbeStrategy(BaseStrategy):
         self.__class__.seen_dates.append(self.broker.datas[0].datetime.datetime(0))
 
 
+class _BuyThenSellProbeStrategy(BaseStrategy):
+    def init(self):
+        self.phase = 0
+
+    def next(self):
+        data = self.broker.datas[0]
+        if self.phase == 0:
+            self.broker.order_target_value(data=data, target=100.0)
+            self.phase = 1
+            return
+
+        if self.phase == 1 and self.broker.getposition(data).size > 0:
+            self.broker.order_target_value(data=data, target=0.0)
+            self.phase = 2
+
+
 class _InsufficientCashBuyProbeStrategy(BaseStrategy):
     skip_reason = None
 
@@ -220,6 +236,71 @@ def test_backtester_keeps_full_dataname_while_feed_starts_at_start_date():
         "20240110",
     ]
     assert bt.get_performance_metrics()["start_date"] == pd.Timestamp("2024-01-06").to_pydatetime()
+
+
+def test_backtester_prints_trade_attribution_before_performance_metrics(monkeypatch, capsys):
+    monkeypatch.setattr(config, 'LOT_SIZE', 1)
+
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02', '2024-01-03', '2024-01-04'])
+    df = pd.DataFrame(
+        {
+            'open': [100.0, 100.0, 100.0, 100.0],
+            'high': [100.0, 100.0, 100.0, 100.0],
+            'low': [100.0, 90.0, 95.0, 100.0],
+            'close': [100.0, 110.0, 120.0, 120.0],
+            'volume': [1.0, 1.0, 1.0, 1.0],
+        },
+        index=idx,
+    )
+
+    bt = Backtester(
+        datas={'AAA': df},
+        strategy_class=_BuyThenSellProbeStrategy,
+        cash=1000.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+    )
+    bt.run()
+
+    closed_trades = bt.get_closed_trades()
+    assert len(closed_trades) == 1
+    assert closed_trades[0]["symbol"] == "AAA"
+    assert closed_trades[0]["lowest_price_during_trade"] == 90.0
+
+    bt.display_results()
+    out = capsys.readouterr().out
+    assert "Trade Attribution by Symbol" in out
+    assert "Winning Trade MAE Statistics" in out
+    assert out.index("Trade Attribution by Symbol") < out.index("Backtest Performance Metrics")
+
+
+def test_backtester_results_report_keeps_attribution_above_performance_metrics():
+    from backtest.reporting import format_backtest_results_report
+
+    metrics = {
+        "start_date": pd.Timestamp("2024-01-01"),
+        "end_date": pd.Timestamp("2024-01-31"),
+        "initial_portfolio": 1000.0,
+        "final_portfolio": 1100.0,
+        "total_return": 0.1,
+        "annual_return": 1.2,
+        "sharpe_ratio": 2.0,
+        "max_drawdown": -0.05,
+        "calmar_ratio": 24.0,
+        "total_trades": 3,
+        "win_rate": 66.666,
+        "profit_factor": 2.5,
+        "pnl_ratio": 1.8,
+    }
+
+    report = format_backtest_results_report(metrics, attribution_report="Trade Attribution by Symbol")
+
+    assert "Trade Attribution by Symbol" in report
+    assert "Backtest Performance Metrics" in report
+    assert report.index("Trade Attribution by Symbol") < report.index("Backtest Performance Metrics")
+    assert " Total Return:         10.00%" in report
 
 
 def test_order_target_value_marks_insufficient_cash_for_min_lot(monkeypatch):

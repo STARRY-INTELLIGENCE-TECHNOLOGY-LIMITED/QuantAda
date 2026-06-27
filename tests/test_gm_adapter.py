@@ -932,6 +932,83 @@ def test_gm_start_alarm_is_sent_once_across_phoenix_restarts(monkeypatch, capsys
     assert "GM shutdown callback received. Restarting session" in captured.out
 
 
+def test_gm_schedule_callback_runs_once_per_schedule_slot(monkeypatch, capsys):
+    """
+    GM schedule 在同一日线 slot 内可能重复回调；同一 slot 只能执行一次策略，
+    防止调仓计划和通知按秒刷屏。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    run_times = []
+    scheduled_callbacks = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.broker = SimpleNamespace(datas=[SimpleNamespace(_name="SHSE.600000")])
+
+        def init(self, ctx):
+            return None
+
+        def run(self, ctx):
+            run_times.append(ctx.now)
+
+    def _schedule(schedule_func, date_rule, time_rule):
+        scheduled_callbacks.append(schedule_func)
+
+    def _poll_repeated_schedule_callbacks_then_stop():
+        fake_context.init_fun(fake_context)
+        schedule_run = scheduled_callbacks[-1]
+        for second in (4, 5, 6):
+            fake_context.now = datetime.datetime(2026, 6, 26, 14, 49, second)
+            schedule_run(fake_context)
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_repeated_schedule_callbacks_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+
+    fake_gm_api = SimpleNamespace(schedule=_schedule)
+    monkeypatch.setitem(sys.modules, "gm.api", fake_gm_api)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id", "schedule": "1d:14:45:00"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert run_times == [datetime.datetime(2026, 6, 26, 14, 49, 4)]
+    assert captured.out.count("Duplicate schedule callback ignored for slot 2026-06-26 14:45:00") == 1
+
+
 def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception(monkeypatch, capsys):
     """
     GM 夜间非交易时段的实时行情连接失败应降噪:

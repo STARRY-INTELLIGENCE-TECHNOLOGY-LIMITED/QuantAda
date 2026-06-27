@@ -5,6 +5,7 @@ import backtrader as bt
 import pandas as pd
 
 import config
+from backtest.closed_trade_tracker import ClosedTradeTracker
 from backtest.plotting import (
     apply_data_feed_plot_scope,
     configure_plot_observers,
@@ -12,7 +13,8 @@ from backtest.plotting import (
     parse_plot_scopes,
     plot_cerebro,
 )
-from common.formatters import format_with_spec
+from backtest.reporting import format_backtest_results_report
+from backtest.trade_attribution import format_trade_micro_attribution_report
 from common import log
 
 
@@ -91,6 +93,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
         self.dataclose = self.datas[0].close
         self.strategy = strategy_class(broker=self, params=params)
         self.risk_controls = []
+        self.trade_tracker = ClosedTradeTracker(self)
+        self.closed_trades = self.trade_tracker.closed_trades
         if risk_control_classes:
             # 如果传入的是单个类（兼容旧代码），转为列表
             if not isinstance(risk_control_classes, list):
@@ -138,6 +142,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         # 仅在回测中，缓存当前 Bar 的账户总价值
         # 避免在调仓循环中重复对所有持仓资产进行市值核算的 O(N) 操作
         self.current_portfolio_value = self.broker.getvalue()
+        self.trade_tracker.update_active_lows()
 
         if self.actual_start_date is None:
             self.actual_start_date = self.datas[0].datetime.datetime(0)
@@ -180,12 +185,16 @@ class BacktraderStrategyWrapper(bt.Strategy):
         return order
 
     def notify_order(self, order):
+        self.trade_tracker.notify_order(order)
+
         for rc in self.risk_controls:
             rc.notify_order(OrderProxy(order))
 
         self.strategy.notify_order(OrderProxy(order))
 
     def notify_trade(self, trade):
+        self.trade_tracker.notify_trade(trade)
+
         for rc in self.risk_controls:
             rc.notify_trade(TradeProxy(trade))
 
@@ -825,6 +834,27 @@ class Backtester:
             "pnl_ratio": pnl_ratio,
         }
 
+    def get_closed_trades(self):
+        """
+        Return the closed-trade list exposed by the backtest stack, if present.
+        """
+        candidates = [getattr(self, "closed_trades", None)]
+        if getattr(self, "results", None):
+            strat = self.results[0]
+            candidates.append(getattr(strat, "closed_trades", None))
+            candidates.append(getattr(getattr(strat, "strategy", None), "closed_trades", None))
+
+        for candidate in candidates:
+            if candidate is not None:
+                return candidate
+        return None
+
+    def get_trade_micro_attribution_report(self):
+        closed_trades = self.get_closed_trades()
+        if closed_trades is None:
+            return None
+        return format_trade_micro_attribution_report(closed_trades)
+
     def display_results(self):
         """
         计算并展示详细的回测性能指标和图表。
@@ -834,21 +864,5 @@ class Backtester:
             print("Backtest generated no valid performance metrics.")
             return
 
-        print("\n" + "=" * 50)
-        print("            Backtest Performance Metrics")
-        print("=" * 50)
-        print(f" Time Frame:           {metrics['start_date'].strftime('%Y-%m-%d')} to {metrics['end_date'].strftime('%Y-%m-%d')}")
-        print(f" Initial Portfolio:    {metrics['initial_portfolio']:,.2f}")
-        print(f" Final Portfolio:      {metrics['final_portfolio']:,.2f}")
-        print("-" * 50)
-        print(f" Total Return:         {format_with_spec(metrics['total_return'], '.2%')}")
-        print(f" Annualized Return:    {format_with_spec(metrics['annual_return'], '.2%')}")
-        print(f" Sharpe Ratio:         {format_with_spec(metrics['sharpe_ratio'], '.2f')}")
-        print(f" Max Drawdown:         {format_with_spec(metrics['max_drawdown'], '.2%')}")
-        print(f" Calmar Ratio:         {format_with_spec(metrics['calmar_ratio'], '.2f')}")
-        print("-" * 50)
-        print(f" Total Trades:         {metrics['total_trades']}")
-        print(f" Win Rate:             {format_with_spec(metrics['win_rate'], '.2f')}%")
-        print(f" Profit Factor:        {format_with_spec(metrics['profit_factor'], '.2f')}")
-        print(f" Avg. Win / Avg. Loss: {format_with_spec(metrics['pnl_ratio'], '.2f')}")
-        print("=" * 50 + "\n")
+        attribution_report = self.get_trade_micro_attribution_report()
+        print(format_backtest_results_report(metrics, attribution_report=attribution_report))

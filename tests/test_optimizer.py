@@ -49,6 +49,20 @@ def _sample_metrics(start="20250101", end="20250331"):
     }
 
 
+def _sample_trade_attribution_report():
+    return (
+        "\n==================================================\n"
+        "          Trade Attribution by Symbol\n"
+        "==================================================\n"
+        "+--------+--------+----------+-----+---------+-------------+\n"
+        "| Symbol | Trades | Win Rate |  PF | Net PnL | PnL Contrib |\n"
+        "+--------+--------+----------+-----+---------+-------------+\n"
+        "| AAPL   |      1 |  100.00% | Inf |   10.00 |     100.00% |\n"
+        "+--------+--------+----------+-----+---------+-------------+\n"
+        "==================================================\n"
+    )
+
+
 class _DummyOptimizationJob:
     def __init__(self, args, fixed_params, opt_params_def, risk_params, shared_context=None):
         self.args = args
@@ -76,13 +90,17 @@ class _DummyOptimizationJob:
         }
 
     def _run_main_eval_backtest(self, params):
-        return _sample_metrics(start="20230101", end="20251231")
+        metrics = _sample_metrics(start="20230101", end="20251231")
+        metrics["trade_micro_attribution_report"] = _sample_trade_attribution_report()
+        return metrics
 
     def _run_recent_3y_backtest(self, params):
         return self._run_main_eval_backtest(params)
 
     def _run_test_set_backtest(self, params, verbose=False):
-        return _sample_metrics(start="20250101", end="20250331")
+        metrics = _sample_metrics(start="20250101", end="20250331")
+        metrics["trade_micro_attribution_report"] = _sample_trade_attribution_report()
+        return metrics
 
     def _run_yearly_validation_backtests(self, params):
         return self.yearly_backtests
@@ -93,9 +111,9 @@ class _DummyOptimizationJob:
             "best_params": {"lookback": 20},
             "trials_completed": 5,
             "log_file": "dummy.log",
-            "main_eval_backtest": _sample_metrics(start="20230101", end="20251231"),
-            "recent_backtest": _sample_metrics(start="20230101", end="20251231"),
-            "test_backtest": _sample_metrics(start="20250101", end="20250331"),
+            "main_eval_backtest": self._run_main_eval_backtest({"lookback": 20}),
+            "recent_backtest": self._run_main_eval_backtest({"lookback": 20}),
+            "test_backtest": self._run_test_set_backtest({"lookback": 20}),
             "yearly_backtests": self.yearly_backtests,
         }
 
@@ -124,6 +142,9 @@ def test_run_optimizer_mode_prints_test_backtest_section(monkeypatch, capsys):
     assert code == 0
     assert "测试集回测结果" in out
     assert "年度固定窗口回测结果" in out
+    assert "TRADE MICRO ATTRIBUTION" in out
+    assert "Trade Attribution by Symbol" in out
+    assert out.index("TRADE MICRO ATTRIBUTION") < out.index("=== 请将上文提供给AI辅助分析 ===")
     assert "20240101->20241231" in out
     assert "20250101 -> 20250331" in out
     assert "当前基准" in out

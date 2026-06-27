@@ -702,6 +702,8 @@ class GmBrokerAdapter(BaseLiveBroker):
                 engine_config['params'] = params
                 engine_config['platform'] = 'gm'
                 engine_config['_suppress_start_alarm'] = launch_state.get('start_alarm_sent', False)
+                if schedule_rule:
+                    engine_config['schedule_rule'] = schedule_rule
                 ctx.use_schedule = False
 
                 # 将资金和费率头传到 LiveTrader 引擎
@@ -801,7 +803,28 @@ class GmBrokerAdapter(BaseLiveBroker):
                                     )
 
                                 schedule(schedule_func=_run_prewarm, date_rule=rule_type, time_rule=prewarm_time_rule)
-                            schedule(schedule_func=trader.run, date_rule=rule_type, time_rule=rule_time)
+
+                            def _run_scheduled(schedule_ctx):
+                                if parsed_schedule:
+                                    now_value = getattr(schedule_ctx, 'now', None) or datetime.datetime.now()
+                                    now_ts = pd.Timestamp(now_value)
+                                    slot_dt = SchedulePlanner.resolve_current_schedule_slot(now_ts, parsed_schedule)
+                                    if slot_dt is not None:
+                                        slot_ts = pd.Timestamp(slot_dt)
+                                        delta = (now_ts - slot_ts).total_seconds()
+                                        slot_key = SchedulePlanner.format_schedule_slot_key(slot_ts)
+                                        if delta < 0:
+                                            return
+                                        if launch_state.get('last_schedule_run_key') == slot_key:
+                                            if launch_state.get('last_schedule_skip_log_key') != slot_key:
+                                                print(f"[GmBroker] Duplicate schedule callback ignored for slot {slot_key}.")
+                                                launch_state['last_schedule_skip_log_key'] = slot_key
+                                            return
+                                        launch_state['last_schedule_run_key'] = slot_key
+
+                                trader.run(schedule_ctx)
+
+                            schedule(schedule_func=_run_scheduled, date_rule=rule_type, time_rule=rule_time)
                             ctx.use_schedule = True
                         else:
                             print(f"[GmBroker Warning] 定时配置格式错误 (应为 freq:time): {schedule_rule}")
