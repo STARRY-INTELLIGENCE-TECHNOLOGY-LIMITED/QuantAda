@@ -452,16 +452,16 @@ def test_ib_get_cash_respects_virtual_ledger():
     )
 
 
-def test_ib_safety_multiplier_floor_is_1_05():
+def test_ib_safety_multiplier_is_1_0():
     """
-    安全垫回归:
-    IB 适配器买入估算安全垫应至少为 1.05，降低 Error 201 概率。
+    资金利用率回归:
+    IB 适配器买入估算不再额外保留资金，交由整数股取整和拒单降级兜底。
     """
     context = types.SimpleNamespace(ib_instance=DummyIBForCash(cash_usd=10000.0))
     broker = IBBrokerAdapter(context=context)
 
-    assert broker.safety_multiplier == pytest.approx(1.05), (
-        "IB safety_multiplier 下限应为 1.05。"
+    assert broker.safety_multiplier == pytest.approx(1.0), (
+        "IB safety_multiplier 应为 1.0，避免调仓阶段过度保留现金。"
     )
 
 

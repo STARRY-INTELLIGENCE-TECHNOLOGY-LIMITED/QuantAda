@@ -43,7 +43,7 @@ QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并�
 
 ### 范式 A: 独立标的信号驱动 (Signal-Driven Targeting)
 适用于：单标的策略、CTA 趋势跟随、简单的突破买入策略。
-- **使用方法**: 直接调用 Broker 的目标方法。引擎会自动处理当前持仓与目标仓位的差额，并计算安全垫。
+- **使用方法**: 直接调用 Broker 的目标方法。引擎会自动处理当前持仓与目标仓位的差额，并估算手续费/滑点占资。
   - `self.broker.order_target_percent(data, target_pct)`：将特定标的调整至占总资产的指定比例（如 `0.5` 代表 50%）。平仓传入 `0.0`。
   - `self.broker.order_target_value(data, target_value)`：将特定标的调整至指定的绝对金额市值。
 
@@ -56,7 +56,7 @@ QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并�
     - 固定频率：在 `params` 里设置 `rebalance_when='bar'|'daily'|'weekly'|'monthly'`
     - next rebalance：若策略知道“这次是不是正式调仓”，直接传 `self.execute_rebalance(..., rebalance_when='next' if is_rebalance_day else 'skip')`
     - 这样闲置资金会等到下一次正式调仓才参与补仓，而不是在中间普通运行周期被动补仓
-  - **优势**: 该方法会自动处理资金安全垫与在途订单，拒单时同 K 线内会触发自动降级重提；若仍失败则放弃本 K，下一根 K 再评估。
+  - **优势**: 该方法会自动处理资金占用与在途订单，拒单时同 K 线内会触发自动降级重提；若仍失败则放弃本 K，下一根 K 再评估。
   - **重要**: 如果你的策略真的需要“不等权”的目标权重，请改用范式 A 的 `order_target_percent/value`，不要伪造 `self.execute_rebalance(target_percents)` 这类旧接口调用。
 
 ---

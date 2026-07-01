@@ -199,8 +199,8 @@ def test_gm_submit_order_live_limit_with_auto_downsize(monkeypatch):
     call = order_calls[0]
 
     expected_freeze_price = round(10.0 * (1 + 0.01), 4)  # 实盘 BUY 限价
-    expected_buffer_rate = 1.0 + 0.0003 + 0.002
-    expected_volume = int(20300.0 / (expected_freeze_price * expected_buffer_rate) // 100) * 100
+    expected_cost_multiplier = 1.0 + 0.0003
+    expected_volume = int(20300.0 / (expected_freeze_price * expected_cost_multiplier) // 100) * 100
 
     assert call["order_type"] == mock_gm_api.OrderType_Limit, "实盘应使用限价单。"
     assert call["price"] == pytest.approx(expected_freeze_price), "实盘 BUY 限价计算不正确。"
@@ -337,9 +337,9 @@ def test_gm_secondary_downsize_updates_active_buy_and_virtual_ledger(monkeypatch
     broker = GmBrokerAdapter(context=MagicMock(), slippage_override=0.01, commission_override=0.0003)
     broker.is_live = True
     # 关键构造:
-    # - 基类 _smart_buy_value 看到 cash=10123.10 时不会先降仓
+    # - 基类 _smart_buy_value 看到 cash=10103.01 时不会先降仓
     # - GM _submit_order 用更贴近实盘的 freeze_price 二次校验后，会把 1000 股降到 900
-    monkeypatch.setattr(broker, "_fetch_real_cash", lambda: 10123.10)
+    monkeypatch.setattr(broker, "_fetch_real_cash", lambda: 10103.01)
     monkeypatch.setattr(broker, "get_current_price", lambda data: 10.0)
     monkeypatch.setattr(broker, "get_pending_orders", lambda: [])
 

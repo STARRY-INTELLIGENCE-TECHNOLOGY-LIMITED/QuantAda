@@ -112,6 +112,16 @@ def _force_lot_size_100(monkeypatch):
     monkeypatch.setattr(config, "LOT_SIZE", 100)
 
 
+def test_base_safety_multiplier_has_no_fixed_cash_buffer():
+    """
+    资金利用率回归:
+    默认 live broker 只估算滑点和手续费，不再额外固定保留 0.2% 现金。
+    """
+    broker = MockBroker(initial_cash=100000.0)
+
+    assert broker.safety_multiplier == pytest.approx(1.0013)
+
+
 def test_stateless_buy_skips_when_cash_insufficient_even_with_pending_sell():
     """
     无状态回归:
@@ -608,7 +618,7 @@ def test_cash_override_and_virtual_ledger_exhaustion():
     # 模拟策略资金池只保留 override 额度口径，确保虚拟账本可直接消耗该额度。
     broker.mock_cash = 20000.0
     cash_after_first = broker.get_cash()
-    assert cash_after_first < 5000.0 + 1.0, "第一笔后剩余可用额度应约为 5000（含安全垫误差）"
+    assert cash_after_first < 5000.0 + 1.0, "第一笔后剩余可用额度应约为 5000（含费用估算误差）"
 
     # 这里直接调用 _smart_buy_value，隔离验证“资金不足 -> 自动降级”逻辑，
     # 避免被 expected_size 的在途仓位穿透规则改写为卖出分支。

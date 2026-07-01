@@ -227,15 +227,6 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         return total_size
 
-    def _live_buy_cash_buffer_rate(self):
-        """
-        GM 实盘买单二次资金校验:
-        - freeze_price 已经包含委托滑点
-        - 此处仅追加手续费与绝对防线，避免重复计入滑点导致小资金过度降仓
-        """
-        comm = self._commission_override if self._commission_override is not None else 0.0003
-        return 1.0 + comm + 0.002
-
     def getcash(self):
         """ 获取可用资金 (Backtrader 命名风格)"""
         return self._fetch_real_cash()
@@ -424,9 +415,13 @@ class GmBrokerAdapter(BaseLiveBroker):
             if available_cash < 0:
                 available_cash = 0.0
 
-            # 实盘下 freeze_price 已含滑点，此处仅补手续费与绝对防线，避免重复计入滑点。
-            buffer_rate = self._live_buy_cash_buffer_rate() if self.is_live else self.safety_multiplier
-            estimated_cost = volume * freeze_price * buffer_rate
+            # 实盘下 freeze_price 已含滑点，此处仅补手续费，避免重复计入滑点。
+            if self.is_live:
+                comm = self._commission_override if self._commission_override is not None else 0.0003
+                cost_multiplier = 1.0 + comm
+            else:
+                cost_multiplier = self.safety_multiplier
+            estimated_cost = volume * freeze_price * cost_multiplier
 
             if freeze_price <= 0:
                 print(f"[GmBroker Warning] 无法获取 {data._name} 的有效价格 (price={price})，拒绝计算并跳过发单。")
@@ -437,9 +432,9 @@ class GmBrokerAdapter(BaseLiveBroker):
                 lot_size = max(1, int(getattr(config, 'LOT_SIZE', 100) or 1))
                 # 倒推最大股数
                 if lot_size > 1:
-                    volume = int(available_cash / (freeze_price * buffer_rate) // lot_size) * lot_size
+                    volume = int(available_cash / (freeze_price * cost_multiplier) // lot_size) * lot_size
                 else:
-                    volume = int(available_cash / (freeze_price * buffer_rate))
+                    volume = int(available_cash / (freeze_price * cost_multiplier))
 
                 min_volume = lot_size if lot_size > 1 else 1
                 if volume < min_volume:

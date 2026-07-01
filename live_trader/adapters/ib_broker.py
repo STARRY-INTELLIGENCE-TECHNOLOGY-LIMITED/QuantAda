@@ -151,10 +151,8 @@ class IBBrokerAdapter(BaseLiveBroker):
 
     @property
     def safety_multiplier(self):
-        """
-        IB 资金预估使用更保守口径，降低 Error 201 概率。
-        """
-        return max(super().safety_multiplier, 1.05)
+        """IB 使用精确现金估算；超额买单交由同 bar 降级重试处理。"""
+        return 1.0
 
     @staticmethod
     def _normalize_account(account_raw) -> str:
@@ -625,7 +623,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                         if p and p > 0:
                             price = p
 
-                    # 如果成功获取价格，累加冻结金额（使用统一安全垫）
+                    # 如果成功获取价格，累加在途买单估算占资。
                     if price > 0:
                         virtual_frozen_cash += size * price * self.safety_multiplier
                         if poid:

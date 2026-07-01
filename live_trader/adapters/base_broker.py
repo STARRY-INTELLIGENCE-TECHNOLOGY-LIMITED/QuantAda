@@ -81,12 +81,11 @@ class BaseLiveBroker(ABC):
     @property
     def safety_multiplier(self):
         """
-        动态计算买入资金安全垫：
-        1.0 + 委托滑点 + 手续费率 + 绝对防线(0.2%，抵御A股不足5元收5元等边缘情况)
+        买入资金成本估算倍率：1.0 + 委托滑点 + 手续费率。
         """
         comm = self._commission_override if self._commission_override is not None else 0.0003
         slip = self._slippage_override if self._slippage_override is not None else 0.001
-        return 1.0 + slip + comm + 0.002
+        return 1.0 + slip + comm
 
     def log(self, txt, dt=None):
         """
@@ -344,13 +343,12 @@ class BaseLiveBroker(ABC):
         """智能买入核心逻辑：资金检查 + 自动降级 + 提交记账"""
         cash = self.get_cash()
 
-        # 动态安全垫
-        buffer_rate = self.safety_multiplier
-        estimated_cost = shares * price * buffer_rate
+        cost_multiplier = self.safety_multiplier
+        estimated_cost = shares * price * cost_multiplier
 
         if cash < estimated_cost:
             # 无状态优先：不排队，直接按当前可用现金降级尝试
-            max_shares = cash / (price * buffer_rate)
+            max_shares = cash / (price * cost_multiplier)
             shares = min(shares, max_shares)
             if shares < 1:
                 print(f"[Broker Warning] Buy {data._name} skipped. Cash ({cash:.2f}) insufficient.")
@@ -361,7 +359,7 @@ class BaseLiveBroker(ABC):
             # 记账到虚拟账本
             if proxy:
                 submitted_shares = self._active_buys.get(proxy.id, {}).get('shares', shares)
-                self._virtual_spent_cash += (submitted_shares * price * buffer_rate)
+                self._virtual_spent_cash += (submitted_shares * price * cost_multiplier)
         return proxy
 
     def _smart_buy(self, data, shares, price, target_pct, **kwargs):

@@ -228,7 +228,7 @@ def test_full_day_engine_lifecycle(monkeypatch):
     buy_order = buy_orders[0]
     expected_deduct = buy_order["volume"] * 10.0 * engine.broker.safety_multiplier
     assert engine.broker._virtual_spent_cash == pytest.approx(expected_deduct), (
-        "开盘建仓后虚拟账本扣减异常，资金安全垫记账与下单量不一致！"
+        "开盘建仓后虚拟账本扣减异常，资金占用记账与下单量不一致！"
     )
     assert buy_order["id"] in engine.broker._active_buys, "开盘买单未进入 _active_buys，后续撤单/拒单回调将失效！"
 

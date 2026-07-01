@@ -291,8 +291,8 @@ class OrderExecutor:
         if available_cash <= 0:
             return 0
 
-        buffer_rate = float(getattr(self.broker, 'safety_multiplier', 1.0) or 1.0)
-        usable_budget = available_cash / max(1.0, buffer_rate)
+        cost_multiplier = float(getattr(self.broker, 'safety_multiplier', 1.0) or 1.0)
+        usable_budget = available_cash / max(1.0, cost_multiplier)
         if usable_budget <= 0:
             return 0
 
