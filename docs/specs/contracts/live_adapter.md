@@ -38,6 +38,11 @@
 1. 不维护长期本地 fake cash / fake position 作为事实来源。
 2. 不在 adapter 内部自建跨回调拒单重试队列。
 3. 状态查询优先实时向柜台或 SDK 拉取。
+4. 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；adapter 不应自行实现固定 sleep、轮询补买或卖后现金等待状态机。
+5. 为支持通用卖后现金等待，adapter 只需保证:
+- `get_rebalance_cash()` 或 `get_cash()` 返回当前真实可用于调仓的现金口径
+- `get_current_price(data)` 能返回当前估算价格
+- 卖单返回的 OrderProxy 可被执行器推断委托数量，优先暴露 `submitted_size` / `requested_size`，或让原始对象保留在 `platform_order.volume` / `raw_order.volume` / `trade.order.totalQuantity`
 
 ## 5. OrderProxy Runtime Contract
 1. 必须实现 `BaseOrderProxy` 全部抽象方法，包括 `is_accepted()`

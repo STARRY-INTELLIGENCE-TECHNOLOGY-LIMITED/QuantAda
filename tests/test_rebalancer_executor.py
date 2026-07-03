@@ -283,6 +283,148 @@ def test_order_executor_clears_local_pending_sell_when_remote_sell_empty(monkeyp
     assert "SELL_LOCAL_1" not in broker._pending_sells
 
 
+def test_order_executor_waits_for_post_sell_cash_snapshot_before_final_buy(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+
+    def _fake_time():
+        return clock["t"]
+
+    def _fake_sleep(seconds):
+        clock["t"] += float(seconds)
+
+    monkeypatch.setattr(executor_module.time, "time", _fake_time)
+    monkeypatch.setattr(executor_module.time, "sleep", _fake_sleep)
+
+    class DummyBroker:
+        is_live = True
+        safety_multiplier = 1.0
+
+        def __init__(self):
+            self.calls = []
+            self.sync_calls = 0
+            self._pending_sells = set()
+            self.sell_submitted = False
+
+        def get_position(self, data):
+            return SimpleNamespace(size=100 if data._name == "SPY.ARCA" else 0, price=100.0)
+
+        def get_current_price(self, data):
+            return 100.0 if data._name == "SPY.ARCA" else 10.0
+
+        def get_rebalance_cash(self):
+            if not self.sell_submitted:
+                return 1000.0
+            if clock["t"] < 3.0:
+                return 8000.0
+            return 11000.0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target), clock["t"]))
+            if data._name == "SPY.ARCA":
+                self.sell_submitted = True
+                self._pending_sells.add("SELL_LOCAL_1")
+                return SimpleNamespace(id="SELL_LOCAL_1", platform_order=SimpleNamespace(volume=100))
+            return object()
+
+        def get_pending_orders(self):
+            return []
+
+        def sync_balance(self):
+            self.sync_calls += 1
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_POLL_SECONDS = 1.0
+    executor._POST_SELL_CASH_POLL_SECONDS = 1.0
+    executor._POST_SELL_CASH_WAIT_SECONDS = 5.0
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SPY.ARCA")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 11000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls[0] == ("SPY.ARCA", 0.0, 0.0)
+    assert broker.calls[1] == ("EWJ.ARCA", 11000.0, 3.0), "应等待卖出释放现金快照追上后再最终买入。"
+    assert broker.sync_calls >= 2
+
+
+def test_order_executor_post_sell_cash_wait_times_out_and_continues(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+
+    def _fake_time():
+        return clock["t"]
+
+    def _fake_sleep(seconds):
+        clock["t"] += float(seconds)
+
+    monkeypatch.setattr(executor_module.time, "time", _fake_time)
+    monkeypatch.setattr(executor_module.time, "sleep", _fake_sleep)
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pushed.append({"content": content, "level": level})
+
+    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    class DummyBroker:
+        is_live = True
+        safety_multiplier = 1.0
+
+        def __init__(self):
+            self.calls = []
+            self._pending_sells = set()
+            self.sell_submitted = False
+
+        def get_position(self, data):
+            return SimpleNamespace(size=100 if data._name == "SPY.ARCA" else 0, price=100.0)
+
+        def get_current_price(self, data):
+            return 100.0 if data._name == "SPY.ARCA" else 10.0
+
+        def get_rebalance_cash(self):
+            return 1000.0 if not self.sell_submitted else 8000.0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target), clock["t"]))
+            if data._name == "SPY.ARCA":
+                self.sell_submitted = True
+                self._pending_sells.add("SELL_LOCAL_1")
+                return SimpleNamespace(id="SELL_LOCAL_1", platform_order=SimpleNamespace(volume=100))
+            return object()
+
+        def get_pending_orders(self):
+            return []
+
+        def sync_balance(self):
+            return None
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_POLL_SECONDS = 1.0
+    executor._POST_SELL_CASH_POLL_SECONDS = 1.0
+    executor._POST_SELL_CASH_WAIT_SECONDS = 2.0
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SPY.ARCA")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 11000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls[0] == ("SPY.ARCA", 0.0, 0.0)
+    assert broker.calls[1] == ("EWJ.ARCA", 11000.0, 3.0), "现金估算追不上时必须有界超时并继续执行。"
+    assert any(item["level"] == "WARNING" for item in pushed)
+    assert any("现金快照仍低于本轮卖出释放预期" in item["content"] for item in pushed)
+
+
 def test_order_executor_backtest_executes_plan_without_waiting(monkeypatch):
     import common.order_executor as executor_module
 

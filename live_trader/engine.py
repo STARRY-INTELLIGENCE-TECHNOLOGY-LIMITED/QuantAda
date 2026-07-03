@@ -1299,7 +1299,7 @@ def on_order_status_callback(context, raw_order):
             if order_proxy.is_sell() and is_completed and order_proxy.executed.size > 0:
                 # 再次确认不是撤单导致的 size>0 (虽然撤单通常 size=0，但为了严谨)
                 if not order_proxy.is_canceled() and not order_proxy.is_rejected():
-                    print("[Engine] Sell filled. Waiting for cash settlement (1s)...")
+                    print("[Engine] Sell filled. Syncing broker cash snapshot...")
 
                     if hasattr(broker, 'sync_balance'):
                         broker.sync_balance()

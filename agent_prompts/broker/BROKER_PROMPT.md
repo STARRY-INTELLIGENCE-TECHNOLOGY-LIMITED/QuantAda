@@ -32,6 +32,7 @@
 - `get_position(self, data)`: 获取指定标的持仓。必须返回一个拥有 `.size` (持仓数量) 和 `.price` (成本价) 属性的对象（可使用 `SimpleNamespace` 模拟）。若市场有可卖限制，建议同时暴露 `.sellable`。
 - `get_sellable_position(self, data)`（建议覆盖）: 返回当前真实可卖仓位；若不覆盖，基类会退化为 `size`。
 - `get_current_price(self, data) -> float`: 获取指定标的实时盘口价或最新快照价。若获取失败、断流或停牌，必须安全返回 `0.0`，严禁抛出异常。
+- 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；适配器不要自行实现固定 sleep、轮询补买或卖后现金等待状态机。若需要支持更准确的通用等待，确保 `get_rebalance_cash()` / `get_cash()`、`get_current_price(data)` 和订单代理的委托数量字段可用。
 
 ### 2. 订单系统
 - `get_pending_orders(self) -> list`: 获取所有未完成的在途订单。**必须返回以下严格格式的字典列表**：
@@ -48,6 +49,7 @@
   - `executed`: 一个带 `size`, `price`, `value`, `comm`，并最好带 `dt` 的对象
   - `data`: 匹配到的框架 data 对象（匹配失败时可为 `None`）
 - `id` 必须稳定且可用于后续撤单；若券商原生 `orderId` 可能缺失，应提供可区分的兜底标识。
+- 为便于通用执行器估算本轮卖出释放资金，订单代理应尽量暴露真实委托数量字段，例如 `submitted_size` / `requested_size`，或保留原始对象的 `platform_order.volume` / `raw_order.volume` / `trade.order.totalQuantity`。
 - `convert_order_proxy(self, raw_order) -> BaseOrderProxy`: 引擎回调入口。将目标券商特有的 Trade/Order 回调对象，解析并转换为上述自定义的 `BaseOrderProxy` 对象。**注意：匹配归属的 data 对象时，严禁使用 `in` 进行模糊匹配，必须使用精确的字符串等于判定。**
 - `is_pending()` / `is_accepted()` 只能对真实在途态返回 `True`。过期、挂起/无效、撤单、拒单等不会继续成交的状态必须离开 pending，避免 `_pending_sells` 或 `_active_buys` 永久残留。
 
@@ -69,6 +71,7 @@
 5. 当前拒单重试语义为“无状态 + 当场重提”: 前 5 次按 `LOT_SIZE` 线性降级，后 5 次按几何倍数降级；适配器侧必须提供真实现金口径，避免重试阶段出现系统性偏差。
 6. 当实盘 schedule 期间券商平台未启动、API 不可用或连接失败时，需在 prewarm 与实际 run 时刻分别推送 slot 级 ERROR 告警，但不得把该 slot 误记为已执行。
 7. 适配器和执行器必须区分 live/backtest：实盘以柜台现实、持仓/现金对账和短生命周期健康标记恢复；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
+8. 卖后现金等待、滚动买入和最终补齐属于 `common.order_executor` 职责；adapter 不要重复实现这些流程，只暴露真实现金、价格、在途订单和订单代理字段。
 
 ---
 

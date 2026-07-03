@@ -10,6 +10,9 @@ class OrderExecutor:
     _SELL_SETTLE_WARN_SECONDS = 300.0
     _SELL_SETTLE_HARD_SECONDS = 600.0
     _SELL_SETTLE_POLL_SECONDS = 1.0
+    _POST_SELL_CASH_WAIT_SECONDS = 10.0
+    _POST_SELL_CASH_POLL_SECONDS = 0.5
+    _POST_SELL_CASH_TOLERANCE = 0.99
     _BENIGN_BACKTEST_SKIP_REASONS = {
         'below_min_lot_delta',
         'insufficient_cash_for_min_lot',
@@ -23,6 +26,10 @@ class OrderExecutor:
     def execute_plan(self, plan):
         """执行调仓计划：利用 order_target_value 及其内部智能逻辑"""
 
+        should_wait_post_sell_cash = getattr(self.broker, 'is_live', False) is True
+        has_sell_plan = bool(plan['sell_clear'] or plan['reduce'])
+        pre_sell_cash = self._get_available_cash() if should_wait_post_sell_cash and has_sell_plan else 0.0
+        expected_sell_cash_release = 0.0
         sell_submitted = False
         sell_submit_failed = False
         submitted_sell_ids = set()
@@ -50,6 +57,13 @@ class OrderExecutor:
                         sell_reconcile_targets[oid] = reconcile_target
                 else:
                     has_untracked_sell = True
+                if should_wait_post_sell_cash:
+                    expected_sell_cash_release += self._estimate_sell_cash_release(
+                        data=data,
+                        before_size=before_size,
+                        sell_order=sell_order,
+                        target_value=0.0,
+                    )
             else:
                 if not self._is_benign_backtest_skip():
                     sell_submit_failed = True
@@ -74,6 +88,13 @@ class OrderExecutor:
                         sell_reconcile_targets[oid] = reconcile_target
                 else:
                     has_untracked_sell = True
+                if should_wait_post_sell_cash:
+                    expected_sell_cash_release += self._estimate_sell_cash_release(
+                        data=data,
+                        before_size=before_size,
+                        sell_order=sell_order,
+                        target_value=target,
+                    )
             else:
                 if not self._is_benign_backtest_skip():
                     sell_submit_failed = True
@@ -107,6 +128,7 @@ class OrderExecutor:
             has_untracked_sell,
             sell_reconcile_targets,
             plan['increase'],
+            min_final_buy_cash=pre_sell_cash + expected_sell_cash_release,
         )
         if not sells_settled:
             msg = (
@@ -221,6 +243,43 @@ class OrderExecutor:
             return max(0.0, float(getter() or 0.0))
         except Exception:
             return 0.0
+
+    def _wait_for_post_sell_cash(self, min_cash):
+        try:
+            min_cash = float(min_cash)
+        except Exception:
+            return False
+
+        tolerance = max(0.0, min(1.0, float(self._POST_SELL_CASH_TOLERANCE)))
+        target_cash = max(0.0, min_cash * tolerance)
+        if target_cash <= 0:
+            return True
+
+        wait_seconds = max(0.0, float(self._POST_SELL_CASH_WAIT_SECONDS))
+        poll = max(0.05, float(self._POST_SELL_CASH_POLL_SECONDS))
+        start_ts = time.time()
+        last_cash = self._get_available_cash()
+
+        while last_cash < target_cash:
+            elapsed = time.time() - start_ts
+            if elapsed >= wait_seconds:
+                msg = (
+                    "[Executor] 卖单已确认清空，但现金快照仍低于本轮卖出释放预期；"
+                    "继续按当前可用现金提交最终买单，可能发生保守截断。"
+                    f" available_cash={last_cash:.2f}, expected_cash>={target_cash:.2f}"
+                )
+                self._emit_warning(msg, level='WARNING')
+                return False
+
+            time.sleep(poll)
+            if hasattr(self.broker, 'sync_balance'):
+                try:
+                    self.broker.sync_balance()
+                except Exception:
+                    pass
+            last_cash = self._get_available_cash()
+
+        return True
 
     def _read_position_value(self, data):
         try:
@@ -398,8 +457,28 @@ class OrderExecutor:
             'target_size': int(target_size),
         }
 
+    def _estimate_sell_cash_release(self, data, before_size, sell_order, target_value):
+        try:
+            price = float(self.broker.get_current_price(data) or 0.0)
+        except Exception:
+            price = 0.0
+        if price <= 0:
+            return 0.0
+
+        submitted_size = self._infer_order_size(sell_order)
+        if submitted_size is not None:
+            return max(0.0, float(submitted_size) * price)
+
+        try:
+            before_value = max(0.0, float(before_size) * price)
+            target_value = max(0.0, float(target_value))
+            return max(0.0, before_value - target_value)
+        except Exception:
+            return 0.0
+
     def _wait_sells_settled(self, submitted_sell_ids=None, has_untracked_sell=False,
-                             sell_reconcile_targets=None, increase_plan=None):
+                             sell_reconcile_targets=None, increase_plan=None,
+                             min_final_buy_cash=0.0):
         tracked_ids = {str(x).strip() for x in (submitted_sell_ids or set()) if str(x).strip()}
         reconcile_targets = sell_reconcile_targets or {}
         increase_plan = list(increase_plan or [])
@@ -540,6 +619,21 @@ class OrderExecutor:
                     except Exception as e:
                         print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
                 if increase_plan:
+                    cash_wait_target = float(min_final_buy_cash or 0.0)
+                    planned_cash_target = 0.0
+                    for _, target in increase_plan:
+                        try:
+                            planned_cash_target += max(0.0, float(target))
+                        except Exception:
+                            continue
+                    if planned_cash_target > 0:
+                        cash_wait_target = min(cash_wait_target, planned_cash_target)
+                    if released_target_by_symbol:
+                        cash_wait_target = max(
+                            0.0,
+                            cash_wait_target - sum(float(v or 0.0) for v in released_target_by_symbol.values())
+                        )
+                    self._wait_for_post_sell_cash(cash_wait_target)
                     self._execute_final_buys(
                         increase_plan,
                         released_target_by_symbol=released_target_by_symbol,

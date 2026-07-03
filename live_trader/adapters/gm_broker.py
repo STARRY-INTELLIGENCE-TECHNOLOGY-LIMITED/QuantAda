@@ -483,18 +483,6 @@ class GmBrokerAdapter(BaseLiveBroker):
         # 返回包装好的对象
         return GmOrderProxy(raw_order, self.is_live, data=matched_data)
 
-    # 专门用于掘金的资金同步缓冲
-    def sync_balance(self):
-        """
-        兼容 engine.py 的资金同步接口。
-        在掘金模式下，卖出成交后必须显式等待，确保柜台资金数据完成结算推送。
-        """
-        import time
-        # 掘金的 SDK 回调通常在独立线程，Sleep 1秒不会造成系统级阻塞，是安全的
-        time.sleep(1.0)
-
-        print(f"[GmBroker] Waiting 1s for cash settlement...")
-
     # --- 实现 BaseLiveBroker 的启动协议 ---
     @classmethod
     def launch(cls, conn_cfg: dict, strategy_path: str, params: dict, **kwargs):
