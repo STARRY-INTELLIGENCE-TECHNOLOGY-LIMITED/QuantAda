@@ -738,14 +738,18 @@ def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
     assert "[Phoenix] Waiting 10s before restart" in captured.out
 
 
-def test_gm_launch_does_not_swallow_plain_system_exit(monkeypatch):
+def test_gm_launch_restarts_unmarked_sdk_system_exit(monkeypatch, capsys):
     """
-    普通 SystemExit 可能来自进程信号处理或上层主动退出；没有 GM shutdown
-    回调证据时，不能被 Phoenix 误判为 SDK 断线并重启。
+    GM SDK/底层事件循环可能直接抛 SystemExit 且没有先触发 on_shutdown。
+    实盘 Phoenix 仍应把它视作 SDK session 退出并重启，避免 nohup 进程直接消失。
     """
     import live_trader.adapters.gm_broker as gm_module
 
     fake_context = SimpleNamespace()
+    pushed = []
+
+    class StopPhoenix(BaseException):
+        pass
 
     class DummyAlarm:
         def push_status(self, status, detail=''):
@@ -755,10 +759,14 @@ def test_gm_launch_does_not_swallow_plain_system_exit(monkeypatch):
             return []
 
         def push_exception(self, *args, **kwargs):
-            return None
+            pushed.append((args, kwargs))
 
     def _poll_raises_system_exit():
         raise SystemExit(0)
+
+    def _sleep(seconds):
+        if seconds >= 10:
+            raise StopPhoenix()
 
     monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
     monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
@@ -773,13 +781,19 @@ def test_gm_launch_does_not_swallow_plain_system_exit(monkeypatch):
     monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
     monkeypatch.setattr(gm_module, "gmi_poll", _poll_raises_system_exit, raising=False)
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", _sleep)
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(StopPhoenix):
         GmBrokerAdapter.launch(
             {"token": "token", "strategy_id": "strategy-id"},
             strategy_path="sample_strategy",
             params={},
         )
+
+    captured = capsys.readouterr()
+    assert "unmarked SDK SystemExit" in captured.out
+    assert "[Phoenix] Waiting 10s before restart" in captured.out
+    assert pushed, "未标记 SystemExit 应推送异常，便于定位 SDK 层直接退出。"
 
 
 def test_gm_duplicate_init_callback_is_ignored_in_same_session(monkeypatch, capsys):
@@ -1007,6 +1021,98 @@ def test_gm_schedule_callback_runs_once_per_schedule_slot(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert run_times == [datetime.datetime(2026, 6, 26, 14, 49, 4)]
     assert captured.out.count("Duplicate schedule callback ignored for slot 2026-06-26 14:45:00") == 1
+
+
+def test_gm_prewarm_callback_runs_once_per_schedule_slot(monkeypatch, capsys):
+    """
+    GM prewarm schedule 也可能在同一 slot 重复回调；同一目标运行 slot
+    只能执行一次预热，避免夜间持续刷 Prewarm Finished。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    prewarm_times = []
+    scheduled_callbacks = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    class DummyBroker:
+        datas = [SimpleNamespace(_name="SHSE.600000")]
+
+        def run_schedule_prewarm(self, **kwargs):
+            prewarm_times.append(fake_context.now)
+            return {
+                "source": "broker",
+                "symbol": "SHSE.600000",
+                "extras": [],
+                "errors": [],
+            }
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.broker = DummyBroker()
+            self.data_provider = object()
+
+        def init(self, ctx):
+            return None
+
+        def run(self, ctx):
+            return None
+
+    def _schedule(schedule_func, date_rule, time_rule):
+        scheduled_callbacks.append((time_rule, schedule_func))
+
+    def _poll_repeated_prewarm_callbacks_then_stop():
+        fake_context.init_fun(fake_context)
+        prewarm_run = scheduled_callbacks[0][1]
+        for second in (0, 1, 2):
+            fake_context.now = datetime.datetime(2026, 6, 26, 14, 44, second)
+            prewarm_run(fake_context)
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module.config, "LIVE_SCHEDULE_PREWARM_LEAD", "60s", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_repeated_prewarm_callbacks_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+
+    fake_gm_api = SimpleNamespace(schedule=_schedule)
+    monkeypatch.setitem(sys.modules, "gm.api", fake_gm_api)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id", "schedule": "1d:14:45:00"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert prewarm_times == [datetime.datetime(2026, 6, 26, 14, 44, 0)]
+    assert captured.out.count("Prewarm Finished") == 1
+    assert captured.out.count("Duplicate/early prewarm callback ignored for slot 2026-06-26 14:45:00") == 1
 
 
 def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception(monkeypatch, capsys):

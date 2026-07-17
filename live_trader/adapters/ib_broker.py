@@ -13,6 +13,7 @@ except ImportError:
 
 from alarms.manager import AlarmManager
 from alarms.live_alarm import LiveAlarmDeduper
+from common.live_runtime import runtime_print
 from common.log import coerce_dt
 from common.ib_symbol_parser import resolve_ib_contract_spec
 import config
@@ -1689,6 +1690,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         import asyncio
         import pytz
         from ib_insync import IB
+        _runtime_print = runtime_print
 
         host = config.IBKR_HOST
         port = config.IBKR_PORT
@@ -1709,26 +1711,26 @@ class IBBrokerAdapter(BaseLiveBroker):
         risk_name = kwargs.get('risk')
         risk_params = kwargs.get('risk_params')
 
-        print(f"\n>>> 🛡️ Launching IBKR Phoenix Mode (Host: {host}:{port}) <<<")
+        _runtime_print(f">>> 🛡️ Launching IBKR Phoenix Mode (Host: {host}:{port}) <<<")
         runtime_marker = getattr(config, 'RUNTIME_MARKER', 'ib-live-2026-02-27-riskfix-v1')
-        print(f">>> 🧬 Runtime Marker: {runtime_marker}")
+        _runtime_print(f">>> 🧬 Runtime Marker: {runtime_marker}")
         if schedule_rule:
             tz_info = timezone_str if timezone_str else "Server Local Time"
-            print(f">>> ⏰ Schedule Active: {schedule_rule} (Zone: {tz_info})")
+            _runtime_print(f">>> ⏰ Schedule Active: {schedule_rule} (Zone: {tz_info})")
         else:
-            print(f">>> ⚠️ No Schedule Found: Strategy will NOT run automatically. (Heartbeat Only)")
+            _runtime_print(">>> ⚠️ No Schedule Found: Strategy will NOT run automatically. (Heartbeat Only)")
 
         parsed_schedule = None
         if schedule_rule:
             try:
                 parsed_schedule = SchedulePlanner.parse_schedule_rule(schedule_rule)
                 if parsed_schedule is None:
-                    print(
+                    _runtime_print(
                         f">>> ⚠️ Unsupported schedule format for IB adapter: {schedule_rule}. "
                         "Expected: 1d|Nm|Nh:HH:MM[:SS]"
                     )
             except Exception as e:
-                print(f">>> ⚠️ Invalid schedule config: {schedule_rule}. Error: {e}")
+                _runtime_print(f">>> ⚠️ Invalid schedule config: {schedule_rule}. Error: {e}")
                 parsed_schedule = None
 
         try:
@@ -1736,18 +1738,18 @@ class IBBrokerAdapter(BaseLiveBroker):
                 getattr(config, 'LIVE_SCHEDULE_PREWARM_LEAD', 0)
             )
         except Exception as e:
-            print(f">>> ⚠️ Invalid LIVE_SCHEDULE_PREWARM_LEAD: {e}. Prewarm disabled.")
+            _runtime_print(f">>> ⚠️ Invalid LIVE_SCHEDULE_PREWARM_LEAD: {e}. Prewarm disabled.")
             prewarm_lead_seconds = 0.0
         if parsed_schedule and prewarm_lead_seconds > 0:
             interval_seconds = float(parsed_schedule.get('interval_seconds') or 0.0)
             if interval_seconds <= 0 or prewarm_lead_seconds >= interval_seconds:
-                print(
+                _runtime_print(
                     f">>> ⚠️ LIVE_SCHEDULE_PREWARM_LEAD={prewarm_lead_seconds:.0f}s is not smaller than "
                     f"schedule interval {interval_seconds:.0f}s. Prewarm disabled."
                 )
                 prewarm_lead_seconds = 0.0
         if parsed_schedule and prewarm_lead_seconds > 0:
-            print(f">>> 🔥 Prewarm enabled: trigger {prewarm_lead_seconds:.0f}s before schedule")
+            _runtime_print(f">>> 🔥 Prewarm enabled: trigger {prewarm_lead_seconds:.0f}s before schedule")
         # 1. 创建全局唯一的 IB 实例
         ib = IB()
 
@@ -1774,7 +1776,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                     prefix=">>>",
                 )
             except Exception as e:
-                print(f">>> ⚠️ Failed to compute next schedule time: {e}")
+                _runtime_print(f">>> ⚠️ Failed to compute next schedule time: {e}")
 
         # 初始化 Engine (只做一次)
         from live_trader.engine import LiveTrader, on_order_status_callback
@@ -1793,7 +1795,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             had_ib_source = any(s in {'ib', 'ibkr'} for s in source_names)
             data_source = cls._augment_live_data_source(raw_data_source)
             if data_source != raw_data_source and not had_ib_source:
-                print(
+                _runtime_print(
                     f"[IBBroker] Live data source fallback enabled: "
                     f"{raw_data_source} -> {data_source}"
                 )
@@ -1824,7 +1826,13 @@ class IBBrokerAdapter(BaseLiveBroker):
         async def on_trade_update(trade):
             # 在这里拦截卖单，安全地异步等待 1 秒
             # 这会让出控制权给 Event Loop，使其有时间处理 IB 推送过来的 AccountValue 更新
-            if trade.order.action == 'SELL' and trade.orderStatus.status == 'Filled':
+            try:
+                order_proxy = trader.broker.convert_order_proxy(trade)
+                should_wait_for_cash = bool(order_proxy.is_sell()) and bool(order_proxy.is_completed())
+            except Exception:
+                should_wait_for_cash = False
+
+            if should_wait_for_cash:
                 await asyncio.sleep(1.0)
 
             on_order_status_callback(ctx, trade)
@@ -1841,10 +1849,10 @@ class IBBrokerAdapter(BaseLiveBroker):
             try:
                 # --- A. 连接阶段 ---
                 if not ib.isConnected():
-                    print(f"[System] Connecting to IB Gateway ({host}:{port}) with clientId={client_id}...")
+                    _runtime_print(f"[System] Connecting to IB Gateway ({host}:{port}) with clientId={client_id}...")
                     try:
                         ib.connect(host, port, clientId=client_id)
-                        print("[System] ✅ Connected successfully.")
+                        _runtime_print("[System] ✅ Connected successfully.")
                         # 连接恢复后先复位行情模式标记，后续若实时不可用可再次自动降级 delayed。
                         try:
                             if hasattr(trader, 'broker') and trader.broker:
@@ -1856,18 +1864,18 @@ class IBBrokerAdapter(BaseLiveBroker):
                                 ib.reqAutoOpenOrders(True)
                                 if hasattr(ib, 'reqOpenOrders'):
                                     ib.reqOpenOrders()
-                                print("[System] 🔗 Manual order binding enabled (clientId=0).")
+                                _runtime_print("[System] 🔗 Manual order binding enabled (clientId=0).")
                             elif client_id != 0:
-                                print(
+                                _runtime_print(
                                     "[System] ℹ️ clientId != 0: manual TWS orders may keep orderId=0 "
                                     "and cannot be canceled individually."
                                 )
                         except Exception as bind_err:
-                            print(f"[System Warning] manual-order bind setup failed: {bind_err}")
+                            _runtime_print(f"[System Warning] manual-order bind setup failed: {bind_err}")
                     except Exception as e:
                         # 🔴 关键修复：使用 repr(e) 捕获空字面量异常
                         err_msg = repr(e)
-                        print(f"[System] ⏳ Connection failed: {err_msg}")
+                        _runtime_print(f"[System] ⏳ Connection failed: {err_msg}")
                         AlarmManager().push_schedule_api_unavailable(
                             "IBBroker",
                             f"IB Gateway/TWS connect failed: {err_msg}",
@@ -1875,18 +1883,18 @@ class IBBrokerAdapter(BaseLiveBroker):
 
                         # 幽灵占用与超时自愈逻辑
                         if "already in use" in err_msg or "326" in err_msg:
-                            print(f"[System] 🔄 发现幽灵占用，坚持使用 client_id={client_id} 每 5 秒尝试抢占 Session...")
+                            _runtime_print(f"[System] 🔄 发现幽灵占用，坚持使用 client_id={client_id} 每 5 秒尝试抢占 Session...")
                             time.sleep(5)
                             continue
 
                         # 其他真网络错误保持较长的冷却
-                        print("[System] ⏳ Retrying in 10s...")
+                        _runtime_print("[System] ⏳ Retrying in 10s...")
                         time.sleep(10)
                         continue
 
                 # --- B. 状态恢复 (Re-Subscribe) ---
                 if is_first_connect or not ib.tickers():  # 如果没有 tickers 说明订阅丢了
-                    print(f"[System] 📡 (Re)Subscribing market data for {len(target_symbols)} symbols...")
+                    _runtime_print(f"[System] 📡 (Re)Subscribing market data for {len(target_symbols)} symbols...")
                     active_tickers = {}
                     for sym in target_symbols:
                         try:
@@ -1896,18 +1904,18 @@ class IBBrokerAdapter(BaseLiveBroker):
                             ticker = ib.reqMktData(contract, '', False, False)
                             active_tickers[sym] = ticker
                         except Exception as e:
-                            print(f"[Warning] Failed to subscribe {sym}: {e}")
+                            _runtime_print(f"[Warning] Failed to subscribe {sym}: {e}")
 
                     # 更新 Broker 的引用
                     trader.broker._tickers = active_tickers
 
                     if not is_first_connect:
-                        print("[System] 🔄 Re-connection logic triggered (Data Stream Restored).")
+                        _runtime_print("[System] 🔄 Re-connection logic triggered (Data Stream Restored).")
 
                 is_first_connect = False
 
                 # --- C. 运行阶段 (Event Loop) ---
-                print("[System] Entering Event Loop...")
+                _runtime_print("[System] Entering Event Loop...")
 
                 while ib.isConnected():
                     # 1. 驱动 IB 事件
@@ -1939,8 +1947,8 @@ class IBBrokerAdapter(BaseLiveBroker):
                             if should_prewarm:
                                 timeframe = trader.config.get('timeframe', 'Days')
                                 compression = trader.config.get('compression', 1)
-                                print(
-                                    f"\n>>> 🔥 Prewarm Triggered: {schedule_rule} "
+                                _runtime_print(
+                                    f">>> 🔥 Prewarm Triggered: {schedule_rule} "
                                     f"(T-{seconds_to_schedule:.2f}s) <<<"
                                 )
                                 summary = trader.broker.run_schedule_prewarm(
@@ -1952,15 +1960,15 @@ class IBBrokerAdapter(BaseLiveBroker):
                                     now=ctx.now,
                                 )
                                 last_prewarm_run_key = schedule_slot_key
-                                print(
+                                _runtime_print(
                                     ">>> Prewarm Finished. "
                                     f"source={summary.get('source')}, "
                                     f"symbol={summary.get('symbol')}, "
                                     f"extras={summary.get('extras')}, "
-                                    f"errors={summary.get('errors')}\n"
+                                    f"errors={summary.get('errors')}"
                                 )
                         except Exception as e:
-                            print(f"[Prewarm Error] Check failed: {e}")
+                            _runtime_print(f"[Prewarm Error] Check failed: {e}")
 
                     # (B) 调度检查逻辑
                     if parsed_schedule:
@@ -1971,8 +1979,9 @@ class IBBrokerAdapter(BaseLiveBroker):
                                 last_schedule_run_key=last_schedule_run_key,
                             )
                             if should_run:
-                                print(
-                                    f"\n>>> ⏰ Schedule Triggered: {schedule_rule} (Delta: {delta:.2f}s) <<<")
+                                _runtime_print(
+                                    f">>> ⏰ Schedule Triggered: {schedule_rule} (Delta: {delta:.2f}s) <<<"
+                                )
 
                                 # === 触发策略运行 ===
                                 trader.run(ctx)
@@ -1983,21 +1992,21 @@ class IBBrokerAdapter(BaseLiveBroker):
                                     now + datetime.timedelta(seconds=1),
                                     parsed_schedule,
                                 )
-                                print(f">>> Run Finished. Next run: {next_run.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                _runtime_print(f">>> Run Finished. Next run: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
 
                         except Exception as e:
-                            print(f"[Schedule Error] Check failed: {e}")
+                            _runtime_print(f"[Schedule Error] Check failed: {e}")
 
                 if not ib.isConnected():
-                    print("[System] IB connection ended. Re-entering recovery mode.")
+                    _runtime_print("[System] IB connection ended. Re-entering recovery mode.")
                     is_first_connect = True
 
             # --- D. 异常处理 ---
             except (ConnectionRefusedError, ConnectionResetError, BrokenPipeError, TimeoutError, ConnectionError,
                     asyncio.TimeoutError) as e:
                 # 捕获这些明确的网络层异常
-                print(f"\n[⚠️ Disconnect] Network Error: {e}")
-                print("[System] Entering Recovery Mode. Waiting for TWS/Gateway...")
+                _runtime_print(f"[⚠️ Disconnect] Network Error: {e}")
+                _runtime_print("[System] Entering Recovery Mode. Waiting for TWS/Gateway...")
                 AlarmManager().push_schedule_api_unavailable(
                     "IBBroker",
                     f"IB Gateway/TWS network error: {e}",
@@ -2012,9 +2021,29 @@ class IBBrokerAdapter(BaseLiveBroker):
                 time.sleep(10)  # 稍微长一点的冷却
                 continue
 
+            except SystemExit as e:
+                _runtime_print(
+                    f"[Phoenix] IBKR SDK/event loop requested process exit ({e}). "
+                    "Restarting session instead..."
+                )
+                try:
+                    AlarmManager().push_exception(
+                        "IBKR SDK SystemExit",
+                        f"IBKR event loop raised SystemExit({e}). Restarting session.",
+                    )
+                except Exception:
+                    pass
+                try:
+                    ib.disconnect()
+                except Exception:
+                    pass
+                is_first_connect = True
+                time.sleep(10)
+                continue
+
             except Exception as e:
                 # 捕获其他未知的崩溃 (如数据解析错误)
-                print(f"[CRITICAL] Unexpected crash in Main Loop: {e}")
+                _runtime_print(f"[CRITICAL] Unexpected crash in Main Loop: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -2029,7 +2058,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 continue
 
             except KeyboardInterrupt:
-                print("\n[Stop] User interrupted. Exiting.")
+                _runtime_print("[Stop] User interrupted. Exiting.")
                 ib.disconnect()
                 break
 

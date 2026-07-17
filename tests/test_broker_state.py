@@ -29,10 +29,10 @@ class MockOrderProxy(BaseOrderProxy):
         return self._status == "Rejected"
 
     def is_pending(self):
-        return self._status in ["PendingSubmit", "Submitted"]
+        return self._status in ["PendingSubmit", "Submitted", "PendingCancel"]
 
     def is_accepted(self):
-        return True
+        return self._status in ["PendingSubmit", "Submitted", "PendingCancel"]
 
     def is_buy(self):
         return self._is_buy
@@ -293,6 +293,231 @@ def test_rejected_buy_multi_symbols_retry_independently(monkeypatch):
     assert broker.submitted_orders[3]["symbol"] == "BBB.TEST", "第二个标的的重试单 symbol 错误"
     assert broker.submitted_orders[2]["volume"] < 29, "第一个标的重试单必须低于原始下单量"
     assert broker.submitted_orders[3]["volume"] < 29, "第二个标的重试单必须低于原始下单量"
+
+
+def test_synchronous_rejected_buy_retries_immediately_without_false_success():
+    """
+    券商同步返回 Rejected 时，也必须走同一套当场降级重试逻辑。
+    防止只打印 BUY 信号、但柜台没有真实在途委托。
+    """
+
+    class SyncRejectedBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            oid = f"ORDER_{len(self.submitted_orders) + 1}"
+            status = "Rejected" if side == "BUY" and len(self.submitted_orders) == 0 else "Submitted"
+            proxy = MockOrderProxy(oid, is_buy_order=(side == "BUY"), status=status)
+            self.submitted_orders.append(
+                {
+                    "id": oid,
+                    "side": side,
+                    "volume": volume,
+                    "symbol": data._name,
+                    "status": status,
+                }
+            )
+            return proxy
+
+    broker = SyncRejectedBroker(initial_cash=100000.0)
+    data = _make_data()
+
+    proxy = broker.order_target_value(data, target=2000.0)  # 首单 200 股，同步拒单后应降到 100 股
+
+    assert proxy is not None, "同步拒单后若降级单成功，应把降级单返回给调用方。"
+    assert proxy.id == "ORDER_2", "返回对象应是本轮实际可跟踪的降级委托。"
+    assert len(broker.submitted_orders) == 2, "同步拒单必须立即触发一次降级重试。"
+    assert broker.submitted_orders[0]["status"] == "Rejected"
+    assert broker.submitted_orders[1]["side"] == "BUY"
+    assert broker.submitted_orders[1]["volume"] == 100
+    assert "ORDER_1" not in broker._active_buys, "同步拒单原单不应残留 active_buys。"
+    assert broker._active_buys["ORDER_2"]["shares"] == 100
+    assert broker._virtual_spent_cash == pytest.approx(100 * 10.0 * broker.safety_multiplier)
+
+
+def test_synchronous_rejected_sell_returns_none_and_does_not_pending():
+    """
+    卖单同步拒绝时不能算作已提交；执行器上层应据此跳过后续买入。
+    """
+
+    class SyncRejectedSellBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            oid = f"ORDER_{len(self.submitted_orders) + 1}"
+            status = "Rejected" if side == "SELL" else "Submitted"
+            proxy = MockOrderProxy(oid, is_buy_order=(side == "BUY"), status=status)
+            self.submitted_orders.append(
+                {
+                    "id": oid,
+                    "side": side,
+                    "volume": volume,
+                    "symbol": data._name,
+                    "status": status,
+                }
+            )
+            return proxy
+
+    broker = SyncRejectedSellBroker(initial_cash=100000.0)
+    data = _make_data()
+    broker.mock_position = 500
+
+    proxy = broker.order_target_value(data, target=0.0)
+
+    assert proxy is None, "同步拒绝的 SELL 不应返回成功代理。"
+    assert len(broker.submitted_orders) == 1
+    assert broker.submitted_orders[0]["status"] == "Rejected"
+    assert broker._pending_sells == set(), "同步拒绝的 SELL 不应进入 pending_sells。"
+
+
+def test_broken_order_state_is_treated_as_not_accepted_and_refunded():
+    """
+    适配器状态方法异常时，基类必须保守处理为未受理，
+    不能留下 active_buys 或虚拟占资。
+    """
+
+    class BrokenStateProxy(MockOrderProxy):
+        @property
+        def status(self):
+            return "BrokenState"
+
+        def is_completed(self):
+            raise RuntimeError("status unavailable")
+
+        def is_canceled(self):
+            raise RuntimeError("status unavailable")
+
+        def is_rejected(self):
+            raise RuntimeError("status unavailable")
+
+        def is_pending(self):
+            raise RuntimeError("status unavailable")
+
+        def is_accepted(self):
+            raise RuntimeError("status unavailable")
+
+    class BrokenStateBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            oid = f"ORDER_{len(self.submitted_orders) + 1}"
+            proxy = BrokenStateProxy(oid, is_buy_order=(side == "BUY"))
+            self.submitted_orders.append(
+                {
+                    "id": oid,
+                    "side": side,
+                    "volume": volume,
+                    "symbol": data._name,
+                    "status": "BrokenState",
+                }
+            )
+            return proxy
+
+    broker = BrokenStateBroker(initial_cash=100000.0)
+    data = _make_data()
+
+    proxy = broker.order_target_value(data, target=1000.0)
+
+    assert proxy is None, "状态不可读时应按未受理处理。"
+    assert len(broker.submitted_orders) == 1
+    assert broker._active_buys == {}, "未受理订单不得残留 active_buys。"
+    assert broker._virtual_spent_cash == pytest.approx(0.0), "未受理订单必须释放虚拟占资。"
+
+
+def test_accepted_only_order_state_stays_active_in_base_broker():
+    """
+    框架层状态契约回归:
+    有些 broker 可能只通过 is_accepted() 表达“已被柜台受理但不在本地 pending 枚举内”。
+    基类不能把 accepted-only 代理误判为终态，否则会提前释放虚拟占资或丢失卖单监控。
+    """
+
+    class AcceptedOnlyProxy(MockOrderProxy):
+        def __init__(self, oid, is_buy_order):
+            super().__init__(oid, is_buy_order=is_buy_order, status="AcceptedOnly")
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
+            return True
+
+    class AcceptedOnlyBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            oid = f"ORDER_{len(self.submitted_orders) + 1}"
+            proxy = AcceptedOnlyProxy(oid, is_buy_order=(side == "BUY"))
+            self.submitted_orders.append(
+                {
+                    "id": oid,
+                    "side": side,
+                    "volume": volume,
+                    "symbol": data._name,
+                    "status": "AcceptedOnly",
+                }
+            )
+            return proxy
+
+    data = _make_data()
+
+    buy_broker = AcceptedOnlyBroker(initial_cash=100000.0)
+    buy_proxy = buy_broker.order_target_value(data, target=1000.0)
+    expected_reserved = 100 * 10.0 * buy_broker.safety_multiplier
+
+    assert buy_proxy is not None
+    assert buy_proxy.id in buy_broker._active_buys
+    assert buy_broker._virtual_spent_cash == pytest.approx(expected_reserved)
+
+    callback_ret = buy_broker.on_order_status(buy_proxy)
+
+    assert callback_ret is buy_proxy, "accepted-only 买单仍是活跃委托，不能被当作终态清理。"
+    assert buy_proxy.id in buy_broker._active_buys
+    assert buy_broker._virtual_spent_cash == pytest.approx(expected_reserved)
+
+    sell_broker = AcceptedOnlyBroker(initial_cash=100000.0)
+    sell_broker.mock_position = 500
+    sell_proxy = sell_broker.order_target_value(data, target=0.0)
+
+    assert sell_proxy is not None
+    sell_broker._pending_sells.clear()
+    sell_broker.on_order_status(sell_proxy)
+
+    assert sell_proxy.id in sell_broker._pending_sells, "accepted-only 卖单必须继续纳入在途卖单监控。"
+
+
+def test_accepted_order_without_id_is_not_treated_as_submitted():
+    """
+    框架层契约回归:
+    BaseOrderProxy.id 是在途跟踪与撤单的硬契约。同步返回 accepted/pending 但无 id 时，
+    基类不能打印成功信号或留下不可追踪的 active/pending 状态。
+    """
+
+    class NoIdProxy(MockOrderProxy):
+        @property
+        def id(self):
+            return ""
+
+    class NoIdBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            proxy = NoIdProxy("", is_buy_order=(side == "BUY"), status="Submitted")
+            self.submitted_orders.append(
+                {
+                    "id": "",
+                    "side": side,
+                    "volume": volume,
+                    "symbol": data._name,
+                    "status": "Submitted",
+                }
+            )
+            return proxy
+
+    data = _make_data()
+
+    buy_broker = NoIdBroker(initial_cash=100000.0)
+    buy_proxy = buy_broker.order_target_value(data, target=1000.0)
+
+    assert buy_proxy is None
+    assert buy_broker._active_buys == {}
+    assert buy_broker._virtual_spent_cash == pytest.approx(0.0)
+
+    sell_broker = NoIdBroker(initial_cash=100000.0)
+    sell_broker.mock_position = 500
+    sell_proxy = sell_broker.order_target_value(data, target=0.0)
+
+    assert sell_proxy is None
+    assert sell_broker._pending_sells == set()
 
 
 def test_stale_state_reset_cross_day():

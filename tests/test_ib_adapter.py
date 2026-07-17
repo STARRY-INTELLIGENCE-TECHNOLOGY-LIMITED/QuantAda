@@ -2278,13 +2278,137 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
     assert "IB connection ended. Re-entering recovery mode." in captured.out
 
 
-def test_ib_launch_does_not_swallow_plain_system_exit(monkeypatch):
+def test_ib_trade_update_uses_proxy_state_for_sell_fill_wait(monkeypatch):
     """
-    普通 SystemExit 可能来自进程信号处理或上层主动退出；IBKR Phoenix loop
-    不应捕获 BaseException 并误重启。
+    设计契约回归:
+    IBKR 回调中的卖单成交等待只能通过 broker.convert_order_proxy(...).is_*() 判断，
+    不能直接解释 raw trade.orderStatus.status，否则会绕过 adapter 的状态翻译。
+    """
+    import asyncio
+    import config
+    import live_trader.engine as engine_module
+
+    captured_handlers = []
+    callback_trades = []
+    sleep_calls = []
+
+    class StopLaunch(BaseException):
+        pass
+
+    class DummyEvent:
+        def __iadd__(self, handler):
+            captured_handlers.append(handler)
+            return self
+
+    class DummyIB:
+        def __init__(self):
+            self.connected = False
+            self.orderStatusEvent = DummyEvent()
+
+        def isConnected(self):
+            return self.connected
+
+        def connect(self, host, port, clientId):
+            self.connected = True
+
+        def tickers(self):
+            return []
+
+        def qualifyContracts(self, contract):
+            return [contract]
+
+        def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False):
+            return SimpleNamespace()
+
+        def sleep(self, seconds):
+            raise StopLaunch()
+
+        def disconnect(self):
+            self.connected = False
+
+    class ProxySaysNotCompleted:
+        def is_sell(self):
+            return True
+
+        def is_completed(self):
+            return False
+
+    class DummyBroker:
+        datas = [SimpleNamespace(_name="AAPL.SMART")]
+
+        def __init__(self):
+            self._tickers = {}
+
+        def convert_order_proxy(self, trade):
+            return ProxySaysNotCompleted()
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.data_provider = SimpleNamespace()
+            self.broker = DummyBroker()
+
+        def init(self, ctx):
+            return None
+
+    async def fake_asyncio_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    def fake_on_order_status_callback(ctx, trade):
+        callback_trades.append(trade)
+
+    monkeypatch.setattr(config, "IBKR_HOST", "127.0.0.1", raising=False)
+    monkeypatch.setattr(config, "IBKR_PORT", 7497, raising=False)
+    monkeypatch.setattr(config, "IBKR_CLIENT_ID", 7, raising=False)
+    monkeypatch.setattr(mock_ib_insync, "IB", DummyIB)
+    monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
+    monkeypatch.setattr(engine_module, "on_order_status_callback", fake_on_order_status_callback)
+    monkeypatch.setattr(asyncio, "sleep", fake_asyncio_sleep)
+    monkeypatch.setattr(
+        IBBrokerAdapter,
+        "parse_contract",
+        staticmethod(lambda symbol: SimpleNamespace(symbol=symbol)),
+    )
+
+    with pytest.raises(StopLaunch):
+        IBBrokerAdapter.launch(
+            {"schedule": None},
+            strategy_path="sample_strategy",
+            params={},
+            symbols=["AAPL.SMART"],
+        )
+
+    assert len(captured_handlers) == 1
+
+    raw_trade = SimpleNamespace(
+        order=SimpleNamespace(action="SELL"),
+        orderStatus=SimpleNamespace(status="Filled"),
+    )
+    asyncio.run(captured_handlers[0](raw_trade))
+
+    assert sleep_calls == [], "proxy 未确认 completed 时，不得因 raw status=Filled 触发现金等待。"
+    assert callback_trades == [raw_trade]
+
+
+def test_ib_launch_restarts_on_system_exit_from_event_loop(monkeypatch, capsys):
+    """
+    ib_insync/底层事件循环若抛 SystemExit，Phoenix 应视为 session 退出并重启，
+    避免 nohup 长进程被底层 SDK 直接带退出。
     """
     import config
     import live_trader.engine as engine_module
+
+    pushed = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_exception(self, *args, **kwargs):
+            pushed.append((args, kwargs))
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
 
     class DummyEvent:
         def __iadd__(self, handler):
@@ -2328,21 +2452,32 @@ def test_ib_launch_does_not_swallow_plain_system_exit(monkeypatch):
         def init(self, ctx):
             return None
 
+    def _sleep(seconds):
+        if seconds >= 10:
+            raise StopPhoenix()
+
     monkeypatch.setattr(config, "IBKR_HOST", "127.0.0.1", raising=False)
     monkeypatch.setattr(config, "IBKR_PORT", 7497, raising=False)
     monkeypatch.setattr(config, "IBKR_CLIENT_ID", 7, raising=False)
     monkeypatch.setattr(mock_ib_insync, "IB", DummyIB)
+    monkeypatch.setattr("time.sleep", _sleep)
     monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
+    import live_trader.adapters.ib_broker as ib_module
+    monkeypatch.setattr(ib_module, "AlarmManager", lambda: DummyAlarm())
     monkeypatch.setattr(
         IBBrokerAdapter,
         "parse_contract",
         staticmethod(lambda symbol: SimpleNamespace(symbol=symbol)),
     )
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(StopPhoenix):
         IBBrokerAdapter.launch(
             {"schedule": None},
             strategy_path="sample_strategy",
             params={},
             symbols=["AAPL.SMART"],
         )
+
+    captured = capsys.readouterr()
+    assert "IBKR SDK/event loop requested process exit" in captured.out
+    assert pushed, "SystemExit 自愈重启应推送异常，便于定位 SDK 层直接退出。"

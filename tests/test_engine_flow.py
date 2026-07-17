@@ -631,10 +631,14 @@ def test_risk_pending_order_terminal_precedence(monkeypatch):
 
     engine.risk_control = DummyRisk()
 
+    class ConflictingCanceledProxy(MockOrderProxy):
+        def is_accepted(self):
+            return True
+
     symbol = engine.broker.datas[0]._name
-    # 复用测试桩 MockOrderProxy: 对于 Canceled 状态，is_canceled=True 且 is_accepted=True
+    # 局部构造冲突代理: 终态优先级必须高于错误的 accepted=True。
     engine._pending_risk_orders = {
-        symbol: MockOrderProxy("RISK_1", is_buy_order=False, status="Canceled")
+        symbol: ConflictingCanceledProxy("RISK_1", is_buy_order=False, status="Canceled")
     }
 
     engine._check_risk_controls()
@@ -663,10 +667,19 @@ def test_on_order_status_callback_sell_fill_triggers_balance_sync_only(monkeypat
         def is_sell(self):
             return True
 
+        def is_completed(self):
+            return True
+
         def is_rejected(self):
             return False
 
         def is_canceled(self):
+            return False
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
             return False
 
     class DummyBroker:
@@ -710,6 +723,85 @@ def test_on_order_status_callback_sell_fill_triggers_balance_sync_only(monkeypat
     assert broker.sync_calls == 1, "卖单成交后应触发资金同步。"
 
 
+def test_on_order_status_callback_uses_proxy_completed_not_raw_status(monkeypatch):
+    """
+    设计契约回归:
+    engine 只能相信 BaseOrderProxy.is_completed()，不能因为原始 status 文本像 Filled
+    就绕过 adapter/proxy 的状态翻译。
+    """
+    import live_trader.engine as engine_module
+
+    class DummyOrderProxy:
+        def __init__(self):
+            self.id = "ORDER_STATUS_TEXT_ONLY"
+            self.status = "Filled"
+            self.data = SimpleNamespace(_name="SHSE.600000")
+            self.executed = SimpleNamespace(size=100, price=10.0, value=1000.0, comm=0.0)
+
+        def is_completed(self):
+            return False
+
+        def is_buy(self):
+            return False
+
+        def is_sell(self):
+            return True
+
+        def is_rejected(self):
+            return False
+
+        def is_canceled(self):
+            return False
+
+        def is_pending(self):
+            return True
+
+        def is_accepted(self):
+            return True
+
+    class DummyBroker:
+        def __init__(self):
+            self.sync_calls = 0
+            self.proxy = DummyOrderProxy()
+
+        def convert_order_proxy(self, raw_order):
+            return self.proxy
+
+        def on_order_status(self, proxy):
+            pass
+
+        def sync_balance(self):
+            self.sync_calls += 1
+
+    class DummyStrategy:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def notify_order(self, order):
+            pass
+
+    pushed_trades = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level='INFO'):
+            pass
+
+        def push_trade(self, trade_info):
+            pushed_trades.append(trade_info)
+
+    monkeypatch.setattr(engine_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    broker = DummyBroker()
+    strategy = DummyStrategy(broker)
+    context = SimpleNamespace(strategy_instance=strategy, now=datetime(2026, 2, 17, 10, 6, 0))
+    raw_order = SimpleNamespace(statusMsg="filled text only")
+
+    engine_module.on_order_status_callback(context, raw_order)
+
+    assert broker.sync_calls == 0, "proxy 未确认 completed 时，不得按原始 status=Filled 同步现金。"
+    assert pushed_trades == [], "proxy 未确认 completed 时，不得推送成交。"
+
+
 def test_on_order_status_callback_rejected_sell_should_not_retry(monkeypatch):
     """
     回调链路测试:
@@ -730,10 +822,19 @@ def test_on_order_status_callback_rejected_sell_should_not_retry(monkeypatch):
         def is_sell(self):
             return True
 
+        def is_completed(self):
+            return False
+
         def is_rejected(self):
             return True
 
         def is_canceled(self):
+            return False
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
             return False
 
     class DummyBroker:
@@ -802,6 +903,12 @@ def test_on_order_status_callback_partial_sell_should_not_sync_balance(monkeypat
         def is_canceled(self):
             return False
 
+        def is_pending(self):
+            return True
+
+        def is_accepted(self):
+            return True
+
     class DummyBroker:
         def __init__(self):
             self.sync_calls = 0
@@ -859,10 +966,19 @@ def test_on_order_status_callback_dedupes_duplicate_status(monkeypatch):
         def is_sell(self):
             return False
 
+        def is_completed(self):
+            return False
+
         def is_rejected(self):
             return True
 
         def is_canceled(self):
+            return False
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
             return False
 
     class DummyBroker:
@@ -928,6 +1044,12 @@ def test_on_order_status_callback_partial_fill_does_not_push_trade_alarm(monkeyp
 
         def is_canceled(self):
             return False
+
+        def is_pending(self):
+            return True
+
+        def is_accepted(self):
+            return True
 
     class DummyBroker:
         def __init__(self):
@@ -1003,6 +1125,12 @@ def test_on_order_status_callback_terminal_fill_pushes_once_with_target_qty(monk
         def is_canceled(self):
             return False
 
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
+            return False
+
     class DummyBroker:
         def __init__(self):
             self.proxy = DummyOrderProxy()
@@ -1069,11 +1197,20 @@ def test_on_order_status_callback_skips_submitted_alarm_for_untracked_external_o
         def is_sell(self):
             return False
 
+        def is_completed(self):
+            return False
+
         def is_rejected(self):
             return False
 
         def is_canceled(self):
             return False
+
+        def is_pending(self):
+            return True
+
+        def is_accepted(self):
+            return True
 
     class DummyBroker:
         def __init__(self):
@@ -1137,11 +1274,20 @@ def test_on_order_status_callback_pushes_cancelled_alarm(monkeypatch):
         def is_sell(self):
             return False
 
+        def is_completed(self):
+            return False
+
         def is_rejected(self):
             return False
 
         def is_canceled(self):
             return True
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
+            return False
 
     class DummyBroker:
         def __init__(self):

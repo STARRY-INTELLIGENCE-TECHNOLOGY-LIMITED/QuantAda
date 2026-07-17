@@ -1178,7 +1178,31 @@ def on_order_status_callback(context, raw_order):
             try:
                 is_completed = bool(order_proxy.is_completed())
             except Exception:
-                is_completed = str(current_status).strip().upper() == 'FILLED'
+                is_completed = False
+            try:
+                is_canceled = bool(order_proxy.is_canceled())
+            except Exception:
+                is_canceled = False
+            try:
+                is_rejected = bool(order_proxy.is_rejected())
+            except Exception:
+                is_rejected = False
+            try:
+                is_pending = bool(order_proxy.is_pending())
+            except Exception:
+                is_pending = False
+            try:
+                is_accepted = bool(order_proxy.is_accepted())
+            except Exception:
+                is_accepted = False
+            try:
+                is_buy_order = bool(order_proxy.is_buy())
+            except Exception:
+                is_buy_order = False
+            try:
+                is_sell_order = bool(order_proxy.is_sell())
+            except Exception:
+                is_sell_order = False
 
             def _extract_target_qty(proxy, fallback=0):
                 qty = None
@@ -1235,7 +1259,7 @@ def on_order_status_callback(context, raw_order):
             if is_completed:
                 print(f"[Engine Callback] Notified strategy of order status: {current_status} ({msg})")
             # 如果状态是 "已提交" 但还没 "成交"，且未被拒绝，则推送一条消息
-            if current_status in ['PreSubmitted', 'Submitted', 'PendingSubmit']:
+            if (is_pending or is_accepted) and not (is_completed or is_rejected or is_canceled):
                 # 为了防止刷屏，只有当成交量为0时才推送这个"提交确认"
                 # (如果成交量>0，下面的成交逻辑会接管)
                 if order_proxy.executed.size == 0:
@@ -1250,7 +1274,7 @@ def on_order_status_callback(context, raw_order):
                     else:
                         total_qty = _extract_target_qty(order_proxy, fallback=0)
 
-                        action = "BUY" if order_proxy.is_buy() else "SELL"
+                        action = "BUY" if is_buy_order else "SELL" if is_sell_order else "UNKNOWN"
                         symbol = order_proxy.data._name if order_proxy.data else "Unknown"
 
                         # 构造消息: ⏳ 代表等待/进行中
@@ -1267,10 +1291,10 @@ def on_order_status_callback(context, raw_order):
             terminal_trade_push_dedupe = strategy._terminal_trade_push_dedupe
             if is_completed and exec_size > 0:
                 # 排除已被拒绝的废单(虽然废单size通常为0，为了严谨双重检查)
-                if not order_proxy.is_rejected() and trade_push_key not in terminal_trade_push_dedupe:
+                if not is_rejected and trade_push_key not in terminal_trade_push_dedupe:
                     trade_info = {
                         'symbol': order_proxy.data._name if order_proxy.data else "Unknown",
-                        'action': 'BUY' if order_proxy.is_buy() else 'SELL',
+                        'action': 'BUY' if is_buy_order else 'SELL' if is_sell_order else 'UNKNOWN',
                         'price': order_proxy.executed.price,
                         'size': _extract_target_qty(order_proxy, fallback=order_proxy.executed.size),
                         'value': order_proxy.executed.value,
@@ -1282,23 +1306,23 @@ def on_order_status_callback(context, raw_order):
                         terminal_trade_push_dedupe.clear()
 
             # B. 异常状态推送 (拒单)
-            if order_proxy.is_rejected():
+            if is_rejected:
                 symbol = order_proxy.data._name if order_proxy.data else "Unknown"
                 alarm_manager.push_text(f"⚠️ 订单被拒绝: {symbol} - {msg}", level='WARNING')
 
             # C. 撤单状态推送（含手动单/隔夜清理单）
-            if order_proxy.is_canceled():
+            if is_canceled:
                 total_qty = _extract_target_qty(order_proxy, fallback=0)
 
-                action = "BUY" if order_proxy.is_buy() else "SELL"
+                action = "BUY" if is_buy_order else "SELL" if is_sell_order else "UNKNOWN"
                 symbol = order_proxy.data._name if order_proxy.data else "Unknown"
                 alarm_manager.push_text(f"🛑 订单已撤销 ({current_status}): {action} {total_qty} {symbol}")
 
             # 3. 如果卖单成交（有钱回笼），仅同步资金。
             # 无状态模式下不执行延迟队列重放。
-            if order_proxy.is_sell() and is_completed and order_proxy.executed.size > 0:
+            if is_sell_order and is_completed and order_proxy.executed.size > 0:
                 # 再次确认不是撤单导致的 size>0 (虽然撤单通常 size=0，但为了严谨)
-                if not order_proxy.is_canceled() and not order_proxy.is_rejected():
+                if not is_canceled and not is_rejected:
                     print("[Engine] Sell filled. Syncing broker cash snapshot...")
 
                     if hasattr(broker, 'sync_balance'):

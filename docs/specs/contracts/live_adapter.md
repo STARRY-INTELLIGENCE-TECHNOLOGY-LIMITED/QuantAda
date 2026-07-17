@@ -20,7 +20,9 @@
 - `_submit_order(data, volume, side, price)`
 - `convert_order_proxy(raw_order)`
 - `is_live_mode(context)`
-3. 建议按市场覆盖 `get_sellable_position(data)`。
+3. `_submit_order()` 返回的代理若已是 Rejected/Canceled/Expired 等不会继续成交的终态，基础层会按未接受处理；BUY Rejected 会立即走统一降级重试。适配器必须准确映射这些状态，不能把同步废单伪装成 accepted/pending。
+4. `_submit_order()` 返回 accepted/pending/completed 代理时必须提供非空 `id`；缺失 `id` 的代理会被基础层按未提交处理，避免留下不可跟踪的在途单或虚拟占资。
+5. 建议按市场覆盖 `get_sellable_position(data)`。
 
 ## 3. Pending Orders Contract
 1. `get_pending_orders()` 返回项必须包含:
@@ -58,6 +60,7 @@
 - `comm`
 4. 最好同时提供 `executed.dt`，便于日志与成交通知使用。
 5. `is_pending()` / `is_accepted()` 只能对真实在途态返回 `True`。过期、挂起/无效、撤单、拒单等不会继续成交的状态必须离开 pending，避免 `_pending_sells` 或 `_active_buys` 永久残留。
+6. 框架层的成交、撤单、拒单、在途判断必须通过 `BaseOrderProxy.is_*()` 契约完成；`status` 只作为日志/告警文本，不得在 engine/base broker 中解释具体券商枚举。
 
 ## 6. Data Matching Contract
 1. `convert_order_proxy()` 在匹配 `data` 时，禁止使用 `in` 做模糊匹配。

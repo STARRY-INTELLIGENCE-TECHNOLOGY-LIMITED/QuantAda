@@ -22,6 +22,7 @@
 - 后 5 次按几何降级
 4. 达到上限后放弃本 K，等待下一根 K 重新决策。
 5. 多标的拒单重试必须互相独立。
+6. 若券商 `_submit_order()` 同步返回 Rejected/Canceled/Expired 等非可继续成交状态，不能把该返回值视为已提交委托；BUY Rejected 必须立即进入同一套降级重试路径。`[BUY] [实盘信号]` 日志只能在委托被接受、在途或已成交后打印，避免出现“信号日志存在但柜台没有委托”的误判。
 
 ## 3. SELL Semantics
 1. 卖出受 `sellable` / `available_now` / `available` 等可卖字段约束。
@@ -60,3 +61,6 @@
 9. `STARTED` / `STOPPED` / `DEAD` 等生命周期消息，以及显式标注为 `plan` 的执行计划消息，不受 schedule 报警时间窗限制。
 10. 实盘阻断类错误告警不得在长进程内永久静默；若按 schedule 去重，应以当前 schedule slot 为作用域（如 `1d` 每日、`5m` 每 5 分钟 slot）。
 11. 若在 schedule prewarm 或实际 run 时刻券商平台未启动、API 不可用或连接失败，应推送 slot 级 ERROR 报警，但不得把该 slot 误记为已执行。
+12. GM / IBKR schedule prewarm 与正式 run 都必须按目标 schedule slot 去重；重复 prewarm 回调不得重复执行或持续打印 `Prewarm Finished`。
+13. 使用 SDK 事件循环的实盘 Phoenix loop 必须把 SDK 轮询/协作等待函数抛出的 `SystemExit` 视为 session 退出并重启；未标记的 `SystemExit` 应打印带时间戳日志并推送异常，避免 nohup 进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。
+14. GM / IBKR 长进程运行期 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带本地时间戳，便于排查夜间断线、SDK 退出和重复回调窗口。

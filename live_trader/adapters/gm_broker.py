@@ -5,6 +5,7 @@ import pandas as pd
 
 import config
 from alarms.manager import AlarmManager
+from common.live_runtime import runtime_print
 from common.log import coerce_dt
 from data_providers.gm_provider import GmDataProvider as UnifiedGmDataProvider
 from live_trader.engine import LiveTrader, on_order_status_callback
@@ -492,7 +493,9 @@ class GmBrokerAdapter(BaseLiveBroker):
         import time
         import traceback
 
-        print(f"\n>>> Launching {cls.__name__} (Phoenix Mode) <<<")
+        _runtime_print = runtime_print
+
+        _runtime_print(f">>> Launching {cls.__name__} (Phoenix Mode) <<<")
 
         token = conn_cfg.get('token')
         serv_addr = conn_cfg.get('serv_addr')
@@ -511,24 +514,24 @@ class GmBrokerAdapter(BaseLiveBroker):
             try:
                 parsed_schedule = SchedulePlanner.parse_schedule_rule(schedule_rule)
             except Exception as e:
-                print(f"[GmBroker Warning] Invalid schedule config: {schedule_rule}. Error: {e}")
+                _runtime_print(f"[GmBroker Warning] Invalid schedule config: {schedule_rule}. Error: {e}")
                 parsed_schedule = None
         try:
             prewarm_lead_seconds = SchedulePlanner.parse_schedule_prewarm_lead(
                 getattr(config, 'LIVE_SCHEDULE_PREWARM_LEAD', 0)
             )
         except Exception as e:
-            print(f"[GmBroker Warning] Invalid LIVE_SCHEDULE_PREWARM_LEAD: {e}. Prewarm disabled.")
+            _runtime_print(f"[GmBroker Warning] Invalid LIVE_SCHEDULE_PREWARM_LEAD: {e}. Prewarm disabled.")
             prewarm_lead_seconds = 0.0
         prewarm_time_rule = None
         if schedule_rule and prewarm_lead_seconds > 0:
             if parsed_schedule is None:
-                print(
+                _runtime_print(
                     "[GmBroker Warning] Prewarm currently supports schedule format "
                     "1d|Nm|Nh:HH:MM[:SS]. Prewarm disabled."
                 )
             elif prewarm_lead_seconds >= float(parsed_schedule.get('interval_seconds') or 0.0):
-                print(
+                _runtime_print(
                     f"[GmBroker Warning] LIVE_SCHEDULE_PREWARM_LEAD={prewarm_lead_seconds:.0f}s is not smaller than "
                     f"schedule interval {float(parsed_schedule.get('interval_seconds') or 0.0):.0f}s. "
                     "Prewarm disabled."
@@ -540,7 +543,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 )
                 if prewarm_time_rule:
                     prewarm_rule_type = f"{parsed_schedule['freq_n']}{parsed_schedule['freq_unit']}"
-                    print(
+                    _runtime_print(
                         f"[GmBroker] Prewarm enabled: trigger {prewarm_lead_seconds:.0f}s before schedule "
                         f"({prewarm_rule_type} @ {prewarm_time_rule})"
                     )
@@ -580,13 +583,13 @@ class GmBrokerAdapter(BaseLiveBroker):
                 latest_close = latest_eob.to_pydatetime().replace(hour=16, minute=0, second=0, microsecond=0)
 
                 if dt_end_value > latest_close:
-                    print(
+                    _runtime_print(
                         "[GmBroker] Backtest end clipped to latest GM history: "
                         f"{latest_close.strftime('%Y-%m-%d 16:00:00')} (requested: {dt_end_value.strftime('%Y-%m-%d 16:00:00')})"
                     )
                     return latest_close
             except Exception as e:
-                print(f"[GmBroker Warning] Failed to probe latest GM history date: {e}")
+                _runtime_print(f"[GmBroker Warning] Failed to probe latest GM history date: {e}")
 
             return dt_end_value
 
@@ -663,7 +666,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                     or now_ts - last_market_data_error_log_at >= market_data_error_log_interval_seconds
                 ):
                     info_text = info_text or "实时行情服务连接失败"
-                    print(f"[GM Warning] Code: {code}, Msg: {info_text}")
+                    _runtime_print(f"[GM Warning] Code: {code}, Msg: {info_text}")
                     last_market_data_error_log_at = now_ts
                 return True
 
@@ -676,10 +679,10 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             def init(ctx):
                 if session_state.get('init_completed') and getattr(ctx, 'strategy_instance', None) is not None:
-                    print("[GmBroker] Duplicate init callback ignored for current GM session.")
+                    _runtime_print("[GmBroker] Duplicate init callback ignored for current GM session.")
                     return
 
-                print(f"[Phoenix] Initializing Strategy '{strategy_path}'...")
+                _runtime_print(f"[Phoenix] Initializing Strategy '{strategy_path}'...")
                 engine_config = config.__dict__.copy()
                 engine_config['strategy_name'] = strategy_path
                 engine_config['params'] = params
@@ -725,13 +728,13 @@ class GmBrokerAdapter(BaseLiveBroker):
                     sub_tf = ctx.strategy_instance.config.get('timeframe', 'Days')
                     sub_cp = int(ctx.strategy_instance.config.get('compression', 1) or 1)
                     sub_freq = f"{sub_cp * 60}s" if sub_tf == 'Minutes' else '1d'
-                    print(f"[GmBroker] Subscribing to {len(current_symbols)} symbols...")
+                    _runtime_print(f"[GmBroker] Subscribing to {len(current_symbols)} symbols...")
                     try:
                         subscribe(symbols=current_symbols, frequency=sub_freq, count=1, wait_group=True)
                     except Exception as e:
                         err_code = getattr(e, 'code', None)
                         if _log_temporary_market_data_error(err_code, str(e)):
-                            print(
+                            _runtime_print(
                                 "[GmBroker Warning] Realtime market subscription unavailable; "
                                 "schedule registration will continue."
                             )
@@ -753,18 +756,53 @@ class GmBrokerAdapter(BaseLiveBroker):
                                     prefix="[GmBroker]",
                                 )
                             except Exception as e:
-                                print(f"[GmBroker Warning] Failed to compute schedule preview: {e}")
+                                _runtime_print(f"[GmBroker Warning] Failed to compute schedule preview: {e}")
                         # 解析格式 "1d:14:50:00" -> freq="1d", time="14:50:00"
                         if ':' in schedule_rule:
                             rule_type, rule_time = schedule_rule.split(':', 1)
-                            print(f"[GmBroker] Schedule enabled (from config): {rule_type} @ {rule_time}")
-                            print(f"            策略将在指定时间主动运行，忽略 on_bar 事件。")
+                            _runtime_print(f"[GmBroker] Schedule enabled (from config): {rule_type} @ {rule_time}")
+                            _runtime_print("            策略将在指定时间主动运行，忽略 on_bar 事件。")
 
                             if prewarm_time_rule:
                                 def _run_prewarm(schedule_ctx):
+                                    if parsed_schedule:
+                                        now_value = getattr(schedule_ctx, 'now', None) or datetime.datetime.now()
+                                        try:
+                                            should_prewarm, seconds_to_schedule, prewarm_slot_key = (
+                                                SchedulePlanner.should_trigger_schedule_prewarm_for_rule(
+                                                    now=pd.Timestamp(now_value),
+                                                    parsed_schedule=parsed_schedule,
+                                                    lead_seconds=prewarm_lead_seconds,
+                                                    last_prewarm_run_key=launch_state.get('last_prewarm_run_key'),
+                                                    last_schedule_run_key=launch_state.get('last_schedule_run_key'),
+                                                )
+                                            )
+                                        except Exception as e:
+                                            should_prewarm = True
+                                            seconds_to_schedule = None
+                                            prewarm_slot_key = None
+                                            _runtime_print(f"[GmBroker Warning] Failed to evaluate prewarm slot: {e}")
+
+                                        if not should_prewarm:
+                                            skip_key = prewarm_slot_key or 'unknown'
+                                            if launch_state.get('last_prewarm_skip_log_key') != skip_key:
+                                                delta_text = (
+                                                    f"{float(seconds_to_schedule):.1f}s"
+                                                    if seconds_to_schedule is not None else "N/A"
+                                                )
+                                                _runtime_print(
+                                                    "[GmBroker] Duplicate/early prewarm callback ignored "
+                                                    f"for slot {skip_key}. seconds_to_schedule={delta_text}"
+                                                )
+                                                launch_state['last_prewarm_skip_log_key'] = skip_key
+                                            return
+
                                     strategy = getattr(schedule_ctx, 'strategy_instance', None)
                                     if strategy is None:
-                                        print("[GmBroker Warning] Prewarm skipped: strategy instance unavailable.")
+                                        skip_key = prewarm_slot_key or 'unknown'
+                                        if launch_state.get('last_prewarm_unavailable_log_key') != skip_key:
+                                            _runtime_print("[GmBroker Warning] Prewarm skipped: strategy instance unavailable.")
+                                            launch_state['last_prewarm_unavailable_log_key'] = skip_key
                                         return
                                     prewarm_symbols = [d._name for d in getattr(strategy.broker, 'datas', [])]
                                     if not prewarm_symbols:
@@ -777,7 +815,9 @@ class GmBrokerAdapter(BaseLiveBroker):
                                         compression=strategy.config.get('compression', 1),
                                         now=getattr(schedule_ctx, 'now', None),
                                     )
-                                    print(
+                                    if prewarm_slot_key:
+                                        launch_state['last_prewarm_run_key'] = prewarm_slot_key
+                                    _runtime_print(
                                         "[GmBroker] Prewarm Finished. "
                                         f"source={summary.get('source')}, "
                                         f"symbol={summary.get('symbol')}, "
@@ -800,7 +840,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                                             return
                                         if launch_state.get('last_schedule_run_key') == slot_key:
                                             if launch_state.get('last_schedule_skip_log_key') != slot_key:
-                                                print(f"[GmBroker] Duplicate schedule callback ignored for slot {slot_key}.")
+                                                _runtime_print(f"[GmBroker] Duplicate schedule callback ignored for slot {slot_key}.")
                                                 launch_state['last_schedule_skip_log_key'] = slot_key
                                             return
                                         launch_state['last_schedule_run_key'] = slot_key
@@ -810,10 +850,10 @@ class GmBrokerAdapter(BaseLiveBroker):
                             schedule(schedule_func=_run_scheduled, date_rule=rule_type, time_rule=rule_time)
                             ctx.use_schedule = True
                         else:
-                            print(f"[GmBroker Warning] 定时配置格式错误 (应为 freq:time): {schedule_rule}")
+                            _runtime_print(f"[GmBroker Warning] 定时配置格式错误 (应为 freq:time): {schedule_rule}")
 
                     except Exception as e:
-                        print(f"[GmBroker Error] 定时任务注册失败: {e}")
+                        _runtime_print(f"[GmBroker Error] 定时任务注册失败: {e}")
 
             def on_bar(ctx, bars):
                 if getattr(ctx, 'use_schedule', False):
@@ -829,7 +869,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 if _log_temporary_market_data_error(code, info):
                     return
 
-                print(f"[GM Error] {msg}")
+                _runtime_print(f"[GM Error] {msg}")
 
                 # 【报警接入】异常推送
                 # 过滤掉一些非致命的错误码 (视情况而定)
@@ -841,7 +881,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                     setattr(ctx, '_quantada_gm_shutdown_requested', True)
                 except Exception:
                     pass
-                print("[System] Strategy Shutdown")
+                _runtime_print("[System] Strategy Shutdown")
 
                 # 【报警接入】停止推送
                 if mode == MODE_LIVE:
@@ -911,10 +951,10 @@ class GmBrokerAdapter(BaseLiveBroker):
                 return False
 
             else:  # 实盘模式
-                print("  Status: Connecting to GM terminal...")
+                _runtime_print("  Status: Connecting to GM terminal...")
                 status = gmi_init()
                 if status != 0:
-                    print(f"[Phoenix] Init failed (Code: {status}). Retrying in 10s...")
+                    _runtime_print(f"[Phoenix] Init failed (Code: {status}). Retrying in 10s...")
                     AlarmManager().push_schedule_api_unavailable(
                         "GmBroker",
                         f"GM terminal init failed (Code: {status})",
@@ -923,7 +963,7 @@ class GmBrokerAdapter(BaseLiveBroker):
 
                 check_gm_status(status)
 
-                print("[Phoenix] Entering Event Loop (Ctrl+C to stop)...")
+                _runtime_print("[Phoenix] Entering Event Loop (Ctrl+C to stop)...")
 
                 try:
                     # 这是一个阻塞循环，通常 gmi_poll 会一直运行
@@ -932,16 +972,33 @@ class GmBrokerAdapter(BaseLiveBroker):
                         try:
                             poll_status = gmi_poll()
                         except SystemExit as e:
+                            restart_reason = (
+                                "shutdown callback"
+                                if session_state.get('shutdown_requested') or getattr(
+                                    context, '_quantada_gm_shutdown_requested', False
+                                )
+                                else "unmarked SDK SystemExit"
+                            )
+                            _runtime_print(
+                                f"[Phoenix] GM SDK requested process exit ({e}; {restart_reason}). "
+                                "Restarting session instead..."
+                            )
                             if session_state.get('shutdown_requested') or getattr(
                                 context, '_quantada_gm_shutdown_requested', False
                             ):
-                                print(f"[Phoenix] GM SDK requested process exit ({e}). Restarting session instead...")
                                 try:
                                     setattr(context, '_quantada_gm_shutdown_requested', False)
                                 except Exception:
                                     pass
-                                return True
-                            raise
+                            else:
+                                try:
+                                    AlarmManager().push_exception(
+                                        "GM SDK SystemExit",
+                                        f"gmi_poll raised SystemExit({e}) without shutdown callback. Restarting session.",
+                                    )
+                                except Exception:
+                                    pass
+                            return True
 
                         if poll_status not in (None, 0):
                             try:
@@ -952,19 +1009,19 @@ class GmBrokerAdapter(BaseLiveBroker):
                                 if _log_temporary_market_data_error(err_code, err_info):
                                     time.sleep(1)
                                     continue
-                                print(f"[Phoenix] gmi_poll status detail: {e}")
-                                print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
+                                _runtime_print(f"[Phoenix] gmi_poll status detail: {e}")
+                                _runtime_print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
                                 return True
                             if _log_temporary_market_data_error(poll_status, ""):
                                 time.sleep(1)
                                 continue
-                            print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
+                            _runtime_print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
                             return True
 
                         if session_state.get('shutdown_requested') or getattr(
                             context, '_quantada_gm_shutdown_requested', False
                         ):
-                            print("[Phoenix] GM shutdown callback received. Restarting session...")
+                            _runtime_print("[Phoenix] GM shutdown callback received. Restarting session...")
                             try:
                                 setattr(context, '_quantada_gm_shutdown_requested', False)
                             except Exception:
@@ -975,7 +1032,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                         time.sleep(1)
 
                 except Exception as e:
-                    print(f"[Phoenix] Event Loop Crashed: {e}")
+                    _runtime_print(f"[Phoenix] Event Loop Crashed: {e}")
                     raise e  # 抛出异常给外层处理
 
 
@@ -985,22 +1042,22 @@ class GmBrokerAdapter(BaseLiveBroker):
             try:
                 should_retry = run_session()
                 if not should_retry:
-                    print(">>> GM Broker Exited Normally.")
+                    _runtime_print(">>> GM Broker Exited Normally.")
                     break  # 回测结束或正常退出
 
                 # 如果 run_session 返回 True，说明是异常退出或断线，需要冷却后重启
-                print("[Phoenix] Waiting 10s before restart...")
+                _runtime_print("[Phoenix] Waiting 10s before restart...")
                 time.sleep(10)
-                print("[Phoenix] Restarting now...")
+                _runtime_print("[Phoenix] Restarting now...")
 
             except KeyboardInterrupt:
-                print("\n[Stop] User interrupted (Ctrl+C). Exiting Phoenix Loop.")
+                _runtime_print("[Stop] User interrupted (Ctrl+C). Exiting Phoenix Loop.")
                 if mode == MODE_LIVE:
                     AlarmManager().push_status("STOPPED", "User Manually Stopped")
                 break
 
             except Exception as e:
-                print(f"\n[CRITICAL] Unexpected Crash: {e}")
+                _runtime_print(f"[CRITICAL] Unexpected Crash: {e}")
                 traceback.print_exc()
 
                 # 严重错误推送
@@ -1010,6 +1067,6 @@ class GmBrokerAdapter(BaseLiveBroker):
                     except:
                         pass
 
-                print("[Phoenix] Critical error. Restarting in 15s...")
+                _runtime_print("[Phoenix] Critical error. Restarting in 15s...")
                 time.sleep(15)
                 continue

@@ -355,12 +355,7 @@ class BaseLiveBroker(ABC):
 
         # 将提交和记账包裹在同一把锁内，拒绝间隙抢占
         with self._ledger_lock:
-            proxy = self._finalize_and_submit(data, shares, price, lot_size)
-            # 记账到虚拟账本
-            if proxy:
-                submitted_shares = self._active_buys.get(proxy.id, {}).get('shares', shares)
-                self._virtual_spent_cash += (submitted_shares * price * cost_multiplier)
-        return proxy
+            return self._finalize_and_submit(data, shares, price, lot_size)
 
     def _smart_buy(self, data, shares, price, target_pct, **kwargs):
         """智能买入 (Percent模式)：资金检查 + 自动降级"""
@@ -412,6 +407,44 @@ class BaseLiveBroker(ABC):
                 continue
 
         return fallback
+
+    @staticmethod
+    def _read_order_state(proxy):
+        """
+        Safely read the common order-state contract from a broker proxy.
+
+        A broken adapter method must not make a synchronous terminal/rejected
+        order look accepted by accident. Unknown states therefore default to
+        False and are handled conservatively by submit finalization.
+        """
+        try:
+            completed = bool(proxy.is_completed())
+        except Exception:
+            completed = False
+        try:
+            canceled = bool(proxy.is_canceled())
+        except Exception:
+            canceled = False
+        try:
+            rejected = bool(proxy.is_rejected())
+        except Exception:
+            rejected = False
+        try:
+            pending = bool(proxy.is_pending())
+        except Exception:
+            pending = False
+        try:
+            accepted = bool(proxy.is_accepted())
+        except Exception:
+            accepted = False
+
+        return {
+            'completed': completed,
+            'canceled': canceled,
+            'rejected': rejected,
+            'pending': pending,
+            'accepted': accepted,
+        }
 
     def _geometric_downgrade_shares(self, old_shares, lot_size, retries):
         """
@@ -487,21 +520,58 @@ class BaseLiveBroker(ABC):
         if shares > 0:
             # 根据是否为重试改变日志标签
             tag = "实盘降级重试" if retries > 0 else "实盘信号"
-            log.signal('BUY', data._name, shares, price, tag=tag, dt=self._datetime)
 
             with self._ledger_lock:
                 proxy = self._submit_order(data, shares, 'BUY', price)
-                if proxy:
-                    final_submitted_shares = self._infer_submitted_shares(proxy, shares)
-                    # 注册到活跃买单库，记录当前的参数和重试次数
-                    self._active_buys[proxy.id] = {
-                        'data': data,
-                        'shares': final_submitted_shares,
-                        'price': price,
-                        'lot_size': lot_size,
-                        'retries': retries
-                    }
-            return proxy
+                if not proxy:
+                    return None
+
+                oid = str(getattr(proxy, 'id', '') or '').strip()
+                if not oid:
+                    print(
+                        f"[Broker Warning] BUY {data._name} returned proxy without order id. "
+                        f"status={getattr(proxy, 'status', 'Unknown')}"
+                    )
+                    return None
+
+                final_submitted_shares = self._infer_submitted_shares(proxy, shares)
+                # 注册到活跃买单库，记录当前的参数和重试次数。
+                self._active_buys[oid] = {
+                    'data': data,
+                    'shares': final_submitted_shares,
+                    'price': price,
+                    'lot_size': lot_size,
+                    'retries': retries
+                }
+                self._virtual_spent_cash += (
+                    final_submitted_shares * price * self.safety_multiplier
+                )
+
+                order_state = self._read_order_state(proxy)
+
+                if order_state['rejected']:
+                    print(
+                        f"[Broker Warning] BUY {data._name} was synchronously rejected "
+                        f"by broker. status={getattr(proxy, 'status', 'Unknown')}"
+                    )
+                    return self.on_order_status(proxy)
+
+                if order_state['canceled'] or not (
+                    order_state['completed'] or order_state['pending'] or order_state['accepted']
+                ):
+                    print(
+                        f"[Broker Warning] BUY {data._name} was not accepted by broker. "
+                        f"status={getattr(proxy, 'status', 'Unknown')}"
+                    )
+                    self.on_order_status(proxy)
+                    return None
+
+                log.signal('BUY', data._name, final_submitted_shares, price, tag=tag, dt=self._datetime)
+
+                if order_state['completed']:
+                    self.on_order_status(proxy)
+
+                return proxy
         return None
 
     def _smart_sell(self, data, shares, price, **kwargs):
@@ -550,25 +620,59 @@ class BaseLiveBroker(ABC):
                 shares = int(shares)
 
         if shares > 0:
-            log.signal('SELL', data._name, shares, price, tag="实盘信号", dt=self._datetime)
             with self._ledger_lock:
                 proxy = self._submit_order(data, shares, 'SELL', price)
-                if proxy:
-                    self._pending_sells.add(proxy.id)
-            return proxy
+                if not proxy:
+                    return None
+
+                oid = str(getattr(proxy, 'id', '') or '').strip()
+                if not oid:
+                    print(
+                        f"[Broker Warning] SELL {data._name} returned proxy without order id. "
+                        f"status={getattr(proxy, 'status', 'Unknown')}"
+                    )
+                    return None
+
+                final_submitted_shares = self._infer_submitted_shares(proxy, shares)
+                order_state = self._read_order_state(proxy)
+
+                if order_state['rejected'] or order_state['canceled'] or not (
+                    order_state['completed'] or order_state['pending'] or order_state['accepted']
+                ):
+                    print(
+                        f"[Broker Warning] SELL {data._name} was not accepted by broker. "
+                        f"status={getattr(proxy, 'status', 'Unknown')}"
+                    )
+                    self.on_order_status(proxy)
+                    return None
+
+                log.signal('SELL', data._name, final_submitted_shares, price, tag="实盘信号", dt=self._datetime)
+
+                if order_state['completed']:
+                    self.on_order_status(proxy)
+                else:
+                    self._pending_sells.add(oid)
+
+                return proxy
         return None
 
     def on_order_status(self, proxy: BaseOrderProxy):
         """由 Engine 回调，自动维护在途单状态与降级重试"""
-        oid = proxy.id
+        oid = str(getattr(proxy, 'id', '') or '').strip()
 
         # 整个回调必须排队，防止抢占主线程刚发出的订单
         with self._ledger_lock:
+            try:
+                is_buy_order = bool(proxy.is_buy())
+            except Exception:
+                is_buy_order = False
+            order_state = self._read_order_state(proxy)
+
             # ==========================================
             # 1. 买单异步降级逻辑 (Buy Order Downgrade)
             # ==========================================
-            if proxy.is_buy():
-                if proxy.is_completed():
+            if is_buy_order:
+                if order_state['completed']:
                     # 买单终态(Filled): 物理现金已结算，必须回退本地虚拟预扣，避免双重扣减可用资金
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
@@ -579,8 +683,9 @@ class BaseLiveBroker(ABC):
                             getattr(self, '_virtual_spent_cash', 0.0) - refund_amount
                         )
                         print(f"[Broker] ✅ 买单 {symbol} 已成交。已释放虚拟扣款: {refund_amount:.2f}")
+                    return proxy
 
-                elif proxy.is_canceled():
+                elif order_state['canceled']:
                     # 撤单防御：精准回退被冻结的虚拟预扣资金
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
@@ -591,8 +696,9 @@ class BaseLiveBroker(ABC):
                             getattr(self, '_virtual_spent_cash', 0.0) - refund_amount
                         )
                         print(f"[Broker] ⚠️ 买单 {symbol} 被撤销。已回退虚拟扣款: {refund_amount:.2f}")
+                    return None
 
-                elif proxy.is_rejected():
+                elif order_state['rejected']:
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
                         retries = buy_info['retries']
@@ -628,25 +734,19 @@ class BaseLiveBroker(ABC):
 
                             if new_shares > 0:
                                 # 无状态优先：不入队，拒单后当场按更小数量重提。
-                                deduct_amount = new_shares * price * self.safety_multiplier
-                                self._virtual_spent_cash += deduct_amount
-
                                 new_proxy = self._finalize_and_submit(data, new_shares, price, lot_size,
                                                                       retries + 1)
 
-                                # 如果同步发单失败(比如断网)，必须把预扣的钱退回来
                                 if not new_proxy:
-                                    self._virtual_spent_cash = max(
-                                        0.0,
-                                        getattr(self, '_virtual_spent_cash', 0.0) - deduct_amount
-                                    )
-                                    print(f"❌ [Broker] 降级发单同步失败，资金已回退。")
+                                    print(f"❌ [Broker] 降级发单同步失败，原订单资金已回退。")
+                                return new_proxy
                             else:
                                 print(f"❌ [Broker] 降级终止: {data._name} 数量已降至 0。")
                         else:
                             symbol = getattr(buy_info.get('data'), '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
                             print(f"❌ [Broker] 降级终止: {symbol} 已达到最大重试次数 {max_retries}，放弃本K。")
-                elif not proxy.is_pending():
+                    return None
+                elif not (order_state['pending'] or order_state['accepted']):
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
                         refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
@@ -659,19 +759,25 @@ class BaseLiveBroker(ABC):
                             f"[Broker] ⚠️ 买单 {symbol} 进入非在途终态({getattr(proxy, 'status', 'Unknown')})。"
                             f"已回退虚拟扣款: {refund_amount:.2f}"
                         )
-                return
+                    return None
+                return proxy
 
             # ==========================================
             # 2. 卖单在途维护逻辑 (Sell Order Pending)
             # ==========================================
-            if not proxy.is_sell(): return
+            try:
+                is_sell_order = bool(proxy.is_sell())
+            except Exception:
+                is_sell_order = False
+            if not is_sell_order:
+                return None
 
-            if proxy.is_completed():
+            if order_state['completed']:
                 self._pending_sells.discard(oid)
 
-            elif proxy.is_canceled() or proxy.is_rejected():
+            elif order_state['canceled'] or order_state['rejected']:
                 self._pending_sells.discard(oid)
-            elif proxy.is_pending():
+            elif order_state['pending'] or order_state['accepted']:
                 self._pending_sells.add(oid)
             else:
                 self._pending_sells.discard(oid)

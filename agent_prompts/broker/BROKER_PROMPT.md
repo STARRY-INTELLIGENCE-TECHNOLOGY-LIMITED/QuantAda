@@ -41,6 +41,8 @@
   该失败标记只能表示当前快照可信度，不得保存交易意图、不得驱动跨 K 重试、不得用于回测路径；回测应保持订单同步成交语义。
 - `cancel_pending_order(self, order_id: str) -> bool`: 按订单ID发起撤单。返回是否成功发起撤单请求（True/False）。该接口用于引擎在交易日首轮前清理隔夜在途单。
 - `_submit_order(self, data, volume: int, side: str, price: float)`: 核心发单路由。`side` 为 `'BUY'` 或 `'SELL'`。将其翻译为目标券商的结构体并发起发单请求，发单成功后返回自定义的 `BaseOrderProxy` 子类实例，失败返回 `None`。
+  若券商同步返回 Rejected/Canceled/Expired 等不会继续成交的订单对象，代理必须准确暴露该终态；基础层会按未接受处理，BUY Rejected 会立即进入统一降级重试。不要把同步废单映射成 accepted/pending，否则会出现“实盘信号已打印但柜台没有委托”的误判。
+  若返回 accepted/pending/completed 代理，`id` 必须非空且稳定；缺失 `id` 的代理会被基础层按未提交处理，避免留下不可跟踪的在途单或虚拟占资。
 
 ### 3. 状态转换器与代理类
 - **必须创建一个子类**继承自 `live_trader.adapters.base_broker.BaseOrderProxy`，并实现其所有的 `@abstractmethod` 属性和方法（包括 `is_accepted()`）。
@@ -48,6 +50,7 @@
   - `status`: 原始或标准化后的订单状态
   - `executed`: 一个带 `size`, `price`, `value`, `comm`，并最好带 `dt` 的对象
   - `data`: 匹配到的框架 data 对象（匹配失败时可为 `None`）
+- 框架层只通过 `BaseOrderProxy.is_*()` 判断成交、拒单、撤单、在途和 accepted；`status` 仅用于日志/告警展示。适配器必须在 proxy 内完成券商状态枚举到统一语义的翻译，不要要求 engine/base broker 识别具体券商状态。
 - `id` 必须稳定且可用于后续撤单；若券商原生 `orderId` 可能缺失，应提供可区分的兜底标识。
 - 为便于通用执行器估算本轮卖出释放资金，订单代理应尽量暴露真实委托数量字段，例如 `submitted_size` / `requested_size`，或保留原始对象的 `platform_order.volume` / `raw_order.volume` / `trade.order.totalQuantity`。
 - `convert_order_proxy(self, raw_order) -> BaseOrderProxy`: 引擎回调入口。将目标券商特有的 Trade/Order 回调对象，解析并转换为上述自定义的 `BaseOrderProxy` 对象。**注意：匹配归属的 data 对象时，严禁使用 `in` 进行模糊匹配，必须使用精确的字符串等于判定。**
@@ -72,6 +75,7 @@
 6. 当实盘 schedule 期间券商平台未启动、API 不可用或连接失败时，需在 prewarm 与实际 run 时刻分别推送 slot 级 ERROR 告警，但不得把该 slot 误记为已执行。
 7. 适配器和执行器必须区分 live/backtest：实盘以柜台现实、持仓/现金对账和短生命周期健康标记恢复；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
 8. 卖后现金等待、滚动买入和最终补齐属于 `common.order_executor` 职责；adapter 不要重复实现这些流程，只暴露真实现金、价格、在途订单和订单代理字段。
+9. 使用 SDK 事件循环的实盘 adapter 必须把 SDK 线程/轮询/协作等待函数抛出的非人工 `SystemExit` 当作 session 退出并交给 Phoenix 重启；不要让 nohup 长进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。schedule prewarm 和正式 run 都应按目标 slot 去重，长进程 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带时间戳。
 
 ---
 
