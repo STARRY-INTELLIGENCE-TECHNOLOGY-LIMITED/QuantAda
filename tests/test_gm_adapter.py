@@ -796,6 +796,121 @@ def test_gm_launch_restarts_unmarked_sdk_system_exit(monkeypatch, capsys):
     assert pushed, "未标记 SystemExit 应推送异常，便于定位 SDK 层直接退出。"
 
 
+def test_gm_launch_soft_resets_sdk_after_init_failure(monkeypatch, capsys):
+    """
+    GM 终端未启动时 gmi_init 可能把失败状态留在 SDK 进程内。
+    init 失败后必须重新绑定 token/server 并尝试 SDK soft reset，避免同进程永久 1001。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    token_calls = []
+    serv_addr_calls = []
+    reset_calls = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    def _sleep(seconds):
+        if seconds >= 10:
+            raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: token_calls.append(token), raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: serv_addr_calls.append(addr), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_close", lambda: reset_calls.append("gmi_close"), raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 1001, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", _sleep)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "serv_addr": "127.0.0.1:7001", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert len(token_calls) >= 2, "外层启动和每轮 run_session 前都应重新绑定 token。"
+    assert len(serv_addr_calls) >= 2, "外层启动和每轮 run_session 前都应重新绑定 serv_addr。"
+    assert reset_calls == ["gmi_close"]
+    assert "GM SDK soft reset after init failure. status=1001" in captured.out
+
+
+def test_gm_launch_reexecs_after_repeated_init_failures(monkeypatch):
+    """
+    若 GM SDK 在同一进程中连续 init 失败，Phoenix 应执行进程级自重启，
+    覆盖“人工 kill 后重跑即可成功”的恢复路径。
+    """
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    pushed = []
+    exec_calls = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            pushed.append((args, kwargs))
+
+    def _execv(executable, argv):
+        exec_calls.append((executable, argv))
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_close", lambda: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 1001, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+    monkeypatch.setattr(gm_module.os, "execv", _execv)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    assert exec_calls, "连续 init 失败后应触发 os.execv 自重启。"
+    executable, argv = exec_calls[0]
+    assert executable == sys.executable
+    assert argv[0] == sys.executable
+    assert argv[1] == "-u"
+    assert pushed, "进程级自重启前应推送异常，便于定位 GM SDK init 卡死。"
+
+
 def test_gm_duplicate_init_callback_is_ignored_in_same_session(monkeypatch, capsys):
     """
     GM SDK 可能在同一实盘 session 内重复触发 init 回调；第二次不能重复初始化

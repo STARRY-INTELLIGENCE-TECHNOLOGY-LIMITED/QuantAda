@@ -75,7 +75,7 @@
 6. 当实盘 schedule 期间券商平台未启动、API 不可用或连接失败时，需在 prewarm 与实际 run 时刻分别推送 slot 级 ERROR 告警，但不得把该 slot 误记为已执行。
 7. 适配器和执行器必须区分 live/backtest：实盘以柜台现实、持仓/现金对账和短生命周期健康标记恢复；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
 8. 卖后现金等待、滚动买入和最终补齐属于 `common.order_executor` 职责；adapter 不要重复实现这些流程，只暴露真实现金、价格、在途订单和订单代理字段。
-9. 使用 SDK 事件循环的实盘 adapter 必须把 SDK 线程/轮询/协作等待函数抛出的非人工 `SystemExit` 当作 session 退出并交给 Phoenix 重启；不要让 nohup 长进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。schedule prewarm 和正式 run 都应按目标 slot 去重，长进程 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带时间戳。
+9. 使用 SDK 事件循环的实盘 adapter 必须把 SDK 线程/轮询/协作等待函数抛出的非人工 `SystemExit` 当作 session 退出并交给 Phoenix 重启；不要让 nohup 长进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。schedule prewarm 和正式 run 都应按目标 slot 去重，长进程 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带时间戳。GM 这类进程内 SDK 若 init 失败，应先重绑 token/server/callback 并 soft reset；连续 init 失败可 re-exec 当前进程作为最后自愈。
 
 ---
 

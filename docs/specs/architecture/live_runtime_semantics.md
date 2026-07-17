@@ -64,3 +64,4 @@
 12. GM / IBKR schedule prewarm 与正式 run 都必须按目标 schedule slot 去重；重复 prewarm 回调不得重复执行或持续打印 `Prewarm Finished`。
 13. 使用 SDK 事件循环的实盘 Phoenix loop 必须把 SDK 轮询/协作等待函数抛出的 `SystemExit` 视为 session 退出并重启；未标记的 `SystemExit` 应打印带时间戳日志并推送异常，避免 nohup 进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。
 14. GM / IBKR 长进程运行期 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带本地时间戳，便于排查夜间断线、SDK 退出和重复回调窗口。
+15. GM live `gmi_init()` 失败后必须在同进程内重新绑定 token/server/strategy/callback 并尝试 SDK soft reset；若连续初始化失败达到自愈阈值，应 re-exec 当前 Python 进程，覆盖“首次终端不可用导致 SDK 状态卡死，人工重启进程才恢复”的场景。

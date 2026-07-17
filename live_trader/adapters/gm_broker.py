@@ -1,4 +1,5 @@
 import datetime
+import os
 import sys
 
 import pandas as pd
@@ -623,9 +624,86 @@ class GmBrokerAdapter(BaseLiveBroker):
         commission = float(kwargs.get('commission')) if kwargs.get('commission') is not None else 0.0003
         slippage = float(kwargs.get('slippage')) if kwargs.get('slippage') is not None else 0.0001
 
+        def _apply_gm_connection_config():
+            """
+            Re-apply GM global connection settings before every SDK init attempt.
+
+            GM SDK keeps part of its connection state process-wide. If the first
+            init happens while the terminal/broker is unavailable, re-binding the
+            token/server on each Phoenix session keeps later retries equivalent
+            to a fresh process start.
+            """
+            if serv_addr and set_serv_addr:
+                set_serv_addr(serv_addr)
+            if token and set_token:
+                set_token(token)
+
+        def _soft_reset_gm_sdk(reason, status=None):
+            """
+            Best-effort cleanup for GM SDK process-global state after init/poll
+            failure. Function names differ across gm versions, so this probes
+            both module globals and gm.csdk.c_sdk dynamically.
+            """
+            reset_names = (
+                'gmi_close', 'gmi_stop', 'gmi_uninit', 'gmi_exit',
+                'py_gmi_close', 'py_gmi_stop', 'py_gmi_uninit', 'py_gmi_exit',
+            )
+            sources = [globals()]
+            try:
+                import gm.csdk.c_sdk as c_sdk
+                sources.append(vars(c_sdk))
+            except Exception:
+                pass
+
+            called = []
+            for source in sources:
+                for name in reset_names:
+                    fn = source.get(name) if isinstance(source, dict) else None
+                    if not callable(fn) or name in called:
+                        continue
+                    try:
+                        fn()
+                        called.append(name)
+                    except TypeError:
+                        # Some versions may expose functions with required args;
+                        # those are not safe to guess here.
+                        continue
+                    except SystemExit:
+                        raise
+                    except Exception as e:
+                        _runtime_print(f"[GmBroker Warning] GM SDK reset hook {name} failed: {e}")
+
+            try:
+                setattr(context, '_quantada_gm_shutdown_requested', False)
+            except Exception:
+                pass
+
+            status_text = f" status={status}" if status is not None else ""
+            hook_text = ", ".join(called) if called else "none"
+            _runtime_print(
+                f"[Phoenix] GM SDK soft reset after {reason}.{status_text} hooks={hook_text}"
+            )
+
+        def _hard_reexec_current_process(reason):
+            """
+            Last-resort self-healing: replace the current Python process with a
+            fresh one. This matches the manual kill/re-run recovery path while
+            preserving nohup file descriptors.
+            """
+            _runtime_print(f"[Phoenix] {reason}. Re-exec current Python process to clear GM SDK state...")
+            try:
+                AlarmManager().push_exception("GM SDK Init Stuck", reason)
+            except Exception:
+                pass
+
+            argv = [sys.executable, '-u'] + list(sys.argv)
+            try:
+                os.execv(sys.executable, argv)
+            except Exception as e:
+                _runtime_print(f"[Phoenix] GM self re-exec failed: {e}. Continue Phoenix retry loop.")
+
         # 设置全局配置
-        if serv_addr: set_serv_addr(serv_addr)
-        set_token(token)
+        _apply_gm_connection_config()
 
         if mode == MODE_BACKTEST:
             dt_end = _clip_backtest_end_by_history(dt_end)
@@ -639,7 +717,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             gm_start_time = dt_start.strftime('%Y-%m-%d 08:00:00')
             gm_end_time = dt_end.strftime('%Y-%m-%d %H:%M:%S')
 
-        launch_state = {'start_alarm_sent': False}
+        launch_state = {'start_alarm_sent': False, 'consecutive_init_failures': 0}
 
         # --- 2. 核心运行逻辑 ---
         def run_session():
@@ -671,6 +749,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 return True
 
             # 每次启动前重置 context 身份
+            _apply_gm_connection_config()
             py_gmi_set_strategy_id(strategy_id)
             gmi_set_mode(mode)
             context.mode = mode
@@ -954,14 +1033,19 @@ class GmBrokerAdapter(BaseLiveBroker):
                 _runtime_print("  Status: Connecting to GM terminal...")
                 status = gmi_init()
                 if status != 0:
+                    launch_state['consecutive_init_failures'] = int(
+                        launch_state.get('consecutive_init_failures', 0) or 0
+                    ) + 1
                     _runtime_print(f"[Phoenix] Init failed (Code: {status}). Retrying in 10s...")
                     AlarmManager().push_schedule_api_unavailable(
                         "GmBroker",
                         f"GM terminal init failed (Code: {status})",
                     )
+                    _soft_reset_gm_sdk("init failure", status=status)
                     return True  # 初始化失败，要求重试
 
                 check_gm_status(status)
+                launch_state['consecutive_init_failures'] = 0
 
                 _runtime_print("[Phoenix] Entering Event Loop (Ctrl+C to stop)...")
 
@@ -1044,6 +1128,13 @@ class GmBrokerAdapter(BaseLiveBroker):
                 if not should_retry:
                     _runtime_print(">>> GM Broker Exited Normally.")
                     break  # 回测结束或正常退出
+
+                init_failures = int(launch_state.get('consecutive_init_failures', 0) or 0)
+                if mode == MODE_LIVE and init_failures >= 12:
+                    _hard_reexec_current_process(
+                        f"GM init failed {init_failures} consecutive times; SDK may be stuck after terminal startup"
+                    )
+                    launch_state['consecutive_init_failures'] = 0
 
                 # 如果 run_session 返回 True，说明是异常退出或断线，需要冷却后重启
                 _runtime_print("[Phoenix] Waiting 10s before restart...")
