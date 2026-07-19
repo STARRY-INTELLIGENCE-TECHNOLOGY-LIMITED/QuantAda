@@ -1,7 +1,6 @@
 from abc import ABC, abstractmethod
 
 import config
-from alarms.manager import AlarmManager
 
 
 class PortfolioRebalancer:
@@ -61,12 +60,6 @@ class PortfolioRebalancer:
         for data in target_symbols:
             if id(data) not in current_data_ids and target_value > 0:
                 plan['increase'].append((data, target_value))
-
-        if config.PRINT_PLAN:
-            plan_md_str = PortfolioRebalancer._log_plan(
-                plan, current_positions, target_symbols, target_value, rebalance_threshold
-            )
-            AlarmManager().push_plan(plan_md_str)
 
         return plan
 

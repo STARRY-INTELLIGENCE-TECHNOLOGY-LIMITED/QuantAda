@@ -52,6 +52,7 @@ QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并�
 - **使用方法**: QuantAda 当前内置的 `execute_rebalance` 是“目标标的列表 + 目标槽位数”的等权调仓接口，不是权重字典接口。
   - 构造目标列表：`target_symbols = [data_a, data_b, data_c]`（这里放 `data` 对象，不放字符串）
   - 执行发单：`self.execute_rebalance(target_symbols=target_symbols, top_k=self.p.selectTopK, rebalance_threshold=self.p.rebalance_threshold)`
+  - 如需把横截面分数排名推送到 IM，排序后调用：`self.publish_rankings(ranked_candidates, title="ranked_symbols", dt=current_dt)`；`ranked_candidates` 推荐为 `[(data, score), ...]`，不要在策略里直接导入 `AlarmManager`。回测模式只会在结束时推送最后一条排名，并附带执行命令、交易归因和最终绩效摘要。
   - **调仓时点**: 统一使用一个参数/概念 `rebalance_when`
     - 固定频率：在 `params` 里设置 `rebalance_when='bar'|'daily'|'weekly'|'monthly'`
     - next rebalance：若策略知道“这次是不是正式调仓”，直接传 `self.execute_rebalance(..., rebalance_when='next' if is_rebalance_day else 'skip')`
@@ -134,6 +135,8 @@ class YourCustomStrategy(BaseStrategy):
             # targets.append(data)
 
         # 3. 如果使用【范式 B】，统一执行调仓
+        # 排序策略如需推送分数排名，可在 execute_rebalance 前调用:
+        # self.publish_rankings(ranked_candidates, title="ranked_symbols", dt=current_dt)
         # self.execute_rebalance(
         #     target_symbols=targets,
         #     top_k=self.p.selectTopK,

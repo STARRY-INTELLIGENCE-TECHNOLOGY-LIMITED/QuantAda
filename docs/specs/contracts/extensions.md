@@ -42,6 +42,10 @@
 - `push_trade`
 - `push_status`
 3. 失败不得抛出未捕获异常，避免影响交易主流程
+4. 调仓、执行器、策略基类、broker 基类等核心/基础层不得直接导入具体 IM manager；需要运行期通知时通过 `common.runtime_notifications` 发出通知意图，由 `alarms` 包负责具体通道。
+5. `PRINT_PLAN=True` 时，live 运行可即时推送每次计划及策略排名快照；backtest 运行必须只在回测结束时按快照 key 推送最后一条计划/排名，并在报警通道启用时附带本次执行命令、交易归因和最终绩效摘要，本地日志可继续打印每次计划，避免历史区间触发 IM 限流。
+6. `ALARMS_ENABLED=None` 为自动模式: 有任一 webhook 时启用报警通道，无 webhook 时不启用；显式 `False` 用于强制禁用。
+7. `LOG` 只控制本地详细日志，不作为 IM 推送总开关。
 
 ## 5. Recorder
 1. 继承 `recorders.base_recorder.BaseRecorder`

@@ -1,6 +1,6 @@
 import time
 
-from alarms.manager import AlarmManager
+from common import runtime_notifications
 
 
 class OrderExecutor:
@@ -149,10 +149,7 @@ class OrderExecutor:
             return
 
         print(msg)
-        try:
-            AlarmManager().push_text(msg, level=level)
-        except Exception:
-            pass
+        runtime_notifications.push_text(msg, level=level)
 
     def _is_benign_backtest_skip(self):
         if getattr(self.broker, 'is_live', True) is True:
@@ -648,10 +645,7 @@ class OrderExecutor:
                     f"继续等待并按已确认现金滚动买入。"
                 )
                 print(warn_msg)
-                try:
-                    AlarmManager().push_text(warn_msg, level='WARNING')
-                except Exception:
-                    pass
+                runtime_notifications.push_text(warn_msg, level='WARNING')
                 warn_sent = True
 
             can_roll_buy = (warn_after <= 0 or elapsed >= warn_after) and remote_has_pending_sell
@@ -669,10 +663,7 @@ class OrderExecutor:
                         f"fetch_failures={pending_fetch_failures}"
                     )
                     print(msg)
-                    try:
-                        AlarmManager().push_text(msg, level='ERROR')
-                    except Exception:
-                        pass
+                    runtime_notifications.push_text(msg, level='ERROR')
                 if hasattr(self.broker, 'sync_balance'):
                     try:
                         self.broker.sync_balance()

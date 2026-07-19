@@ -64,6 +64,7 @@ class SampleAutoRebalanceStrategy(BaseStrategy):
         # ==========================================
         # 按照得分从高到低排序
         valid_candidates.sort(key=lambda x: x[1], reverse=True)
+        self.publish_rankings(valid_candidates, title="ranked_symbols", dt=current_dt)
 
         # 挑出前 selectTopK 名（按照配置，这里会挑出第 1 名）
         targets = [item[0] for item in valid_candidates[:self.p.selectTopK]]

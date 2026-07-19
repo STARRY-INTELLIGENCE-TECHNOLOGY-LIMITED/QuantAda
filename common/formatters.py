@@ -63,3 +63,40 @@ def format_recent_backtest_metrics(metrics):
         "win_rate": format_rate(metrics.get("win_rate")),
         "profit_factor": format_float(metrics.get("profit_factor")),
     }
+
+
+def format_ranked_candidates_markdown(
+    ranked_candidates,
+    title="ranked_symbols",
+    dt=None,
+    score_digits=6,
+):
+    lines = [f"### {title}"]
+    if dt is not None:
+        dt_text = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+        lines.append(f"- **时间**: `{dt_text.replace('T00:00:00', '').replace(' 00:00:00', '')}`")
+
+    rows = list(ranked_candidates or [])
+    if not rows:
+        lines.append("1. (empty)")
+        return "\n".join(lines)
+
+    for idx, item in enumerate(rows, start=1):
+        try:
+            symbol, score = item
+        except (TypeError, ValueError):
+            symbol, score = item, None
+
+        symbol_name = getattr(symbol, "_name", str(symbol))
+        if score is None:
+            lines.append(f"{idx}. {symbol_name}")
+            continue
+
+        try:
+            score_value = float(score)
+            score_text = str(score) if math.isnan(score_value) else f"{score_value:.{int(score_digits)}f}"
+        except (TypeError, ValueError):
+            score_text = str(score)
+        lines.append(f"{idx}. {symbol_name} `{score_text}`")
+
+    return "\n".join(lines)

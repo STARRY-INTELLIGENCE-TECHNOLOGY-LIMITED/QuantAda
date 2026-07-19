@@ -15,7 +15,7 @@ from backtest.plotting import (
 )
 from backtest.reporting import format_backtest_results_report
 from backtest.trade_attribution import format_trade_micro_attribution_report
-from common import log
+from common import log, runtime_command, runtime_notifications
 
 
 class OrderProxy:
@@ -534,6 +534,7 @@ class Backtester:
         return mapping.get(timeframe_str, bt.TimeFrame.Days)
 
     def run(self):
+        runtime_notifications.clear_deferred_plan()
         self._init_data_feeds()
         self._init_strategy()
         self._init_broker()
@@ -541,10 +542,12 @@ class Backtester:
         self.log(f"Starting Portfolio Value: {self.cerebro.broker.getvalue():.2f}")
 
         self.results = self.cerebro.run()
+        runtime_notifications.flush_deferred_plan()
 
         final_val = self.cerebro.broker.getvalue()
         self.log(f"Final Portfolio Value: {final_val:.2f}")
 
+        self._push_backtest_performance_summary()
         self._process_recorder_hooks(final_val)
         self._generate_report()
 
@@ -652,6 +655,27 @@ class Backtester:
             sharpe=sharpe, max_drawdown=max_dd, annual_return=ann_ret,
             trade_count=total_trades, win_rate=win_rate  # 传入新增参数
         )
+
+    def _push_backtest_performance_summary(self):
+        if not getattr(config, "PRINT_PLAN", False):
+            return False
+        if hasattr(config, "is_alarms_enabled") and not config.is_alarms_enabled():
+            return False
+
+        try:
+            metrics = self.get_performance_metrics()
+            if not metrics:
+                return False
+            attribution_report = self.get_trade_micro_attribution_report()
+            report = format_backtest_results_report(metrics, attribution_report=attribution_report)
+            command = str(runtime_command.get_current_command() or "").strip()
+            if command:
+                report = f"### Backtest Command\n```bash\n{command}\n```\n{report}"
+            return runtime_notifications.push_plan(report)
+        except Exception as e:
+            if self.verbose:
+                print(f"[Backtester] Failed to push backtest performance summary: {e}")
+            return False
 
     def _generate_report(self):
         """生成文字报告和图表"""

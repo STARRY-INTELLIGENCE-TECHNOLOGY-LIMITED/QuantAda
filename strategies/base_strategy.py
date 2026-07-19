@@ -3,8 +3,9 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from alarms.manager import AlarmManager
-from common import indicator_cache
+import config
+from common.formatters import format_ranked_candidates_markdown
+from common import indicator_cache, runtime_notifications
 from common.log import extract_order_execution_dt
 
 
@@ -100,6 +101,32 @@ class BaseStrategy(ABC):
         [框架层 API] 安全、极速地获取指标值。自动路由双轨制。
         """
         return indicator_cache.get_indicator(self, data, indicator_name, current_dt)
+
+    def publish_rankings(
+        self,
+        ranked_candidates,
+        title="ranked_symbols",
+        dt=None,
+        level='INFO',
+        key="rankings",
+        score_digits=6,
+    ):
+        """
+        推送策略侧排名快照。
+        live 模式即时推送；backtest 模式只保留同 key 的最后一条，随回测结束统一 flush。
+        """
+        if not getattr(config, 'PRINT_PLAN', False):
+            return False
+
+        content = format_ranked_candidates_markdown(
+            ranked_candidates,
+            title=title,
+            dt=dt,
+            score_digits=score_digits,
+        )
+        if getattr(self.broker, 'is_live', False):
+            return runtime_notifications.push_plan(content, level=level)
+        return runtime_notifications.defer_plan(content, level=level, key=key)
 
     def get_strategy_isolated_capital(self):
         """
@@ -343,10 +370,7 @@ class BaseStrategy(ABC):
                 f" unknown_targets={unknown_targets}"
             )
             self.log(msg)
-            try:
-                AlarmManager().push_text(msg, level='WARNING')
-            except Exception:
-                pass
+            runtime_notifications.push_text(msg, level='WARNING')
 
         # 1. 底层框架全自动盘点真实可用资金 (已完美无视所有豁免底仓)
         allocatable_capital, current_positions = self.get_strategy_isolated_capital()
@@ -359,6 +383,18 @@ class BaseStrategy(ABC):
             select_top_k=top_k,
             rebalance_threshold=rebalance_threshold
         )
+        if getattr(config, 'PRINT_PLAN', False):
+            plan_md_str = PortfolioRebalancer._log_plan(
+                plan,
+                current_positions,
+                resolved_targets,
+                plan.get('target_per_stock', 0.0),
+                rebalance_threshold,
+            )
+            if getattr(self.broker, 'is_live', False):
+                runtime_notifications.push_plan(plan_md_str)
+            else:
+                runtime_notifications.defer_plan(plan_md_str)
 
         # 3. 执行发单
         if not hasattr(self, 'executor'):

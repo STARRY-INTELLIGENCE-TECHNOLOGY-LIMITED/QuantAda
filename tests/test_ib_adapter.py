@@ -1329,7 +1329,7 @@ def test_ib_schedule_prewarm_summary_error_pushes_warning_alarm_once(monkeypatch
 
     import live_trader.data_bridge.data_warm as data_warm_module
 
-    monkeypatch.setattr(data_warm_module, "AlarmManager", lambda: DummyAlarm())
+    monkeypatch.setattr(data_warm_module.runtime_notifications, "push_text", DummyAlarm().push_text)
 
     now = datetime.datetime(2026, 4, 11, 15, 44, 0)
     context = types.SimpleNamespace(ib_instance=DummyIBForCash(cash_usd=0.0), now=now)
@@ -1376,7 +1376,7 @@ def test_ib_schedule_prewarm_exception_pushes_error_alarm_without_raising(monkey
 
     import live_trader.data_bridge.data_warm as data_warm_module
 
-    monkeypatch.setattr(data_warm_module, "AlarmManager", lambda: DummyAlarm())
+    monkeypatch.setattr(data_warm_module.runtime_notifications, "push_text", DummyAlarm().push_text)
 
     now = datetime.datetime(2026, 4, 11, 15, 44, 0)
     context = types.SimpleNamespace(ib_instance=DummyIBForCash(cash_usd=0.0), now=now)

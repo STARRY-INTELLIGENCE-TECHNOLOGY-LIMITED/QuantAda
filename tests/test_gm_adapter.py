@@ -592,7 +592,7 @@ def test_gm_run_schedule_prewarm_is_non_blocking_and_pushes_warning(monkeypatch)
     import live_trader.data_bridge.data_warm as data_warm_module
     import live_trader.adapters.gm_broker as gm_module
 
-    monkeypatch.setattr(data_warm_module, "AlarmManager", lambda: DummyAlarm())
+    monkeypatch.setattr(data_warm_module.runtime_notifications, "push_text", DummyAlarm().push_text)
     monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
 
     broker = GmBrokerAdapter(context=MagicMock())

@@ -58,3 +58,9 @@
 ## 8. Isolated Capital Semantics
 1. 策略调仓使用真实持仓 + 在途订单做 bottom-up 盘点。
 2. 若 broker 提供 `get_rebalance_cash()`，策略计划口径优先使用该值。
+
+## 9. Strategy Ranking Notification
+1. 横截面排名/轮动策略需要推送分数排名时，使用 `self.publish_rankings(ranked_candidates, title="ranked_symbols", dt=current_dt)`。
+2. `ranked_candidates` 推荐传 `[(data, score), ...]`，其中 `data` 是当前 broker 管理的数据对象。
+3. 策略不得直接导入 `AlarmManager` 推送排名；通知分发通过 `common.runtime_notifications` 边界完成。
+4. `PRINT_PLAN=True` 时，live 模式即时推送排名；backtest 模式只保留最后一条排名快照并在回测结束时统一推送，回测结束时还会附带执行命令、交易归因和最终绩效摘要。

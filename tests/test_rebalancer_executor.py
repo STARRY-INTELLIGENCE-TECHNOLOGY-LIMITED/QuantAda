@@ -1,20 +1,13 @@
 from types import SimpleNamespace
 
 
-def test_calculate_plan_pushes_plan_via_semantic_tag(monkeypatch):
+def test_calculate_plan_does_not_push_without_runtime_context(monkeypatch):
     import common.rebalancer as rebalancer_module
-
-    pushed = []
 
     class DummyData:
         def __init__(self, name):
             self._name = name
 
-    class DummyAlarmManager:
-        def push_plan(self, content, level="INFO"):
-            pushed.append({"content": content, "level": level})
-
-    monkeypatch.setattr(rebalancer_module, "AlarmManager", lambda: DummyAlarmManager())
     monkeypatch.setattr(rebalancer_module.config, "PRINT_PLAN", True)
     monkeypatch.setattr(rebalancer_module.config, "LOG", False)
 
@@ -29,8 +22,6 @@ def test_calculate_plan_pushes_plan_via_semantic_tag(monkeypatch):
     )
 
     assert plan["sell_clear"], "应正常生成调仓计划。"
-    assert len(pushed) == 1, "PRINT_PLAN=True 时应通过 push_plan 推送计划。"
-    assert "调仓计划生成" in pushed[0]["content"]
 
 
 def test_calculate_plan_uses_data_identity_not_overloaded_equality(monkeypatch):
@@ -131,7 +122,7 @@ def test_order_executor_waits_beyond_60s_until_sell_settles_then_buys(monkeypatc
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -186,7 +177,7 @@ def test_order_executor_warns_after_5m_but_keeps_waiting_until_sell_settles(monk
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -244,7 +235,7 @@ def test_order_executor_clears_local_pending_sell_when_remote_sell_empty(monkeyp
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -372,7 +363,7 @@ def test_order_executor_post_sell_cash_wait_times_out_and_continues(monkeypatch)
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         is_live = True
@@ -552,7 +543,7 @@ def test_order_executor_stops_when_sell_timeout_and_position_not_reached(monkeyp
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -621,7 +612,7 @@ def test_order_executor_does_not_clear_sell_when_empty_pending_snapshot_untruste
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -694,7 +685,7 @@ def test_order_executor_does_not_full_release_untracked_sell_when_pending_query_
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -757,7 +748,7 @@ def test_order_executor_hard_wait_returns_so_later_schedule_can_run(monkeypatch)
         def push_text(self, content, level="INFO"):
             pass
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -834,7 +825,7 @@ def test_order_executor_rolls_buys_with_confirmed_cash_without_full_release(monk
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     buy_data = SimpleNamespace(_name="EWJ.ARCA")
     sell_data = SimpleNamespace(_name="SPY.ARCA")
@@ -1006,7 +997,7 @@ def test_order_executor_warns_and_skips_buys_when_sell_not_submitted(monkeypatch
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -1044,7 +1035,7 @@ def test_order_executor_warns_when_buy_not_submitted(monkeypatch):
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBroker:
         def __init__(self):
@@ -1079,7 +1070,7 @@ def test_order_executor_keeps_unknown_buy_failure_visible_in_quiet_backtest(monk
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBacktestBroker:
         is_live = False
@@ -1113,7 +1104,7 @@ def test_order_executor_keeps_buy_not_submitted_visible_in_verbose_backtest(monk
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBacktestBroker:
         is_live = False
@@ -1147,7 +1138,7 @@ def test_order_executor_treats_backtest_min_lot_buy_skip_as_noop(monkeypatch, ca
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBacktestBroker:
         is_live = False
@@ -1182,7 +1173,7 @@ def test_order_executor_treats_backtest_benign_sell_skip_as_noop_and_continues_b
         def push_text(self, content, level="INFO"):
             pushed.append({"content": content, "level": level})
 
-    monkeypatch.setattr(executor_module, "AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", DummyAlarmManager().push_text)
 
     class DummyBacktestBroker:
         is_live = False

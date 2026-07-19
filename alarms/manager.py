@@ -41,7 +41,12 @@ class AlarmManager:
         if self._initialized: return
 
         self.alarms = []
-        if config.ALARMS_ENABLED:
+        alarms_enabled = (
+            config.is_alarms_enabled()
+            if hasattr(config, "is_alarms_enabled")
+            else bool(getattr(config, "ALARMS_ENABLED", False))
+        )
+        if alarms_enabled:
             # 加载钉钉
             if config.DINGTALK_WEBHOOK:
                 self.alarms.append(DingTalkAlarm())

@@ -69,6 +69,36 @@ def test_push_text_dispatches_immediately(fresh_alarm_manager):
     assert "重复次数" not in content, "push_text 不应再做文本聚合去重。"
 
 
+def test_alarm_manager_auto_enables_channels_when_webhook_is_configured(monkeypatch):
+    AlarmManager._instance = None
+    monkeypatch.setattr(manager_module.AlarmManager, "_register_dead_letter_handlers", lambda self: None)
+    monkeypatch.setattr(manager_module.config, "ALARMS_ENABLED", None)
+    monkeypatch.setattr(manager_module.config, "DINGTALK_WEBHOOK", "")
+    monkeypatch.setattr(manager_module.config, "WECOM_WEBHOOK", "https://example.invalid/wecom")
+
+    mgr = AlarmManager()
+
+    try:
+        assert [alarm.__class__.__name__ for alarm in mgr.alarms] == ["WeComAlarm"]
+    finally:
+        AlarmManager._instance = None
+
+
+def test_alarm_manager_explicit_false_disables_channels_even_with_webhook(monkeypatch):
+    AlarmManager._instance = None
+    monkeypatch.setattr(manager_module.AlarmManager, "_register_dead_letter_handlers", lambda self: None)
+    monkeypatch.setattr(manager_module.config, "ALARMS_ENABLED", False)
+    monkeypatch.setattr(manager_module.config, "DINGTALK_WEBHOOK", "")
+    monkeypatch.setattr(manager_module.config, "WECOM_WEBHOOK", "https://example.invalid/wecom")
+
+    mgr = AlarmManager()
+
+    try:
+        assert mgr.alarms == []
+    finally:
+        AlarmManager._instance = None
+
+
 def test_runtime_context_status_detail_contains_market_scope(fresh_alarm_manager):
     mgr = fresh_alarm_manager
     fake = FakeAlarmChannel()

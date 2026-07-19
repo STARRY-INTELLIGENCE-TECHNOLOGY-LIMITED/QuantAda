@@ -3,7 +3,7 @@ import re
 
 import pandas as pd
 
-from alarms.manager import AlarmManager
+from common import runtime_notifications
 
 
 class SchedulePlanner:
@@ -395,10 +395,8 @@ class BrokerDataWarmBridge:
             )
 
         print(msg)
-        try:
-            AlarmManager().push_text(msg, level=level)
-        except Exception as exc:
-            print(f"[Broker Warning] failed to push prewarm alarm: {exc}")
+        if not runtime_notifications.push_text(msg, level=level):
+            print("[Broker Warning] failed to push prewarm alarm")
         return True
 
     def run_schedule_prewarm(self, schedule_rule, data_provider=None, symbols=None,

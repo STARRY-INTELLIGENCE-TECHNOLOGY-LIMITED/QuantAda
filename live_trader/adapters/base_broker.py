@@ -4,9 +4,8 @@ from abc import ABC, abstractmethod
 import pandas as pd
 
 import config
-from common import log
+from common import log, runtime_notifications
 
-from alarms.manager import AlarmManager
 from ..data_bridge.data_warm import BrokerDataWarmBridge
 
 
@@ -510,10 +509,8 @@ class BaseLiveBroker(ABC):
 
             print(f"\n{'-' * 30}\n{error_msg}\n{'-' * 30}")
 
-            try:
-                AlarmManager().push_text(error_msg, level='WARNING')
-            except Exception as e:
-                print(f"[Alarm Error] 无法发送截断警告: {e}")
+            if not runtime_notifications.push_text(error_msg, level='WARNING'):
+                print("[Notification Warning] 无法发送截断警告")
 
             return None
 

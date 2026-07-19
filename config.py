@@ -14,7 +14,10 @@ CACHE_DATA = False
 # 是否打印详细交易日志
 LOG = True
 
-# 是否打印交易计划
+# 是否打印交易计划/排名快照。
+# - live: 每次计划即时推送 IM
+# - backtest: 本地仍按计划打印；IM 只推送回测结束时最后一条计划/排名快照，
+#   并附带执行命令、交易归因和最终绩效摘要，避免历史区间刷屏限流
 PRINT_PLAN = False
 
 # 是否跨日保留委托：
@@ -65,7 +68,11 @@ TIINGO_TOKEN = 'your_token_here'
 
 
 # --- 报警与监控配置 ---
-ALARMS_ENABLED = False
+# 报警总开关:
+# - None: 自动模式，有任一 WEBHOOK 时启用报警通道，无 WEBHOOK 时不启用
+# - True: 强制启用已配置 WEBHOOK 的报警通道
+# - False: 强制禁用报警通道，即使 WEBHOOK 已配置
+ALARMS_ENABLED = None
 
 # 钉钉机器人 Webhook
 # 格式: 'https://oapi.dingtalk.com/robot/send?access_token=xxxx'
@@ -77,6 +84,16 @@ WECOM_WEBHOOK = ''
 
 # 报警级别过滤: INFO, WARNING, ERROR, CRITICAL
 ALARM_LEVEL = 'INFO'
+
+
+def has_alarm_webhook() -> bool:
+    return bool(DINGTALK_WEBHOOK or WECOM_WEBHOOK)
+
+
+def is_alarms_enabled() -> bool:
+    if ALARMS_ENABLED is None:
+        return has_alarm_webhook()
+    return bool(ALARMS_ENABLED)
 
 
 # --- 数据库记录配置 ---

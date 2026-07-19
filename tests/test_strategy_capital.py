@@ -309,6 +309,155 @@ def test_execute_rebalance_runs_plan_when_weekly_gate_due(monkeypatch):
     assert len(execute_calls) == 1, "新交易周应将计划交给执行器。"
 
 
+def test_execute_rebalance_pushes_plan_immediately_in_live(monkeypatch):
+    import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
+    import strategies.base_strategy as strategy_module
+
+    pushed = []
+
+    def fake_calculate_plan(**kwargs):
+        return {"sell_clear": [], "reduce": [], "increase": [], "target_per_stock": 1000.0}
+
+    class DummyExecutor:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def execute_plan(self, plan):
+            return None
+
+    monkeypatch.setattr(strategy_module.config, "PRINT_PLAN", True)
+    monkeypatch.setattr(strategy_module.config, "LOG", False)
+    monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "calculate_plan", staticmethod(fake_calculate_plan))
+    monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "_log_plan", staticmethod(lambda *args: "live plan"))
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(strategy_module.runtime_notifications, "push_plan", lambda content, level="INFO": pushed.append((content, level)) or True)
+    monkeypatch.setattr(strategy_module.runtime_notifications, "defer_plan", lambda content, level="INFO": pytest.fail("live 不应缓存计划"))
+
+    data = DummyData("AAPL.SMART")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
+    strategy = DummyStrategy(broker=broker, params={})
+
+    strategy.execute_rebalance(target_symbols=[data], top_k=1, rebalance_threshold=0.2)
+
+    assert pushed == [("live plan", "INFO")]
+
+
+def test_execute_rebalance_defers_plan_in_backtest(monkeypatch):
+    import common.rebalancer as rebalancer_module
+    import common.order_executor as order_executor_module
+    import strategies.base_strategy as strategy_module
+
+    deferred = []
+
+    def fake_calculate_plan(**kwargs):
+        return {"sell_clear": [], "reduce": [], "increase": [], "target_per_stock": 1000.0}
+
+    class DummyExecutor:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def execute_plan(self, plan):
+            return None
+
+    monkeypatch.setattr(strategy_module.config, "PRINT_PLAN", True)
+    monkeypatch.setattr(strategy_module.config, "LOG", False)
+    monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "calculate_plan", staticmethod(fake_calculate_plan))
+    monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "_log_plan", staticmethod(lambda *args: "backtest plan"))
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(strategy_module.runtime_notifications, "push_plan", lambda content, level="INFO": pytest.fail("backtest 不应立即推送计划"))
+    monkeypatch.setattr(strategy_module.runtime_notifications, "defer_plan", lambda content, level="INFO": deferred.append((content, level)) or True)
+
+    data = DummyData("AAPL.SMART")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
+    broker.is_live = False
+    strategy = DummyStrategy(broker=broker, params={})
+
+    strategy.execute_rebalance(target_symbols=[data], top_k=1, rebalance_threshold=0.2)
+
+    assert deferred == [("backtest plan", "INFO")]
+
+
+def test_publish_rankings_pushes_immediately_in_live(monkeypatch):
+    import strategies.base_strategy as strategy_module
+
+    pushed = []
+
+    monkeypatch.setattr(strategy_module.config, "PRINT_PLAN", True)
+    monkeypatch.setattr(
+        strategy_module.runtime_notifications,
+        "push_plan",
+        lambda content, level="INFO": pushed.append((content, level)) or True,
+    )
+    monkeypatch.setattr(
+        strategy_module.runtime_notifications,
+        "defer_plan",
+        lambda *args, **kwargs: pytest.fail("live 不应缓存排名快照"),
+    )
+
+    data = DummyData("AAPL.SMART")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
+    strategy = DummyStrategy(broker=broker, params={})
+
+    assert strategy.publish_rankings([(data, 1.23456789)], dt=datetime(2026, 4, 21)) is True
+
+    assert len(pushed) == 1
+    assert "### ranked_symbols" in pushed[0][0]
+    assert "AAPL.SMART `1.234568`" in pushed[0][0]
+
+
+def test_publish_rankings_defers_last_snapshot_in_backtest(monkeypatch):
+    import strategies.base_strategy as strategy_module
+
+    deferred = []
+
+    monkeypatch.setattr(strategy_module.config, "PRINT_PLAN", True)
+    monkeypatch.setattr(
+        strategy_module.runtime_notifications,
+        "push_plan",
+        lambda *args, **kwargs: pytest.fail("backtest 不应立即推送排名快照"),
+    )
+    monkeypatch.setattr(
+        strategy_module.runtime_notifications,
+        "defer_plan",
+        lambda content, level="INFO", key="plan": deferred.append((content, level, key)) or True,
+    )
+
+    data = DummyData("AAPL.SMART")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
+    broker.is_live = False
+    strategy = DummyStrategy(broker=broker, params={})
+
+    assert strategy.publish_rankings([(data, 2.0)], dt=datetime(2026, 4, 21)) is True
+
+    assert len(deferred) == 1
+    assert deferred[0][2] == "rankings"
+    assert "AAPL.SMART `2.000000`" in deferred[0][0]
+
+
+def test_publish_rankings_respects_print_plan_switch(monkeypatch):
+    import strategies.base_strategy as strategy_module
+
+    monkeypatch.setattr(strategy_module.config, "PRINT_PLAN", False)
+    monkeypatch.setattr(
+        strategy_module.runtime_notifications,
+        "push_plan",
+        lambda *args, **kwargs: pytest.fail("PRINT_PLAN=False 不应推送排名快照"),
+    )
+    monkeypatch.setattr(
+        strategy_module.runtime_notifications,
+        "defer_plan",
+        lambda *args, **kwargs: pytest.fail("PRINT_PLAN=False 不应缓存排名快照"),
+    )
+
+    strategy = DummyStrategy(
+        broker=DummyBroker(cash=1000.0, rebalance_cash=1000.0),
+        params={},
+    )
+
+    assert strategy.publish_rankings([]) is False
+
+
 def test_should_execute_rebalance_respects_rebalance_when_skip(monkeypatch):
     """
     显式调仓信号回归:
@@ -477,7 +626,10 @@ def test_execute_rebalance_skips_unknown_targets_and_pushes_warning(monkeypatch)
 
     monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "calculate_plan", staticmethod(fake_calculate_plan))
     monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
-    monkeypatch.setattr("strategies.base_strategy.AlarmManager", lambda: DummyAlarmManager())
+    monkeypatch.setattr(
+        "strategies.base_strategy.runtime_notifications.push_text",
+        DummyAlarmManager().push_text,
+    )
 
     data = DummyData("AAPL.SMART")
     broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
