@@ -43,11 +43,11 @@
 13. live data refresh 不完整时，可在同一轮内做有限次重试；重试仍失败才跳过并告警。
 14. GM/IB 的 schedule 运行支持 prewarm；相关生成/修复应保留 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 15. schedule 附近的 IM 报警支持时间窗；默认用 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可按连接覆盖。
-16. `STARTED` / `STOPPED` / `DEAD` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。
+16. 初次 `STARTED`、定时 `ALIVE` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。受监督 worker 内部重启和终止不推 `STOPPED` / `DEAD`；只有操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。`1d` schedule 在每个自然日正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`，非日线不发送。
 17. 核心/基础层需要运行期通知时通过 `common.runtime_notifications`，不要在 rebalancer、executor、strategy/base broker 等模块里直接导入 `AlarmManager`。
 18. `PRINT_PLAN=True` 时，live 运行可即时推送每次计划和策略排名快照；backtest 运行必须只在回测结束时按快照 key 推送最后一条计划/排名，并附带本次执行命令、交易归因和最终绩效摘要，本地日志可继续打印每次计划，避免历史区间触发 IM 限流。
 19. `ALARMS_ENABLED=None` 为自动模式: 有任一 webhook 时启用报警通道，无 webhook 时不启用；显式 `False` 可强制禁用。`LOG` 只控制本地详细日志，不作为 IM 总开关。
-20. 实盘阻断类错误告警不得在长进程内永久静默；按 schedule 去重时应以当前 schedule slot 为作用域（例如 `1d` 每日、`5m` 每个 5 分钟 slot）。
+20. 已知券商维护型连接失败仅记录日志并自愈，不直接推异常 IM；schedule slot 内仍会阻断执行的错误不得永久静默，并应按当前 slot 去重。schedule 告警按自然日执行，不按星期筛选，默认覆盖 7x24 时段。
 21. 调仓执行器若遇到订单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警；卖单失败时跳过本轮后续买入，避免“实盘信号”误导为实际委托。
 22. 实盘调仓卖单等待与滚动买入只适用于 live broker；回测按计划同步执行。正常场景应优先等待 SELL 撮合后一次性买入，滚动 BUY 只在卖单等待达到告警阈值且柜台仍明确存在 SELL 在途时作为低频兜底，本轮等待内已提交过滚动买入后不得继续追加滚动单。本轮带 ID 的卖单若可信柜台在途单连续为空且只剩本地 `_pending_sells` 标记，可按终态回调滞后清理本轮 pending。SELL 清空后的最终补齐不能仅因本轮部分滚动 BUY 已出现在可信柜台 pending 快照中而整单跳过；若滚动 BUY 尚未覆盖目标，应继续按目标市值提交差额。
 23. 实盘的 pending 查询若失败、断连或快照不完整，必须用短生命周期健康标记显式告知框架；该标记只用于本轮可信度判断，不得保存为状态，也不得用于回测路径。回测必须假定计划订单同步执行，保持快速流畅。

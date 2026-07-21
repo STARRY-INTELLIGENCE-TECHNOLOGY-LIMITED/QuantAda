@@ -689,6 +689,12 @@ def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
     import live_trader.adapters.gm_broker as gm_module
 
     fake_context = SimpleNamespace()
+    health_states = []
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: health_states.append((state, kwargs)) or True,
+    )
 
     class StopPhoenix(BaseException):
         pass
@@ -736,6 +742,60 @@ def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "GM SDK requested process exit" in captured.out
     assert "[Phoenix] Waiting 10s before restart" in captured.out
+    assert health_states[0] == (
+        "gm_sdk_initializing",
+        {
+            "unhealthy_after_seconds": gm_module._GM_SDK_HEALTH_DEADLINE_SECONDS,
+            "detail": "gmi_init has not completed",
+            "failure_kind": gm_module.LiveWorkerFailureKind.CONNECTIVITY,
+        },
+    )
+    assert health_states[1] == (
+        "gm_sdk_running",
+        {"detail": "gmi_init completed"},
+    )
+
+
+def test_gm_backtest_does_not_publish_live_worker_health(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    health_states = []
+    backtest_configs = []
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "py_gmi_set_backtest_config",
+        lambda **kwargs: backtest_configs.append(kwargs),
+        raising=False,
+    )
+    monkeypatch.setattr(gm_module, "py_gmi_run", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: health_states.append((state, kwargs)) or True,
+    )
+
+    GmBrokerAdapter.launch(
+        {"token": "token", "strategy_id": "strategy-id"},
+        strategy_path="sample_strategy",
+        params={},
+        start_date="20260101",
+        end_date="20260105",
+    )
+
+    assert len(backtest_configs) == 1
+    assert health_states == []
 
 
 def test_gm_launch_restarts_unmarked_sdk_system_exit(monkeypatch, capsys):
@@ -908,7 +968,7 @@ def test_gm_launch_reexecs_after_repeated_init_failures(monkeypatch):
     assert executable == sys.executable
     assert argv[0] == sys.executable
     assert argv[1] == "-u"
-    assert pushed, "进程级自重启前应推送异常，便于定位 GM SDK init 卡死。"
+    assert pushed == [], "GM SDK init 连接维护失败应仅记录并自愈，不推异常 IM。"
 
 
 def test_gm_duplicate_init_callback_is_ignored_in_same_session(monkeypatch, capsys):
@@ -1230,9 +1290,9 @@ def test_gm_prewarm_callback_runs_once_per_schedule_slot(monkeypatch, capsys):
     assert captured.out.count("Duplicate/early prewarm callback ignored for slot 2026-06-26 14:45:00") == 1
 
 
-def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception(monkeypatch, capsys):
+def test_gm_temporary_connection_errors_do_not_push_exception(monkeypatch, capsys):
     """
-    GM 夜间非交易时段的实时行情连接失败应降噪:
+    GM 夜间非交易时段的行情/交易服务连接失败应降噪:
     - 允许打印有限 warning
     - 不推 GM Kernel Error 异常
     - 重复错误不刷屏、不触发 Phoenix 重启
@@ -1241,6 +1301,8 @@ def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception
 
     fake_context = SimpleNamespace()
     poll_count = {"value": 0}
+    health_states = []
+    schedule_unavailable = []
 
     class StopPhoenix(BaseException):
         pass
@@ -1250,13 +1312,14 @@ def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception
             return None
 
         def push_text(self, content, level='INFO'):
-            raise AssertionError("temporary GM market data error should not push text alarm")
+            raise AssertionError("temporary GM connection error should not push text alarm")
 
         def push_schedule_api_unavailable(self, *args, **kwargs):
+            schedule_unavailable.append((args, kwargs))
             return []
 
         def push_exception(self, *args, **kwargs):
-            raise AssertionError("temporary GM market data error should not push exception")
+            raise AssertionError("temporary GM connection error should not push exception")
 
     def _poll_market_data_errors_then_stop():
         poll_count["value"] += 1
@@ -1264,6 +1327,9 @@ def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception
             return 1200
         fake_context.on_error_fun(fake_context, 1200, "实时行情服务连接失败")
         fake_context.on_error_fun(fake_context, 1200, "实时行情服务连接失败")
+        fake_context.on_error_fun(fake_context, 1100, "交易消息服务连接失败")
+        fake_context.on_error_fun(fake_context, 1100, "交易消息服务连接失败")
+        fake_context.on_bar_fun(fake_context, [])
         raise StopPhoenix()
 
     def _sleep(seconds):
@@ -1281,6 +1347,11 @@ def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception
     monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
     monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
     monkeypatch.setattr(gm_module, "gmi_poll", _poll_market_data_errors_then_stop, raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: health_states.append((state, kwargs)) or True,
+    )
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
     monkeypatch.setattr("time.sleep", _sleep)
 
@@ -1293,4 +1364,13 @@ def test_gm_temporary_market_data_error_is_throttled_and_does_not_push_exception
 
     captured = capsys.readouterr()
     assert captured.out.count("[GM Warning] Code: 1200, Msg: 实时行情服务连接失败") == 1
+    assert captured.out.count("[GM Warning] Code: 1100, Msg: 交易消息服务连接失败") == 2
+    assert [state for state, _ in health_states].count("gm_trade_service_unavailable") == 2
+    assert health_states[-1][0] == "gm_trade_service_unavailable"
+    assert all(
+        kwargs.get("failure_kind") is gm_module.LiveWorkerFailureKind.CONNECTIVITY
+        for state, kwargs in health_states
+        if state == "gm_trade_service_unavailable"
+    )
+    assert len(schedule_unavailable) == 2
     assert "Waiting 10s before restart" not in captured.out

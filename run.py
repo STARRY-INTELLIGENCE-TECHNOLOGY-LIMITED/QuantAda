@@ -10,6 +10,14 @@ import config
 from backtest.backtester import Backtester
 import optimizer
 from common.loader import get_class_from_name, pascal_to_snake
+from common.live_process_supervisor import (
+    LiveWorkerOperatorStop,
+    install_live_worker_operator_stop_handler,
+    is_live_worker_process,
+    mark_live_worker_expected_exit,
+    start_live_worker_heartbeat,
+    supervise_live_process,
+)
 from common.terminal_log import configure_text_stream_error_handling
 from data_providers.manager import DataManager
 from recorders.db_recorder import DBRecorder
@@ -117,7 +125,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     return backtester
 
 
-if __name__ == '__main__':
+def _run_main():
     # 1. 创建命令行解析器
     parser = argparse.ArgumentParser(
         description="量化回测框架",
@@ -194,6 +202,10 @@ if __name__ == '__main__':
 
     # 3. 解析参数
     args = parser.parse_args()
+
+    # 非 worker 实盘进程由轻量父进程监督；worker 直接进入 launcher。
+    if args.connect and not is_live_worker_process():
+        sys.exit(supervise_live_process())
 
     # ==========================================
     # 全局时间自动推断逻辑 (Auto-Inference)
@@ -272,7 +284,8 @@ if __name__ == '__main__':
         from live_trader.engine import launch_live
 
         launch_live(broker_name, conn_name, args.strategy, s_params, **exec_args)
-        sys.exit(0)
+        mark_live_worker_expected_exit("live launcher returned normally")
+        return 0
 
     # ==========================
     # 优化模式
@@ -323,3 +336,34 @@ if __name__ == '__main__':
         plot_scope=args.plot_scope,
     )
     print("\n--- Backtest Finished ---")
+
+
+def main():
+    """Run CLI entrypoint and centralize supervised-worker shutdown."""
+
+    if is_live_worker_process():
+        # Install before argument/config/SDK initialization so an operator stop
+        # cannot escape through an early startup exception path.
+        start_live_worker_heartbeat()
+        install_live_worker_operator_stop_handler()
+
+    try:
+        return _run_main()
+    except LiveWorkerOperatorStop:
+        if not is_live_worker_process():
+            raise
+
+        from alarms.manager import AlarmManager
+
+        try:
+            AlarmManager().push_status(
+                "STOPPED",
+                "Operator requested graceful shutdown.",
+            )
+        finally:
+            mark_live_worker_expected_exit("operator requested graceful shutdown")
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

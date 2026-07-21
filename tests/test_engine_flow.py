@@ -2392,7 +2392,7 @@ def test_live_engine_supports_multi_risk_chain_without_fail_open(monkeypatch):
     assert sell_orders, "风控触发后应实际发出 SELL 平仓单。"
 
 
-def test_launch_live_prefers_connection_alarm_window_over_global_default(monkeypatch):
+def test_launch_live_applies_alarm_context_and_suppresses_transient_restart(monkeypatch):
     """
     启动器报警窗口优先级:
     连接配置中的 alarm_window 应覆盖 config.LIVE_SCHEDULE_ALARM_WINDOW。
@@ -2445,6 +2445,16 @@ def test_launch_live_prefers_connection_alarm_window_over_global_default(monkeyp
         lambda import_name: fake_module if import_name == module_name else None,
     )
     monkeypatch.setattr(engine_module, "AlarmManager", lambda: dummy_alarm)
+    monkeypatch.setattr(
+        engine_module,
+        "get_previous_live_worker_failure",
+        lambda: "opaque broker failure detail",
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_previous_live_worker_failure_kind",
+        lambda: engine_module.LiveWorkerFailureKind.CONNECTIVITY,
+    )
 
     engine_module.launch_live(
         broker_name="fake_broker",
@@ -2454,7 +2464,7 @@ def test_launch_live_prefers_connection_alarm_window_over_global_default(monkeyp
         symbols=["QQQ"],
     )
 
-    assert "exception" not in captured, "连接级 alarm_window 覆盖不应导致 launch 崩溃。"
+    assert "exception" not in captured, "维护型连接恢复不应推送 Live Worker Restart 异常。"
     assert captured["runtime_context"]["alarm_window"] == "5m:30s"
     assert captured["runtime_context"]["schedule_rule"] == "1d:15:45:00"
     assert captured["runtime_context"]["schedule_timezone"] == "America/New_York"

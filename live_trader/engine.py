@@ -9,6 +9,12 @@ import pandas as pd
 
 import config
 from alarms.manager import AlarmManager
+from common.live_process_supervisor import (
+    LiveWorkerFailureKind,
+    get_previous_live_worker_failure,
+    get_previous_live_worker_failure_kind,
+)
+from common.live_runtime import runtime_print
 from common.log import extract_order_execution_dt, format_dt
 from data_providers.base_provider import BaseDataProvider
 from data_providers.manager import DataManager
@@ -1349,7 +1355,7 @@ def on_order_status_callback(context, raw_order):
                     if hasattr(strategy_instance, 'strategy') and getattr(strategy_instance.strategy, 'order', None):
                         strategy_instance.strategy.order = None
                         print("[Engine Callback Recovery] Cleared stale strategy.order after force reset.")
-            except:
+            except Exception:
                 # 不抛出异常，让程序继续运行
                 # 这样下一个 Bar 到来时，Broker 会有机会再次自我修正
                 pass
@@ -1429,6 +1435,22 @@ def launch_live(broker_name: str, conn_name: str, strategy_path: str, params: di
             schedule_timezone=conn_cfg.get('timezone'),
             alarm_window=conn_cfg.get('alarm_window'),
         )
+
+        previous_worker_failure = get_previous_live_worker_failure()
+        if previous_worker_failure:
+            previous_failure_kind = get_previous_live_worker_failure_kind()
+            runtime_print(
+                f"[Supervisor] Fresh live worker started after: {previous_worker_failure}"
+            )
+            if previous_failure_kind is LiveWorkerFailureKind.CONNECTIVITY:
+                runtime_print(
+                    "[Supervisor] Routine broker connectivity recovery; restart IM suppressed."
+                )
+            else:
+                AlarmManager().push_exception(
+                    "Live Worker Restart",
+                    previous_worker_failure,
+                )
 
         # 净化 sys.argv
         sys.argv = [sys.argv[0]]

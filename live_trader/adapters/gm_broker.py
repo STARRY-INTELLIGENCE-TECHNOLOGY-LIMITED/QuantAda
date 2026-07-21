@@ -6,12 +6,22 @@ import pandas as pd
 
 import config
 from alarms.manager import AlarmManager
+from common.live_process_supervisor import (
+    LiveWorkerFailureKind,
+    is_live_worker_process,
+    is_live_worker_restart,
+    report_live_worker_state,
+    request_live_worker_restart,
+)
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
 from data_providers.gm_provider import GmDataProvider as UnifiedGmDataProvider
 from live_trader.engine import LiveTrader, on_order_status_callback
 from ..data_bridge.data_warm import SchedulePlanner
 from .base_broker import BaseLiveBroker, BaseOrderProxy
+
+
+_GM_SDK_HEALTH_DEADLINE_SECONDS = 180.0
 
 try:
     from gm.api import order_target_percent, order_target_value, order_volume, current, get_cash, subscribe, history, OrderType_Market, OrderType_Limit, MODE_LIVE, MODE_BACKTEST, \
@@ -691,10 +701,12 @@ class GmBrokerAdapter(BaseLiveBroker):
             preserving nohup file descriptors.
             """
             _runtime_print(f"[Phoenix] {reason}. Re-exec current Python process to clear GM SDK state...")
-            try:
-                AlarmManager().push_exception("GM SDK Init Stuck", reason)
-            except Exception:
-                pass
+
+            if is_live_worker_process():
+                request_live_worker_restart(
+                    reason,
+                    failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                )
 
             argv = [sys.executable, '-u'] + list(sys.argv)
             try:
@@ -717,7 +729,10 @@ class GmBrokerAdapter(BaseLiveBroker):
             gm_start_time = dt_start.strftime('%Y-%m-%d 08:00:00')
             gm_end_time = dt_end.strftime('%Y-%m-%d %H:%M:%S')
 
-        launch_state = {'start_alarm_sent': False, 'consecutive_init_failures': 0}
+        launch_state = {
+            'start_alarm_sent': bool(mode == MODE_LIVE and is_live_worker_restart()),
+            'consecutive_init_failures': 0,
+        }
 
         # --- 2. 核心运行逻辑 ---
         def run_session():
@@ -760,6 +775,12 @@ class GmBrokerAdapter(BaseLiveBroker):
                 if session_state.get('init_completed') and getattr(ctx, 'strategy_instance', None) is not None:
                     _runtime_print("[GmBroker] Duplicate init callback ignored for current GM session.")
                     return
+
+                if mode == MODE_LIVE:
+                    report_live_worker_state(
+                        "gm_sdk_running",
+                        detail="GM init callback received",
+                    )
 
                 _runtime_print(f"[Phoenix] Initializing Strategy '{strategy_path}'...")
                 engine_config = config.__dict__.copy()
@@ -948,6 +969,21 @@ class GmBrokerAdapter(BaseLiveBroker):
                 if _log_temporary_market_data_error(code, info):
                     return
 
+                try:
+                    code_int = int(code)
+                except (TypeError, ValueError):
+                    code_int = None
+                if mode == MODE_LIVE and code_int == 1100:
+                    report_live_worker_state(
+                        "gm_trade_service_unavailable",
+                        unhealthy_after_seconds=_GM_SDK_HEALTH_DEADLINE_SECONDS,
+                        detail=msg,
+                        failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                    )
+                    _runtime_print(f"[GM Warning] {msg}")
+                    AlarmManager().push_schedule_api_unavailable("GmBroker", msg)
+                    return
+
                 _runtime_print(f"[GM Error] {msg}")
 
                 # 【报警接入】异常推送
@@ -963,7 +999,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 _runtime_print("[System] Strategy Shutdown")
 
                 # 【报警接入】停止推送
-                if mode == MODE_LIVE:
+                if mode == MODE_LIVE and not is_live_worker_process():
                     AlarmManager().push_status("INFO", "GM Session Shutdown (Preparing to Restart)")
 
             def on_backtest_finished(ctx, indicator):
@@ -1031,6 +1067,12 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             else:  # 实盘模式
                 _runtime_print("  Status: Connecting to GM terminal...")
+                report_live_worker_state(
+                    "gm_sdk_initializing",
+                    unhealthy_after_seconds=_GM_SDK_HEALTH_DEADLINE_SECONDS,
+                    detail="gmi_init has not completed",
+                    failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                )
                 status = gmi_init()
                 if status != 0:
                     launch_state['consecutive_init_failures'] = int(
@@ -1046,6 +1088,10 @@ class GmBrokerAdapter(BaseLiveBroker):
 
                 check_gm_status(status)
                 launch_state['consecutive_init_failures'] = 0
+                report_live_worker_state(
+                    "gm_sdk_running",
+                    detail="gmi_init completed",
+                )
 
                 _runtime_print("[Phoenix] Entering Event Loop (Ctrl+C to stop)...")
 
@@ -1129,6 +1175,12 @@ class GmBrokerAdapter(BaseLiveBroker):
                     _runtime_print(">>> GM Broker Exited Normally.")
                     break  # 回测结束或正常退出
 
+                if mode == MODE_LIVE and is_live_worker_process():
+                    request_live_worker_restart(
+                        "GM SDK session ended; supervisor will start a clean worker process",
+                        failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                    )
+
                 init_failures = int(launch_state.get('consecutive_init_failures', 0) or 0)
                 if mode == MODE_LIVE and init_failures >= 12:
                     _hard_reexec_current_process(
@@ -1143,7 +1195,7 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             except KeyboardInterrupt:
                 _runtime_print("[Stop] User interrupted (Ctrl+C). Exiting Phoenix Loop.")
-                if mode == MODE_LIVE:
+                if mode == MODE_LIVE and not is_live_worker_process():
                     AlarmManager().push_status("STOPPED", "User Manually Stopped")
                 break
 
@@ -1155,7 +1207,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 if mode == MODE_LIVE:
                     try:
                         AlarmManager().push_exception("Phoenix Crash", str(e))
-                    except:
+                    except Exception:
                         pass
 
                 _runtime_print("[Phoenix] Critical error. Restarting in 15s...")

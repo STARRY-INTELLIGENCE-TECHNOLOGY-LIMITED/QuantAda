@@ -72,10 +72,11 @@
 - `get_pending_orders` 中 `id` 可用于撤单
 - `cancel_pending_order` 幂等、异常安全（失败返回 False，不抛出致命异常）
 5. 当前拒单重试语义为“无状态 + 当场重提”: 前 5 次按 `LOT_SIZE` 线性降级，后 5 次按几何倍数降级；适配器侧必须提供真实现金口径，避免重试阶段出现系统性偏差。
-6. 当实盘 schedule 期间券商平台未启动、API 不可用或连接失败时，需在 prewarm 与实际 run 时刻分别推送 slot 级 ERROR 告警，但不得把该 slot 误记为已执行。
+6. 已知券商维护型连接失败仅记录日志并自愈，不直接推异常 IM；若 schedule prewarm 或实际 run 时刻仍不可用，需分别推送按 slot 去重的 ERROR 告警，但不得把该 slot 误记为已执行。schedule 告警按自然日执行，不按星期筛选，默认覆盖 7x24 时段。
 7. 适配器和执行器必须区分 live/backtest：实盘以柜台现实、持仓/现金对账和短生命周期健康标记恢复；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
 8. 卖后现金等待、滚动买入和最终补齐属于 `common.order_executor` 职责；adapter 不要重复实现这些流程，只暴露真实现金、价格、在途订单和订单代理字段。
 9. 使用 SDK 事件循环的实盘 adapter 必须把 SDK 线程/轮询/协作等待函数抛出的非人工 `SystemExit` 当作 session 退出并交给 Phoenix 重启；不要让 nohup 长进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。schedule prewarm 和正式 run 都应按目标 slot 去重，长进程 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带时间戳。GM 这类进程内 SDK 若 init 失败，应先重绑 token/server/callback 并 soft reset；连续 init 失败可 re-exec 当前进程作为最后自愈。
+10. 通过 `run.py --connect` 运行时，通用父进程监督器负责进程级保活与探活；adapter 应在 native SDK 初始化/连接阶段上报短生命周期健康状态和有界超时。监督器发现 worker 退出、heartbeat 停滞或健康期限超时后，以原始命令冷启动并记录退出码/信号；连接维护等降噪策略必须通过结构化故障类别传递，不得解析状态或原因文本。受监督 worker 的内部重启不重复推 `STOPPED` / `DEAD`；操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。配置 `1d` schedule 时，每个自然日在正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`。监督器不得保存或重放交易意图，回测/优化不得启动该链路。
 
 ---
 

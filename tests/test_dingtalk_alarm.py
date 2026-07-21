@@ -101,8 +101,11 @@ def test_dingtalk_push_status_with_context_keeps_lifecycle_icon(monkeypatch):
 
     alarm = dingtalk_module.DingTalkAlarm()
     alarm.push_status("DEAD [IB_BROKER:7497]", "detail")
+    alarm.push_status("ALIVE [IB_BROKER:7497]", "detail")
 
-    assert len(sent) == 1
-    _, payload, _, _ = sent[0]
-    assert payload["msgtype"] == "markdown"
-    assert "💀 系统状态: DEAD [IB_BROKER:7497]" in payload["markdown"]["text"]
+    assert len(sent) == 2
+    _, dead_payload, _, _ = sent[0]
+    _, alive_payload, _, _ = sent[1]
+    assert dead_payload["msgtype"] == "markdown"
+    assert "💀 系统状态: DEAD [IB_BROKER:7497]" in dead_payload["markdown"]["text"]
+    assert "✅ 系统状态: ALIVE [IB_BROKER:7497]" in alive_payload["markdown"]["text"]

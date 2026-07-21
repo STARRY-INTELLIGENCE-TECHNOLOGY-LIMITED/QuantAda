@@ -58,10 +58,18 @@
 6. GM / IB schedule 运行支持 prewarm；相关改动不得破坏 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 7. schedule 附近的 IM 报警推送支持时间窗限制；默认读取 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可覆盖全局默认值。
 8. 使用实盘 schedule 回调的 adapter 必须在 context 上暴露 `schedule_rule` 或 `use_schedule`，使基础 broker 能区分正常调度间隔和异常长中断。
-9. `STARTED` / `STOPPED` / `DEAD` 等生命周期消息，以及显式标注为 `plan` 的执行计划消息，不受 schedule 报警时间窗限制。
+9. 初次 `STARTED`、定时 `ALIVE` 状态以及显式标注为 `plan` 的执行计划消息不受 schedule 报警时间窗限制；受监督 worker 的内部重启和终止不得推送 `STOPPED` / `DEAD`，监督父进程只负责日志与重启，不初始化告警通道。只有操作者发起的安全退出才由 worker 推送一次 `STOPPED`。
 10. 实盘阻断类错误告警不得在长进程内永久静默；若按 schedule 去重，应以当前 schedule slot 为作用域（如 `1d` 每日、`5m` 每 5 分钟 slot）。
-11. 若在 schedule prewarm 或实际 run 时刻券商平台未启动、API 不可用或连接失败，应推送 slot 级 ERROR 报警，但不得把该 slot 误记为已执行。
+11. 已知券商连接维护错误仅记录日志并自愈，不直接推送异常 IM；若 schedule prewarm 或实际 run 时刻平台仍不可用，应保留按 slot 去重的 ERROR 报警，但不得把该 slot 误记为已执行。schedule 告警按自然日执行，不按星期筛选，默认覆盖 7x24 时段。
 12. GM / IBKR schedule prewarm 与正式 run 都必须按目标 schedule slot 去重；重复 prewarm 回调不得重复执行或持续打印 `Prewarm Finished`。
 13. 使用 SDK 事件循环的实盘 Phoenix loop 必须把 SDK 轮询/协作等待函数抛出的 `SystemExit` 视为 session 退出并重启；未标记的 `SystemExit` 应打印带时间戳日志并推送异常，避免 nohup 进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。
 14. GM / IBKR 长进程运行期 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带本地时间戳，便于排查夜间断线、SDK 退出和重复回调窗口。
 15. GM live `gmi_init()` 失败后必须在同进程内重新绑定 token/server/strategy/callback 并尝试 SDK soft reset；若连续初始化失败达到自愈阈值，应 re-exec 当前 Python 进程，覆盖“首次终端不可用导致 SDK 状态卡死，人工重启进程才恢复”的场景。
+16. 通过 `run.py --connect` 启动的实盘命令由轻量父进程监督、子进程承载策略与券商 SDK:
+    - 子进程必须定期写入短生命周期 heartbeat；父进程检测进程退出、heartbeat 停滞和 adapter 上报的有界健康期限。
+    - 异常退出或探活超时必须终止子进程并以原始命令冷启动，记录退出码/信号与恢复原因；重启使用有界退避。
+    - 连接维护等可降噪故障必须通过结构化故障类别跨进程传递，不得解析 state、detail 或 reason 文本来决定是否推送 IM。
+    - 子进程正常返回时必须显式标记 expected exit，父进程不得无条件重放；监督器不保存订单、持仓或交易意图。
+    - 操作者向父子进程发送 `SIGINT` 时，父进程应转发安全退出信号，worker 推送一次 `STOPPED` 并标记 expected exit；内部探活回收继续使用 `SIGTERM` 且不推生命周期 IM。
+    - 该监督链路只适用于 live connect；回测/优化不得创建监督进程、heartbeat 线程或等待循环。
+17. 配置 `1d` schedule 且启用 IM 时，每个自然日必须在正式 slot 前 30 分钟推送一次 `ALIVE` 状态；该通知只表示 worker 存活，不承诺券商连接可用，不新增配置开关，非日线 schedule 不发送。该调度不按星期筛选，默认覆盖 7x24 时段。

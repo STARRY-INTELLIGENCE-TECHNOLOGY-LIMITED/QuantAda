@@ -41,11 +41,14 @@ def test_wecom_push_status_still_sends_payload(monkeypatch):
 
     alarm = wecom_module.WeComAlarm()
     alarm.push_status("STARTED [GM_BROKER:demo]", "detail")
+    alarm.push_status("ALIVE [GM_BROKER:demo]", "detail")
 
-    assert len(sent) == 1
-    _, payload, _, _ = sent[0]
-    assert payload["msgtype"] == "markdown"
-    assert "系统状态: STARTED [GM_BROKER:demo]" in payload["markdown"]["content"]
+    assert len(sent) == 2
+    _, started_payload, _, _ = sent[0]
+    _, alive_payload, _, _ = sent[1]
+    assert started_payload["msgtype"] == "markdown"
+    assert "系统状态: STARTED [GM_BROKER:demo]" in started_payload["markdown"]["content"]
+    assert "✅ 系统状态: ALIVE [GM_BROKER:demo]" in alive_payload["markdown"]["content"]
 
 
 def test_wecom_push_dead_status_with_context_keeps_dead_style(monkeypatch):

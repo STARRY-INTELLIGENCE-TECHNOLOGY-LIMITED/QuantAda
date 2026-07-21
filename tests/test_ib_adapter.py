@@ -2189,7 +2189,10 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
     不能仅凭 ib.tickers() 非空跳过行情恢复。
     """
     import config
+    import live_trader.adapters.ib_broker as ib_module
     import live_trader.engine as engine_module
+
+    health_states = []
 
     class DummyEvent:
         def __init__(self):
@@ -2260,6 +2263,11 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
     monkeypatch.setattr(mock_ib_insync, "IB", lambda: dummy_ib)
     monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
     monkeypatch.setattr(
+        ib_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: health_states.append((state, kwargs)) or True,
+    )
+    monkeypatch.setattr(
         IBBrokerAdapter,
         "parse_contract",
         staticmethod(lambda symbol: SimpleNamespace(symbol=symbol)),
@@ -2276,6 +2284,17 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
     assert dummy_ib.connect_calls == 2
     assert len(dummy_ib.req_mkt_data_calls) == 2, "断线重连后即使旧 ticker 非空，也必须重新订阅行情。"
     assert "IB connection ended. Re-entering recovery mode." in captured.out
+    connecting = [kwargs for state, kwargs in health_states if state == "ib_connecting"]
+    running = [kwargs for state, kwargs in health_states if state == "ib_running"]
+    assert len(connecting) == 2
+    assert len(running) == 4
+    assert all("refresh_deadline" not in item for item in connecting)
+    assert all(item["refresh_deadline"] is True for item in running)
+    assert all(
+        item["failure_kind"] is ib_module.LiveWorkerFailureKind.CONNECTIVITY
+        for item in connecting
+    )
+    assert all("failure_kind" not in item for item in running)
 
 
 def test_ib_trade_update_uses_proxy_state_for_sell_fill_wait(monkeypatch):

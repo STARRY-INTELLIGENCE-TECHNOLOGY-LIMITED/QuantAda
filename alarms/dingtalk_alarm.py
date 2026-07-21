@@ -109,7 +109,14 @@ class DingTalkAlarm(BaseAlarm):
     def push_status(self, status: str, detail: str = ""):
         # 系统状态：启动/停止/死信
         normalized = str(status or "").strip().upper()
-        emoji = "🚀" if normalized.startswith("STARTED") else "💀" if normalized.startswith("DEAD") else "🛑"
+        if normalized.startswith("STARTED"):
+            emoji = "🚀"
+        elif normalized.startswith("ALIVE"):
+            emoji = "✅"
+        elif normalized.startswith("DEAD"):
+            emoji = "💀"
+        else:
+            emoji = "🛑"
         md_text = f"""### {emoji} 系统状态: {status}
 **时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}
 **详情**: {detail}

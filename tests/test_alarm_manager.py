@@ -52,6 +52,9 @@ def fresh_alarm_manager(monkeypatch):
     timer = getattr(mgr, "_exception_cooldown_timer", None)
     if timer:
         timer.cancel()
+    timer = getattr(mgr, "_daily_schedule_health_timer", None)
+    if timer:
+        timer.cancel()
     AlarmManager._instance = None
 
 
@@ -213,6 +216,123 @@ def test_schedule_alarm_window_uses_global_default_when_runtime_value_missing(mo
     assert mgr._schedule_alarm_window_after_seconds == pytest.approx(900.0)
 
 
+def test_daily_schedule_pushes_health_status_thirty_minutes_before_every_day(monkeypatch, fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+    now = {"value": datetime.datetime(2026, 7, 18, 14, 0, 0)}
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def is_alive(self):
+            return self.started and not self.cancelled
+
+    monkeypatch.setattr(manager_module.threading, "Timer", FakeTimer)
+    monkeypatch.setattr(mgr, "_current_schedule_alarm_time", lambda: now["value"])
+
+    mgr.set_runtime_context(
+        broker="gm_broker",
+        conn_id="demo",
+        strategy="my_strategy",
+        params={},
+        schedule_rule="1d:14:45:00",
+    )
+
+    assert len(timers) == 1
+    assert timers[0].started is True
+    assert timers[0].delay == pytest.approx(15 * 60)
+
+    now["value"] = datetime.datetime(2026, 7, 18, 14, 15, 1)
+    timers[0].callback()
+
+    assert len(timers) == 2
+    assert timers[1].delay == pytest.approx(24 * 60 * 60 - 1)
+    assert _wait_until(lambda: len(fake.status_calls) == 1)
+    status, detail = fake.status_calls[0]
+    assert status == "ALIVE [GM_BROKER:demo]"
+    assert "Next daily schedule: 2026-07-18 14:45:00" in detail
+
+
+def test_interval_schedule_does_not_create_daily_health_timer(monkeypatch, fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    mgr.alarms = [FakeAlarmChannel()]
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback):
+            timers.append((delay, callback))
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(manager_module.threading, "Timer", FakeTimer)
+    mgr.set_runtime_context(
+        broker="ib_broker",
+        conn_id="demo",
+        strategy="my_strategy",
+        params={},
+        schedule_rule="5m:09:30:00",
+    )
+
+    assert timers == []
+
+
+def test_supervised_worker_exit_suppresses_internal_lifecycle_im(monkeypatch, fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+    monkeypatch.setattr(manager_module, "is_live_worker_process", lambda: True)
+
+    mgr._on_exit()
+
+    assert fake.status_calls == []
+
+
+def test_supervised_worker_leaves_signal_handling_to_parent(monkeypatch):
+    AlarmManager._instance = None
+    registered_atexit = []
+    registered_signals = []
+    monkeypatch.setattr(manager_module.config, "ALARMS_ENABLED", False)
+    monkeypatch.setattr(manager_module, "is_live_worker_process", lambda: True)
+    monkeypatch.setattr(
+        manager_module.atexit,
+        "register",
+        lambda callback: registered_atexit.append(callback),
+    )
+    monkeypatch.setattr(
+        manager_module.signal,
+        "signal",
+        lambda sig, handler: registered_signals.append((sig, handler)),
+    )
+
+    try:
+        AlarmManager()
+        assert len(registered_atexit) == 1
+        assert registered_signals == []
+    finally:
+        AlarmManager._instance = None
+
+
 def test_schedule_alarm_window_zero_zero_means_unrestricted(monkeypatch, fresh_alarm_manager):
     mgr = fresh_alarm_manager
     fake = FakeAlarmChannel()
@@ -340,6 +460,7 @@ def test_schedule_alarm_window_allows_lifecycle_status_outside_window(monkeypatc
     mgr = fresh_alarm_manager
     fake = FakeAlarmChannel()
     mgr.alarms = [fake]
+    assert mgr._resolve_status_alarm_tag("ALIVE") == manager_module.BaseAlarm.TAG_LIFECYCLE
 
     mgr.set_runtime_context(
         broker="ib_broker",
@@ -430,6 +551,29 @@ def test_schedule_api_unavailable_alarm_covers_prewarm_and_run_slots(monkeypatch
     assert all(item[1] == "ERROR" for item in fake.text_calls)
     assert "schedule prewarm may be missed" in fake.text_calls[0][0]
     assert "strategy run may be missed" in fake.text_calls[1][0]
+
+
+def test_schedule_api_unavailable_alarm_is_sent_every_day(fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+    mgr.set_runtime_context(
+        broker="gm_broker",
+        conn_id="demo",
+        strategy="my_strategy",
+        params={},
+        schedule_rule="1d:14:45:00",
+    )
+
+    sent = mgr.push_schedule_api_unavailable(
+        "GmBroker",
+        "GM terminal unavailable",
+        now=datetime.datetime(2026, 7, 18, 14, 45, 0),
+    )
+
+    assert [item["event"] for item in sent] == ["run"]
+    assert _wait_until(lambda: len(fake.text_calls) == 1)
+    assert fake.text_calls[0][1] == "ERROR"
 
 
 def test_schedule_api_unavailable_alarm_covers_interval_slot_body(monkeypatch, fresh_alarm_manager):

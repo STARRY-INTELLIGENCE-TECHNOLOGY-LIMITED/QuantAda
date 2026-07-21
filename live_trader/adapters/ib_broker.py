@@ -13,6 +13,11 @@ except ImportError:
 
 from alarms.manager import AlarmManager
 from alarms.live_alarm import LiveAlarmDeduper
+from common.live_process_supervisor import (
+    LiveWorkerFailureKind,
+    is_live_worker_restart,
+    report_live_worker_state,
+)
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
 from common.ib_symbol_parser import resolve_ib_contract_spec
@@ -22,6 +27,9 @@ from data_providers.manager import DataManager
 from data_providers.ibkr_provider import IbkrDataProvider
 from ..data_bridge.data_warm import SchedulePlanner
 from .base_broker import BaseLiveBroker, BaseOrderProxy
+
+
+_IB_SDK_HEALTH_DEADLINE_SECONDS = 180.0
 
 
 class IBOrderProxy(BaseOrderProxy):
@@ -618,7 +626,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                     if price == 0.0 and symbol in self._tickers:
                         ticker = self._tickers[symbol]
                         p = ticker.marketPrice()
-                        # 规避 NaN 或 0 等无效报价，启用盘前/周末休市兜底
+                        # 规避 NaN 或 0 等无效报价，启用非连续报价时段兜底
                         if not (p and p > 0):
                             p = ticker.close if (ticker.close and ticker.close > 0) else ticker.last
                         if p and p > 0:
@@ -1387,7 +1395,7 @@ class IBBrokerAdapter(BaseLiveBroker):
     def get_current_price(self, data):
         """
         获取标的当前价格。
-        增强版：支持周末/休市期间使用 Close/Last 价格兜底，防止无法计算下单数量。
+        增强版：支持休市期间使用 Close/Last 价格兜底，防止无法计算下单数量。
         """
         if not hasattr(self, 'ib') or not self.ib or not self.ib.isConnected():
             return 0.0
@@ -1423,7 +1431,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 price = delayed_price
 
         # 如果仍无效，尝试使用 close 或 last
-        # 这种情况常见于周末、盘前盘后或停牌
+        # 这种情况常见于盘前盘后、休市或停牌
         if not (price and 0 < price == price):
             # 优先用昨日收盘价 (Close)
             if ticker.close and ticker.close > 0:
@@ -1785,6 +1793,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         engine_config['params'] = params
         engine_config['platform'] = 'ib'
         engine_config['symbols'] = symbols
+        engine_config['_suppress_start_alarm'] = is_live_worker_restart()
         if kwargs.get('timeframe') is not None:
             engine_config['timeframe'] = kwargs.get('timeframe')
         if kwargs.get('compression') is not None:
@@ -1851,7 +1860,19 @@ class IBBrokerAdapter(BaseLiveBroker):
                 if not ib.isConnected():
                     _runtime_print(f"[System] Connecting to IB Gateway ({host}:{port}) with clientId={client_id}...")
                     try:
+                        report_live_worker_state(
+                            "ib_connecting",
+                            unhealthy_after_seconds=_IB_SDK_HEALTH_DEADLINE_SECONDS,
+                            detail="IB connect has not completed",
+                            failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                        )
                         ib.connect(host, port, clientId=client_id)
+                        report_live_worker_state(
+                            "ib_running",
+                            unhealthy_after_seconds=_IB_SDK_HEALTH_DEADLINE_SECONDS,
+                            detail="IB connected; waiting for event-loop progress",
+                            refresh_deadline=True,
+                        )
                         _runtime_print("[System] ✅ Connected successfully.")
                         # 连接恢复后先复位行情模式标记，后续若实时不可用可再次自动降级 delayed。
                         try:
@@ -1920,6 +1941,12 @@ class IBBrokerAdapter(BaseLiveBroker):
                 while ib.isConnected():
                     # 1. 驱动 IB 事件
                     # 如果断线，ib.sleep 会抛出 OSError 或 ConnectionResetError
+                    report_live_worker_state(
+                        "ib_running",
+                        unhealthy_after_seconds=_IB_SDK_HEALTH_DEADLINE_SECONDS,
+                        detail="IB event-loop progress deadline",
+                        refresh_deadline=True,
+                    )
                     ib.sleep(1)
 
                     # 基于时区的时间计算
@@ -2014,7 +2041,7 @@ class IBBrokerAdapter(BaseLiveBroker):
 
                 try:
                     ib.disconnect()
-                except:
+                except Exception:
                     pass
 
                 is_first_connect = True
@@ -2052,7 +2079,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 # 尝试重启
                 try:
                     ib.disconnect()
-                except:
+                except Exception:
                     pass
                 is_first_connect = True
                 continue

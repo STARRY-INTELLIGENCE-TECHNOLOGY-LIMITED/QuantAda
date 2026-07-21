@@ -11,6 +11,7 @@ from typing import Dict, Tuple
 from zoneinfo import ZoneInfo
 
 import config
+from common.live_process_supervisor import is_live_worker_process
 from .base_alarm import BaseAlarm
 from .dingtalk_alarm import DingTalkAlarm
 from .wecom_alarm import WeComAlarm
@@ -23,11 +24,12 @@ class AlarmManager:
         BaseAlarm.TAG_LIFECYCLE,
         BaseAlarm.TAG_PLAN,
     })
-    _LIFECYCLE_STATUSES = frozenset({"STARTED", "DEAD", "STOPPED"})
+    _LIFECYCLE_STATUSES = frozenset({"STARTED", "ALIVE", "DEAD", "STOPPED"})
     _EXCEPTION_AGGREGATION_WINDOW_SECONDS = 60
     _COOLDOWN_BASE_DELAY_SECONDS = 30
     _COOLDOWN_MAX_DELAY_SECONDS = 10 * 60
     _COOLDOWN_RESET_WINDOW_SECONDS = 15 * 60
+    _DAILY_SCHEDULE_HEALTH_LEAD_SECONDS = 30 * 60
 
     def __new__(cls):
         if not cls._instance:
@@ -65,6 +67,7 @@ class AlarmManager:
         self._schedule_alarm_window_after_seconds = 0.0
         self._terminal_lifecycle_status = None
         self._schedule_api_unavailable_alarm_keys = set()
+        self._daily_schedule_health_timer = None
 
         # 异常报警聚合: 默认开启，固定 60 秒窗口内合并相同(context, error)
         self._exception_aggregation_window_seconds = self._EXCEPTION_AGGREGATION_WINDOW_SECONDS
@@ -116,6 +119,53 @@ class AlarmManager:
             except Exception as e:
                 print(f"[AlarmManager] Invalid schedule timezone '{tz_name}': {e}. Falling back to local time.")
         return datetime.datetime.now()
+
+    def _schedule_daily_health_status(self):
+        timer = self._daily_schedule_health_timer
+        if timer is not None and timer.is_alive():
+            timer.cancel()
+        self._daily_schedule_health_timer = None
+
+        parsed_schedule = self._parsed_schedule_alarm_rule
+        if not self.alarms or not parsed_schedule or parsed_schedule.get('kind') != 'daily':
+            return
+
+        from live_trader.data_bridge.data_warm import SchedulePlanner
+
+        now_ts = pd.Timestamp(self._current_schedule_alarm_time())
+        slot_dt = SchedulePlanner.resolve_next_schedule_slot(now_ts, parsed_schedule)
+        if slot_dt is None:
+            return
+
+        slot_ts = pd.Timestamp(slot_dt)
+        health_at = slot_ts - pd.Timedelta(seconds=self._DAILY_SCHEDULE_HEALTH_LEAD_SECONDS)
+        if health_at < now_ts:
+            slot_ts = pd.Timestamp(
+                SchedulePlanner.advance_schedule_slot(slot_ts, parsed_schedule)
+            )
+            if pd.isna(slot_ts):
+                return
+            slot_dt = slot_ts
+            health_at = slot_ts - pd.Timedelta(seconds=self._DAILY_SCHEDULE_HEALTH_LEAD_SECONDS)
+
+        delay = max(0.0, (health_at - now_ts).total_seconds())
+        slot_text = pd.Timestamp(slot_dt).strftime('%Y-%m-%d %H:%M:%S')
+
+        def _push_health_status():
+            self._daily_schedule_health_timer = None
+            try:
+                self.push_status(
+                    "ALIVE",
+                    f"Live worker is running. Next daily schedule: {slot_text}.",
+                    alarm_tag=BaseAlarm.TAG_LIFECYCLE,
+                )
+            finally:
+                self._schedule_daily_health_status()
+
+        timer = threading.Timer(delay, _push_health_status)
+        timer.daemon = True
+        self._daily_schedule_health_timer = timer
+        timer.start()
 
     @staticmethod
     def _resolve_last_schedule_slot_for_day(anchor_dt, parsed_schedule):
@@ -249,12 +299,18 @@ class AlarmManager:
                 f"-{self._schedule_alarm_window_before_seconds:.0f}s/+{self._schedule_alarm_window_after_seconds:.0f}s"
             )
         self.context_detail = "\n".join(detail_lines)
+        self._schedule_daily_health_status()
 
     def _register_dead_letter_handlers(self):
         """注册死信监听 (Ctrl+C, Kill, 正常退出)"""
 
         # 1. 正常退出钩子
         atexit.register(self._on_exit)
+
+        # 父监督进程统一拥有停止信号。worker 保留操作系统默认 SIGTERM
+        # 行为，避免 sys.exit() 被券商 SDK 的 SystemExit 恢复逻辑误捕获。
+        if is_live_worker_process():
+            return
 
         # 2. 信号监听 (Ctrl+C, Kill)
         # 注意：在 Windows 下某些信号可能受限，但在 Linux/Docker 中很有效
@@ -267,10 +323,15 @@ class AlarmManager:
 
     def _on_exit(self):
         """程序正常结束的回调"""
+        timer = getattr(self, '_daily_schedule_health_timer', None)
+        if timer is not None and timer.is_alive():
+            timer.cancel()
         # 只有在非异常退出时才发 Finish，如果是 crash，会被 Exception 捕获
         # 这里可以发一个简单的结束报告
         self._flush_exception_aggregation()
         self._flush_exception_cooldown_pending(force=True)
+        if is_live_worker_process():
+            return
         if self._terminal_lifecycle_status in {"DEAD", "STOPPED"}:
             return
         self._terminal_lifecycle_status = "STOPPED"
@@ -573,7 +634,7 @@ class AlarmManager:
             # 异常推送保持同步发送，提升进程异常场景下的送达概率
             try:
                 alarm.push_exception(context, error)
-            except:
+            except Exception:
                 pass
 
     def _buffer_exception_alarm(self, context, error_text):
