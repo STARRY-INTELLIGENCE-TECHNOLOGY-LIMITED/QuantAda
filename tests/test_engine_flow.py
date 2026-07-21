@@ -874,6 +874,77 @@ def test_on_order_status_callback_rejected_sell_should_not_retry(monkeypatch):
     assert broker.sync_calls == 0, "拒单不应触发资金同步。"
 
 
+def test_on_order_status_callback_logs_and_pushes_rejection_detail(monkeypatch, capsys):
+    import live_trader.engine as engine_module
+
+    class DummyOrderProxy:
+        id = "REJECTED_1"
+        status = "Rejected"
+        data = SimpleNamespace(_name="SHSE.512010")
+        executed = SimpleNamespace(size=0.0, price=0.0, value=0.0, comm=0.0)
+
+        def is_buy(self): return True
+        def is_sell(self): return False
+        def is_completed(self): return False
+        def is_rejected(self): return True
+        def is_canceled(self): return False
+        def is_pending(self): return False
+        def is_accepted(self): return False
+
+    class DummyBroker:
+        def __init__(self):
+            self.proxy = DummyOrderProxy()
+            self._active_buys = {}
+            self._pending_sells = set()
+
+        def convert_order_proxy(self, raw_order):
+            return self.proxy
+
+        def on_order_status(self, proxy):
+            pass
+
+    class DummyStrategy:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def notify_order(self, order):
+            pass
+
+    pushed = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level='INFO'):
+            pushed.append({"content": content, "level": level})
+
+        def push_trade(self, trade_info):
+            pass
+
+    monkeypatch.setattr(engine_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    broker = DummyBroker()
+    context = SimpleNamespace(
+        strategy_instance=DummyStrategy(broker),
+        now=datetime(2026, 7, 21, 14, 45, 0),
+    )
+    reject_detail = (
+        "[GMRISK]触发单笔申报最大数量限制: "
+        "基金 单笔最大申报量 1000000, 当前申报数量 1484400"
+    )
+
+    engine_module.on_order_status_callback(
+        context,
+        SimpleNamespace(ord_rej_reason_detail=reject_detail),
+    )
+
+    output = capsys.readouterr().out
+    assert "订单被拒绝: SHSE.512010" in output
+    assert reject_detail in output, "柜台拒单原文必须进入本地 LOG。"
+    assert pushed == [{
+        "content": f"⚠️ 订单被拒绝: SHSE.512010 - {reject_detail}",
+        "level": "WARNING",
+    }]
+
+
 def test_on_order_status_callback_partial_sell_should_not_sync_balance(monkeypatch):
     """
     回调链路测试:

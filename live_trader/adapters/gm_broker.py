@@ -422,8 +422,13 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         # 2. 资金预检查与自动降级 (仅买入)
         if side == 'BUY':
-            # 必须扣除虚拟账本，双重保险
-            available_cash = self._fetch_real_cash() - getattr(self, '_virtual_spent_cash', 0.0)
+            # 拆单批次已经持有一次性可用预算，避免首笔被柜台冻结后又重复扣减
+            # 本地虚拟占资。普通单仍沿用实时现金 + 虚拟账本的保守口径。
+            batch_cash_budget = getattr(self, '_buy_batch_cash_budget', None)
+            if batch_cash_budget is None:
+                available_cash = self._fetch_real_cash() - getattr(self, '_virtual_spent_cash', 0.0)
+            else:
+                available_cash = float(batch_cash_budget)
             if available_cash < 0:
                 available_cash = 0.0
 

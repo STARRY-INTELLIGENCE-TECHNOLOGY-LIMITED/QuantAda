@@ -110,6 +110,7 @@ def _make_data(symbol="SHSE.600000"):
 @pytest.fixture(autouse=True)
 def _force_lot_size_100(monkeypatch):
     monkeypatch.setattr(config, "LOT_SIZE", 100)
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 0)
 
 
 def test_base_safety_multiplier_has_no_fixed_cash_buffer():
@@ -148,6 +149,97 @@ def test_stateless_buy_skips_when_cash_insufficient_even_with_pending_sell():
     assert len(broker.submitted_orders) == 1, "第二次尝试应发出真实买单"
     assert broker.submitted_orders[0]["side"] == "BUY", "买单方向应为 BUY"
     assert broker.submitted_orders[0]["volume"] == 100, "买单数量应为 100 股"
+
+
+def test_live_buy_splits_by_configured_broker_lot_limit(monkeypatch):
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1_000_000)
+    broker = MockBroker(initial_cash=20_000_000.0)
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=14_848_000.0)
+
+    assert proxy is not None
+    assert proxy.id == "ORDER_1", "拆单调用应保持原有单代理返回契约。"
+    assert [order["volume"] for order in broker.submitted_orders] == [1_000_000, 484_800]
+    assert set(broker._active_buys) == {"ORDER_1", "ORDER_2"}
+
+
+def test_backtest_buy_ignores_broker_lot_limit(monkeypatch):
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1_000_000)
+    broker = MockBroker(initial_cash=20_000_000.0)
+    broker.is_live = False
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=14_848_000.0)
+
+    assert proxy is not None
+    assert [order["volume"] for order in broker.submitted_orders] == [1_484_800]
+
+
+def test_later_split_child_sync_failure_retries_by_lot_step(monkeypatch):
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1000)
+
+    class RetryLaterChildBroker(MockBroker):
+        def __init__(self, initial_cash):
+            super().__init__(initial_cash)
+            self.submit_attempts = []
+
+        def _submit_order(self, data, volume, side, price):
+            self.submit_attempts.append(volume)
+            if len(self.submit_attempts) == 2:
+                return None
+            return super()._submit_order(data, volume, side, price)
+
+    broker = RetryLaterChildBroker(initial_cash=100000.0)
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=14000.0)
+
+    assert proxy is not None
+    assert proxy.id == "ORDER_1"
+    assert broker.submit_attempts == [1000, 400, 300]
+    assert [order["volume"] for order in broker.submitted_orders] == [1000, 300]
+    assert broker._active_buys["ORDER_2"]["retries"] == 1
+    assert not hasattr(broker, "_buffered_rejected_retries")
+
+
+def test_later_split_child_sync_failure_exhausts_shared_downgrade_and_alarms(monkeypatch):
+    import live_trader.adapters.base_broker as base_module
+
+    monkeypatch.setattr(config, "LOT_SIZE", 1)
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 30)
+    pushed = []
+    monkeypatch.setattr(
+        base_module.runtime_notifications,
+        "push_text",
+        lambda content, level='INFO': pushed.append({"content": content, "level": level}) or True,
+    )
+
+    class AlwaysFailLaterChildBroker(MockBroker):
+        def __init__(self, initial_cash):
+            super().__init__(initial_cash)
+            self.submit_attempts = []
+
+        def _submit_order(self, data, volume, side, price):
+            self.submit_attempts.append(volume)
+            if len(self.submit_attempts) > 1:
+                return None
+            return super()._submit_order(data, volume, side, price)
+
+    broker = AlwaysFailLaterChildBroker(initial_cash=10000.0)
+    data = _make_data("TEST.SPLIT")
+
+    proxy = broker.order_target_value(data, target=600.0)
+
+    assert proxy is not None
+    assert proxy.id == "ORDER_1"
+    assert broker.submit_attempts == [30, 30, 29, 28, 27, 26, 25, 23, 20, 16, 11, 6]
+    assert [order["volume"] for order in broker.submitted_orders] == [30]
+    assert len(pushed) == 1
+    assert pushed[0]["level"] == "ERROR"
+    assert "downgrade retries exhausted" in pushed[0]["content"]
+    assert not hasattr(broker, "_deferred_orders")
+    assert not hasattr(broker, "_buffered_rejected_retries")
 
 
 def test_base_broker_uses_composed_data_warm_bridge():

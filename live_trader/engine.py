@@ -15,7 +15,7 @@ from common.live_process_supervisor import (
     get_previous_live_worker_failure_kind,
 )
 from common.live_runtime import runtime_print
-from common.log import extract_order_execution_dt, format_dt
+from common.log import extract_order_execution_dt, format_dt, warning as log_warning
 from data_providers.base_provider import BaseDataProvider
 from data_providers.manager import DataManager
 from live_trader.adapters.base_broker import BaseLiveBroker
@@ -1314,7 +1314,9 @@ def on_order_status_callback(context, raw_order):
             # B. 异常状态推送 (拒单)
             if is_rejected:
                 symbol = order_proxy.data._name if order_proxy.data else "Unknown"
-                alarm_manager.push_text(f"⚠️ 订单被拒绝: {symbol} - {msg}", level='WARNING')
+                rejection_msg = f"订单被拒绝: {symbol} - {msg or '柜台未提供拒单原因'}"
+                log_warning(rejection_msg, dt=exec_dt)
+                alarm_manager.push_text(f"⚠️ {rejection_msg}", level='WARNING')
 
             # C. 撤单状态推送（含手动单/隔夜清理单）
             if is_canceled:

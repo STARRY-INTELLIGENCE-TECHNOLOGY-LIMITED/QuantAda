@@ -33,6 +33,15 @@ from live_trader.adapters.gm_broker import GmOrderProxy, GmBrokerAdapter
 from live_trader.data_bridge.data_warm import SchedulePlanner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_gm_order_config(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    # GM 用例验证 A 股适配语义，不依赖开源仓库面向国际市场的中性默认值。
+    monkeypatch.setattr(gm_module.config, "LOT_SIZE", 100)
+    monkeypatch.setattr(gm_module.config, "BROKER_LOT_LIMITS", 0)
+
+
 # 2. 构造掘金底层订单替身
 class DummyGMOrder:
     def __init__(self, status, side=1, filled_volume=0, filled_vwap=0.0, commission=0.0):
@@ -358,6 +367,58 @@ def test_gm_secondary_downsize_updates_active_buy_and_virtual_ledger(monkeypatch
     assert broker._virtual_spent_cash == pytest.approx(expected_ledger), (
         "虚拟账本占资应基于真实受理数量计算。"
     )
+
+
+def test_gm_live_buy_split_uses_single_batch_cash_budget(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module.config, "LOT_SIZE", 100)
+    monkeypatch.setattr(gm_module.config, "BROKER_LOT_LIMITS", 1000)
+    monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    order_calls = []
+
+    class SubmittedOrder(DummyGMOrder):
+        def __init__(self, status, side, volume, oid):
+            super().__init__(status=status, side=side)
+            self.volume = volume
+            self.cl_ord_id = oid
+
+    def _fake_order_volume(**kwargs):
+        order_calls.append(kwargs)
+        return [SubmittedOrder(
+            status=mock_gm_api.OrderStatus_New,
+            side=kwargs["side"],
+            volume=kwargs["volume"],
+            oid=f"GM_SPLIT_{len(order_calls)}",
+        )]
+
+    monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    cash_reads = []
+
+    def _fetch_cash():
+        cash_reads.append(True)
+        # 若子单重新读取柜台现金，会模拟首单冻结后的低余额；正确实现应使用批次预算。
+        return 20_000.0 if len(cash_reads) == 1 else 1_000.0
+
+    monkeypatch.setattr(broker, "_fetch_real_cash", _fetch_cash)
+    monkeypatch.setattr(broker, "get_position", lambda data: SimpleNamespace(size=0))
+    monkeypatch.setattr(broker, "get_pending_orders", lambda: [])
+    monkeypatch.setattr(broker, "get_current_price", lambda data: 10.0)
+
+    proxy = broker.order_target_value(
+        data=SimpleNamespace(_name="SHSE.512010"),
+        target=14_000.0,
+    )
+
+    assert proxy is not None
+    assert [call["volume"] for call in order_calls] == [1000, 400]
+    assert len(cash_reads) == 1, "同一拆单批次不应因柜台冻结而重复扣减可用资金。"
+    assert set(broker._active_buys) == {"GM_SPLIT_1", "GM_SPLIT_2"}
 
 
 def test_gm_sellable_position_prefers_available_now(monkeypatch):

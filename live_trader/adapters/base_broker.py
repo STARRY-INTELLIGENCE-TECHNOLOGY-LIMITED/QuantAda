@@ -53,6 +53,9 @@ class BaseLiveDataProvider(ABC):
 class BaseLiveBroker(ABC):
     """交易执行器适配器的抽象基类，模拟 backtrader 的 broker 接口"""
 
+    _BUY_LOT_STEP_RETRIES = 5
+    _BUY_GEOMETRIC_RETRIES = 5
+
     def __init__(self, context, cash_override=None, commission_override=None, slippage_override=None,):
         self.is_live = True
         self._context = context
@@ -352,9 +355,96 @@ class BaseLiveBroker(ABC):
             if shares < 1:
                 print(f"[Broker Warning] Buy {data._name} skipped. Cash ({cash:.2f}) insufficient.")
 
-        # 将提交和记账包裹在同一把锁内，拒绝间隙抢占
+        chunk_count = 1
+        chunk_limit = 0
+        normalized_shares = shares
+        if self.is_live:
+            try:
+                configured_limit = int(getattr(config, 'BROKER_LOT_LIMITS', 0) or 0)
+            except (TypeError, ValueError):
+                configured_limit = 0
+                log.warning(
+                    f"[Broker] Invalid BROKER_LOT_LIMITS; expected int, got "
+                    f"{getattr(config, 'BROKER_LOT_LIMITS', None)!r}. Limit ignored.",
+                    dt=self._datetime,
+                )
+
+            if configured_limit > 0:
+                lot_int = max(1, int(abs(float(lot_size))))
+                chunk_limit = configured_limit
+                if lot_int > 1:
+                    chunk_limit = (chunk_limit // lot_int) * lot_int
+                if chunk_limit <= 0:
+                    log.warning(
+                        f"[Broker] BROKER_LOT_LIMITS={configured_limit} is below "
+                        f"LOT_SIZE={lot_int}; BUY {data._name} skipped.",
+                        dt=self._datetime,
+                    )
+                    return None
+
+                normalized_shares = int(abs(float(shares)))
+                if lot_int > 1:
+                    normalized_shares = (normalized_shares // lot_int) * lot_int
+                if normalized_shares > chunk_limit:
+                    chunk_count = (normalized_shares + chunk_limit - 1) // chunk_limit
+                    final_chunk = normalized_shares - chunk_limit * (chunk_count - 1)
+                    log.info(
+                        f"[Broker] Live BUY split {data._name}: total={normalized_shares}, "
+                        f"limit={chunk_limit}, orders={chunk_count}, final={final_chunk}",
+                        dt=self._datetime,
+                    )
+
+        # 将整个当前调用内的拆单、提交和记账包裹在同一把锁内，避免并发抢占。
         with self._ledger_lock:
-            return self._finalize_and_submit(data, shares, price, lot_size)
+            first_proxy = None
+            submitted_chunks = 0
+            if chunk_count > 1:
+                # GM 等适配器会二次做 cash-fit。批次预算避免柜台已冻结现金后
+                # 又减一次虚拟占资；该状态只在本次同步拆单调用内存在。
+                self._buy_batch_cash_budget = float(cash)
+
+            try:
+                remaining = normalized_shares
+                for _ in range(chunk_count):
+                    chunk_shares = min(chunk_limit, remaining) if chunk_count > 1 else remaining
+                    proxy = self._finalize_and_submit(
+                        data,
+                        chunk_shares,
+                        price,
+                        lot_size,
+                        retry_sync_failure=submitted_chunks > 0,
+                    )
+                    if not proxy:
+                        if chunk_count > 1:
+                            error_msg = (
+                                f"[Broker] Live BUY split stopped for {data._name}: "
+                                f"submitted={submitted_chunks}/{chunk_count}; "
+                                f"downgrade retries exhausted; remaining intent is not persisted."
+                            )
+                            log.error(error_msg, dt=self._datetime)
+                            runtime_notifications.push_text(error_msg, level='ERROR')
+                        return first_proxy
+
+                    if first_proxy is None:
+                        first_proxy = proxy
+                    submitted_chunks += 1
+
+                    if chunk_count > 1:
+                        submitted_shares = min(
+                            chunk_shares,
+                            self._infer_submitted_shares(proxy, chunk_shares),
+                        )
+                        submitted_cost = submitted_shares * price * self.safety_multiplier
+                        self._buy_batch_cash_budget = max(
+                            0.0,
+                            self._buy_batch_cash_budget - submitted_cost,
+                        )
+                        remaining -= chunk_shares
+
+                return first_proxy
+            finally:
+                if chunk_count > 1:
+                    self.__dict__.pop('_buy_batch_cash_budget', None)
 
     def _smart_buy(self, data, shares, price, target_pct, **kwargs):
         """智能买入 (Percent模式)：资金检查 + 自动降级"""
@@ -492,7 +582,26 @@ class BaseLiveBroker(ABC):
         lot_int = max(1, lot_int)
         return max(0, old_int - lot_int)
 
-    def _finalize_and_submit(self, data, shares, price, lot_size, retries=0):
+    def _next_buy_downgrade(self, old_shares, lot_size, retries):
+        if retries < self._BUY_LOT_STEP_RETRIES:
+            return self._lot_step_downgrade_shares(old_shares, lot_size), "LOT_SIZE阶梯降级"
+
+        geo_retry_idx = retries - self._BUY_LOT_STEP_RETRIES
+        return self._geometric_downgrade_shares(
+            old_shares,
+            lot_size,
+            geo_retry_idx,
+        ), "几何倍数降级"
+
+    def _finalize_and_submit(
+        self,
+        data,
+        shares,
+        price,
+        lot_size,
+        retries=0,
+        retry_sync_failure=False,
+    ):
         """通用的下单收尾逻辑：取整 + 提交"""
         raw_shares = shares
         if lot_size > 1:
@@ -521,6 +630,36 @@ class BaseLiveBroker(ABC):
             with self._ledger_lock:
                 proxy = self._submit_order(data, shares, 'BUY', price)
                 if not proxy:
+                    max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
+                    if retry_sync_failure and retries < max_retries:
+                        new_shares, downgrade_reason = self._next_buy_downgrade(
+                            shares,
+                            lot_size,
+                            retries,
+                        )
+                        print(
+                            f"⚠️ [Broker] 买单 {data._name} 同步提交失败。"
+                            f"触发自动降级 {retries + 1}/{max_retries}..."
+                        )
+                        print(
+                            f"   => {data._name} 尝试数量: {shares} -> {new_shares} "
+                            f"({downgrade_reason})"
+                        )
+                        if new_shares > 0:
+                            return self._finalize_and_submit(
+                                data,
+                                new_shares,
+                                price,
+                                lot_size,
+                                retries + 1,
+                                retry_sync_failure=True,
+                            )
+                        print(f"❌ [Broker] 降级终止: {data._name} 数量已降至 0。")
+                    elif retry_sync_failure:
+                        print(
+                            f"❌ [Broker] 降级终止: {data._name} 已达到最大重试次数 "
+                            f"{max_retries}，放弃本K。"
+                        )
                     return None
 
                 oid = str(getattr(proxy, 'id', '') or '').strip()
@@ -538,7 +677,8 @@ class BaseLiveBroker(ABC):
                     'shares': final_submitted_shares,
                     'price': price,
                     'lot_size': lot_size,
-                    'retries': retries
+                    'retries': retries,
+                    'retry_sync_failure': retry_sync_failure,
                 }
                 self._virtual_spent_cash += (
                     final_submitted_shares * price * self.safety_multiplier
@@ -699,9 +839,7 @@ class BaseLiveBroker(ABC):
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
                         retries = buy_info['retries']
-                        lot_step_retries = 5
-                        geometric_retries = 5
-                        max_retries = lot_step_retries + geometric_retries
+                        max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
 
                         # A. 退回上一笔订单预扣的虚拟资金 (使用动态滑点)
                         refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
@@ -714,25 +852,28 @@ class BaseLiveBroker(ABC):
                             symbol = getattr(data, '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
                             price = buy_info['price']
 
-                            # 可解释性优先:
-                            # - 前 5 次按 lot 线性降级
-                            # - 后 5 次按几何倍数降级
                             old_shares = buy_info['shares']
-                            if retries < lot_step_retries:
-                                new_shares = self._lot_step_downgrade_shares(old_shares, lot_size)
-                                downgrade_reason = "LOT_SIZE阶梯降级"
-                            else:
-                                geo_retry_idx = retries - lot_step_retries
-                                new_shares = self._geometric_downgrade_shares(old_shares, lot_size, geo_retry_idx)
-                                downgrade_reason = "几何倍数降级"
+                            new_shares, downgrade_reason = self._next_buy_downgrade(
+                                old_shares,
+                                lot_size,
+                                retries,
+                            )
 
                             print(f"⚠️ [Broker] 买单 {symbol} 被拒绝。触发自动降级 {retries + 1}/{max_retries}...")
                             print(f"   => {symbol} 尝试数量: {old_shares} -> {new_shares} ({downgrade_reason})")
 
                             if new_shares > 0:
                                 # 无状态优先：不入队，拒单后当场按更小数量重提。
-                                new_proxy = self._finalize_and_submit(data, new_shares, price, lot_size,
-                                                                      retries + 1)
+                                new_proxy = self._finalize_and_submit(
+                                    data,
+                                    new_shares,
+                                    price,
+                                    lot_size,
+                                    retries + 1,
+                                    retry_sync_failure=bool(
+                                        buy_info.get('retry_sync_failure', False)
+                                    ),
+                                )
 
                                 if not new_proxy:
                                     print(f"❌ [Broker] 降级发单同步失败，原订单资金已回退。")
