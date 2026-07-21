@@ -1437,6 +1437,9 @@ def launch_live(broker_name: str, conn_name: str, strategy_path: str, params: di
         )
 
         previous_worker_failure = get_previous_live_worker_failure()
+        if not previous_worker_failure:
+            AlarmManager().push_start(strategy_path)
+
         if previous_worker_failure:
             previous_failure_kind = get_previous_live_worker_failure_kind()
             runtime_print(

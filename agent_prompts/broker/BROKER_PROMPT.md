@@ -76,7 +76,7 @@
 7. 适配器和执行器必须区分 live/backtest：实盘以柜台现实、持仓/现金对账和短生命周期健康标记恢复；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
 8. 卖后现金等待、滚动买入和最终补齐属于 `common.order_executor` 职责；adapter 不要重复实现这些流程，只暴露真实现金、价格、在途订单和订单代理字段。
 9. 使用 SDK 事件循环的实盘 adapter 必须把 SDK 线程/轮询/协作等待函数抛出的非人工 `SystemExit` 当作 session 退出并交给 Phoenix 重启；不要让 nohup 长进程被 SDK 直接带退出。人工 `KeyboardInterrupt` 仍应退出。schedule prewarm 和正式 run 都应按目标 slot 去重，长进程 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带时间戳。GM 这类进程内 SDK 若 init 失败，应先重绑 token/server/callback 并 soft reset；连续 init 失败可 re-exec 当前进程作为最后自愈。
-10. 通过 `run.py --connect` 运行时，通用父进程监督器负责进程级保活与探活；adapter 应在 native SDK 初始化/连接阶段上报短生命周期健康状态和有界超时。监督器发现 worker 退出、heartbeat 停滞或健康期限超时后，以原始命令冷启动并记录退出码/信号；连接维护等降噪策略必须通过结构化故障类别传递，不得解析状态或原因文本。受监督 worker 的内部重启不重复推 `STOPPED` / `DEAD`；操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。配置 `1d` schedule 时，每个自然日在正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`。监督器不得保存或重放交易意图，回测/优化不得启动该链路。
+10. 通过 `run.py --connect` 运行时，通用父进程监督器负责进程级保活与探活；worker 进入 broker SDK 前必须推送一次 `STARTED`，同一 worker 进程内不得重复发送；adapter 应在 native SDK 初始化/连接阶段上报短生命周期健康状态和有界超时。监督器发现 worker 退出、heartbeat 停滞或健康期限超时后，以原始命令冷启动并记录退出码/信号；连接维护等降噪策略必须通过结构化故障类别传递，不得解析状态或原因文本。受监督 worker 的内部重启不重复推 `STOPPED` / `DEAD`；操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。配置 `1d` schedule 时，每个自然日在正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`。监督器不得保存或重放交易意图，回测/优化不得启动该链路。
 
 ---
 

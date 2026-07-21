@@ -58,7 +58,7 @@
 6. GM / IB schedule 运行支持 prewarm；相关改动不得破坏 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 7. schedule 附近的 IM 报警推送支持时间窗限制；默认读取 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可覆盖全局默认值。
 8. 使用实盘 schedule 回调的 adapter 必须在 context 上暴露 `schedule_rule` 或 `use_schedule`，使基础 broker 能区分正常调度间隔和异常长中断。
-9. 初次 `STARTED`、定时 `ALIVE` 状态以及显式标注为 `plan` 的执行计划消息不受 schedule 报警时间窗限制；受监督 worker 的内部重启和终止不得推送 `STOPPED` / `DEAD`，监督父进程只负责日志与重启，不初始化告警通道。只有操作者发起的安全退出才由 worker 推送一次 `STOPPED`。
+9. 初次 `STARTED` 必须在 worker 进入 broker SDK 启动前发送，不能依赖 SDK init 回调；同一 worker 进程内只发送一次。定时 `ALIVE` 状态以及显式标注为 `plan` 的执行计划消息不受 schedule 报警时间窗限制；受监督 worker 的内部重启和终止不得推送 `STOPPED` / `DEAD`，监督父进程只负责日志与重启，不初始化告警通道。只有操作者发起的安全退出才由 worker 推送一次 `STOPPED`。
 10. 实盘阻断类错误告警不得在长进程内永久静默；若按 schedule 去重，应以当前 schedule slot 为作用域（如 `1d` 每日、`5m` 每 5 分钟 slot）。
 11. 已知券商连接维护错误仅记录日志并自愈，不直接推送异常 IM；若 schedule prewarm 或实际 run 时刻平台仍不可用，应保留按 slot 去重的 ERROR 报警，但不得把该 slot 误记为已执行。schedule 告警按自然日执行，不按星期筛选，默认覆盖 7x24 时段。
 12. GM / IBKR schedule prewarm 与正式 run 都必须按目标 schedule slot 去重；重复 prewarm 回调不得重复执行或持续打印 `Prewarm Finished`。

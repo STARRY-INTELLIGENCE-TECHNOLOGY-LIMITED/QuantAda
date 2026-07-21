@@ -123,6 +123,20 @@ def test_runtime_context_status_detail_contains_market_scope(fresh_alarm_manager
     assert f"Market: {market_scope}" in detail, "状态详情应包含 selector/symbols 市场上下文。"
 
 
+def test_push_start_sends_once_per_process(fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+
+    mgr.push_start("strategy_a")
+    mgr.push_start("strategy_a")
+
+    assert _wait_until(lambda: len(fake.status_calls) == 1), "STARTED 生命周期消息应只发送一次。"
+    status, detail = fake.status_calls[0]
+    assert status == "STARTED"
+    assert "strategy_a" in detail
+
+
 def test_push_exception_aggregates_same_error_with_count(fresh_alarm_manager):
     mgr = fresh_alarm_manager
     fake = FakeAlarmChannel()

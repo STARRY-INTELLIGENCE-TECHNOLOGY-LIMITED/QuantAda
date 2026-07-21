@@ -66,6 +66,7 @@ class AlarmManager:
         self._schedule_alarm_window_before_seconds = 0.0
         self._schedule_alarm_window_after_seconds = 0.0
         self._terminal_lifecycle_status = None
+        self._start_lifecycle_sent = False
         self._schedule_api_unavailable_alarm_keys = set()
         self._daily_schedule_health_timer = None
 
@@ -473,6 +474,11 @@ class AlarmManager:
             threading.Thread(target=alarm.push_trade, args=(order_info,)).start()
 
     def push_start(self, strategy_name):
+        if self._start_lifecycle_sent:
+            return
+        if not self.alarms:
+            return
+        self._start_lifecycle_sent = True
         detail = self.context_detail if self.context_detail else f"Strategy: {strategy_name}"
         self.push_status("STARTED", detail, alarm_tag=BaseAlarm.TAG_LIFECYCLE)
 

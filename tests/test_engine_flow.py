@@ -2469,3 +2469,59 @@ def test_launch_live_applies_alarm_context_and_suppresses_transient_restart(monk
     assert captured["runtime_context"]["schedule_rule"] == "1d:15:45:00"
     assert captured["runtime_context"]["schedule_timezone"] == "America/New_York"
 
+
+def test_launch_live_pushes_started_before_broker_launch(monkeypatch):
+    """
+    启动生命周期 IM 不应依赖券商 SDK init 回调；进入 broker launch 前即应推送。
+    """
+    import live_trader.engine as engine_module
+
+    events = []
+    module_name = "live_trader.adapters.fake_broker"
+    fake_module = ModuleType(module_name)
+
+    class FakeBroker(engine_module.BaseLiveBroker):
+        @classmethod
+        def launch(cls, conn_cfg, strategy_path, params, **kwargs):
+            events.append(("launch", strategy_path))
+
+    FakeBroker.__module__ = module_name
+    fake_module.FakeBroker = FakeBroker
+
+    class DummyAlarmManager:
+        def set_runtime_context(self, **kwargs):
+            events.append(("context", kwargs))
+
+        def push_start(self, strategy_name):
+            events.append(("start", strategy_name))
+
+        def push_exception(self, context, error):
+            events.append(("exception", context, str(error)))
+
+    dummy_alarm = DummyAlarmManager()
+
+    monkeypatch.setattr(
+        config,
+        "BROKER_ENVIRONMENTS",
+        {"fake_broker": {"real": {"schedule": "1d:15:45:00"}}},
+    )
+    monkeypatch.setattr(
+        engine_module.importlib,
+        "import_module",
+        lambda import_name: fake_module if import_name == module_name else None,
+    )
+    monkeypatch.setattr(engine_module, "AlarmManager", lambda: dummy_alarm)
+    monkeypatch.setattr(engine_module, "get_previous_live_worker_failure", lambda: "")
+    monkeypatch.setattr(engine_module, "get_previous_live_worker_failure_kind", lambda: None)
+
+    engine_module.launch_live(
+        broker_name="fake_broker",
+        conn_name="real",
+        strategy_path="strategies.my_strategy",
+        params={"lookback": 20},
+        symbols=["QQQ"],
+    )
+
+    assert [event[0] for event in events] == ["context", "start", "launch"]
+    assert events[1] == ("start", "strategies.my_strategy")
+
