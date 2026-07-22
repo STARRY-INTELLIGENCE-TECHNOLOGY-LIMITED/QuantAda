@@ -36,7 +36,9 @@ stop_all() {
 }
 
 interactive_stop() {
-  local selected_pid=""
+  local failures=0
+  local pid
+  local -a selected_pids=()
 
   qada_require_tty "safe_stop.sh"
   trap 'qada_cleanup_and_exit 0' INT TERM
@@ -47,8 +49,17 @@ interactive_stop() {
     exit 0
   fi
 
-  qada_select_process selected_pid "QuantAda live processes" "stop"
-  qada_stop_supervisor "$selected_pid" 30
+  qada_select_processes selected_pids "QuantAda live processes" "stop"
+  for pid in "${selected_pids[@]}"; do
+    if ! qada_stop_supervisor "$pid" 30; then
+      failures=$((failures + 1))
+    fi
+  done
+
+  if (( failures > 0 )); then
+    qada_out "${failures} stop operation(s) failed."
+    return 1
+  fi
 }
 
 if [[ $# -gt 1 ]]; then

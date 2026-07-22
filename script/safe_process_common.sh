@@ -41,6 +41,7 @@ declare -gA qada_children_by_root=()
 declare -gA qada_root_cmdline=()
 declare -ga qada_candidate_pids=()
 declare -ga qada_root_pids=()
+declare -ga qada_visible_pids=()
 
 qada_reset_process_cache() {
   qada_parent_of=()
@@ -53,6 +54,7 @@ qada_reset_process_cache() {
   qada_root_cmdline=()
   qada_candidate_pids=()
   qada_root_pids=()
+  qada_visible_pids=()
 }
 
 qada_read_cmdline() {
@@ -161,19 +163,37 @@ qada_collect_processes() {
   done
 }
 
+qada_filter_processes() {
+  local query=${1,,}
+  local pid command
+
+  qada_visible_pids=()
+  for pid in "${qada_root_pids[@]}"; do
+    command=${qada_root_cmdline[$pid],,}
+    if [[ -z $query || $command == *"$query"* ]]; then
+      qada_visible_pids+=("$pid")
+    fi
+  done
+}
+
 qada_render_menu() {
   local title=$1
   local hint=$2
   local selected=$3
   local status=$4
+  local query=$5
   local idx root marker children
 
   printf '\033[H\033[J' >&4
   printf '%s\n' "$title" >&4
   printf '%s\n\n' "$hint" >&4
 
-  for idx in "${!qada_root_pids[@]}"; do
-    root=${qada_root_pids[$idx]}
+  if [[ -n $query ]]; then
+    printf 'Command filter: %s\n\n' "$query" >&4
+  fi
+
+  for idx in "${!qada_visible_pids[@]}"; do
+    root=${qada_visible_pids[$idx]}
     marker=' '
     if [[ $idx -eq $selected ]]; then
       marker='>'
@@ -189,26 +209,35 @@ qada_render_menu() {
     fi
   done
 
+  if [[ ${#qada_visible_pids[@]} -eq 0 ]]; then
+    printf 'No commands match the current filter.\n\n' >&4
+  fi
+
   if [[ -n $status ]]; then
     printf '%s\n' "$status" >&4
   fi
 }
 
-qada_select_process() {
-  local -n out_pid=$1
+qada_select_processes() {
+  local -n out_pids=$1
   local title=$2
   local action=$3
-  local selected=0
+  local selected_index=0
   local typed=""
   local status=""
-  local key rest choice
+  local query=""
+  local key rest choice answer
+
+  out_pids=()
+  qada_filter_processes ""
 
   while :; do
     qada_render_menu \
       "$title" \
-      "Up/Down move, digits select, Enter ${action}, q cancel" \
-      "$selected" \
-      "$status"
+      "Up/Down move, digits select, / search command, a select all, Enter ${action}, q cancel" \
+      "$selected_index" \
+      "$status" \
+      "$query"
     status=""
 
     key=""
@@ -225,39 +254,100 @@ qada_select_process() {
 
     case "$key" in
       ""|$'\n'|$'\r')
-        if [[ -n $typed ]]; then
+        if [[ $typed == "a" || $typed == "A" ]]; then
+          if [[ ${#qada_visible_pids[@]} -eq 0 ]]; then
+            status="No matching processes to ${action}."
+            typed=""
+            continue
+          fi
+
+          qada_render_menu \
+            "$title" \
+            "Confirm selection before ${action}" \
+            "$selected_index" \
+            "This will ${action} all ${#qada_visible_pids[@]} listed supervisor(s)." \
+            "$query"
+          printf 'Confirm %s all listed supervisors? [y/N] ' "$action" >&4
+          answer=""
+          if ! IFS= read -r answer <&3; then
+            qada_cleanup_and_exit 0
+          fi
+          answer=${answer%$'\r'}
+          if [[ $answer == "y" || $answer == "Y" ]]; then
+            out_pids=("${qada_visible_pids[@]}")
+            return 0
+          fi
+          typed=""
+          status="All selection cancelled."
+          continue
+        elif [[ -n $typed ]]; then
           choice=$((10#$typed - 1))
         else
-          choice=$selected
+          choice=$selected_index
         fi
-        if (( choice < 0 || choice >= ${#qada_root_pids[@]} )); then
-          status="Invalid selection: ${typed:-$((selected + 1))}"
+        if (( choice < 0 || choice >= ${#qada_visible_pids[@]} )); then
+          status="Invalid selection: ${typed:-$((selected_index + 1))}"
           typed=""
           continue
         fi
-        out_pid=${qada_root_pids[$choice]}
+        out_pids=("${qada_visible_pids[$choice]}")
         return 0
         ;;
       q|Q|$'\e')
         qada_cleanup_and_exit 0
         ;;
       $'\e[A')
-        selected=$(( selected > 0 ? selected - 1 : 0 ))
+        selected_index=$(( selected_index > 0 ? selected_index - 1 : 0 ))
         typed=""
         ;;
       $'\e[B')
-        if (( selected + 1 < ${#qada_root_pids[@]} )); then
-          selected=$((selected + 1))
+        if (( selected_index + 1 < ${#qada_visible_pids[@]} )); then
+          selected_index=$((selected_index + 1))
         fi
         typed=""
         ;;
+      /)
+        printf '\nCommand search (empty shows all): ' >&4
+        query=""
+        if ! IFS= read -r query <&3; then
+          qada_cleanup_and_exit 0
+        fi
+        query=${query%$'\r'}
+        qada_filter_processes "$query"
+        selected_index=0
+        typed=""
+        if [[ ${#qada_visible_pids[@]} -eq 0 ]]; then
+          status="No command contains: ${query}"
+        elif [[ -n $query ]]; then
+          status="Matched ${#qada_visible_pids[@]} supervisor(s)."
+        else
+          status="Command filter cleared."
+        fi
+        ;;
       [0-9])
-        typed+="$key"
-        if (( 10#$typed >= 1 && 10#$typed <= ${#qada_root_pids[@]} )); then
-          selected=$((10#$typed - 1))
+        if [[ $typed =~ ^[0-9]*$ ]]; then
+          typed+="$key"
+        else
+          typed="$key"
+        fi
+        if [[ ${#typed} -gt 9 ]]; then
+          typed=""
+          status="Selection number is too large."
+          continue
+        fi
+        if (( 10#$typed >= 1 && 10#$typed <= ${#qada_visible_pids[@]} )); then
+          selected_index=$((10#$typed - 1))
           status="Selected ${typed}. Press Enter to ${action}."
         else
           status="Selected ${typed}."
+        fi
+        ;;
+      a|A)
+        typed="$key"
+        if [[ ${#qada_visible_pids[@]} -gt 0 ]]; then
+          status="Selected all ${#qada_visible_pids[@]} listed supervisor(s). Press Enter to continue."
+        else
+          status="No matching processes to ${action}."
         fi
         ;;
       $'\x7f'|$'\b')
@@ -265,8 +355,8 @@ qada_select_process() {
           typed=${typed%?}
           if [[ -n $typed ]]; then
             choice=$((10#$typed - 1))
-            if (( choice >= 0 && choice < ${#qada_root_pids[@]} )); then
-              selected=$choice
+            if (( choice >= 0 && choice < ${#qada_visible_pids[@]} )); then
+              selected_index=$choice
             fi
           fi
         fi

@@ -123,7 +123,9 @@ restart_all() {
 }
 
 interactive_restart() {
-  local selected_pid=""
+  local failures=0
+  local pid
+  local -a selected_pids=()
 
   qada_require_tty "safe_restart.sh"
   trap 'qada_cleanup_and_exit 0' INT TERM
@@ -134,8 +136,17 @@ interactive_restart() {
     exit 0
   fi
 
-  qada_select_process selected_pid "QuantAda live processes" "restart"
-  restart_supervisor "$selected_pid"
+  qada_select_processes selected_pids "QuantAda live processes" "restart"
+  for pid in "${selected_pids[@]}"; do
+    if ! restart_supervisor "$pid"; then
+      failures=$((failures + 1))
+    fi
+  done
+
+  if (( failures > 0 )); then
+    qada_out "${failures} restart operation(s) failed."
+    return 1
+  fi
 }
 
 case "${1:-}" in
