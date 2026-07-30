@@ -125,7 +125,7 @@ class IbkrDataProvider(BaseDataProvider):
 
         return Stock(spec['symbol'], spec['exchange'], spec['currency'])
 
-    def _calc_duration(self, start_date, end_date):
+    def _calc_duration(self, start_date, end_date, timeframe='Days'):
         """计算 IB API 需要的 durationStr"""
         if not start_date:
             return "1 Y"  # 默认回溯1年
@@ -135,6 +135,11 @@ class IbkrDataProvider(BaseDataProvider):
         end_dt = pd.to_datetime(end_date) if end_date else datetime.now()
 
         delta = end_dt - start_dt
+        if timeframe in {'Minutes', 'Seconds'}:
+            total_seconds = max(1, math.ceil(delta.total_seconds()) + 1)
+            if total_seconds <= 86400:
+                return f"{total_seconds} S"
+            return f"{math.ceil(total_seconds / 86400)} D"
         days = delta.days + 1  # 多取一点buffer
 
         if days < 365:
@@ -165,7 +170,7 @@ class IbkrDataProvider(BaseDataProvider):
         # 2. 决定数据类型 (whatToShow) 和 请求参数
         # 默认规则: 股票用 ADJUSTED_LAST，外汇用 MIDPOINT，其他用 TRADES
         what_to_show = 'TRADES'
-        if contract.secType == 'STK':
+        if contract.secType == 'STK' and timeframe not in {'Minutes', 'Seconds'}:
             what_to_show = 'ADJUSTED_LAST'
         elif contract.secType == 'CASH':
             what_to_show = 'MIDPOINT'
@@ -186,17 +191,22 @@ class IbkrDataProvider(BaseDataProvider):
             # 其他类型正常处理
             if end_date:
                 end_dt = pd.to_datetime(end_date)
-                req_end_date = end_dt.strftime('%Y%m%d 23:59:59')
+                if timeframe in {'Minutes', 'Seconds'}:
+                    req_end_date = end_dt.strftime('%Y%m%d %H:%M:%S')
+                else:
+                    req_end_date = end_dt.strftime('%Y%m%d 23:59:59')
             else:
                 req_end_date = ''
                 calc_end_date = datetime.now()
 
-        duration_str = self._calc_duration(start_date, calc_end_date)
+        duration_str = self._calc_duration(start_date, calc_end_date, timeframe=timeframe)
 
         # Bar Size 映射
         bar_size = "1 day"
         if timeframe == 'Minutes':
             bar_size = f"{compression} min"
+        elif timeframe == 'Seconds':
+            bar_size = f"{compression} secs"
         elif timeframe == 'Weeks':
             bar_size = "1 week"
 
@@ -208,10 +218,16 @@ class IbkrDataProvider(BaseDataProvider):
                 hist_timeout = float(getattr(config, 'IBKR_HIST_TIMEOUT_SEC', 8.0))
             except Exception:
                 hist_timeout = 8.0
-            hist_timeout = max(1.0, hist_timeout)
+            hist_timeout = max(0.1, hist_timeout)
+            if timeframe == 'Seconds':
+                try:
+                    interval_seconds = max(0.1, float(compression or 1))
+                except Exception:
+                    interval_seconds = 1.0
+                hist_timeout = min(hist_timeout, max(0.1, interval_seconds * 0.4))
 
-            # 外汇不使用 RTH；股票默认用 RTH，避免盘前盘后噪声。
-            default_use_rth = False if contract.secType == 'CASH' else True
+            # 外汇/币市不使用 RTH；股票默认用 RTH，避免盘前盘后噪声。
+            default_use_rth = False if contract.secType in {'CASH', 'CRYPTO'} else True
 
             request_plan = [(what_to_show, default_use_rth, hist_timeout, 1)]
             if contract.secType == 'STK' and what_to_show == 'ADJUSTED_LAST':

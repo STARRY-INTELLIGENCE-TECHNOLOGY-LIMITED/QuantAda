@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 import config
 from backtest.backtester import Backtester
@@ -75,6 +76,27 @@ class _BuyThenSellProbeStrategy(BaseStrategy):
         if self.phase == 1 and self.broker.getposition(data).size > 0:
             self.broker.order_target_value(data=data, target=0.0)
             self.phase = 2
+
+
+class _FractionalBuyThenSellProbeStrategy(BaseStrategy):
+    completed_sizes = []
+
+    def init(self):
+        self.phase = 0
+
+    def next(self):
+        data = self.broker.datas[0]
+        if self.phase == 0:
+            order = self.broker.order_target_value(data=data, target=25.0)
+            assert order is not None
+            self.phase = 1
+        elif self.phase == 1 and self.broker.getposition(data).size > 0:
+            self.broker.order_target_value(data=data, target=0.0)
+            self.phase = 2
+
+    def notify_order(self, order):
+        if order.is_completed():
+            self.__class__.completed_sizes.append(abs(order.executed.size))
 
 
 class _InsufficientCashBuyProbeStrategy(BaseStrategy):
@@ -197,6 +219,26 @@ def test_order_target_percent_tracks_virtual_spent_cash_with_multi_symbol_buy(mo
 
     final_sizes = {d._name: wrapper.getposition(d).size for d in wrapper.datas}
     assert final_sizes == {'AAA': 6, 'BBB': 4}, "第二笔买单应按剩余现金自动缩量成交，而非被拒单。"
+
+
+def test_backtester_supports_fractional_crypto_lot_size(monkeypatch):
+    monkeypatch.setattr(config, 'LOT_SIZE', 0.0001)
+    _FractionalBuyThenSellProbeStrategy.completed_sizes = []
+
+    bt = Backtester(
+        datas={'CRYPTO.BTC.USD': _make_constant_price_df(100.0)},
+        strategy_class=_FractionalBuyThenSellProbeStrategy,
+        cash=100.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+    )
+    bt.run()
+
+    wrapper = bt.results[0]
+    assert _FractionalBuyThenSellProbeStrategy.completed_sizes == pytest.approx([0.25, 0.25])
+    assert wrapper.getposition(wrapper.datas[0]).size == pytest.approx(0.0)
 
 
 def test_backtester_keeps_full_dataname_while_feed_starts_at_start_date():

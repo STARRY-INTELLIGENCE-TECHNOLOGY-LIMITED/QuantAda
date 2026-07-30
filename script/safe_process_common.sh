@@ -42,6 +42,22 @@ declare -gA qada_root_cmdline=()
 declare -ga qada_candidate_pids=()
 declare -ga qada_root_pids=()
 declare -ga qada_visible_pids=()
+qada_operation_lock_fd=""
+
+qada_acquire_operation_lock() {
+  local lock_name=${1:-operation}
+  local lock_path
+
+  if ! command -v flock >/dev/null 2>&1; then
+    qada_die "flock is required to serialize QuantAda process operations."
+  fi
+
+  lock_path="${TMPDIR:-/tmp}/quantada-${UID:-$(id -u)}-${lock_name}.lock"
+  exec {qada_operation_lock_fd}>"$lock_path"
+  if ! flock -n "$qada_operation_lock_fd"; then
+    qada_die "Another QuantAda ${lock_name} operation is already running."
+  fi
+}
 
 qada_reset_process_cache() {
   qada_parent_of=()
@@ -82,6 +98,24 @@ qada_is_live_command() {
     esac
   done
   [[ $has_run -eq 1 && $has_connect -eq 1 ]]
+}
+
+qada_live_command_key() {
+  local arg found_run=0 rendered=""
+
+  for arg in "$@"; do
+    if [[ $found_run -eq 0 ]]; then
+      case "$arg" in
+        */run.py|run.py) found_run=1 ;;
+        *) continue ;;
+      esac
+    fi
+    if [[ -n $rendered ]]; then
+      rendered+=" "
+    fi
+    rendered+="$(printf '%q' "$arg")"
+  done
+  printf '%s' "$rendered"
 }
 
 qada_render_cmdline() {
@@ -372,25 +406,42 @@ qada_stop_supervisor() {
   local pid=$1
   local timeout_seconds=${2:-30}
   local deadline
+  local child children_csv
+  local -a child_pids=()
+  local -a child_argv=()
+
+  children_csv=${qada_children_by_root[$pid]:-}
+  if [[ -n $children_csv ]]; then
+    IFS=',' read -r -a child_pids <<< "$children_csv"
+  fi
 
   if ! kill -0 "$pid" 2>/dev/null; then
     qada_out "Supervisor ${pid} is already gone."
-    return 0
-  fi
-
-  qada_out "Sending SIGINT to supervisor ${pid}..."
-  if ! kill -INT "$pid" 2>/dev/null; then
-    qada_out "Failed to send SIGINT to ${pid}."
-    return 1
-  fi
-
-  deadline=$((SECONDS + timeout_seconds))
-  while kill -0 "$pid" 2>/dev/null; do
-    if (( SECONDS >= deadline )); then
-      qada_out "SIGINT sent, but ${pid} is still running after ${timeout_seconds}s."
+  else
+    qada_out "Sending SIGINT to supervisor ${pid}..."
+    if ! kill -INT "$pid" 2>/dev/null; then
+      qada_out "Failed to send SIGINT to ${pid}."
       return 1
     fi
-    sleep 1
+
+    deadline=$((SECONDS + timeout_seconds))
+    while kill -0 "$pid" 2>/dev/null; do
+      if (( SECONDS >= deadline )); then
+        qada_out "SIGINT sent, but ${pid} is still running after ${timeout_seconds}s."
+        return 1
+      fi
+      sleep 1
+    done
+  fi
+
+  for child in "${child_pids[@]}"; do
+    child_argv=()
+    if kill -0 "$child" 2>/dev/null \
+      && qada_read_cmdline "$child" child_argv \
+      && qada_is_live_command "${child_argv[@]}"; then
+      qada_out "Supervisor ${pid} exited, but its live worker ${child} is still running."
+      return 1
+    fi
   done
 
   qada_out "Supervisor ${pid} exited cleanly."

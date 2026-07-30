@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -83,6 +84,85 @@ printf '%s\\n' "${qada_visible_pids[*]}"
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "101"
+
+
+def test_live_command_key_ignores_interpreter_worker_flags(bash):
+    result = _run_bash(
+        bash,
+        """
+supervisor_key=$(qada_live_command_key /opt/venv/python /srv/run.py strategy --connect=gm:real)
+worker_key=$(qada_live_command_key /opt/venv/python -u /srv/run.py strategy --connect=gm:real)
+[[ "$supervisor_key" == "$worker_key" ]]
+printf '%s\n' "$worker_key"
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().startswith("/srv/run.py strategy")
+
+
+def test_operation_lock_rejects_concurrent_restart(bash):
+    flock_probe = subprocess.run(
+        [bash, "-lc", "command -v flock"],
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    if flock_probe.returncode != 0:
+        pytest.skip("flock is required for the Linux safe-restart lock test")
+
+    lock_name = f"safe-restart-test-{uuid.uuid4().hex}"
+    holder_script = f"""
+set -euo pipefail
+source script/safe_process_common.sh
+qada_acquire_operation_lock {lock_name}
+printf 'locked\\n'
+sleep 5
+"""
+    holder = subprocess.Popen(
+        [bash, "-c", holder_script],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout.readline().decode("utf-8", errors="replace").strip() == "locked"
+        contender = _run_bash(
+            bash,
+            f"qada_acquire_operation_lock {lock_name}",
+        )
+        assert contender.returncode != 0
+        assert "already running" in contender.stderr
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+
+def test_stop_refuses_success_while_original_worker_is_alive(bash):
+    result = _run_bash(
+        bash,
+        """
+qada_children_by_root[101]='202'
+kill() {
+  if [[ $1 == '-0' && $2 == '202' ]]; then
+    return 0
+  fi
+  return 1
+}
+qada_read_cmdline() {
+  local -n output=$2
+  output=(/opt/venv/python -u /srv/run.py strategy --connect=gm:real)
+  return 0
+}
+if qada_stop_supervisor 101 0; then
+  printf 'unexpected-success\n'
+else
+  printf 'blocked\n'
+fi
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "live worker 202 is still running" in result.stdout
+    assert result.stdout.strip().endswith("blocked")
 
 
 def test_search_then_enter_selects_one_matching_supervisor(bash):

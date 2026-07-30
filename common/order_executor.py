@@ -1,6 +1,19 @@
 import time
 
+import config
 from common import runtime_notifications
+from common.live_execution_budget import (
+    get_live_run_deadline,
+    live_run_budget_expired,
+    live_run_finalization_reserve,
+    live_run_seconds_remaining,
+    sleep_with_live_run_budget,
+)
+from common.order_quantity import (
+    positive_quantity,
+    quantity_at_most,
+    subtract_quantities,
+)
 
 
 class OrderExecutor:
@@ -36,25 +49,43 @@ class OrderExecutor:
         sell_reconcile_targets = {}
         has_untracked_sell = False
 
+        if should_wait_post_sell_cash and live_run_budget_expired(self.broker):
+            self._emit_warning(
+                "[Executor Warning] Live run execution budget exhausted before rebalance execution.",
+                level='ERROR',
+            )
+            return
+
         # 第一步：处理所有卖出动作 (清仓 + 减仓)
         # 必须先执行卖出，再等待卖单终态，最大化后续买单资金利用率。
         for data in plan['sell_clear']:
+            if should_wait_post_sell_cash and live_run_budget_expired(self.broker):
+                sell_submit_failed = True
+                self._emit_warning(
+                    "[Executor Warning] Live run execution budget exhausted while submitting SELL orders; "
+                    "accepted partial SELL orders remain active and later plan items are skipped.",
+                    level='ERROR',
+                )
+                break
             self._log(f"执行清仓: {data._name}")
             before_size = self._read_position_size(data)
             sell_order = self.broker.order_target_value(data=data, target=0.0)
             if sell_order:
                 sell_submitted = True
-                oid = str(getattr(sell_order, 'id', '') or '').strip()
+                if bool(getattr(sell_order, 'batch_submit_failed', False)):
+                    sell_submit_failed = True
+                order_ids = self._infer_order_ids(sell_order)
                 reconcile_target = self._build_sell_reconcile_target(
                     data=data,
                     before_size=before_size,
                     sell_order=sell_order,
                     target_value=0.0,
                 )
-                if oid:
-                    submitted_sell_ids.add(oid)
+                if order_ids:
+                    submitted_sell_ids.update(order_ids)
                     if reconcile_target is not None:
-                        sell_reconcile_targets[oid] = reconcile_target
+                        for oid in order_ids:
+                            sell_reconcile_targets[oid] = reconcile_target
                 else:
                     has_untracked_sell = True
                 if should_wait_post_sell_cash:
@@ -70,22 +101,33 @@ class OrderExecutor:
                 self._warn_order_not_submitted('SELL', data, 0.0, phase='clear')
 
         for data, target in plan['reduce']:
+            if should_wait_post_sell_cash and live_run_budget_expired(self.broker):
+                sell_submit_failed = True
+                self._emit_warning(
+                    "[Executor Warning] Live run execution budget exhausted while submitting SELL orders; "
+                    "accepted partial SELL orders remain active and later plan items are skipped.",
+                    level='ERROR',
+                )
+                break
             self._log(f"执行减仓: {data._name} -> {target:.2f}")
             before_size = self._read_position_size(data)
             sell_order = self.broker.order_target_value(data=data, target=target)
             if sell_order:
                 sell_submitted = True
-                oid = str(getattr(sell_order, 'id', '') or '').strip()
+                if bool(getattr(sell_order, 'batch_submit_failed', False)):
+                    sell_submit_failed = True
+                order_ids = self._infer_order_ids(sell_order)
                 reconcile_target = self._build_sell_reconcile_target(
                     data=data,
                     before_size=before_size,
                     sell_order=sell_order,
                     target_value=target,
                 )
-                if oid:
-                    submitted_sell_ids.add(oid)
+                if order_ids:
+                    submitted_sell_ids.update(order_ids)
                     if reconcile_target is not None:
-                        sell_reconcile_targets[oid] = reconcile_target
+                        for oid in order_ids:
+                            sell_reconcile_targets[oid] = reconcile_target
                 else:
                     has_untracked_sell = True
                 if should_wait_post_sell_cash:
@@ -102,14 +144,35 @@ class OrderExecutor:
 
         if sell_submit_failed:
             msg = (
-                "[Executor Warning] One or more SELL orders were not submitted. "
-                "Planned BUY orders are skipped for this rebalance run."
+                "[Executor Warning] One or more SELL orders were only partially submitted or not submitted. "
+                "Accepted SELL orders will be reconciled, then BUY orders will use current broker cash; "
+                "without an accepted SELL, BUY orders still attempt a cash-limited partial execution."
             )
             self._emit_warning(msg, level='ERROR')
+            if should_wait_post_sell_cash and sell_submitted:
+                self._wait_sells_settled(
+                    submitted_sell_ids,
+                    has_untracked_sell,
+                    sell_reconcile_targets,
+                    increase_plan=plan['increase'],
+                    min_final_buy_cash=pre_sell_cash + expected_sell_cash_release,
+                )
+            else:
+                self._execute_final_buys(
+                    plan['increase'],
+                    check_pending=should_wait_post_sell_cash,
+                )
             return
 
         if not sell_submitted:
             for data, target in plan['increase']:
+                if should_wait_post_sell_cash and live_run_budget_expired(self.broker):
+                    self._emit_warning(
+                        "[Executor Warning] Live run execution budget exhausted while submitting BUY orders; "
+                        "remaining plan items are skipped.",
+                        level='ERROR',
+                    )
+                    break
                 self._log(f"执行补仓/开仓: {data._name} -> {target:.2f}")
                 buy_order = self.broker.order_target_value(data=data, target=target)
                 if not buy_order:
@@ -131,11 +194,7 @@ class OrderExecutor:
             min_final_buy_cash=pre_sell_cash + expected_sell_cash_release,
         )
         if not sells_settled:
-            msg = (
-                "[Executor Warning] SELL orders remain pending after hard wait. "
-                "Confirmed cash has already been rolled into buy orders conservatively."
-            )
-            self._emit_warning(msg, level='ERROR')
+            return
 
     def _log(self, txt):
         if self.debug:
@@ -254,10 +313,33 @@ class OrderExecutor:
 
         wait_seconds = max(0.0, float(self._POST_SELL_CASH_WAIT_SECONDS))
         poll = max(0.05, float(self._POST_SELL_CASH_POLL_SECONDS))
+        run_deadline = get_live_run_deadline(self.broker)
+        reserve = live_run_finalization_reserve(self.broker) if run_deadline is not None else 0.0
+        if run_deadline is not None:
+            # 卖单已由持仓确认后，现金到账是执行剩余计划的最后关键条件。
+            # 使用本轮剩余预算等待，而不是沿用旧的 10 秒局部上限。
+            wait_seconds = live_run_seconds_remaining(
+                self.broker,
+                reserve,
+                deadline=run_deadline,
+            )
         start_ts = time.time()
         last_cash = self._get_available_cash()
 
         while last_cash < target_cash:
+            if run_deadline is not None and live_run_budget_expired(
+                self.broker,
+                reserve_seconds=reserve,
+                deadline=run_deadline,
+            ):
+                msg = (
+                    "[Executor] 卖单已确认清空，但现金快照在最终买入预留窗口前仍未更新；"
+                    "立即按当前可用现金提交最终买单，可能发生保守截断。"
+                    f" available_cash={last_cash:.2f}, expected_cash>={target_cash:.2f}"
+                )
+                self._emit_warning(msg, level='WARNING')
+                return False
+
             elapsed = time.time() - start_ts
             if elapsed >= wait_seconds:
                 msg = (
@@ -268,8 +350,24 @@ class OrderExecutor:
                 self._emit_warning(msg, level='WARNING')
                 return False
 
-            time.sleep(poll)
+            sleep_seconds = min(poll, max(0.0, wait_seconds - elapsed))
+            if run_deadline is None:
+                time.sleep(sleep_seconds)
+            elif sleep_with_live_run_budget(
+                self.broker,
+                sleep_seconds,
+                reserve_seconds=reserve,
+            ) <= 0:
+                msg = (
+                    "[Executor] 卖单已确认清空，但现金快照在最终买入预留窗口前仍未更新；"
+                    "立即按当前可用现金提交最终买单，可能发生保守截断。"
+                    f" available_cash={last_cash:.2f}, expected_cash>={target_cash:.2f}"
+                )
+                self._emit_warning(msg, level='WARNING')
+                return False
             if hasattr(self.broker, 'sync_balance'):
+                if live_run_budget_expired(self.broker):
+                    continue
                 try:
                     self.broker.sync_balance()
                 except Exception:
@@ -304,8 +402,13 @@ class OrderExecutor:
             return None
 
     def _rolling_buy_pass(self, increase_plan, released_target_by_symbol):
+        if live_run_budget_expired(self.broker):
+            return 0
+
         candidates = []
         for data, target in increase_plan or []:
+            if live_run_budget_expired(self.broker):
+                return 0
             symbol_key = self._symbol_key(data)
             if not symbol_key:
                 continue
@@ -358,6 +461,8 @@ class OrderExecutor:
 
         submitted = 0
         for item in candidates:
+            if live_run_budget_expired(self.broker):
+                break
             alloc = usable_budget * item['deficit'] / total_deficit
             alloc = min(alloc, item['deficit'])
             if alloc <= 0:
@@ -376,6 +481,13 @@ class OrderExecutor:
         released_target_by_symbol = released_target_by_symbol or {}
         submitted = 0
         for data, target in increase_plan or []:
+            if live_run_budget_expired(self.broker):
+                self._emit_warning(
+                    "[Executor Warning] Live run execution budget exhausted during final BUY submission; "
+                    "accepted partial BUY orders remain active and remaining plan items are skipped.",
+                    level='ERROR',
+                )
+                break
             if check_pending and self._has_pending_buy(data):
                 allow_top_up = False
                 symbol_key = self._symbol_key(data)
@@ -391,6 +503,13 @@ class OrderExecutor:
                         allow_top_up = False
                 if not allow_top_up:
                     continue
+            if live_run_budget_expired(self.broker):
+                self._emit_warning(
+                    "[Executor Warning] Live run execution budget exhausted before final BUY submission; "
+                    "remaining plan items are skipped.",
+                    level='ERROR',
+                )
+                break
             self._log(f"执行补仓/开仓: {data._name} -> {target:.2f}")
             buy_order = self.broker.order_target_value(data=data, target=target)
             if buy_order:
@@ -402,9 +521,28 @@ class OrderExecutor:
     def _read_position_size(self, data):
         try:
             pos = self.broker.get_position(data)
-            return max(0, int(float(getattr(pos, 'size', 0) or 0)))
+            return positive_quantity(getattr(pos, 'size', 0) or 0)
         except Exception:
             return None
+
+    @staticmethod
+    def _infer_order_ids(order):
+        raw_ids = getattr(order, 'batch_order_ids', None)
+        if raw_ids is None:
+            raw_ids = [getattr(order, 'id', None)]
+        elif isinstance(raw_ids, (str, bytes)):
+            raw_ids = [raw_ids]
+
+        order_ids = set()
+        try:
+            candidates = list(raw_ids)
+        except TypeError:
+            candidates = [raw_ids]
+        for raw_id in candidates:
+            oid = str(raw_id or '').strip()
+            if oid:
+                order_ids.add(oid)
+        return order_ids
 
     @staticmethod
     def _infer_order_size(order):
@@ -417,6 +555,7 @@ class OrderExecutor:
             return cur
 
         candidate_paths = [
+            ('batch_submitted_size',),
             ('submitted_size',),
             ('requested_size',),
             ('platform_order', 'volume'),
@@ -426,12 +565,9 @@ class OrderExecutor:
 
         for path in candidate_paths:
             raw = _read_path(order, path)
-            try:
-                val = int(abs(float(raw)))
-                if val > 0:
-                    return val
-            except Exception:
-                continue
+            val = positive_quantity(raw)
+            if val > 0:
+                return val
         return None
 
     def _build_sell_reconcile_target(self, data, before_size, sell_order, target_value):
@@ -439,7 +575,7 @@ class OrderExecutor:
         target_size = None
 
         if before_size is not None and submitted_size is not None:
-            target_size = max(0, before_size - submitted_size)
+            target_size = subtract_quantities(before_size, submitted_size)
         else:
             try:
                 if float(target_value) <= 0.0:
@@ -451,7 +587,7 @@ class OrderExecutor:
             return None
         return {
             'data': data,
-            'target_size': int(target_size),
+            'target_size': target_size,
         }
 
     def _estimate_sell_cash_release(self, data, before_size, sell_order, target_value):
@@ -484,14 +620,51 @@ class OrderExecutor:
         warn_after = max(0.0, float(self._SELL_SETTLE_WARN_SECONDS))
         hard_after = max(float(self._SELL_SETTLE_HARD_SECONDS), warn_after * 2.0)
         poll = max(0.1, float(self._SELL_SETTLE_POLL_SECONDS))
+        run_deadline = get_live_run_deadline(self.broker)
+        remaining_run_seconds = live_run_seconds_remaining(
+            self.broker,
+            deadline=run_deadline,
+        )
+        finalization_reserve = 0.0
+        if run_deadline is not None and increase_plan:
+            finalization_reserve = min(
+                live_run_finalization_reserve(self.broker),
+                remaining_run_seconds * 0.5,
+            )
+        hard_after = min(
+            hard_after,
+            max(0.0, remaining_run_seconds - finalization_reserve),
+        )
+        warn_after = min(warn_after, hard_after)
         start_ts = time.time()
         warn_sent = False
         pending_fetch_failures = 0
         synced_balance_once = False
         remote_sell_clear_polls = 0
         rolling_buy_attempted = False
+        reconcile_wait_logged = False
+        last_unreconciled_targets = []
 
         while True:
+            if live_run_budget_expired(self.broker):
+                msg = (
+                    "[Executor] Live run execution budget exhausted while waiting for SELL settlement. "
+                    "Accepted partial orders remain active; planned final BUY orders are skipped."
+                )
+                self._emit_warning(msg, level='ERROR')
+                return False
+            if run_deadline is not None and live_run_budget_expired(
+                self.broker,
+                reserve_seconds=finalization_reserve,
+                deadline=run_deadline,
+            ):
+                msg = (
+                    "[Executor] SELL settlement window ended to preserve finalization time. "
+                    "Accepted partial orders remain active; planned final BUY orders are skipped."
+                )
+                self._emit_warning(msg, level='ERROR')
+                return False
+
             local_pending_ids = set()
             if hasattr(self.broker, '_pending_sells'):
                 try:
@@ -513,6 +686,14 @@ class OrderExecutor:
                     pending_fetch_failures += 1
                     print(f"[Executor] 获取在途订单失败，继续基于本地 pending_sells 等待: {e}")
                     pending_orders = []
+
+            if live_run_budget_expired(self.broker):
+                msg = (
+                    "[Executor] Live run execution budget exhausted during SELL reconciliation. "
+                    "Accepted partial orders remain active; planned final BUY orders are skipped."
+                )
+                self._emit_warning(msg, level='ERROR')
+                return False
 
             pending_fetch_failed = bool(getattr(self.broker, '_last_pending_orders_fetch_failed', False))
             if pending_orders_loaded and not pending_fetch_failed:
@@ -557,7 +738,11 @@ class OrderExecutor:
                         if current_size is None or target_size is None:
                             continue
 
-                        if current_size <= int(target_size):
+                        if quantity_at_most(
+                            current_size,
+                            target_size,
+                            getattr(config, 'LOT_SIZE', 1),
+                        ):
                             reconciled_ids.add(oid)
 
                     if reconciled_ids:
@@ -573,7 +758,10 @@ class OrderExecutor:
                         unresolved -= reconciled_ids
                         ids_text = ", ".join(sorted(reconciled_ids))
                         print(f"[Executor] 卖单终态回调缺失，已通过实时持仓/在途单确认卖出完成: {ids_text}")
-                        if hasattr(self.broker, 'sync_balance'):
+                        if (
+                            hasattr(self.broker, 'sync_balance')
+                            and not live_run_budget_expired(self.broker)
+                        ):
                             try:
                                 self.broker.sync_balance()
                                 synced_balance_once = True
@@ -598,7 +786,10 @@ class OrderExecutor:
                     combined_pending_sell_ids -= stale_local_ids
                     ids_text = ", ".join(sorted(stale_local_ids))
                     print(f"[Executor] 卖单终态回调延迟，已通过柜台在途单连续为空确认本地 pending 过期: {ids_text}")
-                    if hasattr(self.broker, 'sync_balance'):
+                    if (
+                        hasattr(self.broker, 'sync_balance')
+                        and not live_run_budget_expired(self.broker)
+                    ):
                         try:
                             self.broker.sync_balance()
                             synced_balance_once = True
@@ -609,33 +800,75 @@ class OrderExecutor:
             if (tracked_ids or has_untracked_sell) and not pending_orders_trusted:
                 sell_state_clear = False
             if sell_state_clear:
-                if hasattr(self.broker, 'sync_balance') and not synced_balance_once:
+                if (
+                    hasattr(self.broker, 'sync_balance')
+                    and not synced_balance_once
+                    and not live_run_budget_expired(self.broker)
+                ):
                     try:
                         self.broker.sync_balance()
                         synced_balance_once = True
                     except Exception as e:
                         print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
-                if increase_plan:
-                    cash_wait_target = float(min_final_buy_cash or 0.0)
-                    planned_cash_target = 0.0
-                    for _, target in increase_plan:
-                        try:
-                            planned_cash_target += max(0.0, float(target))
-                        except Exception:
-                            continue
-                    if planned_cash_target > 0:
-                        cash_wait_target = min(cash_wait_target, planned_cash_target)
-                    if released_target_by_symbol:
-                        cash_wait_target = max(
-                            0.0,
-                            cash_wait_target - sum(float(v or 0.0) for v in released_target_by_symbol.values())
+
+                unreconciled_targets = []
+                seen_targets = set()
+                for target_info in reconcile_targets.values():
+                    if not target_info:
+                        continue
+                    data = target_info.get('data')
+                    target_size = target_info.get('target_size')
+                    target_key = (id(data), target_size)
+                    if target_key in seen_targets:
+                        continue
+                    seen_targets.add(target_key)
+                    current_size = self._read_position_size(data)
+                    if (
+                        current_size is None
+                        or target_size is None
+                        or not quantity_at_most(
+                            current_size,
+                            target_size,
+                            getattr(config, 'LOT_SIZE', 1),
                         )
-                    self._wait_for_post_sell_cash(cash_wait_target)
-                    self._execute_final_buys(
-                        increase_plan,
-                        released_target_by_symbol=released_target_by_symbol,
-                    )
-                return True
+                    ):
+                        symbol = getattr(data, '_name', 'UNKNOWN')
+                        unreconciled_targets.append(
+                            f"{symbol}: current={current_size}, target<={target_size}"
+                        )
+
+                last_unreconciled_targets = unreconciled_targets
+                if unreconciled_targets:
+                    sell_state_clear = False
+                    if not reconcile_wait_logged:
+                        print(
+                            "[Executor] SELL pending state cleared but broker positions have not "
+                            "yet reached this run's sell targets; continuing bounded reconciliation: "
+                            + "; ".join(unreconciled_targets)
+                        )
+                        reconcile_wait_logged = True
+                else:
+                    if increase_plan:
+                        cash_wait_target = float(min_final_buy_cash or 0.0)
+                        planned_cash_target = 0.0
+                        for _, target in increase_plan:
+                            try:
+                                planned_cash_target += max(0.0, float(target))
+                            except Exception:
+                                continue
+                        if planned_cash_target > 0:
+                            cash_wait_target = min(cash_wait_target, planned_cash_target)
+                        if released_target_by_symbol:
+                            cash_wait_target = max(
+                                0.0,
+                                cash_wait_target - sum(float(v or 0.0) for v in released_target_by_symbol.values())
+                            )
+                        self._wait_for_post_sell_cash(cash_wait_target)
+                        self._execute_final_buys(
+                            increase_plan,
+                            released_target_by_symbol=released_target_by_symbol,
+                        )
+                    return True
 
             elapsed = time.time() - start_ts
 
@@ -655,20 +888,43 @@ class OrderExecutor:
 
             if elapsed >= hard_after:
                 if not sell_state_clear:
-                    msg = (
-                        "[Executor] SELL orders still pending after hard wait. "
-                        f"Continuing with conservative rolling buys only: "
-                        f"local_pending={sorted(local_pending_ids)}, "
-                        f"remote_pending={sorted(remote_pending_sell_ids)}, "
-                        f"fetch_failures={pending_fetch_failures}"
-                    )
+                    if last_unreconciled_targets:
+                        msg = (
+                            "[Executor] SELL reconciliation did not reach broker position targets "
+                            "within the hard wait. Planned final BUY orders are skipped: "
+                            + "; ".join(last_unreconciled_targets)
+                        )
+                    else:
+                        msg = (
+                            "[Executor] SELL orders still pending after hard wait. "
+                            f"Continuing with conservative rolling buys only: "
+                            f"local_pending={sorted(local_pending_ids)}, "
+                            f"remote_pending={sorted(remote_pending_sell_ids)}, "
+                            f"fetch_failures={pending_fetch_failures}"
+                        )
                     print(msg)
                     runtime_notifications.push_text(msg, level='ERROR')
-                if hasattr(self.broker, 'sync_balance'):
+                if (
+                    hasattr(self.broker, 'sync_balance')
+                    and not live_run_budget_expired(self.broker)
+                ):
                     try:
                         self.broker.sync_balance()
                     except Exception:
                         pass
                 return sell_state_clear
 
-            time.sleep(poll)
+            sleep_seconds = min(poll, max(0.0, hard_after - elapsed))
+            if run_deadline is None:
+                time.sleep(sleep_seconds)
+            elif sleep_with_live_run_budget(
+                self.broker,
+                sleep_seconds,
+                reserve_seconds=finalization_reserve,
+            ) <= 0:
+                msg = (
+                    "[Executor] SELL settlement window ended to preserve finalization time. "
+                    "Accepted partial orders remain active; planned final BUY orders are skipped."
+                )
+                self._emit_warning(msg, level='ERROR')
+                return False

@@ -39,21 +39,22 @@
 9. 策略交易循环直接遍历 `self.broker.datas`。
 10. 实盘 adapter 模块需在同一文件中同时暴露 Broker 与 DataProvider 类，供 `LiveTrader` 反射发现。
 11. 风控支持逗号分隔的多模块链式加载；`risk_params` 可为平铺 dict，也可为 `{risk_name: {...}}` 的 scoped 结构。
-12. 实盘引擎自愈基线：当轮 live data refresh 不完整会跳过执行；`datas` 为空会尝试恢复；僵尸 `strategy.order` 会自动清锁。
+12. 实盘引擎自愈基线：当轮 live data refresh 不完整会跳过执行；`datas` 为空会尝试恢复；每轮策略执行前的 pending 快照异常或不可信会失败关闭；僵尸 `strategy.order` 会自动清锁。
 13. live data refresh 不完整时，可在同一轮内做有限次重试；重试仍失败才跳过并告警。
 14. GM/IB 的 schedule 运行支持 prewarm；相关生成/修复应保留 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 15. schedule 附近的 IM 报警支持时间窗；默认用 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可按连接覆盖。
-16. 初次 `STARTED` 必须在 worker 进入 broker SDK 前发送，并在同一 worker 进程内去重；定时 `ALIVE` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。受监督 worker 内部重启和终止不推 `STOPPED` / `DEAD`；只有操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。`1d` schedule 在每个自然日正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`，非日线不发送。
+16. 初次 `STARTED` 必须在 worker 进入 broker SDK 前发送，并在同一 worker 进程内去重；定时 `ALIVE` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。受监督 worker 内部重启和终止不推 `STOPPED` / `DEAD`；只有操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。`1d` schedule 在每个自然日正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`，非日线不发送；GM 维护期低频探测必须复用该恢复边界（更早 prewarm 优先），不得完全停探或让等待跨过下一 slot，且只允许存在于 live Phoenix 路径。
 17. 核心/基础层需要运行期通知时通过 `common.runtime_notifications`，不要在 rebalancer、executor、strategy/base broker 等模块里直接导入 `AlarmManager`。
 18. `PRINT_PLAN=True` 时，live 运行可即时推送每次计划和策略排名快照；backtest 运行必须只在回测结束时按快照 key 推送最后一条计划/排名，并附带本次执行命令、交易归因和最终绩效摘要，本地日志可继续打印每次计划，避免历史区间触发 IM 限流。
 19. `ALARMS_ENABLED=None` 为自动模式: 有任一 webhook 时启用报警通道，无 webhook 时不启用；显式 `False` 可强制禁用。`LOG` 只控制本地详细日志，不作为 IM 总开关。
 20. 已知券商维护型连接失败仅记录日志并自愈，不直接推异常 IM；schedule slot 内仍会阻断执行的错误不得永久静默，并应按当前 slot 去重。schedule 告警按自然日执行，不按星期筛选，默认覆盖 7x24 时段。
-21. 调仓执行器若遇到订单同步提交失败并返回 `None`，必须打印并推送 ERROR 告警；卖单失败时跳过本轮后续买入，避免“实盘信号”误导为实际委托。
-22. 实盘调仓卖单等待与滚动买入只适用于 live broker；回测按计划同步执行。正常场景应优先等待 SELL 撮合后一次性买入，滚动 BUY 只在卖单等待达到告警阈值且柜台仍明确存在 SELL 在途时作为低频兜底，本轮等待内已提交过滚动买入后不得继续追加滚动单。本轮带 ID 的卖单若可信柜台在途单连续为空且只剩本地 `_pending_sells` 标记，可按终态回调滞后清理本轮 pending。SELL 清空后的最终补齐不能仅因本轮部分滚动 BUY 已出现在可信柜台 pending 快照中而整单跳过；若滚动 BUY 尚未覆盖目标，应继续按目标市值提交差额。
+21. BUY/SELL 同步提交失败时必须先在当前 run deadline 内降级重试；最终仍失败则打印并推送 ERROR。部分 SELL 已受理时先按实际受理量有界对账，达到该部分目标后让 BUY 按真实现金保守截断；pending/持仓不可信或该目标未达到时才阻断 BUY。
+22. 实盘调仓卖单等待与滚动买入只适用于 live broker；回测按计划同步执行。正常场景应优先等待 SELL 撮合后一次性买入，滚动 BUY 只在卖单等待达到告警阈值且柜台仍明确存在 SELL 在途时作为低频兜底，本轮等待内已提交过滚动买入后不得继续追加滚动单。本轮带 ID 的卖单若可信柜台在途单连续为空且只剩本地 `_pending_sells` 标记，可按终态回调滞后清理本轮 pending，但最终 BUY 前必须由实时持仓证明本轮卖出目标已达到。SELL 清空后的最终补齐不能仅因本轮部分滚动 BUY 已出现在可信柜台 pending 快照中而整单跳过；若滚动 BUY 尚未覆盖目标，应继续按目标市值提交差额。
 23. 实盘的 pending 查询若失败、断连或快照不完整，必须用短生命周期健康标记显式告知框架；该标记只用于本轮可信度判断，不得保存为状态，也不得用于回测路径。回测必须假定计划订单同步执行，保持快速流畅。
 24. 任何新增执行链路都要在入口边界严格区分 live/backtest：live 只允许本轮内有限轮询、对账和自愈；回测与优化不得因为健康标记、实时 pending、现金结算或 broker 同步而阻塞或降速。
 25. 优化器 MainEval 主回测至少覆盖最近 3 年；如果训练+测试逻辑窗口更长，则覆盖完整训练+测试逻辑窗口。MainEval 与年度固定窗口应优先复用本轮已加载的 `raw_datas` 切片，只有 MainEval 初始请求窗口确实未覆盖目标窗口时才允许补拉数据。
 26. 横截面排名策略需要推送分数排名时，调用 `self.publish_rankings(ranked_candidates, title="ranked_symbols", dt=current_dt)`；不要在策略里直接导入 `AlarmManager`。
+27. 单次实盘 `run` 从隔夜清理前共享一个 monotonic execution deadline：默认最多 600 秒，高频 schedule 自动取间隔的 80%。所有 live 等待、查询重试、数据恢复、撤单、拆单和 BUY 降级都必须在同一预算内；到期停止新动作但保留已受理/成交的部分结果，异步拒单不得借下一轮预算继续。SELL 等待需为最终处理预留时间，adapter SDK 调用必须自带有限超时；回测/优化不进入该机制。
 
 ## 推荐阅读顺序
 1. 先读 `docs/specs/*` 中与你任务最相关的正式规范。

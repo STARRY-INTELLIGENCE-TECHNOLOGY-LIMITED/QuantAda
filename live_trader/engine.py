@@ -14,14 +14,23 @@ from common.live_process_supervisor import (
     get_previous_live_worker_failure,
     get_previous_live_worker_failure_kind,
 )
+from common.live_execution_budget import (
+    begin_live_run_budget,
+    live_run_budget_expired,
+    sleep_with_live_run_budget,
+)
 from common.live_runtime import runtime_print
 from common.log import extract_order_execution_dt, format_dt, warning as log_warning
+from common.order_quantity import format_quantity, quantity_number
 from data_providers.base_provider import BaseDataProvider
 from data_providers.manager import DataManager
 from live_trader.adapters.base_broker import BaseLiveBroker
 from live_trader.data_bridge.data_warm import SchedulePlanner
 from live_trader.data_bridge.provider_bridge import _DataManagerProvider, _DataManagerProxy
 from run import get_class_from_name
+
+
+_INTRADAY_WARMUP_BARS = 1000
 
 
 def _format_market_scope(selection=None, symbols=None):
@@ -276,6 +285,12 @@ class LiveTrader:
         self.broker = self.BrokerClass(context, cash_override=self.config.get('cash'),
                                        commission_override=self.config.get('commission'),
                                        slippage_override=self.config.get('slippage'))
+        self.broker._keep_overnight_orders = bool(
+            self.config.get(
+                'KEEP_OVERNIGHT_ORDERS',
+                getattr(config, 'KEEP_OVERNIGHT_ORDERS', False),
+            )
+        )
         symbols = self._determine_symbols()
         if not symbols: raise ValueError("No symbols to trade.")
 
@@ -358,6 +373,7 @@ class LiveTrader:
         print(f"--- LiveTrader Running at {context.now.strftime('%Y-%m-%d %H:%M:%S')} ---")
         self.broker.set_datetime(context.now)
         if self.broker.is_live:
+            begin_live_run_budget(self.broker, self.config, context)
             try:
                 self._cleanup_overnight_orders_before_refresh(context)
             except Exception as e:
@@ -404,6 +420,13 @@ class LiveTrader:
                         )
                     return
 
+                if live_run_budget_expired(self.broker):
+                    msg = "[Engine Error] Live run execution budget exhausted during data refresh; skipping strategy."
+                    print(msg)
+                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                        self.alarm_manager.push_text(msg, level='ERROR')
+                    return
+
             # 初始化或临时网络故障下，可能出现 datas 为空。
             # 此时禁止继续执行策略，先尝试自愈拉数，避免“空仓/无目标”的误导性计划。
             if not self.broker.datas:
@@ -419,6 +442,13 @@ class LiveTrader:
                         )
                     return
 
+            if self.broker.is_live and live_run_budget_expired(self.broker):
+                msg = "[Engine Error] Live run execution budget exhausted during data recovery; skipping risk and strategy execution."
+                print(msg)
+                if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                    self.alarm_manager.push_text(msg, level='ERROR')
+                return
+
             # 1. 执行风控检查（前置，避免被 pending-order gate 吞掉）
             if self.risk_control and self._check_risk_controls():
                 print("[Engine] 🛡️ 发现风控动作。底层已自动物理上锁，策略流水线继续向下执行...")
@@ -426,24 +456,56 @@ class LiveTrader:
             # 2. 检查策略是否有挂单
             strategy_order = getattr(self.strategy, 'order', None)
 
-            # 若策略层残留了挂单，但柜台和 broker 内部都无在途状态，
-            # 视为僵尸单并主动清理，防止无人值守时永久锁死。
-            if strategy_order:
-                has_real_pending = True
-                if hasattr(self.broker, 'get_pending_orders'):
+            if self.broker.is_live:
+                pending_orders = None
+                pending_error = None
+                for attempt in range(1, 4):
+                    if live_run_budget_expired(self.broker):
+                        pending_error = "live run execution budget exhausted"
+                        break
                     try:
-                        has_real_pending = bool(self.broker.get_pending_orders())
-                        if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
-                            has_real_pending = True
-                    except Exception:
-                        has_real_pending = True
+                        candidate_orders = self.broker.get_pending_orders() or []
+                    except Exception as e:
+                        pending_error = e
+                        print(
+                            f"[Engine Warning] Live pending-order query failed "
+                            f"({attempt}/3): {e}"
+                        )
+                        continue
 
+                    if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+                        pending_error = getattr(
+                            self.broker, '_last_pending_orders_fetch_error', None
+                        )
+                        print(
+                            f"[Engine Warning] Live pending-order snapshot is untrusted "
+                            f"({attempt}/3): {pending_error}"
+                        )
+                        continue
+
+                    pending_orders = candidate_orders
+                    pending_error = None
+                    break
+
+                if pending_orders is None:
+                    msg = (
+                        "[Engine Error] Live pending-order snapshot remained unavailable or "
+                        f"untrusted after 3 attempts; skipping this run. detail={pending_error}"
+                    )
+                    print(msg)
+                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                        self.alarm_manager.push_text(msg, level='ERROR')
+                    return
+
+                has_real_pending = bool(pending_orders)
                 has_internal_pending = bool(
                     getattr(self.broker, '_pending_sells', set())
                     or getattr(self.broker, '_active_buys', {})
                 )
 
-                if (not has_real_pending) and (not has_internal_pending):
+                # 若策略层残留了挂单，但柜台和 broker 内部都无在途状态，
+                # 视为僵尸单并主动清理，防止无人值守时永久锁死。
+                if strategy_order and not has_real_pending and not has_internal_pending:
                     stale_oid = getattr(strategy_order, 'id', 'UNKNOWN')
                     print(f"[Engine Recovery] Stale strategy.order detected ({stale_oid}). Auto-clearing lock.")
                     self.strategy.order = None
@@ -458,6 +520,12 @@ class LiveTrader:
                 return
 
             # 3. 执行策略的 'next'
+            if self.broker.is_live and live_run_budget_expired(self.broker):
+                msg = "[Engine Error] Live run execution budget exhausted before strategy execution."
+                print(msg)
+                if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                    self.alarm_manager.push_text(msg, level='ERROR')
+                return
             self.strategy.next()
 
             # 4. 通知策略的新订单
@@ -497,6 +565,9 @@ class LiveTrader:
                     next_expected_str = pd.Timestamp(next_expected).strftime('%Y-%m-%d %H:%M:%S')
             elif timeframe == 'Minutes':
                 next_expected = context.now + pd.Timedelta(minutes=compression)
+                next_expected_str = next_expected.strftime('%Y-%m-%d %H:%M:%S')
+            elif timeframe == 'Seconds':
+                next_expected = context.now + pd.Timedelta(seconds=compression)
                 next_expected_str = next_expected.strftime('%Y-%m-%d %H:%M:%S')
             elif timeframe == 'Days':
                 next_expected = context.now + pd.Timedelta(days=compression)
@@ -544,6 +615,8 @@ class LiveTrader:
         last_pending_snapshot = []
 
         for attempt in range(1, max_attempts + 1):
+            if live_run_budget_expired(self.broker):
+                break
             try:
                 summary = self.broker.cleanup_overnight_orders() or {}
             except Exception as e:
@@ -562,19 +635,21 @@ class LiveTrader:
             )
 
             if canceled > 0 and hasattr(self.broker, 'sync_balance'):
-                try:
-                    self.broker.sync_balance()
-                except Exception as e:
-                    print(f"[Engine Warning] sync_balance after overnight cleanup failed: {e}")
+                if not live_run_budget_expired(self.broker):
+                    try:
+                        self.broker.sync_balance()
+                    except Exception as e:
+                        print(f"[Engine Warning] sync_balance after overnight cleanup failed: {e}")
 
             # 短确认仍不通过则继续重试，但不中断本轮策略执行。
             pending_cleared = self._confirm_pending_orders_cleared(max_checks=2, sleep_seconds=0.5)
             if pending_cleared:
                 break
-            try:
-                last_pending_snapshot = self.broker.get_pending_orders() or []
-            except Exception:
-                last_pending_snapshot = []
+            if not live_run_budget_expired(self.broker):
+                try:
+                    last_pending_snapshot = self.broker.get_pending_orders() or []
+                except Exception:
+                    last_pending_snapshot = []
 
             if attempt < max_attempts:
                 print("[Engine] Overnight cleanup barrier not cleared, retrying...")
@@ -625,6 +700,8 @@ class LiveTrader:
         attempts_used = 0
 
         for attempt in range(1, max_attempts + 1):
+            if live_run_budget_expired(self.broker):
+                break
             attempts_used = attempt
             refresh_stats = self._refresh_live_data(context) or {}
             total_feeds = int(refresh_stats.get('total_feeds', 0) or 0)
@@ -653,7 +730,7 @@ class LiveTrader:
             if attempt < max_attempts:
                 print("[Engine] Retrying live data refresh...")
                 if retry_sleep_seconds > 0:
-                    time.sleep(retry_sleep_seconds)
+                    sleep_with_live_run_budget(self.broker, retry_sleep_seconds)
 
         last_stats['attempts_used'] = attempts_used
         last_stats['max_attempts'] = max_attempts
@@ -673,6 +750,8 @@ class LiveTrader:
             wait_s = 0.0
 
         for idx in range(checks):
+            if live_run_budget_expired(self.broker):
+                return False
             try:
                 pending = self.broker.get_pending_orders() or []
             except Exception as e:
@@ -688,7 +767,8 @@ class LiveTrader:
                 return True
 
             if idx < checks - 1 and wait_s > 0:
-                time.sleep(wait_s)
+                if sleep_with_live_run_budget(self.broker, wait_s) <= 0:
+                    return False
 
         return False
 
@@ -752,16 +832,24 @@ class LiveTrader:
                                 timeframe: str, compression: int) -> dict:
         """根据模式获取数据：实盘模式获取预热数据，回测模式获取全部历史"""
         datas = {}
+        is_intraday = timeframe in {'Minutes', 'Seconds'}
+        try:
+            compression_value = max(1, int(compression or 1))
+        except Exception:
+            compression_value = 1
 
         if is_live:
             # 实盘模式: 仅获取最近的预热数据，用于计算指标
-            if timeframe == 'Minutes':
+            if is_intraday:
                 end_date = context.now.strftime('%Y-%m-%d %H:%M:%S')
             else:
                 end_date = context.now.strftime('%Y-%m-%d')
-            # 默认使用年交易日以适应各种长周期指标，无需用户配置
-            if timeframe == 'Minutes':
-                start_date = (context.now - pd.Timedelta(days=config.ANNUAL_FACTOR)).strftime('%Y-%m-%d %H:%M:%S')
+            if is_intraday:
+                unit_seconds = 60 if timeframe == 'Minutes' else 1
+                warmup_delta = pd.Timedelta(
+                    seconds=_INTRADAY_WARMUP_BARS * compression_value * unit_seconds
+                )
+                start_date = (context.now - warmup_delta).strftime('%Y-%m-%d %H:%M:%S')
             else:
                 start_date = (context.now - pd.Timedelta(days=config.ANNUAL_FACTOR)).strftime('%Y-%m-%d')
             print(f"[Engine] Live mode data fetch (warm-up): from {start_date} to {end_date}")
@@ -775,7 +863,7 @@ class LiveTrader:
             if raw_start_date and warmup_days > 0:
                 try:
                     warmup_start_ts = pd.to_datetime(raw_start_date) - pd.Timedelta(days=warmup_days)
-                    if timeframe == 'Minutes':
+                    if is_intraday:
                         start_date = warmup_start_ts.strftime('%Y-%m-%d %H:%M:%S')
                     else:
                         start_date = warmup_start_ts.strftime('%Y-%m-%d')
@@ -795,8 +883,14 @@ class LiveTrader:
                 print(f"[Engine] Backtest mode data fetch: from {start_date} to {end_date}")
 
         for symbol in symbols:
+            if is_live and live_run_budget_expired(self.broker):
+                print("[Engine Warning] Live history-data fetch stopped at the run deadline.")
+                break
             df = self.data_provider.get_history(symbol, start_date, end_date,
-                                                timeframe=timeframe, compression=compression)
+                                                 timeframe=timeframe, compression=compression)
+            if is_live and live_run_budget_expired(self.broker):
+                print("[Engine Warning] Live history-data fetch returned after the run deadline.")
+                break
             if df is not None and not df.empty:
                 class DataFeedProxy:
                     def __init__(self, df, name):
@@ -822,10 +916,19 @@ class LiveTrader:
         # 获取配置
         timeframe = self.config.get('timeframe', 'Days')
         compression = self.config.get('compression', 1)
+        is_intraday = timeframe in {'Minutes', 'Seconds'}
+        try:
+            compression_value = max(1, int(compression or 1))
+        except Exception:
+            compression_value = 1
+        unit_seconds = 60 if timeframe == 'Minutes' else 1
+        intraday_window = pd.Timedelta(
+            seconds=_INTRADAY_WARMUP_BARS * compression_value * unit_seconds
+        )
 
         # 重新计算时间窗口 (Warmup ~ Now)
         now_ts = pd.Timestamp(context.now)
-        end_date = now_ts.strftime('%Y-%m-%d %H:%M:%S') if timeframe == 'Minutes' else now_ts.strftime('%Y-%m-%d')
+        end_date = now_ts.strftime('%Y-%m-%d %H:%M:%S') if is_intraday else now_ts.strftime('%Y-%m-%d')
         today_key = now_ts.strftime('%Y-%m-%d')
 
         def _align_to_index_tz(dt_input, index):
@@ -842,12 +945,12 @@ class LiveTrader:
         def _build_incremental_start(existing_df: pd.DataFrame) -> str:
             # 首次/空数据回退到预热窗口
             if existing_df is None or existing_df.empty:
-                warmup_start = now_ts - pd.Timedelta(days=config.ANNUAL_FACTOR)
-                return warmup_start.strftime('%Y-%m-%d %H:%M:%S') if timeframe == 'Minutes' else warmup_start.strftime('%Y-%m-%d')
+                warmup_start = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
+                return warmup_start.strftime('%Y-%m-%d %H:%M:%S') if is_intraday else warmup_start.strftime('%Y-%m-%d')
 
             last_bar_ts = pd.Timestamp(existing_df.index[-1])
-            if timeframe == 'Minutes':
-                backoff = pd.Timedelta(minutes=max(1, int(compression)) * 3)
+            if is_intraday:
+                backoff = pd.Timedelta(seconds=compression_value * unit_seconds * 3)
                 start_ts = last_bar_ts - backoff
                 return start_ts.strftime('%Y-%m-%d %H:%M:%S')
 
@@ -856,24 +959,28 @@ class LiveTrader:
             return start_ts.strftime('%Y-%m-%d')
 
         def _build_window_start() -> str:
-            start_ts = now_ts - pd.Timedelta(days=config.ANNUAL_FACTOR)
-            return start_ts.strftime('%Y-%m-%d %H:%M:%S') if timeframe == 'Minutes' else start_ts.strftime('%Y-%m-%d')
+            start_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
+            return start_ts.strftime('%Y-%m-%d %H:%M:%S') if is_intraday else start_ts.strftime('%Y-%m-%d')
 
         # 遍历 Broker 中已有的 DataFeed
-        total_feeds = 0
+        data_feeds = list(self.broker.datas)
+        total_feeds = len(data_feeds)
         updated_feeds = 0
         failed_feeds = 0
-        for data_feed in self.broker.datas:
-            total_feeds += 1
+        for index, data_feed in enumerate(data_feeds):
+            if live_run_budget_expired(self.broker):
+                failed_feeds += total_feeds - index
+                print("[Engine Warning] Live data refresh stopped at the run deadline.")
+                break
             symbol = data_feed._name
             old_df = None
             if hasattr(data_feed, 'p') and hasattr(data_feed.p, 'dataname'):
                 old_df = data_feed.p.dataname
 
             # Days/Weeks 等低频：每次窗口全量替换，避免复权口径与增量拼接错位。
-            force_window_rebase = timeframe != 'Minutes'
-            # Minutes：保留增量，但每天首次做一次窗口全量重基准。
-            if timeframe == 'Minutes':
+            force_window_rebase = not is_intraday
+            # 分钟/秒线保留增量，但每天首次做一次有界窗口全量重基准。
+            if is_intraday:
                 last_rebase_day = self._intraday_rebase_done_on.get(symbol)
                 if last_rebase_day != today_key:
                     force_window_rebase = True
@@ -881,6 +988,10 @@ class LiveTrader:
             start_date = _build_window_start() if force_window_rebase else _build_incremental_start(old_df)
             new_df = self.data_provider.get_history(symbol, start_date, end_date,
                                                     timeframe=timeframe, compression=compression)
+            if live_run_budget_expired(self.broker):
+                failed_feeds += total_feeds - index
+                print(f"[Engine Warning] Live data refresh for {symbol} returned after the run deadline.")
+                break
 
             if new_df is not None and not new_df.empty:
                 # 原地更新：不创建新对象，而是替换对象内部的 DataFrame
@@ -889,7 +1000,7 @@ class LiveTrader:
                 if hasattr(data_feed, 'p') and hasattr(data_feed.p, 'dataname'):
                     if force_window_rebase:
                         refreshed_df = new_df.sort_index()
-                        cutoff_ts = now_ts - pd.Timedelta(days=config.ANNUAL_FACTOR)
+                        cutoff_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
                         cutoff_ts = _align_to_index_tz(cutoff_ts, refreshed_df.index)
                         refreshed_df = refreshed_df[refreshed_df.index >= cutoff_ts]
                         if refreshed_df.empty:
@@ -897,7 +1008,7 @@ class LiveTrader:
                             failed_feeds += 1
                             continue
                         data_feed.p.dataname = refreshed_df
-                        if timeframe == 'Minutes':
+                        if is_intraday:
                             self._intraday_rebase_done_on[symbol] = today_key
                         print(f"  Data rebased for {symbol}: {len(refreshed_df)} bars (Last: {refreshed_df.index[-1]})")
                         updated_feeds += 1
@@ -907,7 +1018,7 @@ class LiveTrader:
                         merged_df = merged_df.sort_index()
 
                         # 保持固定预热窗口，避免数据无限增长
-                        cutoff_ts = now_ts - pd.Timedelta(days=config.ANNUAL_FACTOR)
+                        cutoff_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
                         cutoff_ts = _align_to_index_tz(cutoff_ts, merged_df.index)
                         merged_df = merged_df[merged_df.index >= cutoff_ts]
                         data_feed.p.dataname = merged_df
@@ -942,11 +1053,21 @@ class LiveTrader:
             self._pending_risk_orders = {}
 
         for data_feed in self.broker.datas:
+            if self.broker.is_live and live_run_budget_expired(self.broker):
+                self.broker.log(
+                    "[Risk] Live run execution budget exhausted; remaining risk checks are skipped."
+                )
+                break
             data_name = data_feed._name
 
             # --- A. 仓位检查与状态重置 ---
             # 无论之前状态如何，只要当前仓位为 0，就说明风控已完成或无风险
             position = self.broker.getposition(data_feed)
+            if self.broker.is_live and live_run_budget_expired(self.broker):
+                self.broker.log(
+                    "[Risk] Position query returned after the live run deadline; remaining checks are skipped."
+                )
+                break
 
             if not position.size:
                 # 如果有遗留的风控状态，清理掉
@@ -1107,6 +1228,12 @@ class LiveTrader:
                 if action == 'SELL':
                     self.broker.log(f"Risk module triggered SELL for {data_feed._name}")
 
+                    if self.broker.is_live and live_run_budget_expired(self.broker):
+                        self.broker.log(
+                            f"[Risk] SELL for {data_name} skipped because the live run deadline was reached."
+                        )
+                        break
+
                     # 底层物理上锁，瞬间切断策略层买入该标的的可能
                     if hasattr(self.broker, 'lock_for_risk'):
                         self.broker.lock_for_risk(data_name)
@@ -1135,6 +1262,10 @@ class LiveTrader:
         当 broker.datas 为空时，尝试按当前 symbols 重拉预热数据并重建 DataFeed。
         返回是否恢复成功。
         """
+        if self.broker.is_live and live_run_budget_expired(self.broker):
+            print("[Engine Warning] Data-feed recovery skipped: live run execution budget exhausted.")
+            return False
+
         symbols = self._determine_symbols()
         if not symbols:
             print("[Engine Warning] Recovery skipped: selector returned no symbols.")
@@ -1149,6 +1280,9 @@ class LiveTrader:
             timeframe=timeframe,
             compression=compression
         )
+        if self.broker.is_live and live_run_budget_expired(self.broker):
+            print("[Engine Warning] Data-feed recovery completed after the live run deadline; results are not traded this run.")
+            return False
         self.broker.set_datas(list(datas.values()))
         if self.broker.datas:
             loaded = [d._name for d in self.broker.datas]
@@ -1223,19 +1357,18 @@ def on_order_status_callback(context, raw_order):
                     qty = fallback
 
                 try:
-                    qty_f = float(qty)
-                    if abs(qty_f - round(qty_f)) < 1e-9:
-                        return int(round(qty_f))
-                    return qty_f
+                    return quantity_number(qty)
                 except Exception:
                     return qty
 
+            raw_exec_size = getattr(order_proxy.executed, 'size', 0) or 0.0
+            raw_exec_price = getattr(order_proxy.executed, 'price', 0) or 0.0
             try:
-                exec_size = float(getattr(order_proxy.executed, 'size', 0) or 0.0)
+                exec_size = float(raw_exec_size)
             except Exception:
                 exec_size = 0.0
             try:
-                exec_price = float(getattr(order_proxy.executed, 'price', 0) or 0.0)
+                exec_price = float(raw_exec_price)
             except Exception:
                 exec_price = 0.0
             exec_dt = extract_order_execution_dt(order_proxy, fallback=getattr(context, 'now', None))
@@ -1245,7 +1378,11 @@ def on_order_status_callback(context, raw_order):
             if not hasattr(strategy, '_order_callback_dedupe'):
                 strategy._order_callback_dedupe = {}
             dedupe_cache = strategy._order_callback_dedupe
-            event_signature = (current_status, round(exec_size, 8), round(exec_price, 8))
+            event_signature = (
+                current_status,
+                format_quantity(raw_exec_size),
+                format_quantity(raw_exec_price),
+            )
             if dedupe_cache.get(dedupe_key) == event_signature:
                 # 重复状态静默丢弃，避免高频回调刷屏。
                 return
@@ -1284,7 +1421,10 @@ def on_order_status_callback(context, raw_order):
                         symbol = order_proxy.data._name if order_proxy.data else "Unknown"
 
                         # 构造消息: ⏳ 代表等待/进行中
-                        alarm_msg = f"⏳ 订单已提交 ({current_status}): {action} {total_qty} {symbol}"
+                        alarm_msg = (
+                            f"⏳ 订单已提交 ({current_status}): {action} "
+                            f"{format_quantity(total_qty)} {symbol}"
+                        )
                         # 使用 push_text 发送普通文本通知
                         alarm_manager.push_text(alarm_msg)
 
@@ -1324,7 +1464,10 @@ def on_order_status_callback(context, raw_order):
 
                 action = "BUY" if is_buy_order else "SELL" if is_sell_order else "UNKNOWN"
                 symbol = order_proxy.data._name if order_proxy.data else "Unknown"
-                alarm_manager.push_text(f"🛑 订单已撤销 ({current_status}): {action} {total_qty} {symbol}")
+                alarm_manager.push_text(
+                    f"🛑 订单已撤销 ({current_status}): {action} "
+                    f"{format_quantity(total_qty)} {symbol}"
+                )
 
             # 3. 如果卖单成交（有钱回笼），仅同步资金。
             # 无状态模式下不执行延迟队列重放。

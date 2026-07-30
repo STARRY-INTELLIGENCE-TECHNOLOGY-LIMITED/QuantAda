@@ -939,6 +939,108 @@ def test_ib_provider_parse_contract_supports_generic_exchange_suffix():
     mock_ib_insync.Stock.assert_called_with("MSFT", "SMART", "USD", primaryExchange="MEMX")
 
 
+def test_ib_crypto_seconds_history_uses_bounded_24x7_request(monkeypatch):
+    import data_providers.ibkr_provider as provider_module
+
+    captured = {}
+    contract = SimpleNamespace(symbol="BTC", secType="CRYPTO")
+
+    class HistoryIB:
+        def isConnected(self):
+            return False
+
+        def reqContractDetails(self, raw_contract):
+            return [SimpleNamespace(contract=contract)]
+
+        def reqHistoricalData(self, raw_contract, **kwargs):
+            captured.update(kwargs)
+            return [object()]
+
+    provider = IbkrDataProvider(ib_instance=HistoryIB())
+    monkeypatch.setattr(provider, "_connect", lambda: True)
+    monkeypatch.setattr(provider, "_parse_contract", lambda symbol: contract)
+    monkeypatch.setattr(
+        provider_module,
+        "util",
+        SimpleNamespace(
+            df=lambda bars: pd.DataFrame({
+                "date": [pd.Timestamp("2026-02-27 09:30:10")],
+                "open": [1.0],
+                "high": [1.0],
+                "low": [1.0],
+                "close": [1.0],
+                "volume": [1.0],
+            })
+        ),
+        raising=False,
+    )
+
+    frame = provider.get_data(
+        "CRYPTO.BTC.USD",
+        start_date="2026-02-27 09:20:10",
+        end_date="2026-02-27 09:30:10",
+        timeframe="Seconds",
+        compression=5,
+    )
+
+    assert frame is not None and len(frame) == 1
+    assert captured["durationStr"] == "601 S"
+    assert captured["barSizeSetting"] == "5 secs"
+    assert captured["endDateTime"] == "20260227 09:30:10"
+    assert captured["useRTH"] is False
+    assert captured["timeout"] == pytest.approx(2.0)
+
+
+def test_ib_stock_seconds_history_uses_single_trades_request(monkeypatch):
+    import data_providers.ibkr_provider as provider_module
+
+    calls = []
+    contract = SimpleNamespace(symbol="AAPL", secType="STK")
+
+    class HistoryIB:
+        def isConnected(self):
+            return False
+
+        def reqContractDetails(self, raw_contract):
+            return [SimpleNamespace(contract=contract)]
+
+        def reqHistoricalData(self, raw_contract, **kwargs):
+            calls.append(kwargs)
+            return [object()]
+
+    provider = IbkrDataProvider(ib_instance=HistoryIB())
+    monkeypatch.setattr(provider, "_connect", lambda: True)
+    monkeypatch.setattr(provider, "_parse_contract", lambda symbol: contract)
+    monkeypatch.setattr(
+        provider_module,
+        "util",
+        SimpleNamespace(
+            df=lambda bars: pd.DataFrame({
+                "date": [pd.Timestamp("2026-02-27 09:30:10")],
+                "open": [1.0],
+                "high": [1.0],
+                "low": [1.0],
+                "close": [1.0],
+                "volume": [1.0],
+            })
+        ),
+        raising=False,
+    )
+
+    frame = provider.get_data(
+        "AAPL.SMART",
+        start_date="2026-02-27 09:30:00",
+        end_date="2026-02-27 09:30:10",
+        timeframe="Seconds",
+        compression=1,
+    )
+
+    assert frame is not None and len(frame) == 1
+    assert len(calls) == 1
+    assert calls[0]["whatToShow"] == "TRADES"
+    assert calls[0]["timeout"] == pytest.approx(0.4)
+
+
 def test_ib_daily_schedule_parse_and_validation():
     """
     调度解析回归:
@@ -1041,6 +1143,21 @@ def test_ib_interval_schedule_parse_and_trigger_inside_slot_window():
     assert not should_before_anchor
     assert delta_before_anchor == pytest.approx(-1.0)
     assert slot_key_before_anchor is None
+
+
+def test_ib_second_schedule_parse_and_trigger():
+    parsed = SchedulePlanner.parse_schedule_rule("5s:00:00:00")
+
+    assert parsed["freq_unit"] == "s"
+    assert parsed["interval_seconds"] == pytest.approx(5.0)
+    should_run, delta, slot_key = SchedulePlanner.should_trigger_schedule(
+        now=datetime.datetime(2026, 2, 27, 0, 0, 10, 200000),
+        parsed_schedule=parsed,
+        last_schedule_run_key=None,
+    )
+    assert should_run is True
+    assert delta == pytest.approx(0.2)
+    assert slot_key == "2026-02-27 00:00:10"
 
 
 def test_ib_schedule_prewarm_lead_parse_and_validation():
@@ -1432,10 +1549,11 @@ def test_ib_submit_order_allows_fractional_sell_for_full_close(monkeypatch):
     )
 
 
-def test_ib_submit_order_fractional_sell_disabled_by_default(monkeypatch):
+def test_ib_stock_fractional_sell_disabled_even_with_crypto_lot_size(monkeypatch):
     """
     安全默认值回归:
-    未显式开启时，SELL 小数股应向下取整为整数，避免触发 IB API 10243。
+    即使全局 LOT_SIZE 为币市精度，股票未显式开启小数卖出时仍应向下取整，
+    避免混合市场配置绕过 IB API 10243 防护。
     """
     context = types.SimpleNamespace(ib_instance=DummyIBForSubmit())
     broker = IBBrokerAdapter(context=context)
@@ -1452,6 +1570,7 @@ def test_ib_submit_order_fractional_sell_disabled_by_default(monkeypatch):
         False,
         raising=False,
     )
+    monkeypatch.setattr(ib_module.config, "LOT_SIZE", 0.00000001)
 
     data = SimpleNamespace(_name="AAPL.SMART")
     proxy = broker._submit_order(data=data, volume=104.617, side="SELL", price=100.0)
@@ -1460,6 +1579,56 @@ def test_ib_submit_order_fractional_sell_disabled_by_default(monkeypatch):
     assert context.ib_instance.last_order.totalQuantity == 104, (
         "禁用小数股时，SELL 数量应向下取整为整数。"
     )
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_ib_crypto_submit_preserves_fractional_quantity_without_stock_switch(monkeypatch, side):
+    context = types.SimpleNamespace(ib_instance=DummyIBForSubmit())
+    broker = IBBrokerAdapter(context=context)
+
+    import live_trader.adapters.ib_broker as ib_module
+    monkeypatch.setattr(
+        ib_module,
+        "MarketOrder",
+        lambda action, qty: SimpleNamespace(action=action, totalQuantity=qty),
+    )
+    monkeypatch.setattr(
+        broker,
+        "parse_contract",
+        lambda symbol: SimpleNamespace(symbol="BTC", secType="CRYPTO"),
+    )
+    monkeypatch.setattr(ib_module.config, "LOT_SIZE", 0.00000001)
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ALLOW_FRACTIONAL_SELL",
+        False,
+        raising=False,
+    )
+
+    proxy = broker._submit_order(
+        data=SimpleNamespace(_name="CRYPTO.BTC.USD"),
+        volume=0.25000001,
+        side=side,
+        price=100000.0,
+    )
+
+    assert proxy is not None
+    assert context.ib_instance.last_order.totalQuantity == pytest.approx(0.25000001)
+
+
+def test_ib_cooperative_sleep_is_capped_by_live_run_deadline(monkeypatch):
+    context = types.SimpleNamespace(ib_instance=DummyIBForSubmit())
+    broker = IBBrokerAdapter(context=context)
+    sleeps = []
+    context.ib_instance.sleep = lambda seconds: sleeps.append(seconds)
+
+    import live_trader.adapters.ib_broker as ib_module
+    monkeypatch.setattr(ib_module, "live_run_seconds_remaining", lambda _broker: 0.02)
+
+    slept = broker._sleep_ib(0.5)
+
+    assert slept == pytest.approx(0.02)
+    assert sleeps == pytest.approx([0.02])
 
 
 def test_ib_submit_order_uses_configured_order_account(monkeypatch):
@@ -1689,6 +1858,47 @@ def test_ib_pending_order_contract_includes_id():
     assert got[0]["symbol"] == "EWJ"
     assert got[0]["direction"] == "BUY"
     assert got[0]["size"] == 282
+
+
+@pytest.mark.parametrize(
+    ("data_name", "symbol", "local_symbol", "sec_type", "currency"),
+    [
+        ("CRYPTO.BTC.USD", "BTC", "BTC", "CRYPTO", "USD"),
+        ("CASH.EUR.USD", "EUR", "EUR.USD", "CASH", "USD"),
+    ],
+)
+def test_ib_pending_and_callback_use_strategy_symbol_with_tiny_quantity(
+    data_name, symbol, local_symbol, sec_type, currency
+):
+    data = SimpleNamespace(_name=data_name)
+    contract = SimpleNamespace(
+        symbol=symbol,
+        localSymbol=local_symbol,
+        secType=sec_type,
+        currency=currency,
+    )
+    open_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=139, action="BUY", totalQuantity=0.0000000001),
+        contract=contract,
+        orderStatus=SimpleNamespace(status="Submitted", remaining="0.0000000001"),
+        fills=[],
+    )
+    context = types.SimpleNamespace(
+        ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10000.0, open_trades=[open_trade])
+    )
+    broker = IBBrokerAdapter(context=context)
+    broker.datas = [data]
+
+    pending = broker.get_pending_orders()
+    proxy = broker.convert_order_proxy(open_trade)
+
+    assert pending == [{
+        "id": "139",
+        "symbol": data_name,
+        "direction": "BUY",
+        "size": pytest.approx(0.0000000001),
+    }]
+    assert proxy.data is data
 
 
 def test_ib_pending_order_fetch_failure_is_marked():
@@ -2297,19 +2507,17 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
     assert all("failure_kind" not in item for item in running)
 
 
-def test_ib_trade_update_uses_proxy_state_for_sell_fill_wait(monkeypatch):
+def test_ib_trade_update_forwards_without_adapter_cash_wait(monkeypatch):
     """
     设计契约回归:
-    IBKR 回调中的卖单成交等待只能通过 broker.convert_order_proxy(...).is_*() 判断，
-    不能直接解释 raw trade.orderStatus.status，否则会绕过 adapter 的状态翻译。
+    IB adapter 必须立即转发订单状态；卖后现金等待由通用执行器负责，
+    不能在 SDK 回调里增加固定 sleep。
     """
-    import asyncio
     import config
     import live_trader.engine as engine_module
 
     captured_handlers = []
     callback_trades = []
-    sleep_calls = []
 
     class StopLaunch(BaseException):
         pass
@@ -2345,21 +2553,11 @@ def test_ib_trade_update_uses_proxy_state_for_sell_fill_wait(monkeypatch):
         def disconnect(self):
             self.connected = False
 
-    class ProxySaysNotCompleted:
-        def is_sell(self):
-            return True
-
-        def is_completed(self):
-            return False
-
     class DummyBroker:
         datas = [SimpleNamespace(_name="AAPL.SMART")]
 
         def __init__(self):
             self._tickers = {}
-
-        def convert_order_proxy(self, trade):
-            return ProxySaysNotCompleted()
 
     class DummyTrader:
         def __init__(self, engine_config):
@@ -2370,9 +2568,6 @@ def test_ib_trade_update_uses_proxy_state_for_sell_fill_wait(monkeypatch):
         def init(self, ctx):
             return None
 
-    async def fake_asyncio_sleep(seconds):
-        sleep_calls.append(seconds)
-
     def fake_on_order_status_callback(ctx, trade):
         callback_trades.append(trade)
 
@@ -2382,7 +2577,6 @@ def test_ib_trade_update_uses_proxy_state_for_sell_fill_wait(monkeypatch):
     monkeypatch.setattr(mock_ib_insync, "IB", DummyIB)
     monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
     monkeypatch.setattr(engine_module, "on_order_status_callback", fake_on_order_status_callback)
-    monkeypatch.setattr(asyncio, "sleep", fake_asyncio_sleep)
     monkeypatch.setattr(
         IBBrokerAdapter,
         "parse_contract",
@@ -2403,9 +2597,8 @@ def test_ib_trade_update_uses_proxy_state_for_sell_fill_wait(monkeypatch):
         order=SimpleNamespace(action="SELL"),
         orderStatus=SimpleNamespace(status="Filled"),
     )
-    asyncio.run(captured_handlers[0](raw_trade))
+    captured_handlers[0](raw_trade)
 
-    assert sleep_calls == [], "proxy 未确认 completed 时，不得因 raw status=Filled 触发现金等待。"
     assert callback_trades == [raw_trade]
 
 

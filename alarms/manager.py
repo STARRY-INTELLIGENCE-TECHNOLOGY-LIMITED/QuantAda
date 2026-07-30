@@ -29,7 +29,6 @@ class AlarmManager:
     _COOLDOWN_BASE_DELAY_SECONDS = 30
     _COOLDOWN_MAX_DELAY_SECONDS = 10 * 60
     _COOLDOWN_RESET_WINDOW_SECONDS = 15 * 60
-    _DAILY_SCHEDULE_HEALTH_LEAD_SECONDS = 30 * 60
 
     def __new__(cls):
         if not cls._instance:
@@ -131,7 +130,10 @@ class AlarmManager:
         if not self.alarms or not parsed_schedule or parsed_schedule.get('kind') != 'daily':
             return
 
-        from live_trader.data_bridge.data_warm import SchedulePlanner
+        from live_trader.data_bridge.data_warm import (
+            DAILY_SCHEDULE_HEALTH_LEAD_SECONDS,
+            SchedulePlanner,
+        )
 
         now_ts = pd.Timestamp(self._current_schedule_alarm_time())
         slot_dt = SchedulePlanner.resolve_next_schedule_slot(now_ts, parsed_schedule)
@@ -139,7 +141,7 @@ class AlarmManager:
             return
 
         slot_ts = pd.Timestamp(slot_dt)
-        health_at = slot_ts - pd.Timedelta(seconds=self._DAILY_SCHEDULE_HEALTH_LEAD_SECONDS)
+        health_at = slot_ts - pd.Timedelta(seconds=DAILY_SCHEDULE_HEALTH_LEAD_SECONDS)
         if health_at < now_ts:
             slot_ts = pd.Timestamp(
                 SchedulePlanner.advance_schedule_slot(slot_ts, parsed_schedule)
@@ -147,7 +149,7 @@ class AlarmManager:
             if pd.isna(slot_ts):
                 return
             slot_dt = slot_ts
-            health_at = slot_ts - pd.Timedelta(seconds=self._DAILY_SCHEDULE_HEALTH_LEAD_SECONDS)
+            health_at = slot_ts - pd.Timedelta(seconds=DAILY_SCHEDULE_HEALTH_LEAD_SECONDS)
 
         delay = max(0.0, (health_at - now_ts).total_seconds())
         slot_text = pd.Timestamp(slot_dt).strftime('%Y-%m-%d %H:%M:%S')

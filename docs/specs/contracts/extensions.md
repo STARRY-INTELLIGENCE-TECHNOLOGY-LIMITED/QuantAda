@@ -33,6 +33,8 @@
 - 升序、去重
 - 失败时返回 `None`
 5. DataManager 支持单个或多个 `data_source` 名称，多个 provider 可按逗号或空格分隔
+6. 日内 provider 必须同时按能力支持 `timeframe='Minutes'|'Seconds'` 与 `compression`；日期参数在日内模式应保留到秒，增量窗口不得擅自扩成整年高频明细。
+7. SDK/网络调用必须使用有限超时；秒级请求的单次超时应明显短于数据周期。24x7 数据源不得强制应用常规交易时段过滤。
 
 ## 4. Alarm
 1. 继承 `alarms.base_alarm.BaseAlarm`

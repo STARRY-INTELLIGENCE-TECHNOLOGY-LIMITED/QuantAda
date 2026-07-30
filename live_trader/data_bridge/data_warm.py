@@ -6,6 +6,9 @@ import pandas as pd
 from common import runtime_notifications
 
 
+DAILY_SCHEDULE_HEALTH_LEAD_SECONDS = 30 * 60
+
+
 class SchedulePlanner:
     """
     通用实盘 schedule 计算器。
@@ -47,18 +50,19 @@ class SchedulePlanner:
         """
         解析通用实盘调度规则，支持:
         - 1d:HH:MM[:SS]
+        - Ns:HH:MM[:SS]
         - Nm:HH:MM[:SS]
         - Nh:HH:MM[:SS]
 
         语义:
         - 1d: 每日固定时刻触发
-        - Nm/Nh: 以 time 为每日 anchor，在当天内按固定频率重复触发
+        - Ns/Nm/Nh: 以 time 为每日 anchor，在当天内按固定频率重复触发
         """
         if not schedule_rule or not isinstance(schedule_rule, str):
             return None
 
         raw = str(schedule_rule).strip().lower()
-        matched = re.fullmatch(r'(\d+)([dmh]):(\d{1,2}):(\d{2})(?::(\d{2}))?', raw)
+        matched = re.fullmatch(r'(\d+)([sdmh]):(\d{1,2}):(\d{2})(?::(\d{2}))?', raw)
         if not matched:
             return None
 
@@ -75,7 +79,8 @@ class SchedulePlanner:
         if freq_unit == 'd' and freq_n != 1:
             raise ValueError(f"Unsupported daily schedule frequency: {schedule_rule}")
 
-        interval_seconds = 86400 if freq_unit == 'd' else freq_n * (60 if freq_unit == 'm' else 3600)
+        unit_seconds = {'s': 1, 'm': 60, 'h': 3600}
+        interval_seconds = 86400 if freq_unit == 'd' else freq_n * unit_seconds[freq_unit]
         return {
             'raw': schedule_rule,
             'freq_n': freq_n,
@@ -345,8 +350,9 @@ class BrokerDataWarmBridge:
         except Exception:
             cp = 1
 
-        if tf == 'Minutes':
-            start_ts = now_ts - pd.Timedelta(minutes=cp * 3)
+        if tf in {'Minutes', 'Seconds'}:
+            delta = pd.Timedelta(minutes=cp * 3) if tf == 'Minutes' else pd.Timedelta(seconds=cp * 3)
+            start_ts = now_ts - delta
             return (
                 start_ts.strftime('%Y-%m-%d %H:%M:%S'),
                 now_ts.strftime('%Y-%m-%d %H:%M:%S'),

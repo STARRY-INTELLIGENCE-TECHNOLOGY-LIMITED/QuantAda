@@ -16,6 +16,7 @@ from backtest.plotting import (
 from backtest.reporting import format_backtest_results_report
 from backtest.trade_attribution import format_trade_micro_attribution_report
 from common import log, runtime_command, runtime_notifications
+from common.order_quantity import align_quantity_down, normalize_quantity_step
 
 
 class OrderProxy:
@@ -202,7 +203,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
     def order_target_percent(self, data=None, target=0.0, **kwargs):
         data = data or self.datas[0]
-        lot_size = kwargs.get('lot_size', config.LOT_SIZE)
+        lot_size = normalize_quantity_step(kwargs.get('lot_size', config.LOT_SIZE))
 
         # 防守逻辑：如果该标的正在被风控接管，且策略试图买入，则拦截
         if hasattr(self.strategy, 'risk_handled_symbols'):
@@ -244,8 +245,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
             shares_to_buy = min(delta_shares, max_buy_by_cash)
 
             # 向下取整到 lot_size
-            if lot_size > 1:
-                shares_to_buy = int(shares_to_buy // lot_size) * lot_size
+            if lot_size != 1:
+                shares_to_buy = align_quantity_down(shares_to_buy, lot_size)
             else:
                 shares_to_buy = int(shares_to_buy)  # 即使是美股也通常是整数股
 
@@ -268,8 +269,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 return self.close(data=data)
 
             # 向下取整到 lot_size
-            if lot_size > 1:
-                shares_to_sell = int(shares_to_sell // lot_size) * lot_size
+            if lot_size != 1:
+                shares_to_sell = align_quantity_down(shares_to_sell, lot_size)
             else:
                 shares_to_sell = int(shares_to_sell)
 
@@ -288,7 +289,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         3. 风控拦截 (Risk Control Lock)
         """
         data = data or self.datas[0]
-        lot_size = kwargs.get('lot_size', config.LOT_SIZE)
+        lot_size = normalize_quantity_step(kwargs.get('lot_size', config.LOT_SIZE))
         self._last_order_target_skip_reason = None
 
         # 0. 风控拦截：如果该标的正在被风控接管，且策略试图买入/持有，则拦截
@@ -338,8 +339,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
             raw_shares_to_buy = shares_to_buy
 
             # 向下取整到 lot_size
-            if lot_size > 1:
-                shares_to_buy = int(shares_to_buy // lot_size) * lot_size
+            if lot_size != 1:
+                shares_to_buy = align_quantity_down(shares_to_buy, lot_size)
             else:
                 shares_to_buy = int(shares_to_buy)
 
@@ -350,9 +351,9 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 self.virtual_spent_cash += estimated_cost
                 return self.buy(data=data, size=shares_to_buy)
 
-            if delta_shares < max(1, lot_size):
+            if delta_shares < lot_size:
                 self._last_order_target_skip_reason = 'below_min_lot_delta'
-            elif raw_shares_to_buy < max(1, lot_size):
+            elif raw_shares_to_buy < lot_size:
                 self._last_order_target_skip_reason = 'insufficient_cash_for_min_lot'
 
         elif delta_shares < 0:  # 卖出
@@ -365,10 +366,10 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 return self.close(data=data)
 
             # [关键] 向下取整到 lot_size
-            if lot_size > 1:
-                shares_to_sell = int(shares_to_sell // lot_size) * lot_size
+            if lot_size != 1:
+                shares_to_sell = align_quantity_down(shares_to_sell, lot_size)
             else:
-                shares_to_sell = int(shares_to_sell)
+                shares_to_sell = align_quantity_down(shares_to_sell, lot_size)
 
             if shares_to_sell > 0:
                 estimated_freed_value = shares_to_sell * price

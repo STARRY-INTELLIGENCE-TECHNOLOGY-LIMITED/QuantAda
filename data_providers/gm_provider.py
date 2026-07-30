@@ -60,6 +60,8 @@ class GmDataProvider(BaseDataProvider):
             return '1d'
         if timeframe == 'Minutes':
             return f"{compression * 60}s"
+        if timeframe == 'Seconds':
+            return f"{compression}s"
         return '1d'
 
     def get_data(self, symbol: str, start_date: str = None, end_date: str = None,

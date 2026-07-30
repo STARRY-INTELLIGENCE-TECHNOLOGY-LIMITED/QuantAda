@@ -1,10 +1,27 @@
+import math
 import threading
 from abc import ABC, abstractmethod
+from decimal import Decimal
 
 import pandas as pd
 
 import config
 from common import log, runtime_notifications
+from common.live_execution_budget import (
+    get_live_run_deadline,
+    live_run_budget_expired,
+)
+from common.order_quantity import (
+    align_quantity_down,
+    decimal_quantity,
+    format_quantity,
+    normalize_quantity_step,
+    positive_quantity,
+    quantity_chunk_plan,
+    quantity_number,
+    subtract_quantities,
+    sum_quantities,
+)
 
 from ..data_bridge.data_warm import BrokerDataWarmBridge
 
@@ -61,6 +78,7 @@ class BaseLiveBroker(ABC):
         self._context = context
         self.datas = []
         self._datetime = None
+        self._keep_overnight_orders = bool(getattr(config, 'KEEP_OVERNIGHT_ORDERS', False))
         self._cash_override = cash_override
         self._commission_override = commission_override
         self._slippage_override = slippage_override
@@ -129,7 +147,7 @@ class BaseLiveBroker(ABC):
         """
         try:
             pos = self.get_position(data)
-            return max(0, int(float(getattr(pos, 'size', 0) or 0)))
+            return positive_quantity(getattr(pos, 'size', 0) or 0)
         except Exception:
             return 0
 
@@ -201,6 +219,9 @@ class BaseLiveBroker(ABC):
         - 无 'id' 时跳过，不抛异常
         """
         summary = {'total': 0, 'canceled': 0, 'failed': 0, 'skipped': 0}
+        if live_run_budget_expired(self):
+            print("[Broker] cleanup_overnight_orders skipped: live run execution budget exhausted.")
+            return summary
         try:
             pending_orders = self.get_pending_orders() or []
         except Exception as e:
@@ -212,12 +233,20 @@ class BaseLiveBroker(ABC):
             summary['failed'] = 1
             err = getattr(self, '_last_pending_orders_fetch_error', None)
             print(f"[Broker] cleanup_overnight_orders pending fetch untrusted: {err}")
+            return summary
 
         summary['total'] = len(pending_orders)
         if not pending_orders:
             return summary
 
-        for po in pending_orders:
+        for index, po in enumerate(pending_orders):
+            if live_run_budget_expired(self):
+                summary['skipped'] += len(pending_orders) - index
+                print(
+                    "[Broker] cleanup_overnight_orders stopped at the live run deadline; "
+                    "remaining orders were left unchanged."
+                )
+                break
             oid = ''
             if isinstance(po, dict):
                 oid = str(po.get('id', '') or '').strip()
@@ -281,12 +310,20 @@ class BaseLiveBroker(ABC):
         return {}
 
     def order_target_percent(self, data, target, **kwargs):
+        if self.is_live and live_run_budget_expired(self):
+            print(f"[Broker Warning] {data._name} target-percent order skipped: live run execution budget exhausted.")
+            return None
+
         # 1. 原子操作：查价
         price = self.get_current_price(data)
         if not price or price <= 0: return None
+        if self.is_live and live_run_budget_expired(self):
+            return None
 
         # 2. 通用逻辑：算净值 (支持子类覆盖优化)
         portfolio_value = self._get_portfolio_nav()
+        if self.is_live and live_run_budget_expired(self):
+            return None
 
         # 3. 核心算法：算股数
         target_value = portfolio_value * target
@@ -294,6 +331,14 @@ class BaseLiveBroker(ABC):
 
         # 改用预期仓位计算差额
         current_size = self.get_expected_size(data)
+        if current_size is None:
+            msg = (
+                f"[Broker Error] {data._name} order skipped because the live pending-order "
+                "snapshot is unavailable or untrusted."
+            )
+            print(msg)
+            runtime_notifications.push_text(msg, level='ERROR')
+            return None
         delta_shares = expected_shares - current_size
 
         # 风控拦截：Percent 模式与 Value 模式保持一致
@@ -313,15 +358,29 @@ class BaseLiveBroker(ABC):
         按目标市值金额下单
         target: 目标持仓金额 (例如 1000 USD)
         """
+        if self.is_live and live_run_budget_expired(self):
+            print(f"[Broker Warning] {data._name} target-value order skipped: live run execution budget exhausted.")
+            return None
+
         # 1. 原子操作：查价
         price = self.get_current_price(data)
         if not price or price <= 0: return None
+        if self.is_live and live_run_budget_expired(self):
+            return None
 
         # 2. 核心算法：直接用目标金额除以价格
         expected_shares = target / price
 
         # 改用预期仓位计算差额
         current_size = self.get_expected_size(data)
+        if current_size is None:
+            msg = (
+                f"[Broker Error] {data._name} order skipped because the live pending-order "
+                "snapshot is unavailable or untrusted."
+            )
+            print(msg)
+            runtime_notifications.push_text(msg, level='ERROR')
+            return None
         delta_shares = expected_shares - current_size
 
         # 风控拦截
@@ -341,84 +400,128 @@ class BaseLiveBroker(ABC):
     #  智能执行逻辑 (Smart Execution)
     # =========================================================
 
+    @classmethod
+    def _align_shares_down(cls, shares, lot_size):
+        return align_quantity_down(shares, normalize_quantity_step(lot_size))
+
+    def _live_order_chunk_limit(self, data, lot_size, side):
+        if not self.is_live:
+            return 0
+
+        raw_limit = getattr(config, 'BROKER_LOT_LIMITS', 0)
+        configured_limit = positive_quantity(raw_limit)
+        if raw_limit not in (None, '', 0, 0.0, '0') and configured_limit <= 0:
+            log.warning(
+                f"[Broker] Invalid BROKER_LOT_LIMITS; expected positive number, got "
+                f"{raw_limit!r}. Limit ignored.",
+                dt=self._datetime,
+            )
+            return 0
+
+        if configured_limit <= 0:
+            return 0
+
+        normalized_lot = normalize_quantity_step(lot_size)
+        chunk_limit = self._align_shares_down(configured_limit, normalized_lot)
+        if chunk_limit <= 0:
+            log.warning(
+                f"[Broker] BROKER_LOT_LIMITS={configured_limit} is below "
+                f"LOT_SIZE={normalized_lot}; {side} {data._name} skipped.",
+                dt=self._datetime,
+            )
+            return None
+        return chunk_limit
+
     def _smart_buy_core(self, data, shares, price, lot_size):
         """智能买入核心逻辑：资金检查 + 自动降级 + 提交记账"""
+        run_deadline = get_live_run_deadline(self)
+        if run_deadline is None:
+            run_deadline = math.inf
+        if live_run_budget_expired(self, deadline=run_deadline):
+            print(f"[Broker Warning] BUY {data._name} skipped: live run execution budget exhausted.")
+            return None
+
         cash = self.get_cash()
 
         cost_multiplier = self.safety_multiplier
         estimated_cost = shares * price * cost_multiplier
 
-        if cash < estimated_cost:
+        cash_limited = cash < estimated_cost
+        if cash_limited:
             # 无状态优先：不排队，直接按当前可用现金降级尝试
             max_shares = cash / (price * cost_multiplier)
             shares = min(shares, max_shares)
-            if shares < 1:
-                print(f"[Broker Warning] Buy {data._name} skipped. Cash ({cash:.2f}) insufficient.")
+            min_lot = normalize_quantity_step(lot_size)
+            if decimal_quantity(shares, absolute=True) < decimal_quantity(min_lot, absolute=True):
+                warning_msg = (
+                    f"[Broker Warning] Buy {data._name} skipped. Cash ({cash:.2f}) "
+                    f"insufficient for minimum lot {min_lot}; this is not a LOT_SIZE rounding error."
+                )
+                print(warning_msg)
+                runtime_notifications.push_text(warning_msg, level='WARNING')
+                return None
 
         chunk_count = 1
-        chunk_limit = 0
-        normalized_shares = shares
-        if self.is_live:
-            try:
-                configured_limit = int(getattr(config, 'BROKER_LOT_LIMITS', 0) or 0)
-            except (TypeError, ValueError):
-                configured_limit = 0
-                log.warning(
-                    f"[Broker] Invalid BROKER_LOT_LIMITS; expected int, got "
-                    f"{getattr(config, 'BROKER_LOT_LIMITS', None)!r}. Limit ignored.",
-                    dt=self._datetime,
-                )
+        normalized_shares = self._align_shares_down(shares, lot_size)
+        if normalized_shares <= 0:
+            return self._finalize_and_submit(
+                data,
+                shares,
+                price,
+                lot_size,
+                retry_sync_failure=self.is_live,
+                run_deadline=run_deadline,
+            )
 
-            if configured_limit > 0:
-                lot_int = max(1, int(abs(float(lot_size))))
-                chunk_limit = configured_limit
-                if lot_int > 1:
-                    chunk_limit = (chunk_limit // lot_int) * lot_int
-                if chunk_limit <= 0:
-                    log.warning(
-                        f"[Broker] BROKER_LOT_LIMITS={configured_limit} is below "
-                        f"LOT_SIZE={lot_int}; BUY {data._name} skipped.",
-                        dt=self._datetime,
-                    )
-                    return None
-
-                normalized_shares = int(abs(float(shares)))
-                if lot_int > 1:
-                    normalized_shares = (normalized_shares // lot_int) * lot_int
-                if normalized_shares > chunk_limit:
-                    chunk_count = (normalized_shares + chunk_limit - 1) // chunk_limit
-                    final_chunk = normalized_shares - chunk_limit * (chunk_count - 1)
-                    log.info(
-                        f"[Broker] Live BUY split {data._name}: total={normalized_shares}, "
-                        f"limit={chunk_limit}, orders={chunk_count}, final={final_chunk}",
-                        dt=self._datetime,
-                    )
+        final_chunk = normalized_shares
+        chunk_limit = self._live_order_chunk_limit(data, lot_size, 'BUY')
+        if chunk_limit is None:
+            return None
+        if chunk_limit > 0 and normalized_shares > chunk_limit:
+            chunk_count, final_chunk = quantity_chunk_plan(normalized_shares, chunk_limit)
+            log.info(
+                f"[Broker] Live BUY split {data._name}: total={normalized_shares}, "
+                f"limit={chunk_limit}, orders={chunk_count}, final={final_chunk}",
+                dt=self._datetime,
+            )
 
         # 将整个当前调用内的拆单、提交和记账包裹在同一把锁内，避免并发抢占。
         with self._ledger_lock:
             first_proxy = None
             submitted_chunks = 0
-            if chunk_count > 1:
-                # GM 等适配器会二次做 cash-fit。批次预算避免柜台已冻结现金后
-                # 又减一次虚拟占资；该状态只在本次同步拆单调用内存在。
+            use_batch_cash_budget = self.is_live
+            if use_batch_cash_budget:
+                # GM 等适配器会二次做 cash-fit。调用级预算避免柜台已冻结前一笔后
+                # 又减一次虚拟占资；该状态只在本次同步调用内存在。
                 self._buy_batch_cash_budget = float(cash)
 
             try:
                 remaining = normalized_shares
-                for _ in range(chunk_count):
-                    chunk_shares = min(chunk_limit, remaining) if chunk_count > 1 else remaining
+                while remaining > 0:
+                    if live_run_budget_expired(self, deadline=run_deadline):
+                        if first_proxy is not None:
+                            error_msg = (
+                                f"[Broker] Live BUY split stopped at run deadline for {data._name}: "
+                                f"accepted_children={submitted_chunks}; accepted children remain active "
+                                "and remaining intent is not persisted."
+                            )
+                            log.error(error_msg, dt=self._datetime)
+                            runtime_notifications.push_text(error_msg, level='ERROR')
+                        return first_proxy
+                    chunk_shares = min(chunk_limit, remaining) if chunk_limit > 0 else remaining
                     proxy = self._finalize_and_submit(
                         data,
                         chunk_shares,
                         price,
                         lot_size,
-                        retry_sync_failure=submitted_chunks > 0,
+                        retry_sync_failure=self.is_live,
+                        run_deadline=run_deadline,
                     )
                     if not proxy:
-                        if chunk_count > 1:
+                        if first_proxy is not None:
                             error_msg = (
                                 f"[Broker] Live BUY split stopped for {data._name}: "
-                                f"submitted={submitted_chunks}/{chunk_count}; "
+                                f"accepted_children={submitted_chunks}; "
                                 f"downgrade retries exhausted; remaining intent is not persisted."
                             )
                             log.error(error_msg, dt=self._datetime)
@@ -429,21 +532,27 @@ class BaseLiveBroker(ABC):
                         first_proxy = proxy
                     submitted_chunks += 1
 
-                    if chunk_count > 1:
-                        submitted_shares = min(
-                            chunk_shares,
-                            self._infer_submitted_shares(proxy, chunk_shares),
-                        )
+                    submitted_shares = min(
+                        chunk_shares,
+                        self._infer_submitted_shares(proxy, chunk_shares),
+                    )
+                    if submitted_shares <= 0:
+                        return first_proxy
+                    if use_batch_cash_budget:
                         submitted_cost = submitted_shares * price * self.safety_multiplier
                         self._buy_batch_cash_budget = max(
                             0.0,
                             self._buy_batch_cash_budget - submitted_cost,
                         )
-                        remaining -= chunk_shares
+                    remaining = subtract_quantities(remaining, submitted_shares)
+                    # Backtests execute the planned order synchronously. Adapter-side
+                    # partial acceptance must not create a live-style tail-order loop.
+                    if not self.is_live:
+                        remaining = 0
 
                 return first_proxy
             finally:
-                if chunk_count > 1:
+                if use_batch_cash_budget:
                     self.__dict__.pop('_buy_batch_cash_budget', None)
 
     def _smart_buy(self, data, shares, price, target_pct, **kwargs):
@@ -461,10 +570,7 @@ class BaseLiveBroker(ABC):
         推断券商最终受理的委托数量。
         某些适配器会在 _submit_order 内做二次降仓，必须以真实数量记账。
         """
-        try:
-            fallback = int(abs(float(fallback_shares)))
-        except Exception:
-            fallback = 0
+        fallback = positive_quantity(fallback_shares)
 
         if not proxy:
             return fallback
@@ -488,12 +594,11 @@ class BaseLiveBroker(ABC):
 
         for path in candidate_paths:
             raw = _read_path(proxy, path)
-            try:
-                val = int(abs(float(raw)))
-                if val > 0:
-                    return val
-            except Exception:
-                continue
+            val = positive_quantity(raw)
+            if val > 0:
+                # An adapter may downsize before submission, but it cannot
+                # legitimately accept more than this base-layer request.
+                return min(val, fallback)
 
         return fallback
 
@@ -540,49 +645,32 @@ class BaseLiveBroker(ABC):
         当资金重算不可用时，按倍数（几何）降级股数。
         采用“先缓后急”曲线：早期尽量保持组合一致性，后期加速收敛。
         """
+        old_quantity = decimal_quantity(old_shares, absolute=True)
+        lot_quantity = decimal_quantity(normalize_quantity_step(lot_size), absolute=True)
         try:
-            old_int = int(abs(float(old_shares)))
-            lot_int = int(abs(float(lot_size)))
             retries_int = int(retries)
         except Exception:
+            retries_int = 0
+        if old_quantity <= 0 or lot_quantity <= 0:
             return 0
-
-        if old_int <= 0:
-            return 0
-
-        lot_int = max(1, lot_int)
-        factors = (0.95, 0.90, 0.82, 0.72, 0.60)
+        factors = (Decimal('0.95'), Decimal('0.90'), Decimal('0.82'), Decimal('0.72'), Decimal('0.60'))
         idx = min(max(0, retries_int), len(factors) - 1)
         factor = factors[idx]
 
-        raw_new = old_int * factor
-        if lot_int > 1:
-            new_shares = int(raw_new // lot_int) * lot_int
-        else:
-            new_shares = int(raw_new)
-
-        # 保证比原单更小，防止无效重复提交
-        upper_bound = old_int - lot_int
-        new_shares = min(new_shares, upper_bound)
-        return max(0, new_shares)
+        raw_new = old_quantity * factor
+        new_shares = align_quantity_down(raw_new, lot_quantity)
+        upper_bound = quantity_number(max(Decimal('0'), old_quantity - lot_quantity))
+        return min(new_shares, upper_bound)
 
     def _lot_step_downgrade_shares(self, old_shares, lot_size):
         """
         线性降级：每次仅减少一个 lot，便于实盘排查和复盘解释。
         """
-        try:
-            old_int = int(abs(float(old_shares)))
-            lot_int = int(abs(float(lot_size)))
-        except Exception:
-            return 0
+        old_quantity = decimal_quantity(old_shares, absolute=True)
+        lot_quantity = decimal_quantity(normalize_quantity_step(lot_size), absolute=True)
+        return quantity_number(max(Decimal('0'), old_quantity - lot_quantity))
 
-        if old_int <= 0:
-            return 0
-
-        lot_int = max(1, lot_int)
-        return max(0, old_int - lot_int)
-
-    def _next_buy_downgrade(self, old_shares, lot_size, retries):
+    def _next_order_downgrade(self, old_shares, lot_size, retries):
         if retries < self._BUY_LOT_STEP_RETRIES:
             return self._lot_step_downgrade_shares(old_shares, lot_size), "LOT_SIZE阶梯降级"
 
@@ -601,20 +689,26 @@ class BaseLiveBroker(ABC):
         lot_size,
         retries=0,
         retry_sync_failure=False,
+        run_deadline=None,
     ):
         """通用的下单收尾逻辑：取整 + 提交"""
+        if run_deadline is None:
+            run_deadline = get_live_run_deadline(self)
+        if run_deadline is None:
+            run_deadline = math.inf
+        if live_run_budget_expired(self, deadline=run_deadline):
+            print(f"[Broker Warning] BUY {data._name} skipped: live run execution budget exhausted.")
+            return None
+
         raw_shares = shares
-        if lot_size > 1:
-            shares = int(shares // lot_size) * lot_size
-        else:
-            shares = int(shares)
+        shares = self._align_shares_down(shares, lot_size)
 
         # lot取整异常
         if raw_shares > 0 >= shares:
-            error_msg = (f"🚨 [Broker Warning] {data._name} 订单取整后股数为0！\n"
-                         f"原始需求: {raw_shares:.2f} 股\n"
+            error_msg = (f"🚨 [Broker Warning] {data._name} 订单取整后数量为0！\n"
+                         f"原始需求: {format_quantity(raw_shares)}\n"
                          f"当前最小交易单位 (LotSize): {lot_size}\n"
-                         f"原因: 原始需求不足一手，订单已自动取消。请检查 LOT_SIZE 配置。")
+                         f"原因: 原始需求不足一个最小交易单位，订单已自动取消。请检查 LOT_SIZE 配置。")
 
             print(f"\n{'-' * 30}\n{error_msg}\n{'-' * 30}")
 
@@ -632,7 +726,7 @@ class BaseLiveBroker(ABC):
                 if not proxy:
                     max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
                     if retry_sync_failure and retries < max_retries:
-                        new_shares, downgrade_reason = self._next_buy_downgrade(
+                        new_shares, downgrade_reason = self._next_order_downgrade(
                             shares,
                             lot_size,
                             retries,
@@ -653,6 +747,7 @@ class BaseLiveBroker(ABC):
                                 lot_size,
                                 retries + 1,
                                 retry_sync_failure=True,
+                                run_deadline=run_deadline,
                             )
                         print(f"❌ [Broker] 降级终止: {data._name} 数量已降至 0。")
                     elif retry_sync_failure:
@@ -679,6 +774,7 @@ class BaseLiveBroker(ABC):
                     'lot_size': lot_size,
                     'retries': retries,
                     'retry_sync_failure': retry_sync_failure,
+                    'run_deadline': run_deadline,
                 }
                 self._virtual_spent_cash += (
                     final_submitted_shares * price * self.safety_multiplier
@@ -713,15 +809,24 @@ class BaseLiveBroker(ABC):
 
     def _smart_sell(self, data, shares, price, **kwargs):
         """智能卖出：自动注册监控"""
+        run_deadline = get_live_run_deadline(self)
+        if run_deadline is None:
+            run_deadline = math.inf
+        if live_run_budget_expired(self, deadline=run_deadline):
+            print(f"[Broker Warning] SELL {data._name} skipped: live run execution budget exhausted.")
+            return None
+
         lot_size = config.LOT_SIZE
 
         # 获取当前【真实的已结算仓位】
         pos_obj = None
         try:
             pos_obj = self.get_position(data)
-            current_pos = max(0, int(float(getattr(pos_obj, 'size', 0) or 0)))
+            current_pos = positive_quantity(getattr(pos_obj, 'size', 0) or 0)
         except Exception:
             current_pos = 0
+        if live_run_budget_expired(self, deadline=run_deadline):
+            return None
 
         # 获取当前【可卖仓位】；A股 T+1 场景下可卖量可能远小于已结算仓位
         try:
@@ -732,11 +837,13 @@ class BaseLiveBroker(ABC):
                     sellable_hint = pos_dict.get('sellable')
 
             if sellable_hint is not None:
-                sellable_pos = max(0, int(float(sellable_hint or 0)))
+                sellable_pos = positive_quantity(sellable_hint or 0)
             else:
-                sellable_pos = max(0, int(float(self.get_sellable_position(data) or 0)))
+                sellable_pos = positive_quantity(self.get_sellable_position(data) or 0)
         except Exception:
             sellable_pos = 0
+        if live_run_budget_expired(self, deadline=run_deadline):
+            return None
         sellable_pos = min(sellable_pos, current_pos)
 
         # T+1 防护：有持仓但不可卖，直接跳过，避免反复触发“仓位不足”拒单。
@@ -751,46 +858,141 @@ class BaseLiveBroker(ABC):
         if shares >= sellable_pos > 0:
             shares = sellable_pos
         else:
-            if lot_size > 1:
-                shares = int(shares // lot_size) * lot_size
-            else:
-                shares = int(shares)
+            shares = self._align_shares_down(shares, lot_size)
 
         if shares > 0:
+            chunk_limit = self._live_order_chunk_limit(data, lot_size, 'SELL')
+            if chunk_limit is None:
+                return None
+
+            chunk_count = 1
+            final_chunk = shares
+            if chunk_limit > 0 and shares > chunk_limit:
+                chunk_count, final_chunk = quantity_chunk_plan(shares, chunk_limit)
+                log.info(
+                    f"[Broker] Live SELL split {data._name}: total={shares}, "
+                    f"limit={chunk_limit}, orders={chunk_count}, final={final_chunk}",
+                    dt=self._datetime,
+                )
+
             with self._ledger_lock:
-                proxy = self._submit_order(data, shares, 'SELL', price)
-                if not proxy:
-                    return None
+                first_proxy = None
+                batch_order_ids = []
+                total_submitted_shares = 0
+                batch_submit_failed = False
+                remaining = shares
 
-                oid = str(getattr(proxy, 'id', '') or '').strip()
-                if not oid:
-                    print(
-                        f"[Broker Warning] SELL {data._name} returned proxy without order id. "
-                        f"status={getattr(proxy, 'status', 'Unknown')}"
+                while remaining > 0:
+                    chunk_shares = min(chunk_limit, remaining) if chunk_limit > 0 else remaining
+                    if live_run_budget_expired(self, deadline=run_deadline):
+                        batch_submit_failed = True
+                        if first_proxy is not None:
+                            log.error(
+                                f"[Broker] Live SELL split stopped at run deadline for {data._name}: "
+                                f"accepted_children={len(batch_order_ids)}; accepted children remain active "
+                                "and remaining intent is not persisted.",
+                                dt=self._datetime,
+                            )
+                        break
+
+                    proxy = None
+                    candidate_shares = chunk_shares
+                    max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
+                    retry_limit = max_retries if self.is_live else 0
+                    for retries in range(retry_limit + 1):
+                        if live_run_budget_expired(self, deadline=run_deadline):
+                            break
+                        proxy = self._submit_order(data, candidate_shares, 'SELL', price)
+                        if proxy:
+                            oid = str(getattr(proxy, 'id', '') or '').strip()
+                            if not oid:
+                                print(
+                                    f"[Broker Warning] SELL {data._name} returned proxy without order id. "
+                                    f"status={getattr(proxy, 'status', 'Unknown')}"
+                                )
+                                proxy = None
+                                break
+                            order_state = self._read_order_state(proxy)
+                            if order_state['completed'] or order_state['pending'] or order_state['accepted']:
+                                break
+                            print(
+                                f"[Broker Warning] SELL {data._name} was not accepted by broker. "
+                                f"status={getattr(proxy, 'status', 'Unknown')}"
+                            )
+                            self.on_order_status(proxy)
+                            proxy = None
+
+                        if retries >= retry_limit:
+                            break
+                        aligned_candidate = self._align_shares_down(candidate_shares, lot_size)
+                        if 0 < aligned_candidate < candidate_shares:
+                            new_shares = aligned_candidate
+                            downgrade_reason = "LOT_SIZE对齐降级"
+                        else:
+                            new_shares, downgrade_reason = self._next_order_downgrade(
+                                candidate_shares,
+                                lot_size,
+                                retries,
+                            )
+                        print(
+                            f"[Broker] SELL {data._name} 同步提交失败/拒绝，"
+                            f"当前run内降级重试 {retries + 1}/{max_retries}: "
+                            f"{candidate_shares} -> {new_shares} ({downgrade_reason})"
+                        )
+                        if new_shares <= 0:
+                            break
+                        candidate_shares = new_shares
+
+                    if not proxy:
+                        batch_submit_failed = True
+                        error_msg = (
+                            f"[Broker] Live SELL submission stopped for {data._name}: "
+                            f"accepted_children={len(batch_order_ids)}; downgrade retries exhausted "
+                            "or run deadline reached; remaining sell intent is not persisted."
+                        )
+                        log.error(error_msg, dt=self._datetime)
+                        runtime_notifications.push_text(error_msg, level='ERROR')
+                        break
+
+                    oid = str(getattr(proxy, 'id', '') or '').strip()
+                    final_submitted_shares = min(
+                        remaining,
+                        self._infer_submitted_shares(proxy, candidate_shares),
                     )
-                    return None
+                    order_state = self._read_order_state(proxy)
+                    if final_submitted_shares <= 0:
+                        batch_submit_failed = True
+                        break
 
-                final_submitted_shares = self._infer_submitted_shares(proxy, shares)
-                order_state = self._read_order_state(proxy)
-
-                if order_state['rejected'] or order_state['canceled'] or not (
-                    order_state['completed'] or order_state['pending'] or order_state['accepted']
-                ):
-                    print(
-                        f"[Broker Warning] SELL {data._name} was not accepted by broker. "
-                        f"status={getattr(proxy, 'status', 'Unknown')}"
+                    if first_proxy is None:
+                        first_proxy = proxy
+                    batch_order_ids.append(oid)
+                    total_submitted_shares = sum_quantities(
+                        (total_submitted_shares, final_submitted_shares)
                     )
-                    self.on_order_status(proxy)
+
+                    log.signal(
+                        'SELL', data._name, final_submitted_shares, price,
+                        tag="实盘信号", dt=self._datetime,
+                    )
+
+                    if order_state['completed']:
+                        self.on_order_status(proxy)
+                    else:
+                        self._pending_sells.add(oid)
+                    remaining = subtract_quantities(remaining, final_submitted_shares)
+                    # Keep backtests and optimizations single-submit and non-blocking.
+                    if not self.is_live:
+                        remaining = 0
+
+                if first_proxy is None:
                     return None
 
-                log.signal('SELL', data._name, final_submitted_shares, price, tag="实盘信号", dt=self._datetime)
-
-                if order_state['completed']:
-                    self.on_order_status(proxy)
-                else:
-                    self._pending_sells.add(oid)
-
-                return proxy
+                # 保持返回首笔代理的兼容性，并把整批信息交给本轮调仓执行器。
+                first_proxy.batch_order_ids = tuple(batch_order_ids)
+                first_proxy.batch_submitted_size = total_submitted_shares
+                first_proxy.batch_submit_failed = batch_submit_failed
+                return first_proxy
         return None
 
     def on_order_status(self, proxy: BaseOrderProxy):
@@ -845,6 +1047,22 @@ class BaseLiveBroker(ABC):
                         refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
                         self._virtual_spent_cash = max(0.0, getattr(self, '_virtual_spent_cash', 0.0) - refund_amount)
 
+                        run_deadline = buy_info.get('run_deadline')
+                        if run_deadline is None:
+                            run_deadline = math.inf
+                        if live_run_budget_expired(self, deadline=run_deadline):
+                            symbol = (
+                                getattr(buy_info.get('data'), '_name', None)
+                                or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
+                            )
+                            msg = (
+                                f"[Broker Warning] BUY {symbol} rejected after its originating live run "
+                                "deadline; virtual cash was refunded and downgrade retry was skipped."
+                            )
+                            print(msg)
+                            runtime_notifications.push_text(msg, level='ERROR')
+                            return None
+
                         # B. 检查是否还有重试机会
                         if retries < max_retries:
                             lot_size = buy_info['lot_size']
@@ -853,7 +1071,7 @@ class BaseLiveBroker(ABC):
                             price = buy_info['price']
 
                             old_shares = buy_info['shares']
-                            new_shares, downgrade_reason = self._next_buy_downgrade(
+                            new_shares, downgrade_reason = self._next_order_downgrade(
                                 old_shares,
                                 lot_size,
                                 retries,
@@ -873,6 +1091,7 @@ class BaseLiveBroker(ABC):
                                     retry_sync_failure=bool(
                                         buy_info.get('retry_sync_failure', False)
                                     ),
+                                    run_deadline=run_deadline,
                                 )
 
                                 if not new_proxy:
@@ -922,19 +1141,55 @@ class BaseLiveBroker(ABC):
 
     def get_expected_size(self, data):
         """获取包含在途订单的【预期仓位】，防止底层下单方法出现认知撕裂"""
+        if self.is_live and live_run_budget_expired(self):
+            return None
         pos_size = self.get_position(data).size
+        if not self.is_live:
+            return pos_size
+        if live_run_budget_expired(self):
+            return None
+
+        pending_orders = None
+        last_error = None
+        for attempt in range(1, 4):
+            if live_run_budget_expired(self):
+                last_error = "live run execution budget exhausted"
+                break
+            try:
+                candidate_orders = self.get_pending_orders() or []
+                if getattr(self, '_last_pending_orders_fetch_failed', False):
+                    last_error = getattr(self, '_last_pending_orders_fetch_error', None)
+                    print(
+                        f"[Broker] 获取预期仓位: 在途订单快照不可信 "
+                        f"({attempt}/3, {last_error})"
+                    )
+                    continue
+                pending_orders = candidate_orders
+                break
+            except Exception as e:
+                last_error = e
+                print(f"[Broker] 获取预期仓位异常 ({attempt}/3): {e}")
+
+        if pending_orders is None:
+            print(f"[Broker] 获取预期仓位失败: 已耗尽在途订单快照重试 ({last_error})")
+            return None
+
         try:
-            pending_orders = self.get_pending_orders()
+            expected_parts = [pos_size]
             for po in pending_orders:
                 sym = str(po['symbol']).upper()
                 data_name = data._name.upper()
                 # 兼容 QQQ.ISLAND 和 QQQ 的匹配
                 if sym == data_name or sym == data_name.split('.')[0]:
-                    if po['direction'] == 'BUY': pos_size += po['size']
-                    if po['direction'] == 'SELL': pos_size -= po['size']
+                    pending_size = decimal_quantity(po.get('size', 0), absolute=True)
+                    if str(po.get('direction', '')).upper() == 'BUY':
+                        expected_parts.append(pending_size)
+                    if str(po.get('direction', '')).upper() == 'SELL':
+                        expected_parts.append(-pending_size)
         except Exception as e:
             print(f"[Broker] 获取预期仓位异常: {e}")
-        return pos_size
+            return None
+        return sum_quantities(expected_parts)
 
     def get_cash(self):
         """公有接口：获取资金"""
@@ -1003,8 +1258,9 @@ class BaseLiveBroker(ABC):
 
             is_new_day = dt.date() > self._datetime.date()
 
-            # 仅跨日清空虚拟占资，避免日内 bar 推进误释放占资保护。
-            if is_new_day:
+            keep_overnight = bool(getattr(self, '_keep_overnight_orders', False))
+            # 24x7 市场可保留跨午夜委托；其本地占资/跟踪也必须一并保留。
+            if is_new_day and not keep_overnight:
                 self._virtual_spent_cash = 0.0
 
             # 计算时间差 (秒)
@@ -1014,9 +1270,13 @@ class BaseLiveBroker(ABC):
                 isinstance(context_attrs, dict)
                 and (context_attrs.get('schedule_rule') or context_attrs.get('use_schedule'))
             )
-            is_long_gap = (time_delta > 600) and not has_schedule  # schedule 间隔可能天然超过 10 分钟
+            is_long_gap = (
+                time_delta > 600
+                and not has_schedule
+                and not keep_overnight
+            )  # schedule/24x7 bar 间隔可能天然超过 10 分钟
 
-            if is_new_day or is_long_gap:
+            if (is_new_day and not keep_overnight) or is_long_gap:
                 has_stale_state = bool(
                     self._pending_sells
                     or self._active_buys

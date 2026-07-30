@@ -1,4 +1,5 @@
 import datetime
+import math
 import os
 import sys
 
@@ -6,6 +7,7 @@ import pandas as pd
 
 import config
 from alarms.manager import AlarmManager
+from common.live_execution_budget import resolve_live_run_budget_seconds
 from common.live_process_supervisor import (
     LiveWorkerFailureKind,
     is_live_worker_process,
@@ -15,13 +17,87 @@ from common.live_process_supervisor import (
 )
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
+from common.order_quantity import align_quantity_down, normalize_quantity_step
 from data_providers.gm_provider import GmDataProvider as UnifiedGmDataProvider
 from live_trader.engine import LiveTrader, on_order_status_callback
-from ..data_bridge.data_warm import SchedulePlanner
+from ..data_bridge.data_warm import DAILY_SCHEDULE_HEALTH_LEAD_SECONDS, SchedulePlanner
 from .base_broker import BaseLiveBroker, BaseOrderProxy
 
 
 _GM_SDK_HEALTH_DEADLINE_SECONDS = 180.0
+_GM_AGGRESSIVE_RETRY_SECONDS = 10.0
+_GM_QUIET_PROBE_SECONDS = 10 * 60.0
+_GM_CONNECTIVITY_LOG_INTERVAL_SECONDS = 10 * 60.0
+
+
+def _resolve_gm_connectivity_retry(
+    now,
+    parsed_schedule,
+    prewarm_lead_seconds=0.0,
+    active_after_seconds=600.0,
+):
+    """Return ``(quiet, retry_delay, wake_at)`` for GM connectivity recovery."""
+
+    if not parsed_schedule:
+        return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+
+    now_ts = pd.Timestamp(now)
+    try:
+        prewarm_lead = max(0.0, float(prewarm_lead_seconds or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        prewarm_lead = 0.0
+    if not math.isfinite(prewarm_lead):
+        prewarm_lead = 0.0
+    try:
+        active_after = max(0.0, float(active_after_seconds or 0.0))
+    except (TypeError, ValueError, OverflowError):
+        active_after = 600.0
+    if not math.isfinite(active_after):
+        active_after = 600.0
+
+    current_slot = SchedulePlanner.resolve_current_schedule_slot(now_ts, parsed_schedule)
+    if parsed_schedule.get('kind') == 'daily':
+        recovery_lead = max(
+            float(DAILY_SCHEDULE_HEALTH_LEAD_SECONDS),
+            prewarm_lead,
+        )
+        if current_slot is None:
+            return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+        current_slot = pd.Timestamp(current_slot)
+        active_start = current_slot - pd.Timedelta(seconds=recovery_lead)
+        active_end = current_slot + pd.Timedelta(seconds=active_after)
+        if active_start <= now_ts <= active_end:
+            return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+        target_slot = (
+            current_slot
+            if now_ts < active_start
+            else SchedulePlanner.advance_schedule_slot(current_slot, parsed_schedule)
+        )
+        wake_at = pd.Timestamp(target_slot) - pd.Timedelta(seconds=recovery_lead)
+    else:
+        interval_seconds = float(parsed_schedule.get('interval_seconds') or 0.0)
+        if not math.isfinite(interval_seconds) or interval_seconds <= 0:
+            return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+        recovery_lead = max(
+            prewarm_lead,
+            max(0.0, interval_seconds - active_after),
+        )
+        if current_slot is not None:
+            current_slot = pd.Timestamp(current_slot)
+            if now_ts <= current_slot + pd.Timedelta(seconds=active_after):
+                return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+
+        next_slot = SchedulePlanner.resolve_next_schedule_slot(now_ts, parsed_schedule)
+        if next_slot is None:
+            return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+        wake_at = pd.Timestamp(next_slot) - pd.Timedelta(seconds=recovery_lead)
+        if now_ts >= wake_at:
+            return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+
+    seconds_to_wake = max(0.0, (wake_at - now_ts).total_seconds())
+    if seconds_to_wake <= 0:
+        return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
+    return True, min(_GM_QUIET_PROBE_SECONDS, seconds_to_wake), wake_at
 
 try:
     from gm.api import order_target_percent, order_target_value, order_volume, current, get_cash, subscribe, history, OrderType_Market, OrderType_Limit, MODE_LIVE, MODE_BACKTEST, \
@@ -446,14 +522,12 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             if estimated_cost > available_cash:
                 old_volume = volume
-                lot_size = max(1, int(getattr(config, 'LOT_SIZE', 100) or 1))
-                # 倒推最大股数
-                if lot_size > 1:
-                    volume = int(available_cash / (freeze_price * cost_multiplier) // lot_size) * lot_size
-                else:
-                    volume = int(available_cash / (freeze_price * cost_multiplier))
-
-                min_volume = lot_size if lot_size > 1 else 1
+                lot_size = normalize_quantity_step(getattr(config, 'LOT_SIZE', 100) or 1)
+                volume = align_quantity_down(
+                    available_cash / (freeze_price * cost_multiplier),
+                    lot_size,
+                )
+                min_volume = lot_size
                 if volume < min_volume:
                     print(
                         f"[GmBroker Warning] Buy {data._name} skipped. "
@@ -544,7 +618,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             if parsed_schedule is None:
                 _runtime_print(
                     "[GmBroker Warning] Prewarm currently supports schedule format "
-                    "1d|Nm|Nh:HH:MM[:SS]. Prewarm disabled."
+                    "1d|Ns|Nm|Nh:HH:MM[:SS]. Prewarm disabled."
                 )
             elif prewarm_lead_seconds >= float(parsed_schedule.get('interval_seconds') or 0.0):
                 _runtime_print(
@@ -563,6 +637,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                         f"[GmBroker] Prewarm enabled: trigger {prewarm_lead_seconds:.0f}s before schedule "
                         f"({prewarm_rule_type} @ {prewarm_time_rule})"
                     )
+
         def _pick_probe_symbol(raw_symbols):
             if isinstance(raw_symbols, (list, tuple)):
                 for s in raw_symbols:
@@ -653,7 +728,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             if token and set_token:
                 set_token(token)
 
-        def _soft_reset_gm_sdk(reason, status=None):
+        def _soft_reset_gm_sdk(reason, status=None, log_result=True):
             """
             Best-effort cleanup for GM SDK process-global state after init/poll
             failure. Function names differ across gm versions, so this probes
@@ -693,11 +768,12 @@ class GmBrokerAdapter(BaseLiveBroker):
             except Exception:
                 pass
 
-            status_text = f" status={status}" if status is not None else ""
-            hook_text = ", ".join(called) if called else "none"
-            _runtime_print(
-                f"[Phoenix] GM SDK soft reset after {reason}.{status_text} hooks={hook_text}"
-            )
+            if log_result:
+                status_text = f" status={status}" if status is not None else ""
+                hook_text = ", ".join(called) if called else "none"
+                _runtime_print(
+                    f"[Phoenix] GM SDK soft reset after {reason}.{status_text} hooks={hook_text}"
+                )
 
         def _hard_reexec_current_process(reason):
             """
@@ -737,12 +813,68 @@ class GmBrokerAdapter(BaseLiveBroker):
         launch_state = {
             'start_alarm_sent': bool(mode == MODE_LIVE and is_live_worker_restart()),
             'consecutive_init_failures': 0,
+            'connectivity_log': None,
+            'connectivity_failure_seen': False,
         }
+
+        effective_prewarm_lead_seconds = (
+            prewarm_lead_seconds if prewarm_time_rule else 0.0
+        )
+        connectivity_active_after_seconds = resolve_live_run_budget_seconds({
+            'schedule_rule': schedule_rule,
+            'timeframe': timeframe,
+            'compression': compression,
+        })
+
+        def _connectivity_retry_plan(now=None):
+            return _resolve_gm_connectivity_retry(
+                now=now or datetime.datetime.now(),
+                parsed_schedule=parsed_schedule,
+                prewarm_lead_seconds=effective_prewarm_lead_seconds,
+                active_after_seconds=connectivity_active_after_seconds,
+            )
+
+        def _log_connectivity_failure(kind, message, quiet):
+            now_monotonic = time.monotonic()
+            phase = 'quiet' if quiet else 'active'
+            key = (str(kind), str(message), phase)
+            previous = launch_state.get('connectivity_log')
+            if previous and previous.get('key') == key:
+                elapsed = now_monotonic - float(previous.get('last_at') or 0.0)
+                if elapsed < _GM_CONNECTIVITY_LOG_INTERVAL_SECONDS:
+                    previous['suppressed'] = int(previous.get('suppressed', 0) or 0) + 1
+                    launch_state['connectivity_failure_seen'] = True
+                    return False
+
+            suppressed = int(previous.get('suppressed', 0) or 0) if previous else 0
+            suffix = f" (suppressed {suppressed} repeated reports)" if suppressed else ""
+            _runtime_print(f"{message}{suffix}")
+            launch_state['connectivity_log'] = {
+                'key': key,
+                'last_at': now_monotonic,
+                'suppressed': 0,
+            }
+            launch_state['connectivity_failure_seen'] = True
+            return True
+
+        def _log_connectivity_recovered(detail):
+            if not launch_state.get('connectivity_failure_seen'):
+                return
+            previous = launch_state.get('connectivity_log') or {}
+            suppressed = int(previous.get('suppressed', 0) or 0)
+            suffix = f"; suppressed {suppressed} repeated reports" if suppressed else ""
+            _runtime_print(f"[Phoenix] GM connectivity recovered: {detail}{suffix}.")
+            launch_state['connectivity_log'] = None
+            launch_state['connectivity_failure_seen'] = False
 
         # --- 2. 核心运行逻辑 ---
         def run_session():
+            launch_state['retry_quiet'] = False
+            launch_state['retry_delay_seconds'] = _GM_AGGRESSIVE_RETRY_SECONDS
+            launch_state['retry_wake_at'] = None
             session_state = {'shutdown_requested': False}
             last_market_data_error_log_at = None
+            last_poll_status_log_at = None
             market_data_error_log_interval_seconds = 600.0
 
             def _log_temporary_market_data_error(code, info):
@@ -832,7 +964,12 @@ class GmBrokerAdapter(BaseLiveBroker):
                 if current_symbols:
                     sub_tf = ctx.strategy_instance.config.get('timeframe', 'Days')
                     sub_cp = int(ctx.strategy_instance.config.get('compression', 1) or 1)
-                    sub_freq = f"{sub_cp * 60}s" if sub_tf == 'Minutes' else '1d'
+                    if sub_tf == 'Minutes':
+                        sub_freq = f"{sub_cp * 60}s"
+                    elif sub_tf == 'Seconds':
+                        sub_freq = f"{sub_cp}s"
+                    else:
+                        sub_freq = '1d'
                     _runtime_print(f"[GmBroker] Subscribing to {len(current_symbols)} symbols...")
                     try:
                         subscribe(symbols=current_symbols, frequency=sub_freq, count=1, wait_group=True)
@@ -979,14 +1116,36 @@ class GmBrokerAdapter(BaseLiveBroker):
                 except (TypeError, ValueError):
                     code_int = None
                 if mode == MODE_LIVE and code_int == 1100:
-                    report_live_worker_state(
+                    now_value = datetime.datetime.now()
+                    quiet, _, wake_at = _connectivity_retry_plan(now_value)
+                    if quiet and wake_at is not None:
+                        seconds_to_wake = max(
+                            0.1,
+                            (pd.Timestamp(wake_at) - pd.Timestamp(now_value)).total_seconds(),
+                        )
+                        report_live_worker_state(
+                            "gm_connectivity_quiet_wait",
+                            unhealthy_after_seconds=seconds_to_wake,
+                            detail=(
+                                f"GM trade service unavailable; aggressive recovery at "
+                                f"{pd.Timestamp(wake_at).strftime('%Y-%m-%d %H:%M:%S')}"
+                            ),
+                            failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                            refresh_deadline=True,
+                        )
+                    else:
+                        report_live_worker_state(
+                            "gm_trade_service_unavailable",
+                            unhealthy_after_seconds=_GM_SDK_HEALTH_DEADLINE_SECONDS,
+                            detail=msg,
+                            failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                        )
+                    if _log_connectivity_failure(
                         "gm_trade_service_unavailable",
-                        unhealthy_after_seconds=_GM_SDK_HEALTH_DEADLINE_SECONDS,
-                        detail=msg,
-                        failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
-                    )
-                    _runtime_print(f"[GM Warning] {msg}")
-                    AlarmManager().push_schedule_api_unavailable("GmBroker", msg)
+                        f"[GM Warning] {msg}",
+                        quiet,
+                    ):
+                        AlarmManager().push_schedule_api_unavailable("GmBroker", msg)
                     return
 
                 _runtime_print(f"[GM Error] {msg}")
@@ -1083,16 +1242,44 @@ class GmBrokerAdapter(BaseLiveBroker):
                     launch_state['consecutive_init_failures'] = int(
                         launch_state.get('consecutive_init_failures', 0) or 0
                     ) + 1
-                    _runtime_print(f"[Phoenix] Init failed (Code: {status}). Retrying in 10s...")
-                    AlarmManager().push_schedule_api_unavailable(
-                        "GmBroker",
-                        f"GM terminal init failed (Code: {status})",
+                    now_value = datetime.datetime.now()
+                    quiet, retry_delay, wake_at = _connectivity_retry_plan(now_value)
+                    launch_state['retry_quiet'] = quiet
+                    launch_state['retry_delay_seconds'] = retry_delay
+                    launch_state['retry_wake_at'] = wake_at
+                    if quiet and wake_at is not None:
+                        retry_detail = (
+                            f"quiet probe in {retry_delay:.0f}s; aggressive recovery at "
+                            f"{pd.Timestamp(wake_at).strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                        report_live_worker_state(
+                            "gm_connectivity_quiet_wait",
+                            detail=retry_detail,
+                            failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                        )
+                    else:
+                        retry_detail = f"retrying in {retry_delay:.0f}s"
+                    message = f"[Phoenix] Init failed (Code: {status}); {retry_detail}."
+                    emitted = _log_connectivity_failure(
+                        "gm_init_failed",
+                        message,
+                        quiet,
                     )
-                    _soft_reset_gm_sdk("init failure", status=status)
+                    if emitted:
+                        AlarmManager().push_schedule_api_unavailable(
+                            "GmBroker",
+                            f"GM terminal init failed (Code: {status})",
+                        )
+                    _soft_reset_gm_sdk(
+                        "init failure",
+                        status=status,
+                        log_result=emitted,
+                    )
                     return True  # 初始化失败，要求重试
 
                 check_gm_status(status)
                 launch_state['consecutive_init_failures'] = 0
+                _log_connectivity_recovered("gmi_init succeeded")
                 report_live_worker_state(
                     "gm_sdk_running",
                     detail="gmi_init completed",
@@ -1101,8 +1288,8 @@ class GmBrokerAdapter(BaseLiveBroker):
                 _runtime_print("[Phoenix] Entering Event Loop (Ctrl+C to stop)...")
 
                 try:
-                    # 这是一个阻塞循环，通常 gmi_poll 会一直运行
-                    # 如果 gmi_poll 返回，说明连接断开或 shutdown 触发
+                    # GM's official run() loop intentionally ignores gmi_poll's
+                    # return value. Session lifecycle is reported by callbacks.
                     while True:
                         try:
                             poll_status = gmi_poll()
@@ -1135,24 +1322,6 @@ class GmBrokerAdapter(BaseLiveBroker):
                                     pass
                             return True
 
-                        if poll_status not in (None, 0):
-                            try:
-                                check_gm_status(poll_status)
-                            except Exception as e:
-                                err_code = getattr(e, 'code', poll_status)
-                                err_info = str(e)
-                                if _log_temporary_market_data_error(err_code, err_info):
-                                    time.sleep(1)
-                                    continue
-                                _runtime_print(f"[Phoenix] gmi_poll status detail: {e}")
-                                _runtime_print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
-                                return True
-                            if _log_temporary_market_data_error(poll_status, ""):
-                                time.sleep(1)
-                                continue
-                            _runtime_print(f"[Phoenix] gmi_poll returned status {poll_status}. Restarting session...")
-                            return True
-
                         if session_state.get('shutdown_requested') or getattr(
                             context, '_quantada_gm_shutdown_requested', False
                         ):
@@ -1162,6 +1331,28 @@ class GmBrokerAdapter(BaseLiveBroker):
                             except Exception:
                                 pass
                             return True
+
+                        if poll_status not in (None, 0):
+                            if _log_temporary_market_data_error(poll_status, ""):
+                                time.sleep(1)
+                                continue
+
+                            now_ts = time.time()
+                            if (
+                                last_poll_status_log_at is None
+                                or now_ts - last_poll_status_log_at
+                                >= market_data_error_log_interval_seconds
+                            ):
+                                _runtime_print(
+                                    f"[GM Warning] gmi_poll returned transient status {poll_status}; "
+                                    "continuing the SDK event loop."
+                                )
+                                last_poll_status_log_at = now_ts
+                            # Avoid a CPU spin if a particular SDK build returns
+                            # immediately while idle. Explicit shutdown/SystemExit
+                            # and bounded connection-health callbacks still restart.
+                            time.sleep(0.05)
+                            continue
 
                         # 稍微休眠，释放 CPU，同时检测外部中断
                         time.sleep(1)
@@ -1180,12 +1371,6 @@ class GmBrokerAdapter(BaseLiveBroker):
                     _runtime_print(">>> GM Broker Exited Normally.")
                     break  # 回测结束或正常退出
 
-                if mode == MODE_LIVE and is_live_worker_process():
-                    request_live_worker_restart(
-                        "GM SDK session ended; supervisor will start a clean worker process",
-                        failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
-                    )
-
                 init_failures = int(launch_state.get('consecutive_init_failures', 0) or 0)
                 if mode == MODE_LIVE and init_failures >= 12:
                     _hard_reexec_current_process(
@@ -1193,10 +1378,22 @@ class GmBrokerAdapter(BaseLiveBroker):
                     )
                     launch_state['consecutive_init_failures'] = 0
 
+                quiet_retry = bool(launch_state.get('retry_quiet'))
+                if mode == MODE_LIVE and is_live_worker_process() and not quiet_retry:
+                    request_live_worker_restart(
+                        "GM SDK session ended; supervisor will start a clean worker process",
+                        failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                    )
+
                 # 如果 run_session 返回 True，说明是异常退出或断线，需要冷却后重启
-                _runtime_print("[Phoenix] Waiting 10s before restart...")
-                time.sleep(10)
-                _runtime_print("[Phoenix] Restarting now...")
+                retry_delay = float(
+                    launch_state.get('retry_delay_seconds') or _GM_AGGRESSIVE_RETRY_SECONDS
+                )
+                if not quiet_retry:
+                    _runtime_print(f"[Phoenix] Waiting {retry_delay:.0f}s before restart...")
+                time.sleep(retry_delay)
+                if not quiet_retry:
+                    _runtime_print("[Phoenix] Restarting now...")
 
             except KeyboardInterrupt:
                 _runtime_print("[Stop] User interrupted (Ctrl+C). Exiting Phoenix Loop.")

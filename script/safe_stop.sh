@@ -16,6 +16,7 @@ stop_all() {
   local failures=0
   local pid
 
+  qada_acquire_operation_lock "process-control"
   qada_collect_processes
   if [[ ${#qada_root_pids[@]} -eq 0 ]]; then
     qada_out "No running QuantAda live supervisor processes were found."
@@ -41,6 +42,7 @@ interactive_stop() {
   local -a selected_pids=()
 
   qada_require_tty "safe_stop.sh"
+  qada_acquire_operation_lock "process-control"
   trap 'qada_cleanup_and_exit 0' INT TERM
 
   qada_collect_processes

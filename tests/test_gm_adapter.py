@@ -333,13 +333,22 @@ def test_gm_secondary_downsize_updates_active_buy_and_virtual_ledger(monkeypatch
 
     # 模拟柜台返回对象，携带最终受理 volume
     class SubmittedOrder(DummyGMOrder):
-        def __init__(self, status, side, volume):
+        def __init__(self, status, side, volume, order_id):
             super().__init__(status=status, side=side)
             self.volume = volume
+            self.cl_ord_id = order_id
+
+    available_cash = {"value": 10103.01}
 
     def _fake_order_volume(**kwargs):
         order_calls.append(kwargs)
-        return [SubmittedOrder(status=mock_gm_api.OrderStatus_New, side=kwargs["side"], volume=kwargs["volume"])]
+        available_cash["value"] = 0.0
+        return [SubmittedOrder(
+            status=mock_gm_api.OrderStatus_New,
+            side=kwargs["side"],
+            volume=kwargs["volume"],
+            order_id=f"GM_TEST_{len(order_calls):03d}",
+        )]
 
     monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
 
@@ -348,7 +357,7 @@ def test_gm_secondary_downsize_updates_active_buy_and_virtual_ledger(monkeypatch
     # 关键构造:
     # - 基类 _smart_buy_value 看到 cash=10103.01 时不会先降仓
     # - GM _submit_order 用更贴近实盘的 freeze_price 二次校验后，会把 1000 股降到 900
-    monkeypatch.setattr(broker, "_fetch_real_cash", lambda: 10103.01)
+    monkeypatch.setattr(broker, "_fetch_real_cash", lambda: available_cash["value"])
     monkeypatch.setattr(broker, "get_current_price", lambda data: 10.0)
     monkeypatch.setattr(broker, "get_pending_orders", lambda: [])
 
@@ -356,14 +365,13 @@ def test_gm_secondary_downsize_updates_active_buy_and_virtual_ledger(monkeypatch
     proxy = broker.order_target_value(data=data, target=10000.0)  # expected_shares=1000
 
     assert proxy is not None, "应成功提交降仓后的买单。"
-    assert len(order_calls) == 1, "应实际触发一次 order_volume。"
-    assert order_calls[0]["volume"] == 900, "GM 二次降仓后真实委托量应为 900。"
+    assert [call["volume"] for call in order_calls] == [900, 100], (
+        "GM 二次降仓后应继续用剩余预算补足可执行数量。"
+    )
 
-    tracked = broker._active_buys.get(proxy.id)
-    assert tracked is not None, "_active_buys 应记录该订单。"
-    assert tracked["shares"] == 900, "活跃买单跟踪应使用真实受理数量，而非降仓前数量。"
+    assert [item["shares"] for item in broker._active_buys.values()] == [900, 100]
 
-    expected_ledger = 900 * 10.0 * broker.safety_multiplier
+    expected_ledger = 1000 * 10.0 * broker.safety_multiplier
     assert broker._virtual_spent_cash == pytest.approx(expected_ledger), (
         "虚拟账本占资应基于真实受理数量计算。"
     )
@@ -419,6 +427,57 @@ def test_gm_live_buy_split_uses_single_batch_cash_budget(monkeypatch):
     assert [call["volume"] for call in order_calls] == [1000, 400]
     assert len(cash_reads) == 1, "同一拆单批次不应因柜台冻结而重复扣减可用资金。"
     assert set(broker._active_buys) == {"GM_SPLIT_1", "GM_SPLIT_2"}
+
+
+def test_gm_live_sell_splits_by_broker_lot_limit(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module.config, "LOT_SIZE", 100)
+    monkeypatch.setattr(gm_module.config, "BROKER_LOT_LIMITS", 1_000_000)
+    monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    order_calls = []
+
+    class SubmittedOrder(DummyGMOrder):
+        def __init__(self, status, side, volume, oid):
+            super().__init__(status=status, side=side)
+            self.volume = volume
+            self.cl_ord_id = oid
+
+    def _fake_order_volume(**kwargs):
+        order_calls.append(kwargs)
+        return [SubmittedOrder(
+            status=mock_gm_api.OrderStatus_New,
+            side=kwargs["side"],
+            volume=kwargs["volume"],
+            oid=f"GM_SELL_SPLIT_{len(order_calls)}",
+        )]
+
+    monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    monkeypatch.setattr(
+        broker,
+        "get_position",
+        lambda data: SimpleNamespace(size=1_486_700, sellable=1_486_700),
+    )
+    monkeypatch.setattr(broker, "get_pending_orders", lambda: [])
+    monkeypatch.setattr(broker, "get_current_price", lambda data: 0.37)
+
+    proxy = broker.order_target_value(
+        data=SimpleNamespace(_name="SHSE.512010"),
+        target=0.0,
+    )
+
+    assert proxy is not None
+    assert [call["volume"] for call in order_calls] == [1_000_000, 486_700]
+    assert all(call["side"] == mock_gm_api.OrderSide_Sell for call in order_calls)
+    assert proxy.batch_order_ids == ("GM_SELL_SPLIT_1", "GM_SELL_SPLIT_2")
+    assert proxy.batch_submitted_size == 1_486_700
+    assert proxy.batch_submit_failed is False
+    assert broker._pending_sells == {"GM_SELL_SPLIT_1", "GM_SELL_SPLIT_2"}
 
 
 def test_gm_sellable_position_prefers_available_now(monkeypatch):
@@ -639,6 +698,65 @@ def test_gm_schedule_preview_uses_common_live_helper():
     ]
 
 
+def test_gm_daily_connectivity_recovery_reuses_alive_boundary_and_prewarm():
+    import live_trader.adapters.gm_broker as gm_module
+
+    parsed = SchedulePlanner.parse_schedule_rule("1d:14:45:00")
+    quiet, delay, wake_at = gm_module._resolve_gm_connectivity_retry(
+        datetime.datetime(2026, 7, 30, 10, 0, 0),
+        parsed,
+        prewarm_lead_seconds=0,
+        active_after_seconds=600,
+    )
+
+    assert quiet is True
+    assert delay == pytest.approx(600.0)
+    assert wake_at == datetime.datetime(2026, 7, 30, 14, 15, 0)
+
+    quiet, delay, wake_at = gm_module._resolve_gm_connectivity_retry(
+        datetime.datetime(2026, 7, 30, 13, 0, 0),
+        parsed,
+        prewarm_lead_seconds=3600,
+        active_after_seconds=600,
+    )
+    assert quiet is True
+    assert delay == pytest.approx(600.0)
+    assert wake_at == datetime.datetime(2026, 7, 30, 13, 45, 0)
+
+    assert gm_module._resolve_gm_connectivity_retry(
+        datetime.datetime(2026, 7, 30, 14, 15, 0),
+        parsed,
+        prewarm_lead_seconds=0,
+        active_after_seconds=600,
+    ) == (False, gm_module._GM_AGGRESSIVE_RETRY_SECONDS, None)
+
+
+def test_gm_interval_connectivity_wait_never_crosses_next_slot():
+    import live_trader.adapters.gm_broker as gm_module
+
+    parsed = SchedulePlanner.parse_schedule_rule("1m:14:45:00")
+    quiet, delay, wake_at = gm_module._resolve_gm_connectivity_retry(
+        datetime.datetime(2026, 7, 30, 14, 44, 40),
+        parsed,
+        prewarm_lead_seconds=0,
+        active_after_seconds=48,
+    )
+
+    assert quiet is True
+    assert delay == pytest.approx(8.0)
+    assert wake_at == datetime.datetime(2026, 7, 30, 14, 44, 48)
+    assert gm_module._resolve_gm_connectivity_retry(
+        datetime.datetime(2026, 7, 30, 14, 45, 49),
+        parsed,
+        prewarm_lead_seconds=0,
+        active_after_seconds=48,
+    ) == (False, gm_module._GM_AGGRESSIVE_RETRY_SECONDS, None)
+    assert gm_module._resolve_gm_connectivity_retry(
+        datetime.datetime(2026, 7, 30, 14, 45, 49),
+        None,
+    ) == (False, gm_module._GM_AGGRESSIVE_RETRY_SECONDS, None)
+
+
 def test_gm_run_schedule_prewarm_is_non_blocking_and_pushes_warning(monkeypatch):
     """
     通用预热执行回归:
@@ -740,6 +858,65 @@ def test_gm_launch_restarts_when_shutdown_callback_fires(monkeypatch, capsys):
     assert "GM shutdown callback received. Restarting session" in captured.out
     assert "[Phoenix] Waiting 10s before restart" in captured.out
     assert ("INFO", "GM Session Shutdown (Preparing to Restart)") in statuses
+
+
+def test_gm_launch_continues_on_transient_poll_minus_one(monkeypatch, capsys):
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    poll_count = {"value": 0}
+    sleep_calls = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    def _poll_twice_then_stop():
+        poll_count["value"] += 1
+        if poll_count["value"] <= 2:
+            return -1
+        raise StopPhoenix()
+
+    def _check_status(status):
+        if status != 0:
+            raise AssertionError("gmi_poll return values must follow the official ignored-status loop")
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", _check_status, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_twice_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert poll_count["value"] == 3
+    assert captured.out.count("gmi_poll returned transient status -1") == 1
+    assert "Restarting session" not in captured.out
+    assert sleep_calls == [0.05, 0.05]
 
 
 def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
@@ -972,6 +1149,81 @@ def test_gm_launch_soft_resets_sdk_after_init_failure(monkeypatch, capsys):
     assert len(serv_addr_calls) >= 2, "外层启动和每轮 run_session 前都应重新绑定 serv_addr。"
     assert reset_calls == ["gmi_close"]
     assert "GM SDK soft reset after init failure. status=1001" in captured.out
+
+
+def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeypatch, capsys):
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    health_states = []
+    restart_requests = []
+    sleep_calls = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    def _sleep(seconds):
+        sleep_calls.append(seconds)
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_close", lambda: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 1001, raising=False)
+    monkeypatch.setattr(gm_module, "is_live_worker_process", lambda: True)
+    monkeypatch.setattr(
+        gm_module,
+        "request_live_worker_restart",
+        lambda *args, **kwargs: restart_requests.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: health_states.append((state, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        gm_module,
+        "_resolve_gm_connectivity_retry",
+        lambda *args, **kwargs: (
+            True,
+            123.0,
+            datetime.datetime(2026, 7, 30, 14, 15, 0),
+        ),
+    )
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", _sleep)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {
+                "token": "token",
+                "strategy_id": "strategy-id",
+                "schedule": "1d:14:45:00",
+            },
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert sleep_calls == [123.0]
+    assert restart_requests == []
+    assert health_states[-1][0] == "gm_connectivity_quiet_wait"
+    assert health_states[-1][1].get("unhealthy_after_seconds") is None
+    assert "quiet probe in 123s; aggressive recovery at 2026-07-30 14:15:00" in captured.out
 
 
 def test_gm_launch_reexecs_after_repeated_init_failures(monkeypatch):
@@ -1425,7 +1677,7 @@ def test_gm_temporary_connection_errors_do_not_push_exception(monkeypatch, capsy
 
     captured = capsys.readouterr()
     assert captured.out.count("[GM Warning] Code: 1200, Msg: 实时行情服务连接失败") == 1
-    assert captured.out.count("[GM Warning] Code: 1100, Msg: 交易消息服务连接失败") == 2
+    assert captured.out.count("[GM Warning] Code: 1100, Msg: 交易消息服务连接失败") == 1
     assert [state for state, _ in health_states].count("gm_trade_service_unavailable") == 2
     assert health_states[-1][0] == "gm_trade_service_unavailable"
     assert all(
@@ -1433,5 +1685,5 @@ def test_gm_temporary_connection_errors_do_not_push_exception(monkeypatch, capsy
         for state, kwargs in health_states
         if state == "gm_trade_service_unavailable"
     )
-    assert len(schedule_unavailable) == 2
+    assert len(schedule_unavailable) == 1
     assert "Waiting 10s before restart" not in captured.out

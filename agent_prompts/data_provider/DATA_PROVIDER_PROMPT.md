@@ -32,7 +32,8 @@ def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
 2. 尽量不要在 provider 内写业务策略逻辑，只做“数据获取+标准化”。
 3. 如需缓存，遵循 `DataManager` 的缓存流程，不在此处重复造轮子。
 4. 日期入参兼容 `YYYYMMDD` 与标准时间字符串。
-5. 分钟线场景要正确处理 `timeframe='Minutes'` 和 `compression`。
+5. 日内场景要正确处理 `timeframe='Minutes'|'Seconds'` 和 `compression`；时间参数保留到秒，避免把秒/分钟级增量请求扩成整年明细。
+6. SDK/网络请求必须使用有限超时；秒级请求的单次超时应明显短于周期。外汇/币市等 24x7 数据不得强制使用常规交易时段过滤。
 
 ## 输出格式
 1. 输出完整 Python 文件代码。
@@ -47,4 +48,3 @@ python .\run.py sample_macd_cross_strategy --symbols=<example_symbol> --data_sou
 
 ## 现在开始
 基于我的输入生成完整代码与验证命令。
-

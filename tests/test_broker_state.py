@@ -82,6 +82,7 @@ class MockBroker(BaseLiveBroker):
     def _submit_order(self, data, volume, side, price):
         oid = f"ORDER_{len(self.submitted_orders) + 1}"
         proxy = MockOrderProxy(oid, is_buy_order=(side == "BUY"))
+        proxy.submitted_size = volume
         self.submitted_orders.append(
             {
                 "id": oid,
@@ -164,6 +165,135 @@ def test_live_buy_splits_by_configured_broker_lot_limit(monkeypatch):
     assert set(broker._active_buys) == {"ORDER_1", "ORDER_2"}
 
 
+def test_live_buy_aligns_total_before_tail_submission(capsys):
+    broker = MockBroker(initial_cash=10_000.0)
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=1486.7)
+
+    assert proxy is not None
+    assert [order["volume"] for order in broker.submitted_orders] == [100]
+    output = capsys.readouterr().out
+    assert "订单取整后数量为0" not in output
+    assert "split stopped" not in output
+
+
+def test_live_sell_splits_by_configured_broker_lot_limit(monkeypatch):
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1_000_000)
+    broker = MockBroker(initial_cash=1000.0)
+    broker.mock_position = 1_486_700
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=0.0)
+
+    assert proxy is not None
+    assert proxy.id == "ORDER_1", "拆单调用应保持原有首笔订单代理返回契约。"
+    assert [order["volume"] for order in broker.submitted_orders] == [1_000_000, 486_700]
+    assert proxy.batch_order_ids == ("ORDER_1", "ORDER_2")
+    assert proxy.submitted_size == 1_000_000, "单笔 submitted_size 不得被批次总量覆盖。"
+    assert proxy.batch_submitted_size == 1_486_700
+    assert proxy.batch_submit_failed is False
+    assert broker._pending_sells == {"ORDER_1", "ORDER_2"}
+
+
+def test_live_sell_split_keeps_odd_lot_in_final_clear_order(monkeypatch):
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1_000_000)
+    broker = MockBroker(initial_cash=1000.0)
+    broker.mock_position = 1_486_750
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=0.0)
+
+    assert proxy is not None
+    assert [order["volume"] for order in broker.submitted_orders] == [1_000_000, 486_750]
+    assert proxy.submitted_size == 1_000_000
+    assert proxy.batch_submitted_size == 1_486_750
+
+
+def test_fractional_lot_size_splits_buy_and_sell_without_rounding_to_zero(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 0.00001)
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 0.1)
+    data = _make_data("CRYPTO.BTC.USD")
+
+    buy_broker = MockBroker(initial_cash=1000.0)
+    buy_proxy = buy_broker.order_target_value(data, target=2.5003)
+
+    assert buy_proxy is not None
+    assert [order["volume"] for order in buy_broker.submitted_orders] == pytest.approx(
+        [0.1, 0.1, 0.05003]
+    )
+    assert sum(item["shares"] for item in buy_broker._active_buys.values()) == pytest.approx(0.25003)
+
+    sell_broker = MockBroker(initial_cash=1000.0)
+    sell_broker.mock_position = 0.25003
+    sell_proxy = sell_broker.order_target_value(data, target=0.0)
+
+    assert sell_proxy is not None
+    assert [order["volume"] for order in sell_broker.submitted_orders] == pytest.approx(
+        [0.1, 0.1, 0.05003]
+    )
+    assert sell_proxy.batch_submitted_size == pytest.approx(0.25003)
+
+
+def test_fractional_rejected_buy_downgrades_by_one_lot(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 0.00001)
+    broker = MockBroker(initial_cash=1000.0)
+    data = _make_data("CRYPTO.BTC.USD")
+
+    first = broker.order_target_value(data, target=0.0003)
+    assert first is not None
+    assert broker.submitted_orders[0]["volume"] == pytest.approx(0.00003)
+
+    broker.on_order_status(MockOrderProxy("ORDER_1", is_buy_order=True, status="Rejected"))
+
+    assert broker.submitted_orders[1]["volume"] == pytest.approx(0.00002)
+    assert broker._active_buys["ORDER_2"]["shares"] == pytest.approx(0.00002)
+
+
+def test_expected_size_accepts_fractional_pending_quantity_strings(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 0.00000001)
+    broker = MockBroker(initial_cash=1000.0)
+    broker.mock_position = 0.1
+    data = _make_data("CRYPTO.BTC.USD")
+    broker.submitted_orders = [
+        {
+            "id": "ORDER_BUY",
+            "side": "BUY",
+            "volume": "0.00000002",
+            "symbol": data._name,
+            "status": "Submitted",
+        },
+        {
+            "id": "ORDER_SELL",
+            "side": "SELL",
+            "volume": "0.00000001",
+            "symbol": data._name,
+            "status": "Submitted",
+        },
+    ]
+
+    assert broker.get_expected_size(data) == pytest.approx(0.10000001)
+
+
+def test_adapter_reported_quantity_is_capped_to_requested_quantity(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 100)
+
+    class OversizedReportBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            proxy = super()._submit_order(data, volume, side, price)
+            proxy.submitted_size = volume + 100
+            return proxy
+
+    broker = OversizedReportBroker(initial_cash=100000.0)
+    proxy = broker.order_target_value(_make_data(), target=10000.0)
+
+    assert proxy is not None
+    assert broker._active_buys[proxy.id]["shares"] == 1000
+    assert broker._virtual_spent_cash == pytest.approx(
+        1000 * 10.0 * broker.safety_multiplier
+    )
+
+
 def test_backtest_buy_ignores_broker_lot_limit(monkeypatch):
     monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1_000_000)
     broker = MockBroker(initial_cash=20_000_000.0)
@@ -174,6 +304,84 @@ def test_backtest_buy_ignores_broker_lot_limit(monkeypatch):
 
     assert proxy is not None
     assert [order["volume"] for order in broker.submitted_orders] == [1_484_800]
+
+
+def test_backtest_sell_ignores_broker_lot_limit(monkeypatch):
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1_000_000)
+    broker = MockBroker(initial_cash=1000.0)
+    broker.is_live = False
+    broker.mock_position = 1_486_700
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=0.0)
+
+    assert proxy is not None
+    assert [order["volume"] for order in broker.submitted_orders] == [1_486_700]
+
+
+def test_backtest_sell_sync_failure_does_not_enter_live_downgrade_loop(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 100)
+
+    class FailSellBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            return None
+
+    broker = FailSellBroker(initial_cash=1000.0)
+    broker.is_live = False
+    broker.mock_position = 1000
+
+    assert broker.order_target_value(_make_data(), target=0.0) is None
+
+
+def test_backtest_partial_acceptance_does_not_create_live_tail_orders(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 100)
+
+    class PartialAcceptanceBroker(MockBroker):
+        def _submit_order(self, data, volume, side, price):
+            proxy = super()._submit_order(data, volume, side, price)
+            proxy.submitted_size = 900
+            return proxy
+
+    buy_broker = PartialAcceptanceBroker(initial_cash=100000.0)
+    buy_broker.is_live = False
+    assert buy_broker.order_target_value(_make_data(), target=10000.0) is not None
+    assert [order["volume"] for order in buy_broker.submitted_orders] == [1000]
+
+    sell_broker = PartialAcceptanceBroker(initial_cash=100000.0)
+    sell_broker.is_live = False
+    sell_broker.mock_position = 1000
+    assert sell_broker.order_target_value(_make_data(), target=0.0) is not None
+    assert [order["volume"] for order in sell_broker.submitted_orders] == [1000]
+
+
+def test_later_split_sell_sync_failure_returns_accepted_batch_for_reconciliation(monkeypatch):
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 1_000_000)
+
+    class FailSecondSellBroker(MockBroker):
+        def __init__(self, initial_cash):
+            super().__init__(initial_cash)
+            self.submit_attempts = 0
+
+        def _submit_order(self, data, volume, side, price):
+            self.submit_attempts += 1
+            if self.submit_attempts == 2:
+                return None
+            return super()._submit_order(data, volume, side, price)
+
+    broker = FailSecondSellBroker(initial_cash=1000.0)
+    broker.mock_position = 1_486_700
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=0.0)
+
+    assert proxy is not None, "已受理的 SELL 子单必须返回给执行器继续等待。"
+    assert proxy.id == "ORDER_1"
+    assert proxy.submitted_size == 1_000_000
+    assert proxy.batch_order_ids == ("ORDER_1", "ORDER_2", "ORDER_3")
+    assert proxy.batch_submitted_size == 1_486_700
+    assert proxy.batch_submit_failed is False
+    assert [order["volume"] for order in broker.submitted_orders] == [1_000_000, 486_600, 100]
+    assert broker._pending_sells == {"ORDER_1", "ORDER_2", "ORDER_3"}
 
 
 def test_later_split_child_sync_failure_retries_by_lot_step(monkeypatch):
@@ -197,10 +405,56 @@ def test_later_split_child_sync_failure_retries_by_lot_step(monkeypatch):
 
     assert proxy is not None
     assert proxy.id == "ORDER_1"
-    assert broker.submit_attempts == [1000, 400, 300]
-    assert [order["volume"] for order in broker.submitted_orders] == [1000, 300]
+    assert broker.submit_attempts == [1000, 400, 300, 100]
+    assert [order["volume"] for order in broker.submitted_orders] == [1000, 300, 100]
     assert broker._active_buys["ORDER_2"]["retries"] == 1
     assert not hasattr(broker, "_buffered_rejected_retries")
+
+
+def test_first_buy_sync_failure_downgrades_then_completes_remaining_quantity(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 100)
+
+    class FailFirstBuyBroker(MockBroker):
+        def __init__(self, initial_cash):
+            super().__init__(initial_cash)
+            self.submit_attempts = []
+
+        def _submit_order(self, data, volume, side, price):
+            self.submit_attempts.append(volume)
+            if len(self.submit_attempts) == 1:
+                return None
+            return super()._submit_order(data, volume, side, price)
+
+    broker = FailFirstBuyBroker(initial_cash=100000.0)
+    proxy = broker.order_target_value(_make_data(), target=10000.0)
+
+    assert proxy is not None
+    assert broker.submit_attempts == [1000, 900, 100]
+    assert [order["volume"] for order in broker.submitted_orders] == [900, 100]
+
+
+def test_first_sell_sync_failure_downgrades_then_completes_remaining_quantity(monkeypatch):
+    monkeypatch.setattr(config, "LOT_SIZE", 100)
+
+    class FailFirstSellBroker(MockBroker):
+        def __init__(self, initial_cash):
+            super().__init__(initial_cash)
+            self.submit_attempts = []
+
+        def _submit_order(self, data, volume, side, price):
+            self.submit_attempts.append(volume)
+            if len(self.submit_attempts) == 1:
+                return None
+            return super()._submit_order(data, volume, side, price)
+
+    broker = FailFirstSellBroker(initial_cash=100000.0)
+    broker.mock_position = 1000
+    proxy = broker.order_target_value(_make_data(), target=0.0)
+
+    assert proxy is not None
+    assert broker.submit_attempts == [1000, 900, 100]
+    assert [order["volume"] for order in broker.submitted_orders] == [900, 100]
+    assert proxy.batch_submitted_size == 1000
 
 
 def test_later_split_child_sync_failure_exhausts_shared_downgrade_and_alarms(monkeypatch):
@@ -425,7 +679,7 @@ def test_synchronous_rejected_buy_retries_immediately_without_false_success():
     assert broker._virtual_spent_cash == pytest.approx(100 * 10.0 * broker.safety_multiplier)
 
 
-def test_synchronous_rejected_sell_returns_none_and_does_not_pending():
+def test_synchronous_rejected_sell_retries_current_run_without_pending():
     """
     卖单同步拒绝时不能算作已提交；执行器上层应据此跳过后续买入。
     """
@@ -453,8 +707,8 @@ def test_synchronous_rejected_sell_returns_none_and_does_not_pending():
     proxy = broker.order_target_value(data, target=0.0)
 
     assert proxy is None, "同步拒绝的 SELL 不应返回成功代理。"
-    assert len(broker.submitted_orders) == 1
-    assert broker.submitted_orders[0]["status"] == "Rejected"
+    assert [order["volume"] for order in broker.submitted_orders] == [500, 400, 300, 200, 100]
+    assert all(order["status"] == "Rejected" for order in broker.submitted_orders)
     assert broker._pending_sells == set(), "同步拒绝的 SELL 不应进入 pending_sells。"
 
 
@@ -628,6 +882,36 @@ def test_stale_state_reset_cross_day():
     assert len(broker._pending_sells) == 0, "跨日后 _pending_sells 必须被清空"
 
 
+def test_keep_overnight_preserves_local_tracking_across_midnight():
+    broker = MockBroker(initial_cash=10000.0)
+    broker._keep_overnight_orders = True
+    broker.set_datetime(datetime(2026, 2, 16, 23, 59, 59))
+    broker._pending_sells.add("SELL_24X7")
+    broker._active_buys["BUY_24X7"] = {"shares": 0.1, "price": 1.0}
+    broker._virtual_spent_cash = 0.1
+
+    broker.set_datetime(datetime(2026, 2, 17, 0, 0, 1))
+
+    assert broker._pending_sells == {"SELL_24X7"}
+    assert "BUY_24X7" in broker._active_buys
+    assert broker._virtual_spent_cash == pytest.approx(0.1)
+
+
+def test_keep_overnight_preserves_tracking_across_long_24x7_bar_gap():
+    broker = MockBroker(initial_cash=10000.0)
+    broker._keep_overnight_orders = True
+    broker.set_datetime(datetime(2026, 2, 16, 23, 30, 0))
+    broker._pending_sells.add("SELL_24X7")
+    broker._active_buys["BUY_24X7"] = {"shares": 0.1, "price": 1.0}
+    broker._virtual_spent_cash = 0.1
+
+    broker.set_datetime(datetime(2026, 2, 17, 0, 30, 0))
+
+    assert broker._pending_sells == {"SELL_24X7"}
+    assert "BUY_24X7" in broker._active_buys
+    assert broker._virtual_spent_cash == pytest.approx(0.1)
+
+
 def test_risk_block_buy():
     """
     风控锁命中后，买单必须被物理拦截，不进入任何真实下单流程。
@@ -672,6 +956,117 @@ def test_lot_size_truncation():
     assert ret is None, "不足一手时应直接取消下单并返回 None"
     assert len(broker.submitted_orders) == 0, "碎片股拦截后不应有真实委托"
     assert broker._virtual_spent_cash == pytest.approx(0.0), "订单未提交时 _virtual_spent_cash 应保持 0"
+
+
+def test_near_integer_share_quantity_is_not_truncated_by_float_noise():
+    broker = MockBroker(initial_cash=2000.0)
+    data = _make_data()
+
+    ret = broker.order_target_value(data, target=999.999999999)
+
+    assert ret is not None
+    assert broker.submitted_orders[0]["volume"] == 100
+
+
+def test_cash_fit_below_min_lot_is_not_reported_as_rounding_error(monkeypatch, capsys):
+    import live_trader.adapters.base_broker as base_module
+
+    pushed = []
+    monkeypatch.setattr(
+        base_module.runtime_notifications,
+        "push_text",
+        lambda content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+    broker = MockBroker(initial_cash=125.0)
+    data = _make_data()
+
+    ret = broker.order_target_value(data, target=1000.0)
+
+    captured = capsys.readouterr()
+    assert ret is None
+    assert broker.submitted_orders == []
+    assert "insufficient for minimum lot 100" in captured.out
+    assert "订单取整后股数为0" not in captured.out
+    assert pushed == [{
+        "content": (
+            "[Broker Warning] Buy SHSE.600000 skipped. Cash (125.00) "
+            "insufficient for minimum lot 100; this is not a LOT_SIZE rounding error."
+        ),
+        "level": "WARNING",
+    }]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "target"),
+    [("order_target_value", 1000.0), ("order_target_percent", 0.5)],
+)
+def test_direct_live_target_order_fails_closed_when_pending_snapshot_untrusted(
+    monkeypatch, method_name, target
+):
+    import live_trader.adapters.base_broker as base_module
+
+    pushed = []
+    monkeypatch.setattr(
+        base_module.runtime_notifications,
+        "push_text",
+        lambda content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+    broker = MockBroker(initial_cash=10_000.0)
+    data = _make_data()
+
+    def _untrusted_pending():
+        broker._last_pending_orders_fetch_failed = True
+        broker._last_pending_orders_fetch_error = "pending query failed"
+        return []
+
+    broker.get_pending_orders = _untrusted_pending
+
+    ret = getattr(broker, method_name)(data, target=target)
+
+    assert ret is None
+    assert broker.submitted_orders == []
+    assert pushed and pushed[-1]["level"] == "ERROR"
+    assert "pending-order snapshot is unavailable or untrusted" in pushed[-1]["content"]
+
+
+def test_direct_live_target_order_retries_pending_snapshot_and_continues():
+    broker = MockBroker(initial_cash=10_000.0)
+    data = _make_data()
+    pending_reads = {"count": 0}
+
+    def _recovering_pending():
+        pending_reads["count"] += 1
+        if pending_reads["count"] < 3:
+            broker._last_pending_orders_fetch_failed = True
+            broker._last_pending_orders_fetch_error = "temporary pending query failure"
+            return []
+        broker._last_pending_orders_fetch_failed = False
+        broker._last_pending_orders_fetch_error = None
+        return []
+
+    broker.get_pending_orders = _recovering_pending
+
+    ret = broker.order_target_value(data, target=1000.0)
+
+    assert ret is not None
+    assert pending_reads["count"] == 3
+    assert [order["volume"] for order in broker.submitted_orders] == [100]
+
+
+def test_backtest_target_order_does_not_query_live_pending_snapshot():
+    broker = MockBroker(initial_cash=10_000.0)
+    broker.is_live = False
+    data = _make_data()
+
+    def _unexpected_pending_query():
+        raise AssertionError("backtest must not query live pending orders")
+
+    broker.get_pending_orders = _unexpected_pending_query
+
+    ret = broker.order_target_value(data, target=1000.0)
+
+    assert ret is not None
+    assert [order["volume"] for order in broker.submitted_orders] == [100]
 
 
 def test_target_percent_rebalance():

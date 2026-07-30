@@ -243,6 +243,9 @@ def test_order_executor_clears_local_pending_sell_when_remote_sell_empty(monkeyp
             self.sync_calls = 0
             self._pending_sells = set()
 
+        def get_position(self, data):
+            return SimpleNamespace(size=0, price=1.0)
+
         def order_target_value(self, data, target):
             self.calls.append((data._name, float(target)))
             if float(target) == 0.0:
@@ -274,6 +277,224 @@ def test_order_executor_clears_local_pending_sell_when_remote_sell_empty(monkeyp
     assert "SELL_LOCAL_1" not in broker._pending_sells
 
 
+def test_order_executor_tracks_all_split_sell_ids_and_total_cash_release(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+
+    def _fake_time():
+        return clock["t"]
+
+    def _fake_sleep(seconds):
+        clock["t"] += float(seconds)
+
+    monkeypatch.setattr(executor_module.time, "time", _fake_time)
+    monkeypatch.setattr(executor_module.time, "sleep", _fake_sleep)
+
+    class DummyBroker:
+        is_live = True
+
+        def __init__(self):
+            self.calls = []
+            self._pending_sells = set()
+
+        def get_position(self, data):
+            size = 1_486_700 if data._name == "SHSE.512010" and clock["t"] < 1.0 else 0
+            return SimpleNamespace(size=size, price=0.37)
+
+        def get_current_price(self, data):
+            return 0.37 if data._name == "SHSE.512010" else 1.13
+
+        def get_rebalance_cash(self):
+            return 14.09 if clock["t"] < 3.0 else 550_100.0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target), clock["t"]))
+            if data._name == "SHSE.512010":
+                self._pending_sells.update({"SELL_1", "SELL_2"})
+                return SimpleNamespace(
+                    id="SELL_1",
+                    batch_order_ids=("SELL_1", "SELL_2"),
+                    submitted_size=1_000_000,
+                    batch_submitted_size=1_486_700,
+                    batch_submit_failed=False,
+                )
+            return object()
+
+        def get_pending_orders(self):
+            return []
+
+        def sync_balance(self):
+            return None
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_POLL_SECONDS = 1.0
+    executor._POST_SELL_CASH_POLL_SECONDS = 1.0
+    executor._POST_SELL_CASH_WAIT_SECONDS = 5.0
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SHSE.512010")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="SHSE.513050"), 554_553.19)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [
+        ("SHSE.512010", 0.0, 0.0),
+        ("SHSE.513050", 554_553.19, 3.0),
+    ]
+    assert broker._pending_sells == set()
+
+
+def test_order_executor_blocks_buy_when_sell_ids_disappear_but_position_misses_target(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(executor_module.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        executor_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("t", clock["t"] + float(seconds)),
+    )
+    pushed = []
+    monkeypatch.setattr(
+        executor_module.runtime_notifications,
+        "push_text",
+        lambda content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+
+    class DummyBroker:
+        is_live = True
+
+        def __init__(self):
+            self.calls = []
+            self._pending_sells = set()
+            self._last_pending_orders_fetch_failed = False
+
+        def get_position(self, data):
+            size = 1_486_700 if not self.calls else 486_700
+            return SimpleNamespace(size=size, price=0.37)
+
+        def get_current_price(self, data):
+            return 0.37 if data._name == "SHSE.512010" else 1.13
+
+        def get_rebalance_cash(self):
+            return 550_100.0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            if data._name == "SHSE.512010":
+                return SimpleNamespace(
+                    id="SELL_1",
+                    batch_order_ids=("SELL_1", "SELL_2"),
+                    batch_submitted_size=1_486_700,
+                    batch_submit_failed=False,
+                )
+            return object()
+
+        def get_pending_orders(self):
+            return []
+
+        def sync_balance(self):
+            return None
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_WARN_SECONDS = 1.0
+    executor._SELL_SETTLE_HARD_SECONDS = 3.0
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SHSE.512010")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="SHSE.513050"), 554_553.19)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("SHSE.512010", 0.0)]
+    assert pushed and pushed[-1]["level"] == "ERROR"
+    assert "did not reach broker position targets" in pushed[-1]["content"]
+
+
+def test_order_executor_waits_for_accepted_sell_children_after_partial_batch_failure(monkeypatch):
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(executor_module.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        executor_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("t", clock["t"] + float(seconds)),
+    )
+    pushed = []
+    monkeypatch.setattr(
+        executor_module.runtime_notifications,
+        "push_text",
+        lambda content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+
+    class DummyBroker:
+        is_live = True
+
+        def __init__(self):
+            self.calls = []
+            self.pending_reads = 0
+            self._pending_sells = {"SELL_1"}
+            self._last_pending_orders_fetch_failed = False
+
+        def get_position(self, data):
+            size = 1_486_700 if not self.calls else (
+                1_486_700 if self.pending_reads < 2 else 486_700
+            )
+            return SimpleNamespace(size=size, price=0.37)
+
+        def get_current_price(self, data):
+            return 0.37
+
+        def get_rebalance_cash(self):
+            return 0.0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            return SimpleNamespace(
+                id="SELL_1",
+                batch_order_ids=("SELL_1",),
+                submitted_size=1_000_000,
+                batch_submitted_size=1_000_000,
+                batch_submit_failed=True,
+            )
+
+        def get_pending_orders(self):
+            self.pending_reads += 1
+            if self.pending_reads == 1:
+                return [{
+                    "id": "SELL_1",
+                    "symbol": "SHSE.512010",
+                    "direction": "SELL",
+                    "size": 1_000_000,
+                }]
+            return []
+
+        def sync_balance(self):
+            return None
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_POLL_SECONDS = 1.0
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SHSE.512010")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="SHSE.513050"), 554_553.19)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("SHSE.512010", 0.0), ("SHSE.513050", 554_553.19)]
+    assert broker.pending_reads >= 2, "已受理子单必须等待到可信终态后再结束本轮。"
+    assert broker._pending_sells == set()
+    assert pushed and pushed[0]["level"] == "ERROR"
+
+
 def test_order_executor_waits_for_post_sell_cash_snapshot_before_final_buy(monkeypatch):
     import common.order_executor as executor_module
 
@@ -299,7 +520,8 @@ def test_order_executor_waits_for_post_sell_cash_snapshot_before_final_buy(monke
             self.sell_submitted = False
 
         def get_position(self, data):
-            return SimpleNamespace(size=100 if data._name == "SPY.ARCA" else 0, price=100.0)
+            size = 100 if data._name == "SPY.ARCA" and not self.sell_submitted else 0
+            return SimpleNamespace(size=size, price=100.0)
 
         def get_current_price(self, data):
             return 100.0 if data._name == "SPY.ARCA" else 10.0
@@ -375,7 +597,8 @@ def test_order_executor_post_sell_cash_wait_times_out_and_continues(monkeypatch)
             self.sell_submitted = False
 
         def get_position(self, data):
-            return SimpleNamespace(size=100 if data._name == "SPY.ARCA" else 0, price=100.0)
+            size = 100 if data._name == "SPY.ARCA" and not self.sell_submitted else 0
+            return SimpleNamespace(size=size, price=100.0)
 
         def get_current_price(self, data):
             return 100.0 if data._name == "SPY.ARCA" else 10.0
@@ -411,7 +634,7 @@ def test_order_executor_post_sell_cash_wait_times_out_and_continues(monkeypatch)
     executor.execute_plan(plan)
 
     assert broker.calls[0] == ("SPY.ARCA", 0.0, 0.0)
-    assert broker.calls[1] == ("EWJ.ARCA", 11000.0, 3.0), "现金估算追不上时必须有界超时并继续执行。"
+    assert broker.calls[1] == ("EWJ.ARCA", 11000.0, 2.0), "现金估算追不上时必须有界超时并继续执行。"
     assert any(item["level"] == "WARNING" for item in pushed)
     assert any("现金快照仍低于本轮卖出释放预期" in item["content"] for item in pushed)
 
@@ -922,9 +1145,17 @@ def test_order_executor_delays_rolling_buy_and_tops_up_after_sell_clear(monkeypa
             self._pending_sells = set()
             self._active_buys = {}
             self.positions = {"SPY.ARCA": 100, "EWJ.ARCA": 0}
+            self.sell_submitted = False
 
         def get_position(self, data):
-            return SimpleNamespace(size=self.positions.get(data._name, 0), price=1.0)
+            size = self.positions.get(data._name, 0)
+            if (
+                data._name == "SPY.ARCA"
+                and self.sell_submitted
+                and clock["t"] >= self.sell_clear_after
+            ):
+                size = 0
+            return SimpleNamespace(size=size, price=1.0)
 
         def get_current_price(self, data):
             return 1.0
@@ -935,6 +1166,7 @@ def test_order_executor_delays_rolling_buy_and_tops_up_after_sell_clear(monkeypa
         def order_target_value(self, data, target):
             self.calls.append((data._name, float(target)))
             if data._name == "SPY.ARCA":
+                self.sell_submitted = True
                 self._pending_sells.add("SELL_LOCAL_1")
                 return SimpleNamespace(id="SELL_LOCAL_1", platform_order=SimpleNamespace(volume=100))
             self._active_buys[f"BUY_{len(self._active_buys) + 1}"] = {"data": data}
@@ -988,7 +1220,105 @@ def test_order_executor_delays_rolling_buy_and_tops_up_after_sell_clear(monkeypa
     ], "滚动 BUY 只有本地 active 但未出现在柜台 pending 快照时，不应继续补齐以免重复计算仓位。"
 
 
-def test_order_executor_warns_and_skips_buys_when_sell_not_submitted(monkeypatch):
+def test_order_executor_tops_up_customer_case_after_100_share_rolling_buy(monkeypatch):
+    import common.order_executor as executor_module
+
+    monkeypatch.setattr(executor_module.config, "LOT_SIZE", 100)
+    clock = {"t": 0.0}
+    monkeypatch.setattr(executor_module.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        executor_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("t", clock["t"] + float(seconds)),
+    )
+
+    sell_data = SimpleNamespace(_name="SHSE.512010")
+    buy_data = SimpleNamespace(_name="SHSE.513050")
+
+    class Broker:
+        is_live = True
+        safety_multiplier = 1.0
+
+        def __init__(self):
+            self.calls = []
+            self.buy_targets = []
+            self.accepted_buy_sizes = []
+            self.buy_size = 0
+            self._pending_sells = set()
+            self._active_buys = {}
+            self._last_pending_orders_fetch_failed = False
+
+        def get_position(self, data):
+            if data._name == sell_data._name:
+                size = 264_700 if clock["t"] < 360.0 else 0
+                return SimpleNamespace(size=size, price=0.373)
+            return SimpleNamespace(size=self.buy_size, price=1.132)
+
+        def get_current_price(self, data):
+            return 0.373 if data._name == sell_data._name else 1.132
+
+        def get_rebalance_cash(self):
+            return 120.0 if clock["t"] < 360.0 else 98_753.80
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target), clock["t"]))
+            if data._name == sell_data._name:
+                self._pending_sells.add("SELL_CUSTOMER")
+                return SimpleNamespace(
+                    id="SELL_CUSTOMER",
+                    submitted_size=264_700,
+                    batch_order_ids=("SELL_CUSTOMER",),
+                    batch_submitted_size=264_700,
+                    batch_submit_failed=False,
+                )
+
+            self.buy_targets.append(float(target))
+            if len(self.buy_targets) == 1:
+                self.accepted_buy_sizes.append(100)
+                self.buy_size = 100
+                self._active_buys["BUY_100"] = {"data": data}
+            else:
+                self.accepted_buy_sizes.append(87_200)
+                self.buy_size = 87_300
+            return object()
+
+        def get_pending_orders(self):
+            if clock["t"] >= 307.0:
+                self._active_buys.clear()
+            orders = []
+            if clock["t"] < 360.0:
+                orders.append({
+                    "id": "SELL_CUSTOMER",
+                    "symbol": sell_data._name,
+                    "direction": "SELL",
+                    "size": 264_700,
+                })
+            if "BUY_100" in self._active_buys:
+                orders.append({
+                    "id": "BUY_100",
+                    "symbol": buy_data._name,
+                    "direction": "BUY",
+                    "size": 100,
+                })
+            return orders
+
+        def sync_balance(self):
+            return None
+
+    broker = Broker()
+    executor = executor_module.OrderExecutor(broker)
+    executor.execute_plan({
+        "sell_clear": [sell_data],
+        "reduce": [],
+        "increase": [(buy_data, 98_883.86)],
+    })
+
+    assert broker.accepted_buy_sizes == [100, 87_200]
+    assert [round(value, 2) for value in broker.buy_targets] == [120.0, 98_883.86]
+    assert clock["t"] < 600.0
+
+
+def test_order_executor_uses_current_cash_when_sell_not_submitted(monkeypatch):
     import common.order_executor as executor_module
 
     pushed = []
@@ -1019,11 +1349,11 @@ def test_order_executor_warns_and_skips_buys_when_sell_not_submitted(monkeypatch
 
     executor.execute_plan(plan)
 
-    assert broker.calls == [("SPY.ARCA", 0.0)], "卖单未提交时不应继续买入。"
-    assert len(pushed) == 2, "应分别推送卖单未提交与跳过买入告警。"
+    assert broker.calls == [("SPY.ARCA", 0.0), ("EWJ.ARCA", 100000.0)]
+    assert len(pushed) == 2, "应分别推送卖单未提交与尽力执行告警。"
     assert all(item["level"] == "ERROR" for item in pushed)
     assert "SELL order not submitted" in pushed[0]["content"]
-    assert "Planned BUY orders are skipped" in pushed[1]["content"]
+    assert "cash-limited partial execution" in pushed[1]["content"]
 
 
 def test_order_executor_warns_when_buy_not_submitted(monkeypatch):

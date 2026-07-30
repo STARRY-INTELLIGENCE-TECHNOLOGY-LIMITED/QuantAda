@@ -579,11 +579,11 @@ def test_live_minutes_warmup_window_uses_full_timestamp(monkeypatch):
     assert calls, "分钟级初始化应触发至少一次 get_history。"
     first = calls[0]
 
-    expected_start = (pd.Timestamp(now) - pd.Timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    expected_start = (pd.Timestamp(now) - pd.Timedelta(minutes=1000 * 5)).strftime("%Y-%m-%d %H:%M:%S")
     expected_end = pd.Timestamp(now).strftime("%Y-%m-%d %H:%M:%S")
 
     assert first["timeframe"] == "Minutes", "分钟级配置应透传给 DataProvider。"
-    assert first["start_date"] == expected_start, "分钟级预热起点应保留完整时分秒。"
+    assert first["start_date"] == expected_start, "分钟级预热应按 bar 数限制并保留完整时分秒。"
     assert first["end_date"] == expected_end, "分钟级预热终点应保留完整时分秒。"
 
 
@@ -1086,6 +1086,64 @@ def test_on_order_status_callback_dedupes_duplicate_status(monkeypatch):
     assert strategy.notify_calls == 1, "重复状态回调应被去重，避免重复通知策略。"
 
 
+def test_on_order_status_callback_preserves_sub_eight_decimal_fill_precision():
+    import live_trader.engine as engine_module
+
+    class DummyOrderProxy:
+        def __init__(self, size):
+            self.id = "ORDER_TINY_FILL_1"
+            self.status = "Submitted"
+            self.data = SimpleNamespace(_name="CRYPTO.BTC.USD")
+            self.executed = SimpleNamespace(size=size, price=0.0, value=0.0, comm=0.0)
+
+        def is_buy(self):
+            return False
+
+        def is_sell(self):
+            return False
+
+        def is_completed(self):
+            return False
+
+        def is_rejected(self):
+            return False
+
+        def is_canceled(self):
+            return False
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
+            return False
+
+    class DummyBroker:
+        def convert_order_proxy(self, raw_order):
+            return DummyOrderProxy(raw_order.size)
+
+        def on_order_status(self, proxy):
+            pass
+
+    class DummyStrategy:
+        def __init__(self):
+            self.broker = DummyBroker()
+            self.notify_calls = 0
+
+        def notify_order(self, order):
+            self.notify_calls += 1
+
+    strategy = DummyStrategy()
+    context = SimpleNamespace(
+        strategy_instance=strategy,
+        now=datetime(2026, 2, 17, 10, 10, 0),
+    )
+
+    engine_module.on_order_status_callback(context, SimpleNamespace(size=0.0000000001))
+    engine_module.on_order_status_callback(context, SimpleNamespace(size=0.0000000002))
+
+    assert strategy.notify_calls == 2
+
+
 def test_on_order_status_callback_partial_fill_does_not_push_trade_alarm(monkeypatch):
     """
     成交推送降噪:
@@ -1337,7 +1395,7 @@ def test_on_order_status_callback_pushes_cancelled_alarm(monkeypatch):
             self.status = "Cancelled"
             self.data = SimpleNamespace(_name="PSQ.ARCA")
             self.executed = SimpleNamespace(size=0.0, price=0.0, value=0.0, comm=0.0)
-            self.trade = SimpleNamespace(order=SimpleNamespace(totalQuantity=100.0))
+            self.trade = SimpleNamespace(order=SimpleNamespace(totalQuantity=0.0000000001))
 
         def is_buy(self):
             return True
@@ -1399,6 +1457,7 @@ def test_on_order_status_callback_pushes_cancelled_alarm(monkeypatch):
     assert len(cancel_msgs) == 1, "撤单终态应推送一次撤单通知。"
     assert "Cancelled" in cancel_msgs[0]["content"]
     assert "PSQ.ARCA" in cancel_msgs[0]["content"]
+    assert "0.0000000001" in cancel_msgs[0]["content"]
 
 
 def test_refresh_live_data_rebases_window_for_daily(monkeypatch):
@@ -1680,7 +1739,7 @@ def test_refresh_live_minutes_rebase_then_incremental_same_day(monkeypatch):
 
     calls = engine.data_provider.history_calls
     assert len(calls) >= 3, "初始化 + 两次刷新应至少触发 3 次 get_history。"
-    assert calls[1]["start_date"] == "2026-02-05 10:20:00", "分钟级当天首刷应使用窗口全量重基准。"
+    assert calls[1]["start_date"] == "2026-02-06 23:00:00", "分钟级当天首刷应使用固定的 1000 bars 窗口重基准。"
     assert calls[2]["start_date"] == "2026-02-10 10:05:00", "同日后续刷新应回退 3*compression 分钟做增量。"
 
     refreshed_df = engine.broker.datas[0].p.dataname
@@ -1688,6 +1747,37 @@ def test_refresh_live_minutes_rebase_then_incremental_same_day(monkeypatch):
     assert refreshed_df.loc[pd.Timestamp("2026-02-10 10:20:00"), "close"] == pytest.approx(30.3), (
         "重复分钟应保留增量新值（keep='last'）。"
     )
+
+
+def test_refresh_live_seconds_uses_bounded_bar_window():
+    frame = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+        index=[pd.Timestamp("2026-02-10 10:00:00")],
+    )
+    calls = []
+
+    class Provider:
+        def get_history(self, symbol, start_date, end_date, timeframe="Days", compression=1):
+            calls.append((start_date, end_date, timeframe, compression))
+            return frame.copy()
+
+    trader = object.__new__(LiveTrader)
+    trader.config = {
+        "timeframe": "Seconds",
+        "compression": 5,
+    }
+    trader.broker = SimpleNamespace(
+        datas=[SimpleNamespace(_name="CRYPTO.BTC.USD", p=SimpleNamespace(dataname=frame.copy()))]
+    )
+    trader.data_provider = Provider()
+    trader._intraday_rebase_done_on = {}
+
+    stats = trader._refresh_live_data(
+        SimpleNamespace(now=pd.Timestamp("2026-02-10 10:10:00"))
+    )
+
+    assert calls == [("2026-02-10 08:46:40", "2026-02-10 10:10:00", "Seconds", 5)]
+    assert stats == {"total_feeds": 1, "updated_feeds": 1, "failed_feeds": 0}
 
 
 def test_live_run_recovers_data_feeds_when_init_has_none(monkeypatch):
@@ -2132,6 +2222,109 @@ def test_stale_strategy_order_not_cleared_when_pending_snapshot_untrusted(monkey
 
     assert engine.strategy.order is stale_order
     assert engine.strategy.next_calls == 0
+
+
+def test_live_run_blocks_on_untrusted_pending_snapshot_without_strategy_order(monkeypatch):
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    cfg = {
+        "strategy_name": "CounterStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "params": {},
+        "KEEP_OVERNIGHT_ORDERS": True,
+    }
+    engine = LiveTrader(cfg)
+    context = MockContext(now=datetime(2026, 3, 3, 9, 30, 0))
+    engine.init(context)
+    engine._refresh_live_data = lambda _ctx: {
+        "total_feeds": 1,
+        "updated_feeds": 1,
+        "failed_feeds": 0,
+    }
+
+    pushed = []
+    monkeypatch.setattr(
+        type(engine.alarm_manager),
+        "push_text",
+        lambda self, content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+
+    def _untrusted_empty_pending():
+        engine.broker._last_pending_orders_fetch_failed = True
+        engine.broker._last_pending_orders_fetch_error = "pending snapshot unavailable"
+        return []
+
+    engine.broker.get_pending_orders = _untrusted_empty_pending
+    assert engine.strategy.order is None
+
+    engine.run(context)
+
+    assert engine.strategy.next_calls == 0
+    assert pushed and pushed[-1]["level"] == "ERROR"
+    assert "pending-order snapshot remained unavailable" in pushed[-1]["content"]
+
+
+def test_live_run_retries_transient_pending_failure_then_executes_strategy(monkeypatch):
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    cfg = {
+        "strategy_name": "CounterStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "params": {},
+        "KEEP_OVERNIGHT_ORDERS": True,
+    }
+    engine = LiveTrader(cfg)
+    context = MockContext(now=datetime(2026, 3, 3, 9, 30, 0))
+    engine.init(context)
+    engine._refresh_live_data = lambda _ctx: {
+        "total_feeds": 1,
+        "updated_feeds": 1,
+        "failed_feeds": 0,
+    }
+    pending_reads = {"count": 0}
+
+    def _recovering_pending():
+        pending_reads["count"] += 1
+        if pending_reads["count"] < 3:
+            engine.broker._last_pending_orders_fetch_failed = True
+            engine.broker._last_pending_orders_fetch_error = "temporary pending failure"
+            return []
+        engine.broker._last_pending_orders_fetch_failed = False
+        engine.broker._last_pending_orders_fetch_error = None
+        return []
+
+    engine.broker.get_pending_orders = _recovering_pending
+
+    engine.run(context)
+
+    assert pending_reads["count"] == 3
+    assert engine.strategy.next_calls == 1
 
 
 def test_live_run_skips_overnight_cleanup_when_keep_overnight_orders_true(monkeypatch):

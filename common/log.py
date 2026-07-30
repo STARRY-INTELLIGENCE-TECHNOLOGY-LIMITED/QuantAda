@@ -1,6 +1,7 @@
 import datetime
 
 import config
+from common.order_quantity import format_quantity
 
 
 def coerce_dt(dt):
@@ -214,5 +215,6 @@ def signal(action, symbol, size, price, tag="信号触发", dt=None):
 
         time_str = _fmt_dt(dt)
         # 使用 safe_size 和 safe_price 打印
+        size_text = format_quantity(safe_size)
         print(
-            f"[{action_tag}] [{tag}] {time_str} {act_cn} {symbol:<12} 数量: {int(safe_size):<8} 价格: {safe_price:.2f} (约 {val_str})")
+            f"[{action_tag}] [{tag}] {time_str} {act_cn} {symbol:<12} 数量: {size_text:<12} 价格: {safe_price:.2f} (约 {val_str})")

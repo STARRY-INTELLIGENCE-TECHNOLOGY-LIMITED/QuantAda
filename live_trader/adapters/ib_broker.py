@@ -18,9 +18,11 @@ from common.live_process_supervisor import (
     is_live_worker_restart,
     report_live_worker_state,
 )
+from common.live_execution_budget import live_run_seconds_remaining
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
 from common.ib_symbol_parser import resolve_ib_contract_spec
+from common.order_quantity import positive_quantity
 import config
 from data_providers.csv_provider import CsvDataProvider
 from data_providers.manager import DataManager
@@ -483,8 +485,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             source_data = self._query_account_rows(
                 'accountSummary', configured_account, debug_info['summary_attempts']
             )
-            if not source_data and hasattr(self.ib, 'sleep'):
-                self.ib.sleep(0.5)
+            if not source_data and self._sleep_ib(0.5) > 0:
                 source_data = self._query_account_rows(
                     'accountSummary', configured_account, debug_info['summary_attempts'], note=' [retry]'
                 )
@@ -778,7 +779,8 @@ class IBBrokerAdapter(BaseLiveBroker):
             price = self._extract_price_from_ticker(ticker)
             if price > 0:
                 return price
-            self._sleep_ib(0.05)
+            if self._sleep_ib(0.05) <= 0:
+                break
         return self._extract_price_from_ticker(ticker)
 
     def _safe_pending_id(self, trade) -> str:
@@ -812,6 +814,44 @@ class IBBrokerAdapter(BaseLiveBroker):
             if acct:
                 return acct
         return ''
+
+    def _find_data_for_contract(self, contract):
+        target_symbol = str(getattr(contract, 'symbol', '') or '').strip().upper()
+        target_local = str(getattr(contract, 'localSymbol', '') or '').strip().upper()
+        target_sec_type = str(getattr(contract, 'secType', '') or '').strip().upper()
+        target_currency = str(getattr(contract, 'currency', '') or '').strip().upper()
+        if not target_symbol and not target_local:
+            return None
+
+        sec_type_by_kind = {'stock': 'STK', 'forex': 'CASH', 'crypto': 'CRYPTO'}
+        for data in self.datas:
+            data_name = str(getattr(data, '_name', '') or '').strip()
+            if not data_name:
+                continue
+            try:
+                spec = resolve_ib_contract_spec(data_name)
+            except Exception:
+                continue
+
+            kind = spec.get('kind')
+            expected_sec_type = sec_type_by_kind.get(kind, '')
+            if target_sec_type and expected_sec_type and target_sec_type != expected_sec_type:
+                continue
+
+            if kind == 'forex':
+                pair = str(spec.get('pair', '') or '').strip().upper()
+                expected_symbol = pair[:-3] if len(pair) >= 6 else pair
+                expected_currency = pair[-3:] if len(pair) >= 6 else ''
+            else:
+                expected_symbol = str(spec.get('symbol', '') or '').strip().upper()
+                expected_currency = str(spec.get('currency', '') or '').strip().upper()
+
+            if target_currency and expected_currency and target_currency != expected_currency:
+                continue
+            if expected_symbol in {target_symbol, target_local}:
+                return data
+
+        return None
 
     def _connected_client_id(self):
         try:
@@ -874,15 +914,20 @@ class IBBrokerAdapter(BaseLiveBroker):
         except Exception:
             wait_s = 0.0
         if wait_s <= 0:
-            return
+            return 0.0
+
+        wait_s = min(wait_s, live_run_seconds_remaining(self))
+        if wait_s <= 0:
+            return 0.0
 
         if hasattr(self, 'ib') and self.ib and hasattr(self.ib, 'sleep') and not self._in_async_task():
             try:
                 self.ib.sleep(wait_s)
-                return
+                return wait_s
             except Exception:
                 pass
         time.sleep(wait_s)
+        return wait_s
 
     def _find_trade_by_pending_id(self, pending_id: str):
         for t in self._collect_open_trades(force_refresh_all=True, include_trade_cache=False):
@@ -921,7 +966,9 @@ class IBBrokerAdapter(BaseLiveBroker):
             if not self._is_trade_still_pending(trade):
                 return True
             if idx < checks - 1:
-                self._sleep_ib(sleep_seconds)
+                slept = self._sleep_ib(sleep_seconds)
+                if slept is not None and slept <= 0:
+                    break
         return False
 
     def _collect_open_trades(self, force_refresh_all=False, include_trade_cache=False):
@@ -1007,10 +1054,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 if not order or not status:
                     continue
 
-                try:
-                    rem = float(getattr(status, 'remaining', 0) or 0)
-                except Exception:
-                    rem = 0.0
+                rem = positive_quantity(getattr(status, 'remaining', 0) or 0)
                 raw_status = str(getattr(status, 'status', '') or '').strip()
                 norm_status = raw_status.upper()
 
@@ -1029,7 +1073,12 @@ class IBBrokerAdapter(BaseLiveBroker):
                     if rem <= 0:
                         continue
 
-                symbol = str(getattr(contract, 'symbol', '') or '').strip()
+                matched_data = self._find_data_for_contract(contract)
+                symbol = (
+                    str(getattr(matched_data, '_name', '') or '').strip()
+                    if matched_data is not None
+                    else str(getattr(contract, 'symbol', '') or '').strip()
+                )
                 oid = self._safe_pending_id(t)
                 action = str(getattr(order, 'action', '') or '').strip().upper()
                 res.append({
@@ -1280,7 +1329,8 @@ class IBBrokerAdapter(BaseLiveBroker):
         if not in_loop:
             start_wait = datetime.datetime.now()
             while (datetime.datetime.now() - start_wait).total_seconds() < 1.0:
-                self.ib.sleep(0.1)
+                if self._sleep_ib(0.1) <= 0:
+                    break
                 if self._extract_rate_from_ticker(ticker) > 0:
                     break
         return ticker
@@ -1415,7 +1465,8 @@ class IBBrokerAdapter(BaseLiveBroker):
             import time
             start_time = time.time()
             while time.time() - start_time < 1.0:
-                self.ib.sleep(0.01)  # 允许较短的协作式让出
+                if self._sleep_ib(0.01) <= 0:
+                    break
                 if ticker.marketPrice() == ticker.marketPrice() and ticker.marketPrice() > 0:
                     break
 
@@ -1507,8 +1558,11 @@ class IBBrokerAdapter(BaseLiveBroker):
         return selected
 
     def _build_price_window(self, now_ts: pd.Timestamp, timeframe: str, compression: int):
-        if timeframe == 'Minutes':
-            start_ts = now_ts - pd.Timedelta(days=2)
+        if timeframe in {'Minutes', 'Seconds'}:
+            if timeframe == 'Minutes':
+                start_ts = now_ts - pd.Timedelta(minutes=max(1, int(compression or 1)) * 3)
+            else:
+                start_ts = now_ts - pd.Timedelta(seconds=max(1, int(compression or 1)) * 3)
             return (
                 start_ts.strftime('%Y-%m-%d %H:%M:%S'),
                 now_ts.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1589,29 +1643,28 @@ class IBBrokerAdapter(BaseLiveBroker):
         contract = self.parse_contract(data._name)
         action = 'BUY' if side == 'BUY' else 'SELL'
 
-        try:
-            raw_volume = abs(float(volume))
-        except Exception:
-            raw_volume = 0.0
+        raw_volume = positive_quantity(volume)
 
         # 默认禁用 API 小数股卖单，避免在不支持分数股的 IB 账户触发 10243 拒单。
         # 如账户已确认支持，可显式在 config 中开启 IBKR_ALLOW_FRACTIONAL_SELL=True。
         allow_fractional_sell = bool(getattr(config, 'IBKR_ALLOW_FRACTIONAL_SELL', False))
-        should_use_fractional_sell = (
-            side == 'SELL'
-            and allow_fractional_sell
-            and raw_volume > 0
-            and abs(raw_volume - round(raw_volume)) > 1e-9
+        contract_type = str(getattr(contract, 'secType', '') or '').upper()
+        should_use_fractional = (
+            raw_volume > 0
+            and not float(raw_volume).is_integer()
+            and (
+                contract_type == 'CRYPTO'
+                or (side == 'SELL' and allow_fractional_sell)
+            )
         )
-        if should_use_fractional_sell:
-            volume_final = round(raw_volume, 6)
+        if should_use_fractional:
+            volume_final = raw_volume
         else:
-            # 买单维持整数向下取整，防止超额占资
             volume_final = int(raw_volume)
 
         # 防止零股交易
         if volume_final <= 0:
-            print(f"[IB Warning] Order size < 1 (raw: {volume}), skipped.")
+            print(f"[IB Warning] Order size <= 0 (raw: {volume}), skipped.")
             return None
 
         configured_account = self._configured_order_account()
@@ -1667,23 +1720,10 @@ class IBBrokerAdapter(BaseLiveBroker):
         trade = raw_trade_or_order
         # 如果传入的只是 Order 对象（没有 Trade 包装），可能需要特殊处理或者在 IB 回调入口处统一封装
 
-        # 查找 Data
-        target_symbol = ""
-        if hasattr(trade, 'contract'):
-            target_symbol = trade.contract.symbol
-        elif hasattr(trade, 'symbol'):  # 万一是 Contract
-            target_symbol = trade.symbol
-
-        matched_data = None
-        # 简单的符号匹配逻辑 (可能需要根据 IBBrokerAdapter.parse_contract 的逆逻辑来匹配)
-        for d in self.datas:
-            # 提取策略层命名中的基础代码 (例如将 'AAPL.SMART' 提取为 'AAPL')
-            base_name = d._name.split('.')[0].upper()
-
-            # 使用精确等于 (==) 而非包含 (in)
-            if base_name == target_symbol.upper():
-                matched_data = d
-                break
+        contract = getattr(trade, 'contract', None)
+        if contract is None and hasattr(trade, 'symbol'):
+            contract = trade
+        matched_data = self._find_data_for_contract(contract) if contract is not None else None
 
         return IBOrderProxy(trade, data=matched_data)
 
@@ -1735,11 +1775,17 @@ class IBBrokerAdapter(BaseLiveBroker):
                 if parsed_schedule is None:
                     _runtime_print(
                         f">>> ⚠️ Unsupported schedule format for IB adapter: {schedule_rule}. "
-                        "Expected: 1d|Nm|Nh:HH:MM[:SS]"
+                        "Expected: 1d|Ns|Nm|Nh:HH:MM[:SS]"
                     )
             except Exception as e:
                 _runtime_print(f">>> ⚠️ Invalid schedule config: {schedule_rule}. Error: {e}")
                 parsed_schedule = None
+        event_loop_poll_seconds = 1.0
+        if parsed_schedule:
+            event_loop_poll_seconds = min(
+                1.0,
+                max(0.05, float(parsed_schedule.get('interval_seconds') or 1.0) / 5.0),
+            )
 
         try:
             prewarm_lead_seconds = SchedulePlanner.parse_schedule_prewarm_lead(
@@ -1832,18 +1878,9 @@ class IBBrokerAdapter(BaseLiveBroker):
             target_symbols = symbols
 
         # 注册回调
-        async def on_trade_update(trade):
-            # 在这里拦截卖单，安全地异步等待 1 秒
-            # 这会让出控制权给 Event Loop，使其有时间处理 IB 推送过来的 AccountValue 更新
-            try:
-                order_proxy = trader.broker.convert_order_proxy(trade)
-                should_wait_for_cash = bool(order_proxy.is_sell()) and bool(order_proxy.is_completed())
-            except Exception:
-                should_wait_for_cash = False
-
-            if should_wait_for_cash:
-                await asyncio.sleep(1.0)
-
+        def on_trade_update(trade):
+            # Broker state must observe terminal updates immediately. Post-sell
+            # cash propagation is bounded centrally by OrderExecutor.
             on_order_status_callback(ctx, trade)
 
         ib.orderStatusEvent += on_trade_update
@@ -1947,7 +1984,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                         detail="IB event-loop progress deadline",
                         refresh_deadline=True,
                     )
-                    ib.sleep(1)
+                    ib.sleep(event_loop_poll_seconds)
 
                     # 基于时区的时间计算
                     if target_tz:
