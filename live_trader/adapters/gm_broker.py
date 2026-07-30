@@ -603,9 +603,9 @@ class GmBrokerAdapter(BaseLiveBroker):
         if schedule_rule:
             try:
                 parsed_schedule = SchedulePlanner.parse_schedule_rule(schedule_rule)
-            except Exception as e:
-                _runtime_print(f"[GmBroker Warning] Invalid schedule config: {schedule_rule}. Error: {e}")
-                parsed_schedule = None
+            except ValueError as e:
+                _runtime_print(f"[GmBroker Error] Invalid schedule config: {schedule_rule}. Error: {e}")
+                raise
         try:
             prewarm_lead_seconds = SchedulePlanner.parse_schedule_prewarm_lead(
                 getattr(config, 'LIVE_SCHEDULE_PREWARM_LEAD', 0)
@@ -618,7 +618,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             if parsed_schedule is None:
                 _runtime_print(
                     "[GmBroker Warning] Prewarm currently supports schedule format "
-                    "1d|Ns|Nm|Nh:HH:MM[:SS]. Prewarm disabled."
+                    "1d|Nm|Nh:HH:MM[:SS]. Prewarm disabled."
                 )
             elif prewarm_lead_seconds >= float(parsed_schedule.get('interval_seconds') or 0.0):
                 _runtime_print(

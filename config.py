@@ -8,7 +8,7 @@ LOT_SIZE = 1
 BROKER_LOT_LIMITS = 0
 
 # 单次实盘 run 的最长执行预算（秒）。所有等待、查询重试、拆单和降级共享该截止时间。
-# 秒/分钟/小时 schedule 会自动缩短为调度间隔的 80%，避免上一轮占住下一轮。
+# 分钟/小时 schedule 会自动缩短为调度间隔的 80%，避免上一轮占住下一轮。
 LIVE_RUN_MAX_EXECUTION_SECONDS = 600
 
 # 年交易日，如果是加密货币请设置为365

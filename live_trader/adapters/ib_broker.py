@@ -1775,11 +1775,11 @@ class IBBrokerAdapter(BaseLiveBroker):
                 if parsed_schedule is None:
                     _runtime_print(
                         f">>> ⚠️ Unsupported schedule format for IB adapter: {schedule_rule}. "
-                        "Expected: 1d|Ns|Nm|Nh:HH:MM[:SS]"
+                        "Expected: 1d|Nm|Nh:HH:MM[:SS]"
                     )
-            except Exception as e:
-                _runtime_print(f">>> ⚠️ Invalid schedule config: {schedule_rule}. Error: {e}")
-                parsed_schedule = None
+            except ValueError as e:
+                _runtime_print(f">>> ❌ Invalid schedule config: {schedule_rule}. Error: {e}")
+                raise
         event_loop_poll_seconds = 1.0
         if parsed_schedule:
             event_loop_poll_seconds = min(

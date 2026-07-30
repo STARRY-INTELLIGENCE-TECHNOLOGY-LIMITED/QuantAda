@@ -126,8 +126,13 @@ def test_budget_resolution_is_bounded_and_schedule_aware():
     ) == 240.0
     assert resolve_live_run_budget_seconds(
         {"LIVE_RUN_MAX_EXECUTION_SECONDS": 600},
-        SimpleNamespace(schedule_rule="5s:00:00:00"),
-    ) == 4.0
+        SimpleNamespace(schedule_rule="1m:00:00:00"),
+    ) == 48.0
+    with pytest.raises(ValueError, match="Second-level schedule.*not supported"):
+        resolve_live_run_budget_seconds(
+            {"LIVE_RUN_MAX_EXECUTION_SECONDS": 600},
+            SimpleNamespace(schedule_rule="5s:00:00:00"),
+        )
     assert resolve_live_run_budget_seconds(
         {
             "LIVE_RUN_MAX_EXECUTION_SECONDS": 600,

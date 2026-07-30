@@ -50,19 +50,25 @@ class SchedulePlanner:
         """
         解析通用实盘调度规则，支持:
         - 1d:HH:MM[:SS]
-        - Ns:HH:MM[:SS]
         - Nm:HH:MM[:SS]
         - Nh:HH:MM[:SS]
 
         语义:
         - 1d: 每日固定时刻触发
-        - Ns/Nm/Nh: 以 time 为每日 anchor，在当天内按固定频率重复触发
+        - Nm/Nh: 以 time 为每日 anchor，在当天内按固定频率重复触发
         """
         if not schedule_rule or not isinstance(schedule_rule, str):
             return None
 
         raw = str(schedule_rule).strip().lower()
-        matched = re.fullmatch(r'(\d+)([sdmh]):(\d{1,2}):(\d{2})(?::(\d{2}))?', raw)
+        if re.match(r'^\d+s(?:$|:)', raw):
+            raise ValueError(
+                f"Second-level schedule '{schedule_rule}' is not supported. "
+                "Use a long-lived broker connection with event-driven bars/ticks and "
+                "timeframe='Seconds' instead. Supported schedule frequencies: 1d, Nm, Nh."
+            )
+
+        matched = re.fullmatch(r'(\d+)([dmh]):(\d{1,2}):(\d{2})(?::(\d{2}))?', raw)
         if not matched:
             return None
 
@@ -79,7 +85,7 @@ class SchedulePlanner:
         if freq_unit == 'd' and freq_n != 1:
             raise ValueError(f"Unsupported daily schedule frequency: {schedule_rule}")
 
-        unit_seconds = {'s': 1, 'm': 60, 'h': 3600}
+        unit_seconds = {'m': 60, 'h': 3600}
         interval_seconds = 86400 if freq_unit == 'd' else freq_n * unit_seconds[freq_unit]
         return {
             'raw': schedule_rule,

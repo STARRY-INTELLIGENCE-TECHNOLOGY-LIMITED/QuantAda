@@ -676,6 +676,24 @@ def test_gm_schedule_prewarm_time_rule_uses_common_live_helper():
     assert SchedulePlanner.build_schedule_prewarm_time_rule("5m:14:45:00", 300.0) is None
 
 
+def test_gm_launch_rejects_second_schedule_before_sdk_start(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    sdk_calls = []
+    monkeypatch.setattr(gm_module, "set_token", lambda token: sdk_calls.append(("set_token", token)))
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: sdk_calls.append(("gmi_init", None)))
+
+    with pytest.raises(ValueError, match="Second-level schedule.*not supported") as exc_info:
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id", "schedule": "5s:00:00:00"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    assert "timeframe='Seconds'" in str(exc_info.value)
+    assert sdk_calls == []
+
+
 def test_gm_schedule_preview_uses_common_live_helper():
     parsed = SchedulePlanner.parse_schedule_rule("1h:09:30:00")
 

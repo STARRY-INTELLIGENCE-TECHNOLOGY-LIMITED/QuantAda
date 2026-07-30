@@ -31,6 +31,8 @@ def resolve_live_run_budget_seconds(runtime_config=None, context=None):
             parsed = SchedulePlanner.parse_schedule_rule(schedule_rule)
             if parsed:
                 interval_seconds = float(parsed.get('interval_seconds') or 0.0)
+        except ValueError:
+            raise
         except Exception:
             interval_seconds = None
 

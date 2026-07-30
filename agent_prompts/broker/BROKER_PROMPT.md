@@ -60,7 +60,7 @@
 - `@staticmethod` `is_live_mode(context) -> bool`: 判断当前上下文是否为实盘模式。
 - `@classmethod` `launch(cls, conn_cfg: dict, strategy_path: str, params: dict, **kwargs)`: [可选实现] 命令行实盘启动入口，负责初始化券商 SDK、建立连接并挂载事件循环。
 - 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
-- schedule 需兼容 `1d|Ns|Nm|Nh:HH:MM[:SS]`。秒级事件循环轮询和 SDK 超时必须随周期缩短，不能让一次调用跨过下一轮。
+- schedule 只兼容 `1d|Nm|Nh:HH:MM[:SS]`；配置 `Ns` 必须明确报错，并引导使用长连接事件回调与 `timeframe='Seconds'`。分钟级事件循环轮询和 SDK 超时必须随周期缩短，不能让一次调用跨过下一轮。
 - `DataProvider` 子类: 必须让引擎能通过当前 adapter 模块直接发现；如果历史数据能力来自现有 provider，也请在本文件中提供桥接类，而不是只写说明文字。
 
 ---
@@ -80,7 +80,7 @@
 10. 卖后现金等待、滚动买入和最终补齐属于 `common.order_executor` 职责；adapter 不要重复实现这些流程，只暴露真实现金、价格、在途订单和订单代理字段。
 11. 使用 SDK 事件循环的实盘 adapter 必须把 SDK 线程/轮询/协作等待函数抛出的非人工 `SystemExit` 当作 session 退出并交给 Phoenix 重启；不要让 nohup 长进程被 SDK 直接带退出。GM `gmi_poll()` 的普通非零返回值按官方循环语义限频记录并继续，不能因无消息的 `-1` 持续重建 worker；明确 shutdown、`SystemExit` 和连接健康超时仍须重启。人工 `KeyboardInterrupt` 仍应退出。schedule prewarm 和正式 run 都应按目标 slot 去重，长进程 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带时间戳。GM 这类进程内 SDK 若 init 失败，应先重绑 token/server/callback 并 soft reset；连续 init 失败可 re-exec 当前进程作为最后自愈。
 12. 通过 `run.py --connect` 运行时，通用父进程监督器负责进程级保活与探活；worker 进入 broker SDK 前必须推送一次 `STARTED`，同一 worker 进程内不得重复发送；adapter 应在 native SDK 初始化/连接阶段上报短生命周期健康状态和有界超时。监督器发现 worker 退出、heartbeat 停滞或健康期限超时后，以原始命令冷启动并记录退出码/信号；连接维护等降噪策略必须通过结构化故障类别传递，不得解析状态或原因文本。受监督 worker 的内部重启不重复推 `STOPPED` / `DEAD`；操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。配置 `1d` schedule 时，每个自然日在正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`。GM 维护期连接故障可在该同一边界（或更早 prewarm）前低频探测，但不能停探；边界到达必须通过 heartbeat/干净重建切回积极恢复，区间 schedule 的等待不得跨 slot，无有效 schedule 时不得降频。监督器不得保存或重放交易意图，回测/优化不得启动该链路。
-13. 每次实盘 `run` 从隔夜清理前共享一个 monotonic deadline：默认最多 600 秒，高频 schedule 自动缩短为间隔的 80%。pending 查询、撤单、数据恢复、SELL 等待、资金等待、BUY/SELL 拆单和 BUY 降级都必须在该 deadline 内；到期后停止发起新动作但保留已受理/成交的部分结果。异步拒单只能沿用原订单提交时的 deadline，不能借下一轮预算重放旧意图。所有 SDK 查询/撤单/发单接口必须设置明显短于该预算的有限超时；回测/优化不得进入此机制。
+13. 每次实盘 `run` 从隔夜清理前共享一个 monotonic deadline：默认最多 600 秒，分钟/小时 schedule 或 `Minutes|Seconds` timeframe 自动缩短为触发间隔的 80%。pending 查询、撤单、数据恢复、SELL 等待、资金等待、BUY/SELL 拆单和 BUY 降级都必须在该 deadline 内；到期后停止发起新动作但保留已受理/成交的部分结果。异步拒单只能沿用原订单提交时的 deadline，不能借下一轮预算重放旧意图。所有 SDK 查询/撤单/发单接口必须设置明显短于该预算的有限超时；回测/优化不得进入此机制。
 14. 24x7 市场配置 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日必须保留远端委托以及本地 `_active_buys`、`_pending_sells`、虚拟占资的短期跟踪；仍须持续用实时柜台状态对账，不能将这些跟踪演化为跨 K 交易意图。
 
 ---

@@ -1145,19 +1145,35 @@ def test_ib_interval_schedule_parse_and_trigger_inside_slot_window():
     assert slot_key_before_anchor is None
 
 
-def test_ib_second_schedule_parse_and_trigger():
-    parsed = SchedulePlanner.parse_schedule_rule("5s:00:00:00")
+@pytest.mark.parametrize("schedule_rule", ["5s:00:00:00", "5s"])
+def test_second_schedule_is_rejected_with_event_driven_guidance(schedule_rule):
+    with pytest.raises(ValueError, match="Second-level schedule.*not supported") as exc_info:
+        SchedulePlanner.parse_schedule_rule(schedule_rule)
 
-    assert parsed["freq_unit"] == "s"
-    assert parsed["interval_seconds"] == pytest.approx(5.0)
-    should_run, delta, slot_key = SchedulePlanner.should_trigger_schedule(
-        now=datetime.datetime(2026, 2, 27, 0, 0, 10, 200000),
-        parsed_schedule=parsed,
-        last_schedule_run_key=None,
-    )
-    assert should_run is True
-    assert delta == pytest.approx(0.2)
-    assert slot_key == "2026-02-27 00:00:10"
+    message = str(exc_info.value)
+    assert "timeframe='Seconds'" in message
+    assert "1d, Nm, Nh" in message
+
+
+def test_ib_launch_rejects_second_schedule_before_sdk_connect(monkeypatch):
+    import config
+
+    ib_instances = []
+    monkeypatch.setattr(config, "IBKR_HOST", "127.0.0.1", raising=False)
+    monkeypatch.setattr(config, "IBKR_PORT", 7497, raising=False)
+    monkeypatch.setattr(config, "IBKR_CLIENT_ID", 7, raising=False)
+    monkeypatch.setattr(mock_ib_insync, "IB", lambda: ib_instances.append(object()))
+
+    with pytest.raises(ValueError, match="Second-level schedule.*not supported") as exc_info:
+        IBBrokerAdapter.launch(
+            {"schedule": "5s:00:00:00"},
+            strategy_path="sample_strategy",
+            params={},
+            symbols=["AAPL.SMART"],
+        )
+
+    assert "timeframe='Seconds'" in str(exc_info.value)
+    assert ib_instances == []
 
 
 def test_ib_schedule_prewarm_lead_parse_and_validation():

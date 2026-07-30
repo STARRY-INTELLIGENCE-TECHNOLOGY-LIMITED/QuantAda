@@ -54,7 +54,7 @@
 24. 任何新增执行链路都要在入口边界严格区分 live/backtest：live 只允许本轮内有限轮询、对账和自愈；回测与优化不得因为健康标记、实时 pending、现金结算或 broker 同步而阻塞或降速。
 25. 优化器 MainEval 主回测至少覆盖最近 3 年；如果训练+测试逻辑窗口更长，则覆盖完整训练+测试逻辑窗口。MainEval 与年度固定窗口应优先复用本轮已加载的 `raw_datas` 切片，只有 MainEval 初始请求窗口确实未覆盖目标窗口时才允许补拉数据。
 26. 横截面排名策略需要推送分数排名时，调用 `self.publish_rankings(ranked_candidates, title="ranked_symbols", dt=current_dt)`；不要在策略里直接导入 `AlarmManager`。
-27. 单次实盘 `run` 从隔夜清理前共享一个 monotonic execution deadline：默认最多 600 秒，高频 schedule 自动取间隔的 80%。所有 live 等待、查询重试、数据恢复、撤单、拆单和 BUY 降级都必须在同一预算内；到期停止新动作但保留已受理/成交的部分结果，异步拒单不得借下一轮预算继续。SELL 等待需为最终处理预留时间，adapter SDK 调用必须自带有限超时；回测/优化不进入该机制。
+27. 单次实盘 `run` 从隔夜清理前共享一个 monotonic execution deadline：默认最多 600 秒，分钟/小时 schedule 或 `Minutes|Seconds` timeframe 自动取触发间隔的 80%。所有 live 等待、查询重试、数据恢复、撤单、拆单和 BUY 降级都必须在同一预算内；到期停止新动作但保留已受理/成交的部分结果，异步拒单不得借下一轮预算继续。SELL 等待需为最终处理预留时间，adapter SDK 调用必须自带有限超时；回测/优化不进入该机制。
 
 ## 推荐阅读顺序
 1. 先读 `docs/specs/*` 中与你任务最相关的正式规范。
