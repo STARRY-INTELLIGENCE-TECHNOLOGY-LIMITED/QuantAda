@@ -2,6 +2,8 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+简体中文 | [English](README_EN.md)
+
 一个优雅、可扩展、可实盘的量化交易框架，实现算法的分模块独立或协作开发。
 `Ada` 是 `Adapter`（适配器）的缩写，也借此向计算机先驱 **阿达·洛夫莱斯 (Ada Lovelace)** 及以她命名的 Ada 语言致敬。
 
@@ -103,7 +105,10 @@ python run.py my_strategies.my_cool_strategy --selection=my_selectors.my_selecto
 - 自愈优先：断连、拒单、数据失败优先恢复与降级，不轻易中断。
 - 最小改动：优先局部修复，避免状态机膨胀。
 - 执行纪律：统一遵循先卖后买、失败告警、可审计日志链路。
-  ![diagram](https://github.com/SUTFutureCoder/QuantAda/blob/main/.sample_pictures/diagram.png?raw=true)
+
+![QuantAda 架构](https://github.com/SUTFutureCoder/QuantAda/blob/main/.sample_pictures/architecture_zh.png?raw=true)
+
+图中重点展示 `run.py` 的模式分流、`Backtester` / `LiveTrader` / `Optimizer` 的职责边界，以及策略扩展、数据责任链、调仓计划与订单执行、券商适配和运行期通知之间的关系。实盘路径包含有界执行预算、柜台状态对账和进程级 heartbeat 自愈；回测与优化保持同步、非阻塞执行。
 
 ## AI与二次开发入口
 

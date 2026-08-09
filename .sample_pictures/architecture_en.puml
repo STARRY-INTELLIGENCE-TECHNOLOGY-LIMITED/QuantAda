@@ -1,0 +1,95 @@
+@startuml quantada-architecture-en
+top to bottom direction
+skinparam backgroundColor #F8FAFC
+skinparam shadowing true
+skinparam defaultFontName "Segoe UI"
+skinparam ArrowColor #475569
+skinparam ArrowThickness 2
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam roundcorner 8
+skinparam linetype ortho
+skinparam nodesep 48
+skinparam ranksep 42
+skinparam component {
+  FontColor #0F172A
+  BorderColor #334155
+  BackgroundColor #FFFFFF
+}
+
+title QuantAda Architecture
+
+package "User & Entry Layer" {
+  component "run.py + config.py + loader\nCLI / SDK entry · dynamically loads external strategies, selectors, and risk controls" as entry #EEF2FF
+}
+
+package "Mode Orchestration" {
+  component "Backtester\nSynchronous Backtrader execution" as backtest #FFF7ED
+  component "LiveTrader\nSchedule / SDK callbacks · bounded self-healing" as live #FFF7ED
+  component "Optimizer\nOptuna studies · each trial reuses Backtester" as optimizer #FFF7ED
+
+  backtest -[hidden]right-> live
+  live -[hidden]right-> optimizer
+}
+
+package "Extension Contracts" {
+  component "BaseStrategy: init() / next() · signals, targets, and rebalancing\nBaseSelector: run_selection() · symbol universe\nBaseRiskControl: chained checks · SELL takeover" as extensions #FDF4FF
+}
+
+package "Core Services" {
+  component "Data Engine\nDataManager · provider chain\nLive Data Bridge · cache" as data #ECFEFF
+  component "Execution Core\nPortfolioRebalancer · OrderExecutor\nBroker contracts · sell before buy" as execution #ECFEFF
+  component "Runtime Services\nruntime_notifications · alarms / recorders\nlive supervisor + heartbeat" as runtime #F0FDF4
+
+  data -[hidden]right-> execution
+  execution -[hidden]right-> runtime
+}
+
+package "Adapters" {
+  component "BaseDataProvider\nTushare · Akshare · Tiingo · GM · IBKR · CSV" as data_adapters #EFF6FF
+  component "Broker Adapters\nBacktest Broker · BaseLiveBroker · GM · IBKR" as broker_adapters #EFF6FF
+  component "Output Adapters\nDingTalk · WeCom · DB · HTTP" as output_adapters #EFF6FF
+
+  data_adapters -[hidden]right-> broker_adapters
+  broker_adapters -[hidden]right-> output_adapters
+}
+
+package "External Systems" {
+  component "Market / Research APIs\nOnline providers and local CSV" as market #F8FAFC
+  component "Backtrader · GM · IBKR\nFills, orders, positions, and cash" as brokers #F8FAFC
+  component "IM Channels · Database · HTTP\nAlerts, trades, and performance" as sinks #F8FAFC
+
+  market -[hidden]right-> brokers
+  brokers -[hidden]right-> sinks
+}
+
+entry --> backtest : backtest
+entry --> live : live / simulation
+entry --> optimizer : optimization
+
+backtest --> extensions
+live --> extensions
+optimizer --> extensions
+
+extensions --> data : selection and market data
+extensions --> execution : targets and trade plans
+extensions --> runtime : plans, risks, and status events
+
+data --> data_adapters
+execution --> broker_adapters
+runtime --> output_adapters
+
+data_adapters --> market
+broker_adapters --> brokers
+output_adapters --> sinks
+
+note bottom of brokers
+  Broker reality is the source of truth for live accounts, positions, and pending orders.
+end note
+
+note bottom of sinks
+  Self-healing first: recover, retry, reconcile, and alert; never persist trade intent across bars.
+end note
+
+footer Live may poll and reconcile within a bounded run; backtests and optimization remain synchronous and non-blocking.
+@enduml

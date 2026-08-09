@@ -1,0 +1,95 @@
+@startuml quantada-architecture-zh
+top to bottom direction
+skinparam backgroundColor #F8FAFC
+skinparam shadowing true
+skinparam defaultFontName "Microsoft YaHei"
+skinparam ArrowColor #475569
+skinparam ArrowThickness 2
+skinparam componentStyle rectangle
+skinparam packageStyle rectangle
+skinparam roundcorner 8
+skinparam linetype ortho
+skinparam nodesep 48
+skinparam ranksep 42
+skinparam component {
+  FontColor #0F172A
+  BorderColor #334155
+  BackgroundColor #FFFFFF
+}
+
+title QuantAda 架构
+
+package "用户与入口层" {
+  component "run.py + config.py + loader\nCLI / SDK 入口 · 动态加载外部策略、选股器与风控" as entry #EEF2FF
+}
+
+package "模式编排" {
+  component "Backtester\nBacktrader 同步回测" as backtest #FFF7ED
+  component "LiveTrader\nschedule / SDK 回调 · 有界自愈" as live #FFF7ED
+  component "Optimizer\nOptuna 试验 · 每个 trial 复用 Backtester" as optimizer #FFF7ED
+
+  backtest -[hidden]right-> live
+  live -[hidden]right-> optimizer
+}
+
+package "扩展契约" {
+  component "BaseStrategy：init() / next() · 信号、目标与调仓\nBaseSelector：run_selection() · 标的池\nBaseRiskControl：多风控链式检查 · SELL 接管" as extensions #FDF4FF
+}
+
+package "核心服务" {
+  component "数据引擎\nDataManager · provider 责任链\nLive Data Bridge · 缓存" as data #ECFEFF
+  component "执行核心\nPortfolioRebalancer · OrderExecutor\nBroker Contracts · 先卖后买" as execution #ECFEFF
+  component "运行期服务\nruntime_notifications · Alarm / Recorder\nlive supervisor + heartbeat" as runtime #F0FDF4
+
+  data -[hidden]right-> execution
+  execution -[hidden]right-> runtime
+}
+
+package "适配器层" {
+  component "BaseDataProvider\nTushare · Akshare · Tiingo · GM · IBKR · CSV" as data_adapters #EFF6FF
+  component "券商适配器\nBacktest Broker · BaseLiveBroker · GM · IBKR" as broker_adapters #EFF6FF
+  component "输出适配器\nDingTalk · WeCom · DB · HTTP" as output_adapters #EFF6FF
+
+  data_adapters -[hidden]right-> broker_adapters
+  broker_adapters -[hidden]right-> output_adapters
+}
+
+package "外部系统" {
+  component "行情 / 研究 API\n在线数据源与本地 CSV" as market #F8FAFC
+  component "Backtrader · GM 柜台 · IBKR\n撮合、订单、持仓与现金" as brokers #F8FAFC
+  component "IM 通道 · 数据库 · HTTP 服务\n告警、交易记录与绩效" as sinks #F8FAFC
+
+  market -[hidden]right-> brokers
+  brokers -[hidden]right-> sinks
+}
+
+entry --> backtest : 回测
+entry --> live : 实盘 / 仿真
+entry --> optimizer : 参数优化
+
+backtest --> extensions
+live --> extensions
+optimizer --> extensions
+
+extensions --> data : 选股与行情请求
+extensions --> execution : 目标 / 交易计划
+extensions --> runtime : 计划、风控与状态事件
+
+data --> data_adapters
+execution --> broker_adapters
+runtime --> output_adapters
+
+data_adapters --> market
+broker_adapters --> brokers
+output_adapters --> sinks
+
+note bottom of brokers
+  broker reality 是实盘账户、持仓与在途订单的事实源
+end note
+
+note bottom of sinks
+  自愈优先：恢复、重试、对账、告警；不跨 K 持久化交易意图
+end note
+
+footer live 允许本轮有界轮询与对账；backtest / optimization 保持同步、非阻塞
+@enduml
