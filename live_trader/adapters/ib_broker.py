@@ -3,6 +3,7 @@ import datetime
 import math
 import re
 import time
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 from ib_insync import IB, Stock, MarketOrder, Trade, Forex, Contract
@@ -22,7 +23,7 @@ from common.live_execution_budget import live_run_seconds_remaining
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
 from common.ib_symbol_parser import resolve_ib_contract_spec
-from common.order_quantity import positive_quantity
+from common.order_quantity import positive_quantity, quantity_number
 import config
 from data_providers.csv_provider import CsvDataProvider
 from data_providers.manager import DataManager
@@ -32,6 +33,7 @@ from .base_broker import BaseLiveBroker, BaseOrderProxy
 
 
 _IB_SDK_HEALTH_DEADLINE_SECONDS = 180.0
+_IB_SYNC_QUERY_TIMEOUT_SECONDS = 3.0
 
 
 class IBOrderProxy(BaseOrderProxy):
@@ -153,8 +155,18 @@ class IBBrokerAdapter(BaseLiveBroker):
         # 跨 client 的 open orders 拉取节流，避免高频路径反复 reqAllOpenOrders。
         self._req_all_open_orders_last_ts = 0.0
         self._req_all_open_orders_interval_s = 2.0
+        self._req_all_open_orders_cache = []
+        self._req_all_open_orders_cache_valid = False
+        self._last_open_trades_fetch_failed = False
+        self._last_open_trades_fetch_error = None
         self._live_alarm = LiveAlarmDeduper()
         self._last_account_snapshot_debug = {}
+        # 账户快照是实盘交易的安全前提。连接尚未建立或柜台未返回快照时，
+        # 仅允许本轮失败关闭，不能把空结果当成真实的零现金/空仓。
+        self._last_account_snapshot_fetch_failed = False
+        self._last_account_snapshot_fetch_error = None
+        self._last_position_snapshot_fetch_failed = False
+        self._last_position_snapshot_fetch_error = None
         # 无实时价兜底与告警去重
         self._price_data_manager = None
         self._delayed_market_data_enabled = False
@@ -200,19 +212,46 @@ class IBBrokerAdapter(BaseLiveBroker):
                 has_account_info = True
             paired.append((item, account))
 
-        # 若当前数据源不携带账户字段，降级为不过滤，兼容旧结构。
+        # Requested account-summary views from older IB builds can omit the
+        # account field. They remain compatible only after the target account
+        # has been verified as the sole visible account; otherwise an unscoped
+        # row could be aggregate cash from another account.
         if not has_account_info:
-            return raw_items
+            known_accounts = {
+                account
+                for account in self._collect_known_accounts()
+                if not self._is_aggregate_account_marker(account)
+            }
+            if known_accounts == {scoped_account}:
+                return raw_items
+            raise RuntimeError(
+                "IB unscoped account snapshot cannot be attributed to configured "
+                f"IBKR_ORDER_ACCOUNT={scoped_account!r}; visible_accounts="
+                f"{sorted(known_accounts)}"
+            )
 
         filtered = [item for item, account in paired if account == scoped_account]
         if filtered:
             return filtered
 
-        # accountSummary/accountValues 在部分 IB 会话下仅返回聚合账户标记（如 All），
-        # 此时退化为不过滤，避免把有效账户误判为“快照为空”。
+        # accountSummary/accountValues 在部分 IB 会话下仅返回聚合账户标记（如 All）。
+        # ``All`` 只能在已经确认当前会话恰好可见目标账户时用作兼容兜底；
+        # 若同时可见多个账户（或账户可见性无法确认），它可能是聚合资金，
+        # 绝不能归属给一个配置的子账户。
         non_empty_accounts = {account for _, account in paired if account}
         if non_empty_accounts and all(self._is_aggregate_account_marker(a) for a in non_empty_accounts):
-            return raw_items
+            known_accounts = {
+                account
+                for account in self._collect_known_accounts()
+                if not self._is_aggregate_account_marker(account)
+            }
+            if known_accounts == {scoped_account}:
+                return raw_items
+            raise RuntimeError(
+                "IB aggregate account snapshot cannot be attributed to configured "
+                f"IBKR_ORDER_ACCOUNT={scoped_account!r}; visible_accounts="
+                f"{sorted(known_accounts)}"
+            )
 
         return filtered
 
@@ -269,7 +308,11 @@ class IBBrokerAdapter(BaseLiveBroker):
                 if not callable(getter):
                     continue
                 try:
-                    for item in getter() or []:
+                    if getter_name == 'accountSummary' and not self._in_async_task():
+                        rows = self._bounded_sync_query(getter_name)
+                    else:
+                        rows = getter()
+                    for item in rows or []:
                         acct = self._extract_account_from_obj(item)
                         if acct:
                             accounts.add(acct)
@@ -296,11 +339,11 @@ class IBBrokerAdapter(BaseLiveBroker):
             f"managedAccounts={accounts}. Orders are blocked to avoid wrong routing. "
             "Please set IBKR_ORDER_ACCOUNT to the intended account."
         )
-        print(msg)
+        self._runtime_log(msg)
         try:
             AlarmManager().push_text(msg, level='ERROR')
         except Exception as e:
-            print(f"[IBBroker Warning] failed to push missing account alarm: {e}")
+            self._runtime_log(f"[IBBroker Warning] failed to push missing account alarm: {e}")
 
     def _query_account_rows(self, method_name: str, configured_account: str, attempts_log: list, note: str = ''):
         method = getattr(self.ib, method_name, None)
@@ -310,23 +353,154 @@ class IBBrokerAdapter(BaseLiveBroker):
         try:
             if configured_account:
                 try:
-                    rows = method(configured_account)
+                    if method_name == 'accountSummary' and not self._in_async_task():
+                        rows = self._bounded_sync_query(method_name, configured_account)
+                    else:
+                        rows = method(configured_account)
                     attempts_log.append(
                         f"{method_name}({configured_account}){note} -> {len(rows or [])}"
                     )
-                    return list(rows or [])
+                    rows = list(rows or [])
+                    # Gateway 在连接刚恢复、或 account updates 尚未完成时，
+                    # 指定账户视图可能暂时为空。回退到全量视图后再由调用方
+                    # 按账户精确过滤，避免把“尚未同步”误判成空账户。
+                    if rows:
+                        return rows
+                    if method_name == 'accountSummary' and not self._in_async_task():
+                        all_rows = self._bounded_sync_query(method_name)
+                    else:
+                        all_rows = method()
+                    attempts_log.append(
+                        f"{method_name}(){note} [fallback-empty-account] -> {len(all_rows or [])}"
+                    )
+                    return list(all_rows or [])
                 except TypeError:
-                    rows = method()
+                    if method_name == 'accountSummary' and not self._in_async_task():
+                        rows = self._bounded_sync_query(method_name)
+                    else:
+                        rows = method()
                     attempts_log.append(
                         f"{method_name}() [fallback]{note} -> {len(rows or [])}"
                     )
                     return list(rows or [])
-            rows = method()
+            if method_name == 'accountSummary' and not self._in_async_task():
+                rows = self._bounded_sync_query(method_name)
+            else:
+                rows = method()
             attempts_log.append(f"{method_name}(){note} -> {len(rows or [])}")
             return list(rows or [])
         except Exception as e:
             attempts_log.append(f"{method_name} failed{note}: {repr(e)}")
             return []
+
+    def is_account_snapshot_trusted(self) -> bool:
+        """Return whether the current live IB session exposes a usable account snapshot.
+
+        A connected socket alone is insufficient: ``IB.connect`` can succeed while
+        account updates are still unavailable (or the configured account is not
+        visible in this Gateway session).  The engine uses this short-lived health
+        check to fail closed for the current run and retry on the next schedule.
+        """
+        if not self.ib:
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = 'ib instance missing'
+            return False
+        try:
+            if not self.ib.isConnected():
+                self._last_account_snapshot_fetch_failed = True
+                self._last_account_snapshot_fetch_error = 'ib not connected'
+                return False
+        except Exception as e:
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = f'ib connection check failed: {e}'
+            return False
+
+        configured_account = self._configured_order_account()
+        if configured_account:
+            known_accounts = {
+                account
+                for account in self._collect_known_accounts()
+                if not self._is_aggregate_account_marker(account)
+            }
+            if known_accounts and configured_account not in known_accounts:
+                self._last_account_snapshot_fetch_failed = True
+                self._last_account_snapshot_fetch_error = (
+                    f"IBKR_ORDER_ACCOUNT={configured_account!r} is not visible; "
+                    f"managed_accounts={sorted(known_accounts)}"
+                )
+                return False
+        else:
+            known_accounts = {
+                account
+                for account in self._collect_known_accounts()
+                if not self._is_aggregate_account_marker(account)
+            }
+            if len(known_accounts) > 1:
+                self._warn_missing_order_account_for_schedule_scope(known_accounts)
+                self._last_account_snapshot_fetch_failed = True
+                self._last_account_snapshot_fetch_error = (
+                    "multiple IB accounts are visible but IBKR_ORDER_ACCOUNT is not set; "
+                    f"managed_accounts={sorted(known_accounts)}"
+                )
+                return False
+
+        snapshot = self._load_account_snapshot()
+        account_values_valid = any(
+            str(getattr(row, 'tag', '') or '')
+            in {'AvailableFunds', 'TotalCashValue', 'NetLiquidation'}
+            and self._is_finite_account_value(row)
+            for row in snapshot
+        )
+        if account_values_valid:
+            if self._in_async_task():
+                # The live schedule loop runs synchronously outside the IB event
+                # loop, where reqPositions is safe and required.  An order-status
+                # callback, however, executes inside that loop: blocking
+                # IB._run would re-enter it.  The already-loaded, validated
+                # account snapshot is enough for this transient callback probe;
+                # the next schedule run still performs the fresh position query.
+                self._last_account_snapshot_fetch_failed = False
+                self._last_account_snapshot_fetch_error = None
+                return True
+            try:
+                self._bounded_sync_query('reqPositions')
+                self._last_position_snapshot_fetch_failed = False
+                self._last_position_snapshot_fetch_error = None
+                self._last_account_snapshot_fetch_failed = False
+                self._last_account_snapshot_fetch_error = None
+                return True
+            except Exception as e:
+                self._last_position_snapshot_fetch_failed = True
+                self._last_position_snapshot_fetch_error = e
+                self._last_account_snapshot_fetch_failed = True
+                self._last_account_snapshot_fetch_error = f"IB position snapshot unavailable: {e}"
+                return False
+
+        debug = getattr(self, '_last_account_snapshot_debug', {}) or {}
+        prior_error = (
+            self._last_account_snapshot_fetch_error
+            if self._last_account_snapshot_fetch_failed
+            else None
+        )
+        detail = (
+            f"configured_account={debug.get('configured_account')!r}, "
+            f"summary_attempts={debug.get('summary_attempts', [])}, "
+            f"values_attempts={debug.get('values_attempts', [])}, "
+            f"raw_rows={debug.get('raw_rows', 0)}, filtered_rows={debug.get('filtered_rows', 0)}, "
+            f"snapshot_tags={sorted({str(getattr(row, 'tag', '') or '') for row in snapshot})}"
+        )
+        if prior_error:
+            detail = f"{prior_error}; {detail}"
+        self._last_account_snapshot_fetch_failed = True
+        self._last_account_snapshot_fetch_error = detail
+        return False
+
+    @staticmethod
+    def _is_finite_account_value(row) -> bool:
+        try:
+            return math.isfinite(float(getattr(row, 'value', None)))
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def _is_configured_order_account_valid(self, configured_account: str) -> bool:
         account = self._normalize_account(configured_account)
@@ -335,13 +509,13 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         known_accounts = self._collect_known_accounts()
         if not known_accounts:
-            print(
+            self._runtime_log(
                 f"[IBBroker] Skip order: unable to validate IBKR_ORDER_ACCOUNT='{account}' "
                 f"(no managed/visible accounts from IB session)."
             )
             return False
         if account not in known_accounts:
-            print(
+            self._runtime_log(
                 f"[IBBroker] Skip order: IBKR_ORDER_ACCOUNT='{account}' not in "
                 f"managed/visible accounts={sorted(known_accounts)}."
             )
@@ -397,12 +571,12 @@ class IBBrokerAdapter(BaseLiveBroker):
             f"原因: {reason}。"
             f"{account_hint}"
         )
-        print(warn_msg)
+        self._runtime_log(warn_msg)
         self._log_account_probe_debug_once(account, known_accounts, accounts_debug)
         try:
             AlarmManager().push_text(warn_msg, level='ERROR')
         except Exception as e:
-            print(f"[IBBroker Warning] failed to push zero-cash alarm: {e}")
+            self._runtime_log(f"[IBBroker Warning] failed to push zero-cash alarm: {e}")
 
     def _log_account_probe_debug_once(self, account: str, known_accounts: set, accounts_debug: dict):
         acct = self._normalize_account(account)
@@ -429,7 +603,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             f"snapshot_raw_rows={snapshot_debug.get('raw_rows', 0)}, "
             f"snapshot_filtered_rows={snapshot_debug.get('filtered_rows', 0)}."
         )
-        print(msg)
+        self._runtime_log(msg)
 
     def _load_account_snapshot(self):
         """
@@ -437,6 +611,8 @@ class IBBrokerAdapter(BaseLiveBroker):
         在异步回调任务中避免阻塞式等待。
         """
         if not hasattr(self, 'ib') or not self.ib:
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = 'ib instance missing'
             self._last_account_snapshot_debug = {
                 'ib_connected': False,
                 'in_async_task': False,
@@ -455,6 +631,8 @@ class IBBrokerAdapter(BaseLiveBroker):
         except Exception:
             ib_connected = False
         if not ib_connected:
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = 'ib not connected'
             self._last_account_snapshot_debug = {
                 'ib_connected': False,
                 'in_async_task': self._in_async_task(),
@@ -503,13 +681,93 @@ class IBBrokerAdapter(BaseLiveBroker):
             if self._extract_account_from_obj(item)
         }
         debug_info['raw_accounts'] = sorted(raw_accounts)
-        filtered = self._filter_account_scoped_items(
-            raw_source,
-            lambda item: self._extract_account_from_obj(item),
-        )
+        try:
+            filtered = self._filter_account_scoped_items(
+                raw_source,
+                lambda item: self._extract_account_from_obj(item),
+            )
+        except Exception as e:
+            debug_info['filter_error'] = str(e)
+            self._last_account_snapshot_debug = debug_info
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = str(e)
+            return []
         debug_info['filtered_rows'] = len(filtered)
         self._last_account_snapshot_debug = debug_info
+        if filtered:
+            self._last_account_snapshot_fetch_failed = False
+            self._last_account_snapshot_fetch_error = None
+        else:
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = (
+                f"account snapshot empty after filtering: configured_account={configured_account!r}, "
+                f"raw_rows={len(raw_source)}, raw_accounts={sorted(raw_accounts)}"
+            )
         return filtered
+
+    def _filter_execution_account_scoped_items(self, items, account_getter, source_name):
+        """Filter order/position facts without accepting an unknown account scope.
+
+        Account-summary calls can be scoped by their request argument and may
+        legitimately omit an account field in older IB API views.  Open orders
+        and positions have no equivalent request scope here: with
+        ``IBKR_ORDER_ACCOUNT`` configured, a record without its own account
+        field cannot safely be attributed to the target account.
+        """
+        scoped_account = self._configured_order_account()
+        raw_items = list(items or [])
+        if not scoped_account or not raw_items:
+            return raw_items
+
+        paired = [
+            (item, self._normalize_account(account_getter(item)))
+            for item in raw_items
+        ]
+        if not any(account for _, account in paired):
+            raise RuntimeError(
+                f"IB {source_name} snapshot has no account fields while "
+                f"IBKR_ORDER_ACCOUNT={scoped_account!r} is configured"
+            )
+        # ``reqPositions`` and ``reqAllOpenOrders`` are all-account requests.
+        # Once a target account is configured, a mixed batch where even one
+        # record has no account field cannot be safely partitioned: that row
+        # may belong to the target account and silently dropping it would make
+        # a non-empty position/order look absent.  Reject the whole snapshot
+        # instead of returning a partial truth.
+        if any(not account for _, account in paired):
+            raise RuntimeError(
+                f"IB {source_name} snapshot contains records without account fields while "
+                f"IBKR_ORDER_ACCOUNT={scoped_account!r} is configured"
+            )
+        return [item for item, account in paired if account == scoped_account]
+
+    def _bounded_sync_query(self, method_name: str, *args, **kwargs):
+        """Run one blocking ib_insync snapshot request within the current run budget."""
+        if self._in_async_task():
+            raise RuntimeError(f"{method_name} is unavailable inside an active async task")
+
+        method = getattr(self.ib, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"IB.{method_name} is unavailable")
+
+        remaining = live_run_seconds_remaining(self)
+        if remaining <= 0:
+            raise TimeoutError("live run execution budget exhausted")
+        timeout = min(_IB_SYNC_QUERY_TIMEOUT_SECONDS, remaining)
+
+        had_timeout_attr = hasattr(self.ib, 'RequestTimeout')
+        previous_timeout = getattr(self.ib, 'RequestTimeout', None)
+        try:
+            self.ib.RequestTimeout = timeout
+            return method(*args, **kwargs)
+        finally:
+            if had_timeout_attr:
+                self.ib.RequestTimeout = previous_timeout
+            else:
+                try:
+                    delattr(self.ib, 'RequestTimeout')
+                except AttributeError:
+                    pass
 
     @staticmethod
     def _extract_base_tag_value(source_data, tag):
@@ -609,6 +867,9 @@ class IBBrokerAdapter(BaseLiveBroker):
         covered_local_order_ids = set()
         try:
             pending_orders = self.get_pending_orders()
+            if getattr(self, '_last_pending_orders_fetch_failed', False):
+                detail = getattr(self, '_last_pending_orders_fetch_error', 'pending snapshot unavailable')
+                raise RuntimeError(f"IB pending-order snapshot is untrusted: {detail}")
             for po in pending_orders:
                 if po['direction'] == 'BUY':
                     poid = str(po.get('id', '')).strip()
@@ -640,7 +901,8 @@ class IBBrokerAdapter(BaseLiveBroker):
                             covered_local_order_ids.add(poid)
 
         except Exception as e:
-            print(f"[IBBroker] 计算买单虚拟冻结资金时发生异常: {e}")
+            self._runtime_log(f"[IBBroker] 计算买单虚拟冻结资金时发生异常: {e}")
+            return 0.0
 
         # 3. 与本地占资做去重合并:
         # - active_buys_total: 基于 _active_buys 逐单估算的本地占资
@@ -712,7 +974,11 @@ class IBBrokerAdapter(BaseLiveBroker):
     def _in_async_task() -> bool:
         try:
             loop = asyncio.get_running_loop()
-            return asyncio.current_task(loop=loop) is not None
+            # ib_insync dispatches ordinary Event callbacks directly via
+            # loop.call_soon(). Those callbacks have no current Task, yet calling
+            # a synchronous ``IB._run`` query from them would still re-enter the
+            # already-running loop. Treat either form as non-blocking context.
+            return loop.is_running()
         except RuntimeError:
             return False
         except Exception:
@@ -749,10 +1015,10 @@ class IBBrokerAdapter(BaseLiveBroker):
             switcher(3)  # delayed
             self._delayed_market_data_enabled = True
             reason_msg = f" ({reason})" if reason else ""
-            print(f"[IB Warning] Realtime quote unavailable, switched to delayed market data{reason_msg}.")
+            self._runtime_log(f"[IB Warning] Realtime quote unavailable, switched to delayed market data{reason_msg}.")
             return True
         except Exception as e:
-            print(f"[IB Warning] Failed to switch to delayed market data: {e}")
+            self._runtime_log(f"[IB Warning] Failed to switch to delayed market data: {e}")
             return False
 
     def _resubscribe_symbol_ticker(self, symbol: str):
@@ -874,7 +1140,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             if hasattr(self.ib, 'reqOpenOrders'):
                 self.ib.reqOpenOrders()
         except Exception as e:
-            print(f"[IBBroker] reqOpenOrders bind attempt failed: {e}")
+            self._runtime_log(f"[IBBroker] reqOpenOrders bind attempt failed: {e}")
 
         for t in self._collect_open_trades(force_refresh_all=True):
             if self._safe_perm_id(t) != pid:
@@ -901,11 +1167,11 @@ class IBBrokerAdapter(BaseLiveBroker):
             f"(pending_id={pending_id}, permId={perm_id}, clientId={client_id}). "
             f"{hint}"
         )
-        print(warn_msg)
+        self._runtime_log(warn_msg)
         try:
             AlarmManager().push_text(warn_msg, level='ERROR')
         except Exception as e:
-            print(f"[IBBroker Warning] failed to push manual-bind alarm: {e}")
+            self._runtime_log(f"[IBBroker Warning] failed to push manual-bind alarm: {e}")
 
     def _sleep_ib(self, seconds: float):
         wait_s = 0.0
@@ -1000,7 +1266,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             _append(self.ib.openTrades())
         except Exception as e:
             source_errors.append(f"openTrades: {e}")
-            print(f"[IBBroker] openTrades 拉取失败: {e}")
+            self._runtime_log(f"[IBBroker] openTrades 拉取失败: {e}")
 
         can_refresh_all = hasattr(self.ib, 'reqAllOpenOrders')
         if can_refresh_all:
@@ -1008,33 +1274,54 @@ class IBBrokerAdapter(BaseLiveBroker):
             # "This event loop is already running"，该场景退化为用本地可见缓存。
             if self._in_async_task():
                 can_refresh_all = False
+                cache_age = time.monotonic() - self._req_all_open_orders_last_ts
+                if (
+                    self._req_all_open_orders_cache_valid
+                    and cache_age < self._req_all_open_orders_interval_s
+                ):
+                    _append(self._req_all_open_orders_cache)
+                else:
+                    source_errors.append('reqAllOpenOrders unavailable in async task without fresh cache')
         if can_refresh_all:
             now_ts = time.monotonic()
             should_refresh = force_refresh_all or (
                 now_ts - self._req_all_open_orders_last_ts >= self._req_all_open_orders_interval_s
             )
             if should_refresh:
-                self._req_all_open_orders_last_ts = now_ts
                 try:
-                    _append(self.ib.reqAllOpenOrders())
+                    refreshed_all = list(self._bounded_sync_query('reqAllOpenOrders') or [])
+                    self._req_all_open_orders_last_ts = now_ts
+                    self._req_all_open_orders_cache = refreshed_all
+                    self._req_all_open_orders_cache_valid = True
+                    _append(refreshed_all)
                 except Exception as e:
                     source_errors.append(f"reqAllOpenOrders: {e}")
-                    print(f"[IBBroker] reqAllOpenOrders 拉取失败: {e}")
+                    self._runtime_log(f"[IBBroker] reqAllOpenOrders 拉取失败: {e}")
+            else:
+                _append(self._req_all_open_orders_cache)
 
         if include_trade_cache and hasattr(self.ib, 'trades'):
             try:
                 _append(self.ib.trades())
             except Exception as e:
                 source_errors.append(f"trades: {e}")
-                print(f"[IBBroker] trades 缓存读取失败: {e}")
+                self._runtime_log(f"[IBBroker] trades 缓存读取失败: {e}")
 
         self._last_open_trades_fetch_failed = bool(source_errors)
         self._last_open_trades_fetch_error = "; ".join(source_errors) if self._last_open_trades_fetch_failed else None
 
-        return self._filter_account_scoped_items(
-            collected,
-            lambda trade: self._extract_trade_account(trade),
-        )
+        try:
+            return self._filter_execution_account_scoped_items(
+                collected,
+                lambda trade: self._extract_trade_account(trade),
+                'open-order',
+            )
+        except Exception as e:
+            self._last_open_trades_fetch_failed = True
+            detail = str(e)
+            prior = str(self._last_open_trades_fetch_error or '').strip()
+            self._last_open_trades_fetch_error = f"{prior}; {detail}" if prior else detail
+            return []
 
     def get_pending_orders(self) -> list:
         """盈透：获取在途订单（含跨 client 兜底视角）"""
@@ -1052,40 +1339,58 @@ class IBBrokerAdapter(BaseLiveBroker):
                 status = getattr(t, 'orderStatus', None)
                 contract = getattr(t, 'contract', None)
                 if not order or not status:
-                    continue
+                    raise RuntimeError("IB pending trade is missing order or orderStatus")
 
-                rem = positive_quantity(getattr(status, 'remaining', 0) or 0)
                 raw_status = str(getattr(status, 'status', '') or '').strip()
                 norm_status = raw_status.upper()
 
                 # 优先按 IB 状态机判定：
                 # - 终态直接排除，避免“已撤单但 remaining 未及时归零”导致误判在途。
-                # - 有状态且非 pending 态时保守排除。
+                # - 未知状态不能静默排除，否则可能漏掉真实在途单并重复下单。
                 # - 无状态才回退到 remaining>0 规则。
                 if norm_status in self._TERMINAL_STATUSES:
                     continue
                 if norm_status:
                     if norm_status not in self._PENDING_STATUSES:
-                        continue
-                    if rem <= 0:
-                        continue
-                else:
-                    if rem <= 0:
-                        continue
+                        raise RuntimeError(
+                            f"IB pending trade has unknown non-terminal status: {raw_status!r}"
+                        )
+
+                raw_remaining = getattr(status, 'remaining', None)
+                try:
+                    remaining = Decimal(str(raw_remaining))
+                except (InvalidOperation, TypeError, ValueError) as e:
+                    raise RuntimeError("IB pending trade has invalid remaining quantity") from e
+                if not remaining.is_finite() or remaining <= 0:
+                    raise RuntimeError(
+                        f"IB pending trade has non-positive remaining quantity: {raw_remaining!r}"
+                    )
 
                 matched_data = self._find_data_for_contract(contract)
                 symbol = (
                     str(getattr(matched_data, '_name', '') or '').strip()
                     if matched_data is not None
-                    else str(getattr(contract, 'symbol', '') or '').strip()
+                    else str(
+                        getattr(contract, 'symbol', '')
+                        or getattr(contract, 'localSymbol', '')
+                        or ''
+                    ).strip()
                 )
                 oid = self._safe_pending_id(t)
                 action = str(getattr(order, 'action', '') or '').strip().upper()
+                if not oid:
+                    raise RuntimeError("IB pending trade is missing orderId and permId")
+                if not symbol:
+                    raise RuntimeError(f"IB pending trade is missing symbol: id={oid!r}")
+                if action not in {'BUY', 'SELL'}:
+                    raise RuntimeError(
+                        f"IB pending trade has unknown action: id={oid!r}, action={action!r}"
+                    )
                 res.append({
                     'id': oid,
                     'symbol': symbol,
-                    'direction': 'BUY' if action == 'BUY' else 'SELL',
-                    'size': rem
+                    'direction': action,
+                    'size': quantity_number(remaining),
                 })
             if open_trades_fetch_failed:
                 self._last_pending_orders_fetch_failed = True
@@ -1098,7 +1403,8 @@ class IBBrokerAdapter(BaseLiveBroker):
         except Exception as e:
             self._last_pending_orders_fetch_failed = True
             self._last_pending_orders_fetch_error = e
-            print(f"[IBBroker] 获取在途订单失败: {e}")
+            self._runtime_log(f"[IBBroker] 获取在途订单失败: {e}")
+            return []
         return res
 
     def cancel_pending_order(self, order_id: str) -> bool:
@@ -1111,7 +1417,17 @@ class IBBrokerAdapter(BaseLiveBroker):
             return False
 
         try:
-            for t in self._collect_open_trades(force_refresh_all=True, include_trade_cache=False):
+            open_trades = self._collect_open_trades(
+                force_refresh_all=True,
+                include_trade_cache=False,
+            )
+            if getattr(self, '_last_open_trades_fetch_failed', False):
+                detail = getattr(self, '_last_open_trades_fetch_error', 'open-order snapshot unavailable')
+                self._runtime_log(
+                    f"[IBBroker] cancel_pending_order skipped ({oid}): untrusted snapshot ({detail})."
+                )
+                return False
+            for t in open_trades:
                 if not self._match_pending_id(t, oid):
                     continue
                 remaining = float(getattr(getattr(t, 'orderStatus', None), 'remaining', 0) or 0)
@@ -1131,7 +1447,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                     rebound = self._try_bind_manual_order_and_resolve(perm_id)
                     if rebound is None:
                         cid = self._connected_client_id()
-                        print(
+                        self._runtime_log(
                             f"[IBBroker] cancel_pending_order skipped ({oid}): "
                             f"unresolved api orderId (permId={perm_id}, clientId={cid})."
                         )
@@ -1143,7 +1459,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                     order = getattr(t, 'order', None)
                     if not order or not self._safe_order_id(t):
                         cid = self._connected_client_id()
-                        print(
+                        self._runtime_log(
                             f"[IBBroker] cancel_pending_order skipped ({oid}): "
                             f"bind retry still has invalid orderId (clientId={cid})."
                         )
@@ -1157,7 +1473,7 @@ class IBBrokerAdapter(BaseLiveBroker):
 
                 cid = self._connected_client_id()
                 perm_id = self._safe_perm_id(t)
-                print(
+                self._runtime_log(
                     f"[IBBroker] cancel_pending_order failed ({oid}): "
                     f"cancel not confirmed (permId={perm_id}, clientId={cid})."
                 )
@@ -1167,7 +1483,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 return False
             return False
         except Exception as e:
-            print(f"[IBBroker] cancel_pending_order failed ({oid}): {e}")
+            self._runtime_log(f"[IBBroker] cancel_pending_order failed ({oid}): {e}")
             return False
 
     @staticmethod
@@ -1238,8 +1554,10 @@ class IBBrokerAdapter(BaseLiveBroker):
             for v in source_data:
                 if v.tag == tag and v.currency == 'BASE':
                     try:
-                        base_value = float(v.value)
-                        break
+                        candidate = float(v.value)
+                        if math.isfinite(candidate):
+                            base_value = candidate
+                            break
                     except Exception:
                         continue
 
@@ -1257,6 +1575,8 @@ class IBBrokerAdapter(BaseLiveBroker):
             for item in items:
                 try:
                     val = float(item.value)
+                    if not math.isfinite(val):
+                        continue
                     # 忽略为0的货币项 (除非是查净值)
                     if val == 0 and tag != 'NetLiquidation':
                         continue
@@ -1283,13 +1603,13 @@ class IBBrokerAdapter(BaseLiveBroker):
                         else:
                             if val != 0:
                                 missing_fx = True
-                                print(f"[IB Warning] 无法获取 {item.currency} 汇率, 金额 {val} 未计入。")
+                                self._runtime_log(f"[IB Warning] 无法获取 {item.currency} 汇率, 金额 {val} 未计入。")
                 except Exception:
                     continue
 
             # 若多币种中存在无法换汇项，且券商提供 BASE 汇总，优先回退 BASE，避免低估可用资金。
             if missing_fx and base_value is not None:
-                print(f"[IB Warning] {tag} 存在汇率缺口，回退使用 BASE 汇总口径。")
+                self._runtime_log(f"[IB Warning] {tag} 存在汇率缺口，回退使用 BASE 汇总口径。")
                 return base_value
 
             # 只要在这个 tag 下成功计算了哪怕一个有效条目（即便加总是负数），都直接返回
@@ -1387,20 +1707,46 @@ class IBBrokerAdapter(BaseLiveBroker):
     # 2. 查持仓
     def get_position(self, data):
         class Pos:
-            size = 0
-            price = 0.0
-
-        if not self.ib: return Pos()
+            def __init__(self):
+                self.size = 0
+                self.price = 0.0
+                self.sellable = 0
 
         symbol = str(getattr(data, '_name', '')).strip()
         if not symbol:
             return Pos()
 
-        # 遍历 ib.positions()；兼容 QQQ.ISLAND / QQQ.SMART 与 QQQ 的双向匹配
-        positions = self._filter_account_scoped_items(
-            self.ib.positions(),
-            lambda p: self._extract_account_from_obj(p),
-        )
+        if not self.ib:
+            self._last_position_snapshot_fetch_failed = True
+            self._last_position_snapshot_fetch_error = 'ib instance missing'
+            raise RuntimeError("IB live position query failed: ib instance missing")
+
+        try:
+            if not self.ib.isConnected():
+                raise RuntimeError("ib not connected")
+            # positions() only exposes ib_insync's wrapper cache. During the
+            # synchronous SELL settlement loop that cache can lag a fill, so
+            # explicitly request a fresh counter snapshot before reconciliation.
+            positions = list(self._bounded_sync_query('reqPositions') or [])
+            self._last_position_snapshot_fetch_failed = False
+            self._last_position_snapshot_fetch_error = None
+        except Exception as e:
+            self._last_position_snapshot_fetch_failed = True
+            self._last_position_snapshot_fetch_error = e
+            raise RuntimeError(f"IB live position query failed: {e}") from e
+
+        # 遍历柜台刷新结果；兼容 QQQ.ISLAND / QQQ.SMART 与 QQQ 的双向匹配
+        raw_positions = list(positions or [])
+        try:
+            positions = self._filter_execution_account_scoped_items(
+                raw_positions,
+                lambda p: self._extract_account_from_obj(p),
+                'position',
+            )
+        except Exception as e:
+            self._last_position_snapshot_fetch_failed = True
+            self._last_position_snapshot_fetch_error = e
+            raise RuntimeError(f"IB live position query failed: {e}") from e
 
         expected_symbols = {symbol.upper(), symbol.split('.')[0].upper()}
         expected_sec_type = None
@@ -1438,6 +1784,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 o = Pos()
                 o.size = p.position
                 o.price = p.avgCost
+                o.sellable = positive_quantity(p.position)
                 return o
         return Pos()
 
@@ -1478,7 +1825,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             delayed_price = self._try_get_delayed_quote(symbol)
             ticker = self._tickers.get(symbol, ticker)
             if delayed_price > 0:
-                print(f"[IB Warning] {symbol} realtime quote invalid. Using DELAYED price: {delayed_price}")
+                self._runtime_log(f"[IB Warning] {symbol} realtime quote invalid. Using DELAYED price: {delayed_price}")
                 price = delayed_price
 
         # 如果仍无效，尝试使用 close 或 last
@@ -1486,18 +1833,18 @@ class IBBrokerAdapter(BaseLiveBroker):
         if not (price and 0 < price == price):
             # 优先用昨日收盘价 (Close)
             if ticker.close and ticker.close > 0:
-                print(
+                self._runtime_log(
                     f"[IB Debug] {symbol} marketPrice invalid ({price}). Using CLOSE price for execution: {ticker.close}")
                 price = ticker.close
             # 其次用最后成交价 (Last)
             elif ticker.last and ticker.last > 0:
-                print(f"[IB Debug] {symbol} marketPrice invalid. Using LAST price: {ticker.last}")
+                self._runtime_log(f"[IB Debug] {symbol} marketPrice invalid. Using LAST price: {ticker.last}")
                 price = ticker.last
             else:
                 # 无实时价时，从非 CSV 数据源按优先级兜底获取
                 fallback_price, tried_sources = self._fallback_price_from_sources(symbol)
                 if fallback_price > 0:
-                    print(
+                    self._runtime_log(
                         f"[IB Warning] No valid price (Market/Close/Last) for {symbol}. "
                         f"Using provider price: {fallback_price}"
                     )
@@ -1621,7 +1968,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             f"[IBBroker] No valid price for {symbol}. "
             f"Tried providers: {tried_str}. Orders will be blocked."
         )
-        print(f"[IB Warning] {msg}")
+        self._runtime_log(f"[IB Warning] {msg}")
         try:
             AlarmManager().push_text(msg, level='ERROR')
         except Exception:
@@ -1664,7 +2011,7 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         # 防止零股交易
         if volume_final <= 0:
-            print(f"[IB Warning] Order size <= 0 (raw: {volume}), skipped.")
+            self._runtime_log(f"[IB Warning] Order size <= 0 (raw: {volume}), skipped.")
             return None
 
         configured_account = self._configured_order_account()
@@ -1903,7 +2250,19 @@ class IBBrokerAdapter(BaseLiveBroker):
                             detail="IB connect has not completed",
                             failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
                         )
-                        ib.connect(host, port, clientId=client_id)
+                        # Passing the configured account at connect time is important
+                        # for multi-account Gateway sessions: ib_insync otherwise
+                        # initializes only its default/first account subscription.
+                        # Keep a TypeError fallback for older test doubles/SDKs that
+                        # do not expose the ``account`` keyword.
+                        order_account = str(getattr(config, 'IBKR_ORDER_ACCOUNT', '') or '').strip()
+                        try:
+                            if order_account:
+                                ib.connect(host, port, clientId=client_id, account=order_account)
+                            else:
+                                ib.connect(host, port, clientId=client_id)
+                        except TypeError:
+                            ib.connect(host, port, clientId=client_id)
                         report_live_worker_state(
                             "ib_running",
                             unhealthy_after_seconds=_IB_SDK_HEALTH_DEADLINE_SECONDS,
@@ -1930,6 +2289,28 @@ class IBBrokerAdapter(BaseLiveBroker):
                                 )
                         except Exception as bind_err:
                             _runtime_print(f"[System Warning] manual-order bind setup failed: {bind_err}")
+                        # Do not let the first schedule run treat an account-sync
+                        # gap as a legitimate zero-cash account.  The next loop/run
+                        # retries the broker snapshot without persisting intent.
+                        try:
+                            if (
+                                hasattr(trader.broker, 'is_account_snapshot_trusted')
+                                and not IBBrokerAdapter._in_async_task()
+                            ):
+                                trusted = trader.broker.is_account_snapshot_trusted()
+                                if not trusted:
+                                    detail = getattr(
+                                        trader.broker,
+                                        '_last_account_snapshot_fetch_error',
+                                        'account snapshot unavailable',
+                                    )
+                                    _runtime_print(
+                                        f"[System Warning] IB account snapshot unavailable after connect: {detail}"
+                                    )
+                        except Exception as account_probe_error:
+                            _runtime_print(
+                                f"[System Warning] IB account snapshot probe failed: {account_probe_error}"
+                            )
                     except Exception as e:
                         # 🔴 关键修复：使用 repr(e) 捕获空字面量异常
                         err_msg = repr(e)

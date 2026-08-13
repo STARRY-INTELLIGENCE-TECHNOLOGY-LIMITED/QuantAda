@@ -544,6 +544,134 @@ def test_gm_sellable_position_fallback_to_available_then_volume_today(monkeypatc
     assert broker.get_sellable_position(d2) == 650, "available_now 缺失时应使用 available。"
 
 
+def test_gm_live_position_uses_synchronous_counter_snapshot(monkeypatch):
+    """实盘 SELL 对账不能依赖被当前 schedule 回调阻塞的 context 持仓缓存。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    cached_pos = SimpleNamespace(
+        symbol="SHSE.513050",
+        volume=488000,
+        vwap=1.14,
+        available_now=488000,
+    )
+    ctx = SimpleNamespace(account=lambda: SimpleNamespace(positions=lambda: [cached_pos]))
+    broker = GmBrokerAdapter(context=ctx)
+    broker.is_live = True
+
+    counter_queries = []
+    monkeypatch.setattr(
+        gm_module,
+        "gm_get_position",
+        lambda: counter_queries.append(True) or [],
+    )
+
+    got = broker.get_position(SimpleNamespace(_name="SHSE.513050"))
+
+    assert counter_queries == [True]
+    assert got.size == 0, "柜台已空仓时不得继续读取 schedule 进入前的 488000 缓存。"
+    assert broker._last_position_snapshot_fetch_failed is False
+
+
+def test_gm_live_position_query_failure_is_not_silent_empty_position(monkeypatch):
+    """同步持仓查询失败必须向执行器暴露为未知状态，不能伪装成空仓并放行 BUY。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+
+    def _raise_position_error():
+        raise RuntimeError("trade service unavailable")
+
+    monkeypatch.setattr(gm_module, "gm_get_position", _raise_position_error)
+
+    with pytest.raises(RuntimeError, match="GM live position query failed"):
+        broker.get_position(SimpleNamespace(_name="SHSE.513050"))
+
+    assert broker._last_position_snapshot_fetch_failed is True
+    assert "trade service unavailable" in str(broker._last_position_snapshot_fetch_error)
+
+
+def test_gm_live_account_snapshot_probe_accepts_flat_account(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    cash_calls = []
+    position_calls = []
+    monkeypatch.setattr(
+        gm_module,
+        "get_cash",
+        lambda *args, **kwargs: cash_calls.append((args, kwargs))
+        or SimpleNamespace(available=123.45),
+    )
+    monkeypatch.setattr(
+        gm_module,
+        "gm_get_position",
+        lambda *args, **kwargs: position_calls.append((args, kwargs)) or [],
+    )
+
+    assert broker.is_account_snapshot_trusted() is True
+    assert broker._last_account_snapshot_fetch_failed is False
+    assert cash_calls == [((), {})]
+    assert position_calls == [((), {})]
+
+
+def test_gm_live_account_snapshot_probe_rejects_missing_cash(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    monkeypatch.setattr(gm_module, "get_cash", lambda: {})
+    monkeypatch.setattr(gm_module, "gm_get_position", lambda: [])
+
+    assert broker.is_account_snapshot_trusted() is False
+    assert broker._last_account_snapshot_fetch_failed is True
+    assert "available field" in str(broker._last_account_snapshot_fetch_error)
+
+
+@pytest.mark.parametrize("available", ["N/A", float("nan"), float("inf")])
+def test_gm_live_account_snapshot_probe_rejects_invalid_cash(monkeypatch, available):
+    import live_trader.adapters.gm_broker as gm_module
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    monkeypatch.setattr(
+        gm_module,
+        "get_cash",
+        lambda: SimpleNamespace(available=available),
+    )
+    monkeypatch.setattr(gm_module, "gm_get_position", lambda: [])
+
+    assert broker.is_account_snapshot_trusted() is False
+    assert broker._last_account_snapshot_fetch_failed is True
+
+
+def test_gm_backtest_position_keeps_context_snapshot_fast_path(monkeypatch):
+    """同步柜台查询仅属于实盘；GM 回测继续使用 context 内存持仓。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    pos = SimpleNamespace(
+        symbol="SHSE.600000",
+        volume=1000,
+        vwap=10.0,
+        available_now=None,
+        available=1000,
+    )
+    ctx = SimpleNamespace(account=lambda: SimpleNamespace(positions=lambda: [pos]))
+    broker = GmBrokerAdapter(context=ctx)
+    broker.is_live = False
+    monkeypatch.setattr(
+        gm_module,
+        "gm_get_position",
+        lambda: (_ for _ in ()).throw(AssertionError("backtest must not query live counter")),
+    )
+
+    got = broker.get_position(SimpleNamespace(_name="SHSE.600000"))
+
+    assert got.size == 1000
+    assert got.sellable == 1000
+
+
 def test_gm_pending_order_contract_includes_id(monkeypatch):
     """
     最小契约:
@@ -625,6 +753,116 @@ def test_gm_pending_order_fetch_success_clears_failure_flag(monkeypatch):
     assert len(got) == 1
     assert broker._last_pending_orders_fetch_failed is False
     assert broker._last_pending_orders_fetch_error is None
+
+
+@pytest.mark.parametrize(
+    "pending",
+    [
+        SimpleNamespace(
+            cl_ord_id="",
+            symbol="SHSE.600000",
+            side=mock_gm_api.OrderSide_Buy,
+            volume=1000,
+            filled_volume=0,
+        ),
+        SimpleNamespace(
+            cl_ord_id="GM_NO_SYMBOL",
+            symbol="",
+            side=mock_gm_api.OrderSide_Buy,
+            volume=1000,
+            filled_volume=0,
+        ),
+        SimpleNamespace(
+            cl_ord_id="GM_UNKNOWN_SIDE",
+            symbol="SHSE.600000",
+            side=999,
+            volume=1000,
+            filled_volume=0,
+        ),
+        SimpleNamespace(
+            cl_ord_id="GM_ZERO_REMAINING",
+            symbol="SHSE.600000",
+            side=mock_gm_api.OrderSide_Buy,
+            volume=1000,
+            filled_volume=1000,
+        ),
+        SimpleNamespace(
+            cl_ord_id="GM_BAD_SIZE",
+            symbol="SHSE.600000",
+            side=mock_gm_api.OrderSide_Buy,
+            volume="not-a-number",
+            filled_volume=0,
+        ),
+    ],
+)
+def test_gm_pending_order_malformed_record_marks_snapshot_untrusted(monkeypatch, pending):
+    """A malformed in-flight order must invalidate the whole GM snapshot."""
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+    monkeypatch.setattr(mock_gm_api, "get_unfinished_orders", lambda: [pending], raising=False)
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+
+    assert broker.get_pending_orders() == []
+    assert broker._last_pending_orders_fetch_failed is True
+    assert broker._last_pending_orders_fetch_error is not None
+
+
+def test_gm_pending_order_partial_snapshot_is_never_returned_after_bad_record(monkeypatch):
+    """坏记录出现在后半段时，也不能泄漏此前收集的部分在途订单。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    valid = SimpleNamespace(
+        cl_ord_id="GM_VALID_FIRST",
+        symbol="SHSE.600000",
+        side=mock_gm_api.OrderSide_Buy,
+        volume=1000,
+        filled_volume=0,
+    )
+    malformed = SimpleNamespace(
+        cl_ord_id="",
+        symbol="SHSE.600001",
+        side=mock_gm_api.OrderSide_Buy,
+        volume=1000,
+        filled_volume=0,
+    )
+    monkeypatch.setattr(mock_gm_api, "get_unfinished_orders", lambda: [valid, malformed], raising=False)
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+
+    assert broker.get_pending_orders() == []
+    assert broker._last_pending_orders_fetch_failed is True
+
+
+def test_gm_pending_query_keeps_account_id_for_cancel(monkeypatch):
+    """GM 原生 pending 记录的 account_id 必须原样用于撤单。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    pending = {
+        "cl_ord_id": "GM_ACCOUNT_OID",
+        "account_id": "A001",
+        "symbol": "SHSE.600000",
+        "side": mock_gm_api.OrderSide_Buy,
+        "volume": 1000,
+        "filled_volume": 0,
+    }
+    monkeypatch.setattr(mock_gm_api, "get_unfinished_orders", lambda: [pending], raising=False)
+    mock_gm.api = mock_gm_api
+
+    cancel_calls = []
+    monkeypatch.setattr(
+        mock_gm_api,
+        "order_cancel",
+        lambda payload: cancel_calls.append(payload),
+        raising=False,
+    )
+    monkeypatch.setattr(mock_gm_api, "cancel_order", None, raising=False)
+
+    assert broker.cancel_pending_order("GM_ACCOUNT_OID") is True
+    assert cancel_calls == [{"cl_ord_id": "GM_ACCOUNT_OID", "account_id": "A001"}]
 
 
 def test_gm_cancel_pending_order_by_id(monkeypatch):
@@ -937,6 +1175,87 @@ def test_gm_launch_continues_on_transient_poll_minus_one(monkeypatch, capsys):
     assert sleep_calls == [0.05, 0.05]
 
 
+def test_gm_daily_schedule_quiet_window_suppresses_maintenance_logs_without_stopping_poll(monkeypatch, capsys):
+    """日线恢复窗口外继续驱动 SDK，但不刷 -1/1200/1201/1100 维护日志。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    poll_count = {"value": 0}
+    health_states = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, *args, **kwargs):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            raise AssertionError("quiet maintenance window must not push schedule alarm")
+
+        def push_exception(self, *args, **kwargs):
+            raise AssertionError("known maintenance statuses must not push exception")
+
+    def _poll_maintenance_then_stop():
+        poll_count["value"] += 1
+        if poll_count["value"] == 1:
+            return -1
+        if poll_count["value"] == 2:
+            fake_context.on_error_fun(fake_context, 1201, "实时行情服务连接断开")
+            fake_context.on_error_fun(fake_context, 1200, "实时行情服务连接失败")
+            fake_context.on_error_fun(fake_context, 1100, "交易消息服务连接失败")
+            return -1
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_maintenance_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "_resolve_gm_connectivity_retry",
+        lambda *args, **kwargs: (
+            True,
+            600.0,
+            datetime.datetime(2026, 8, 13, 14, 15, 0),
+        ),
+    )
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: health_states.append((state, kwargs)) or True,
+    )
+    monkeypatch.setattr("time.sleep", lambda seconds: None)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {
+                "token": "token",
+                "strategy_id": "strategy-id",
+                "schedule": "1d:14:45:00",
+            },
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert poll_count["value"] == 3, "日志降噪不能停止 gmi_poll 探测。"
+    assert "gmi_poll returned transient status" not in captured.out
+    assert "Code: 1200" not in captured.out
+    assert "Code: 1201" not in captured.out
+    assert "Code: 1100" not in captured.out
+    assert any(state == "gm_connectivity_quiet_wait" for state, _ in health_states)
+
+
 def test_gm_launch_converts_sdk_system_exit_to_restart(monkeypatch, capsys):
     """
     GM SDK 可能在底层 shutdown 时抛 SystemExit。launch 必须拦截并重启
@@ -1176,6 +1495,7 @@ def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeyp
     health_states = []
     restart_requests = []
     sleep_calls = []
+    wake_at = datetime.datetime.now() + datetime.timedelta(seconds=900)
 
     class StopPhoenix(BaseException):
         pass
@@ -1219,7 +1539,7 @@ def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeyp
         lambda *args, **kwargs: (
             True,
             123.0,
-            datetime.datetime(2026, 7, 30, 14, 15, 0),
+            wake_at,
         ),
     )
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
@@ -1240,8 +1560,9 @@ def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeyp
     assert sleep_calls == [123.0]
     assert restart_requests == []
     assert health_states[-1][0] == "gm_connectivity_quiet_wait"
-    assert health_states[-1][1].get("unhealthy_after_seconds") is None
-    assert "quiet probe in 123s; aggressive recovery at 2026-07-30 14:15:00" in captured.out
+    assert 895.0 <= health_states[-1][1].get("unhealthy_after_seconds", 0.0) <= 900.0
+    assert health_states[-1][1].get("refresh_deadline") is True
+    assert "quiet probe in 123s; aggressive recovery at" not in captured.out
 
 
 def test_gm_launch_reexecs_after_repeated_init_failures(monkeypatch):

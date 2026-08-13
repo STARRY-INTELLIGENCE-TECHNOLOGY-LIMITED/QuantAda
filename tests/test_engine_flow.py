@@ -1306,6 +1306,100 @@ def test_on_order_status_callback_terminal_fill_pushes_once_with_target_qty(monk
     assert pushed_trades[0]["dt"] == "2026-02-17T10:17:32", "成交推送时间应优先使用真实执行时间。"
 
 
+def test_live_fill_without_broker_timestamp_does_not_reuse_schedule_time(monkeypatch):
+    """实盘回报缺时间字段时使用回调墙钟时间，不能打印固定的 schedule 启动时间。"""
+    import live_trader.engine as engine_module
+
+    class DummyOrderProxy:
+        id = "GM_FILLED_NO_DT"
+        status = "Filled"
+        data = SimpleNamespace(_name="SHSE.512010")
+        executed = SimpleNamespace(size=100.0, price=0.4, value=40.0, comm=0.0, dt=None)
+        platform_order = SimpleNamespace(volume=100.0)
+
+        def is_completed(self): return True
+        def is_buy(self): return True
+        def is_sell(self): return False
+        def is_rejected(self): return False
+        def is_canceled(self): return False
+        def is_pending(self): return False
+        def is_accepted(self): return False
+
+    class DummyBroker:
+        is_live = True
+
+        def convert_order_proxy(self, raw_order): return DummyOrderProxy()
+        def on_order_status(self, proxy): return proxy
+
+    logged_dts = []
+    pushed_trades = []
+
+    class DummyStrategy:
+        def __init__(self): self.broker = DummyBroker()
+        def notify_order(self, order): logged_dts.append(engine_module.extract_order_execution_dt(order))
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"): return None
+        def push_trade(self, trade_info): pushed_trades.append(trade_info)
+
+    monkeypatch.setattr(engine_module, "AlarmManager", lambda: DummyAlarmManager())
+    context = SimpleNamespace(
+        strategy_instance=DummyStrategy(),
+        now=datetime(2026, 8, 12, 14, 45, 0, 45000),
+    )
+
+    engine_module.on_order_status_callback(context, SimpleNamespace())
+
+    assert logged_dts and logged_dts[0] is not None
+    assert pushed_trades[0]["dt"] != "2026-08-12T14:45:00.045000"
+
+
+def test_backtest_fill_without_broker_timestamp_keeps_simulated_time(monkeypatch):
+    """非实盘回报缺时间字段时仍保留确定性的 context 模拟时间。"""
+    import live_trader.engine as engine_module
+
+    class DummyOrderProxy:
+        id = "BT_FILLED_NO_DT"
+        status = "Filled"
+        data = SimpleNamespace(_name="SHSE.512010")
+        executed = SimpleNamespace(size=100.0, price=0.4, value=40.0, comm=0.0, dt=None)
+        platform_order = SimpleNamespace(volume=100.0)
+
+        def is_completed(self): return True
+        def is_buy(self): return True
+        def is_sell(self): return False
+        def is_rejected(self): return False
+        def is_canceled(self): return False
+        def is_pending(self): return False
+        def is_accepted(self): return False
+
+    class DummyBroker:
+        is_live = False
+
+        def convert_order_proxy(self, raw_order): return DummyOrderProxy()
+        def on_order_status(self, proxy): return proxy
+
+    pushed_trades = []
+
+    class DummyStrategy:
+        def __init__(self): self.broker = DummyBroker()
+        def notify_order(self, order): return None
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"): return None
+        def push_trade(self, trade_info): pushed_trades.append(trade_info)
+
+    monkeypatch.setattr(engine_module, "AlarmManager", lambda: DummyAlarmManager())
+    context = SimpleNamespace(
+        strategy_instance=DummyStrategy(),
+        now=datetime(2026, 8, 12, 14, 45, 0, 45000),
+    )
+
+    engine_module.on_order_status_callback(context, SimpleNamespace())
+
+    assert pushed_trades[0]["dt"] == "2026-08-12T14:45:00.045000"
+
+
 def test_on_order_status_callback_skips_submitted_alarm_for_untracked_external_order(monkeypatch):
     """
     回调告警回归:
@@ -2275,6 +2369,94 @@ def test_live_run_blocks_on_untrusted_pending_snapshot_without_strategy_order(mo
     assert engine.strategy.next_calls == 0
     assert pushed and pushed[-1]["level"] == "ERROR"
     assert "pending-order snapshot remained unavailable" in pushed[-1]["content"]
+
+
+def test_live_run_blocks_when_broker_account_snapshot_is_unavailable(monkeypatch):
+    """连接可用但账户未同步时，不得把空快照当作空仓继续执行策略。"""
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    engine = LiveTrader({
+        "strategy_name": "CounterStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "params": {},
+        "KEEP_OVERNIGHT_ORDERS": True,
+    })
+    context = MockContext(now=datetime(2026, 8, 13, 9, 30, 0))
+    engine.init(context)
+    engine._refresh_live_data = lambda _ctx: {
+        "total_feeds": 1,
+        "updated_feeds": 1,
+        "failed_feeds": 0,
+    }
+
+    probes = []
+
+    def _untrusted_account():
+        probes.append(True)
+        engine.broker._last_account_snapshot_fetch_error = "target account not visible"
+        return False
+
+    engine.broker.is_account_snapshot_trusted = _untrusted_account
+    pushed = []
+    monkeypatch.setattr(
+        type(engine.alarm_manager),
+        "push_text",
+        lambda self, content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+
+    engine.run(context)
+
+    assert len(probes) == 3
+    assert engine.strategy.next_calls == 0
+    assert pushed and pushed[-1]["level"] == "ERROR"
+    assert "account snapshot remained unavailable" in pushed[-1]["content"]
+
+
+def test_non_live_run_does_not_probe_live_account_snapshot(monkeypatch):
+    """账户健康门只属于实盘路径，回测/优化应继续同步快速执行。"""
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    engine = LiveTrader({
+        "strategy_name": "CounterStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "params": {},
+    })
+    context = MockContext(now=datetime(2026, 8, 13, 9, 30, 0))
+    engine.init(context)
+    engine.broker.is_live = False
+    engine.broker.is_account_snapshot_trusted = lambda: (_ for _ in ()).throw(
+        AssertionError("non-live path must not query live account health")
+    )
+
+    engine.run(context)
+
+    assert engine.strategy.next_calls == 1
 
 
 def test_live_run_retries_transient_pending_failure_then_executes_strategy(monkeypatch):

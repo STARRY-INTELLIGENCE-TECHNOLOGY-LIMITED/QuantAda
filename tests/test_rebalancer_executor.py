@@ -416,6 +416,60 @@ def test_order_executor_blocks_buy_when_sell_ids_disappear_but_position_misses_t
     assert "did not reach broker position targets" in pushed[-1]["content"]
 
 
+def test_order_executor_live_settlement_logs_include_wall_clock_timestamp(monkeypatch, capsys):
+    """实盘 SELL 对账关键日志必须自带墙钟时间，便于核对 14:55 前的剩余窗口。"""
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(executor_module.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        executor_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("t", clock["t"] + float(seconds)),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "runtime_print",
+        lambda message: print(f"[2026-08-13 14:54:30] {message}"),
+    )
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", lambda *args, **kwargs: True)
+
+    class DummyBroker:
+        is_live = True
+
+        def __init__(self):
+            self.calls = []
+            self._pending_sells = set()
+
+        def get_position(self, data):
+            return SimpleNamespace(size=488000, price=1.14)
+
+        def get_current_price(self, data): return 1.14
+        def get_rebalance_cash(self): return 19.47
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            self._pending_sells.add("SELL_1")
+            return SimpleNamespace(id="SELL_1", submitted_size=488000)
+
+        def get_pending_orders(self): return []
+        def sync_balance(self): return None
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_WARN_SECONDS = 1.0
+    executor._SELL_SETTLE_HARD_SECONDS = 2.0
+    executor.execute_plan({
+        "sell_clear": [SimpleNamespace(_name="SHSE.513050")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="SHSE.512010"), 554409.0)],
+    })
+
+    output = capsys.readouterr().out
+    assert "[2026-08-13 14:54:30] [Executor]" in output
+    assert broker.calls == [("SHSE.513050", 0.0)]
+
+
 def test_order_executor_waits_for_accepted_sell_children_after_partial_batch_failure(monkeypatch):
     import common.order_executor as executor_module
 
@@ -1218,6 +1272,82 @@ def test_order_executor_delays_rolling_buy_and_tops_up_after_sell_clear(monkeypa
         ("SPY.ARCA", 0.0),
         ("EWJ.ARCA", 1000.0),
     ], "滚动 BUY 只有本地 active 但未出现在柜台 pending 快照时，不应继续补齐以免重复计算仓位。"
+
+
+def test_order_executor_blocks_buy_when_remote_pending_snapshot_is_untrusted():
+    """挂单快照失败时，最终/滚动 BUY 必须失败关闭，避免重复下单。"""
+    from common.order_executor import OrderExecutor
+
+    data = SimpleNamespace(_name="EWJ.ARCA")
+
+    class Broker:
+        is_live = True
+        _last_pending_orders_fetch_failed = True
+        _last_pending_orders_fetch_error = "temporary pending query failure"
+
+        def get_pending_orders(self):
+            return []
+
+    assert OrderExecutor(Broker())._has_remote_pending_buy(data) is True
+
+    class RaisingBroker:
+        is_live = True
+
+        def get_pending_orders(self):
+            raise RuntimeError("socket unavailable")
+
+    assert OrderExecutor(RaisingBroker())._has_remote_pending_buy(data) is True
+
+
+def test_order_executor_does_not_top_up_after_rolling_buy_when_second_pending_snapshot_fails(monkeypatch):
+    """A failed second pending read must not turn a conservative guard into a BUY top-up."""
+    import common.order_executor as executor_module
+
+    data = SimpleNamespace(_name="EWJ.ARCA")
+
+    class Broker:
+        is_live = True
+
+        def __init__(self):
+            self.calls = []
+            # The rolling order was accepted earlier in this run. Its local
+            # callback tracker may already have cleared, so the first remote
+            # snapshot is the evidence used by final-buy reconciliation.
+            self._active_buys = {}
+            self._last_pending_orders_fetch_failed = False
+            self._last_pending_orders_fetch_error = None
+            self.pending_reads = 0
+
+        def get_pending_orders(self):
+            self.pending_reads += 1
+            if self.pending_reads == 1:
+                return [{
+                    "id": "BUY_ROLLING",
+                    "symbol": "EWJ.ARCA",
+                    "direction": "BUY",
+                    "size": 100,
+                }]
+            self._last_pending_orders_fetch_failed = True
+            self._last_pending_orders_fetch_error = "temporary pending query failure"
+            return []
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            return object()
+
+    broker = Broker()
+    executor = executor_module.OrderExecutor(broker)
+
+    submitted = executor._execute_final_buys(
+        [(data, 1_000.0)],
+        check_pending=True,
+        released_target_by_symbol={"EWJ.ARCA": 100.0},
+    )
+
+    assert submitted == 0
+    assert broker.calls == []
+    assert broker.pending_reads == 2
+    assert broker._last_pending_orders_fetch_failed is True
 
 
 def test_order_executor_tops_up_customer_case_after_100_share_rolling_buy(monkeypatch):

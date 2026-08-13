@@ -17,6 +17,7 @@
 1. **继承基类**: 你的主类必须命名为 `[BrokerName]Broker`，并且严格继承自 `live_trader.adapters.base_broker.BaseLiveBroker`。
 2. **模块装载契约**: `live_trader.engine.LiveTrader` 会在同一个 adapter 模块中同时反射 Broker 和 DataProvider。因此输出文件中除了 `[BrokerName]Broker` 外，还必须同时暴露一个 `BaseDataProvider` 子类（可为薄封装），并兼容 `get_history(...)` 调用。
 3. **绝对无状态 (Stateless)**: QuantAda 已移除 `deferred/buffered` 买单队列。适配器内部**严禁**维护任何类似 `self.local_cash` 或 `self.local_positions` 的缓存变量，也**严禁**自行实现跨回调重试队列。所有状态查询必须实时通过 API 向物理柜台发起。
+   若 SDK/TCP 已连接但账户摘要或持仓订阅尚未同步，必须暴露当前会话的短生命周期健康失败并让实盘当轮有界重试后失败关闭；禁止把空快照静默解释为真实的零现金/空仓。该健康状态不得进入回测/优化路径或保存交易意图。
 4. **数据对象解包**: 框架传入的 `data` 参数是一个代理对象（DataFeedProxy）。获取标的代码时，必须使用 `data._name`，并在与券商 API 交互前，根据需要进行格式化（例如截取基础代码 `data._name.split('.')[0].upper()`）。
 5. **卖出可用仓位约束**: 对存在 T+1 或可卖冻结语义的市场，必须提供准确可卖仓位（建议实现/覆盖 `get_sellable_position`），不要仅用总仓位代替可卖仓位。
 
@@ -29,7 +30,7 @@
 ### 1. 资产与持仓查询
 - `getvalue(self) -> float`: 获取当前账户总权益（Net Liquidation Value）。可调用父类的 `self._get_portfolio_nav()` 或直接调用券商 API 获取。
 - `_fetch_real_cash(self) -> float`: 实时向柜台请求当前可用于开新仓的真实购买力（现金）。如券商口径不含在途冻结，需在适配器层补充扣减逻辑。
-- `get_position(self, data)`: 获取指定标的持仓。必须返回一个拥有 `.size` (持仓数量，可为整数或小数) 和 `.price` (成本价) 属性的对象（可使用 `SimpleNamespace` 模拟）。若市场有可卖限制，建议同时暴露 `.sellable`。
+- `get_position(self, data)`: 获取指定标的持仓。必须返回一个拥有 `.size` (持仓数量，可为整数或小数) 和 `.price` (成本价) 属性的对象（可使用 `SimpleNamespace` 模拟）。若市场有可卖限制，建议同时暴露 `.sellable`。若 SDK 在同一事件线程串行执行 schedule 和订单/持仓回调，实盘实现必须在当前 run 的 SELL 等待期间使用同步柜台查询，不能读取被 schedule 阻塞的旧 context 缓存；查询失败必须暴露为不可信状态，不能当作零持仓。基类会让持仓/可卖仓位查询异常失败关闭，adapter 不应依赖异常被静默转换为零仓。
 - `get_sellable_position(self, data)`（建议覆盖）: 返回当前真实可卖仓位；若不覆盖，基类会退化为 `size`。
 - `get_current_price(self, data) -> float`: 获取指定标的实时盘口价或最新快照价。若获取失败、断流或停牌，必须安全返回 `0.0`，严禁抛出异常。
 - 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；适配器不要自行实现固定 sleep、轮询补买或卖后现金等待状态机。若需要支持更准确的通用等待，确保 `get_rebalance_cash()` / `get_cash()`、`get_current_price(data)` 和订单代理的委托数量字段可用。
@@ -38,7 +39,8 @@
 - `get_pending_orders(self) -> list`: 获取所有未完成的在途订单。**必须返回以下严格格式的字典列表**：
   `[{'id': '123', 'symbol': 'AAPL', 'direction': 'BUY' 或 'SELL', 'size': 100}, ...]`，其中 `size` 可为整数或小数且必须保留券商精度。
   若实时查询失败、断连或快照不完整，可安全返回 `[]`，但必须设置 `self._last_pending_orders_fetch_failed = True` 和 `self._last_pending_orders_fetch_error = error`；成功查询必须清零，避免框架把“查不到”误判为“无在途”。
-  该失败标记只能表示当前快照可信度，不得保存交易意图、不得驱动跨 K 重试、不得用于回测路径；实盘引擎每轮策略执行前和基础层目标下单边界都会有界重试检查该标记，耗尽后失败关闭并跳过下单；可信在途数量必须计入目标差额以继续执行剩余计划；回测应保持订单同步成交语义且不得查询 live pending。
+  原始记录若缺失/空 `id`、缺失 `symbol`、方向未知、剩余数量非正或非数值，也属于快照不完整：必须使整份快照失败关闭，不能静默跳过坏记录或将未知方向默认映射为 SELL。
+  该失败标记只能表示当前快照可信度，不得保存交易意图、不得驱动跨 K 重试、不得用于回测路径；实盘引擎每轮策略执行前、策略资金盘点时和基础层目标下单边界都必须检查该标记，失败时关闭并跳过当轮调仓；可信在途数量必须计入目标差额以继续执行剩余计划；回测应保持订单同步成交语义且不得查询 live pending。
 - `cancel_pending_order(self, order_id: str) -> bool`: 按订单ID发起撤单。返回是否成功发起撤单请求（True/False）。该接口用于引擎在交易日首轮前清理隔夜在途单。
 - `_submit_order(self, data, volume, side: str, price: float)`: 核心发单路由。`volume` 可为整数或小数，只有目标券商/合约明确要求整数时才能在最终提交边界转换为 `int`；`side` 为 `'BUY'` 或 `'SELL'`。将其翻译为目标券商的结构体并发起发单请求，发单成功后返回自定义的 `BaseOrderProxy` 子类实例，失败返回 `None`。
   若券商同步返回 Rejected/Canceled/Expired 等不会继续成交的订单对象，代理必须准确暴露该终态；基础层会按未接受处理，BUY Rejected 会立即进入统一降级重试。不要把同步废单映射成 accepted/pending，否则会出现“实盘信号已打印但柜台没有委托”的误判。
@@ -60,6 +62,7 @@
 - `@staticmethod` `is_live_mode(context) -> bool`: 判断当前上下文是否为实盘模式。
 - `@classmethod` `launch(cls, conn_cfg: dict, strategy_path: str, params: dict, **kwargs)`: [可选实现] 命令行实盘启动入口，负责初始化券商 SDK、建立连接并挂载事件循环。
 - 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
+- 多账户券商的现金、持仓、pending 和下单必须使用同一明确账户。GM adapter 当前只支持券商会话绑定的单一账户，使用 SDK 默认单账户语义，不增加账户选择配置；IB 等多账户 adapter 仍须按其连接配置明确筛选目标账户。明确筛选目标账户后，其他账户有仓而目标账户为空属于合法零仓，不能误报为快照故障。
 - schedule 只兼容 `1d|Nm|Nh:HH:MM[:SS]`；配置 `Ns` 必须明确报错，并引导使用长连接事件回调与 `timeframe='Seconds'`。分钟级事件循环轮询和 SDK 超时必须随周期缩短，不能让一次调用跨过下一轮。
 - `DataProvider` 子类: 必须让引擎能通过当前 adapter 模块直接发现；如果历史数据能力来自现有 provider，也请在本文件中提供桥接类，而不是只写说明文字。
 
@@ -79,7 +82,7 @@
 9. 适配器和执行器必须区分 live/backtest：实盘以柜台现实、持仓/现金对账和短生命周期健康标记恢复；回测不得进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步路径。
 10. 卖后现金等待、滚动买入和最终补齐属于 `common.order_executor` 职责；adapter 不要重复实现这些流程，只暴露真实现金、价格、在途订单和订单代理字段。
 11. 使用 SDK 事件循环的实盘 adapter 必须把 SDK 线程/轮询/协作等待函数抛出的非人工 `SystemExit` 当作 session 退出并交给 Phoenix 重启；不要让 nohup 长进程被 SDK 直接带退出。GM `gmi_poll()` 的普通非零返回值按官方循环语义限频记录并继续，不能因无消息的 `-1` 持续重建 worker；明确 shutdown、`SystemExit` 和连接健康超时仍须重启。人工 `KeyboardInterrupt` 仍应退出。schedule prewarm 和正式 run 都应按目标 slot 去重，长进程 warning/error/Phoenix 生命周期日志应通过 `common.live_runtime.runtime_print()` 带时间戳。GM 这类进程内 SDK 若 init 失败，应先重绑 token/server/callback 并 soft reset；连续 init 失败可 re-exec 当前进程作为最后自愈。
-12. 通过 `run.py --connect` 运行时，通用父进程监督器负责进程级保活与探活；worker 进入 broker SDK 前必须推送一次 `STARTED`，同一 worker 进程内不得重复发送；adapter 应在 native SDK 初始化/连接阶段上报短生命周期健康状态和有界超时。监督器发现 worker 退出、heartbeat 停滞或健康期限超时后，以原始命令冷启动并记录退出码/信号；连接维护等降噪策略必须通过结构化故障类别传递，不得解析状态或原因文本。受监督 worker 的内部重启不重复推 `STOPPED` / `DEAD`；操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。配置 `1d` schedule 时，每个自然日在正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`。GM 维护期连接故障可在该同一边界（或更早 prewarm）前低频探测，但不能停探；边界到达必须通过 heartbeat/干净重建切回积极恢复，区间 schedule 的等待不得跨 slot，无有效 schedule 时不得降频。监督器不得保存或重放交易意图，回测/优化不得启动该链路。
+12. 通过 `run.py --connect` 运行时，通用父进程监督器负责进程级保活与探活；worker 进入 broker SDK 前必须推送一次 `STARTED`，同一 worker 进程内不得重复发送；adapter 应在 native SDK 初始化/连接阶段上报短生命周期健康状态和有界超时。监督器发现 worker 退出、heartbeat 停滞或健康期限超时后，以原始命令冷启动并记录退出码/信号；连接维护等降噪策略必须通过结构化故障类别传递，不得解析状态或原因文本。受监督 worker 的内部重启不重复推 `STOPPED` / `DEAD`；操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。配置 `1d` schedule 时，每个自然日在正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`。GM 维护期连接故障可在该同一边界（或更早 prewarm）前低频探测，但不能停探；边界外的 `gmi_poll=-1`、1200/1201 行情连接及 1100 交易连接维护状态不得周期性刷 warning/error 日志，边界到达后恢复有限日志并通过 heartbeat/干净重建切回积极恢复。区间 schedule 的等待不得跨 slot，无有效 schedule 时不得降频。监督器不得保存或重放交易意图，回测/优化不得启动该链路。
 13. 每次实盘 `run` 从隔夜清理前共享一个 monotonic deadline：默认最多 600 秒，分钟/小时 schedule 或 `Minutes|Seconds` timeframe 自动缩短为触发间隔的 80%。pending 查询、撤单、数据恢复、SELL 等待、资金等待、BUY/SELL 拆单和 BUY 降级都必须在该 deadline 内；到期后停止发起新动作但保留已受理/成交的部分结果。异步拒单只能沿用原订单提交时的 deadline，不能借下一轮预算重放旧意图。所有 SDK 查询/撤单/发单接口必须设置明显短于该预算的有限超时；回测/优化不得进入此机制。
 14. 24x7 市场配置 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日必须保留远端委托以及本地 `_active_buys`、`_pending_sells`、虚拟占资的短期跟踪；仍须持续用实时柜台状态对账，不能将这些跟踪演化为跨 K 交易意图。
 

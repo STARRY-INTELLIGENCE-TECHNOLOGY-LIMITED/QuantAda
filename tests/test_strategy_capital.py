@@ -110,6 +110,22 @@ def test_strategy_isolated_capital_backtest_ignores_pending_orders(monkeypatch):
     assert len(current_positions) == 1
 
 
+def test_strategy_isolated_capital_live_fails_closed_on_untrusted_pending_snapshot():
+    """Live capital planning must not reinterpret an unavailable pending snapshot as empty."""
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0)
+
+    def _untrusted_pending():
+        broker._last_pending_orders_fetch_failed = True
+        broker._last_pending_orders_fetch_error = "counter timeout"
+        return []
+
+    broker.get_pending_orders = _untrusted_pending
+    strategy = DummyStrategy(broker=broker, params={})
+
+    with pytest.raises(RuntimeError, match="本轮调仓已中止"):
+        strategy.get_strategy_isolated_capital()
+
+
 def test_notify_order_prefers_execution_dt_for_logs(monkeypatch):
     """
     成交日志时间回归:

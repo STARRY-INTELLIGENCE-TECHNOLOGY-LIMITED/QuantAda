@@ -218,6 +218,64 @@ def test_sell_and_cash_wait_share_deadline_and_preserve_final_buy_window(fake_cl
     assert fake_clock["t"] <= 10.0
 
 
+def test_sell_settled_at_finalization_boundary_still_submits_final_buy(fake_clock, monkeypatch):
+    """A fresh counter snapshot at the reserve boundary must not lose a filled SELL."""
+    sell_data = SimpleNamespace(_name="SPY.ARCA")
+    buy_data = SimpleNamespace(_name="EWJ.ARCA")
+
+    class Broker:
+        is_live = True
+        safety_multiplier = 1.0
+
+        def __init__(self):
+            self._pending_sells = set()
+            self.calls = []
+            self.sell_submitted = False
+
+        def get_position(self, data):
+            size = 100 if data._name == sell_data._name and fake_clock["t"] < 9.0 else 0
+            return SimpleNamespace(size=size, price=1.0)
+
+        def get_current_price(self, data):
+            return 1.0
+
+        def get_rebalance_cash(self):
+            return 100.0
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target), fake_clock["t"]))
+            if data._name == sell_data._name:
+                self.sell_submitted = True
+                self._pending_sells.add("SELL_1")
+                return SimpleNamespace(id="SELL_1", submitted_size=100)
+            return object()
+
+        def get_pending_orders(self):
+            if fake_clock["t"] < 9.0:
+                return [{"id": "SELL_1", "symbol": sell_data._name, "direction": "SELL", "size": 100}]
+            return []
+
+        def sync_balance(self):
+            return None
+
+    monkeypatch.setattr(executor_module.runtime_notifications, "push_text", lambda *args, **kwargs: True)
+    broker = Broker()
+    begin_live_run_budget(broker, {"LIVE_RUN_MAX_EXECUTION_SECONDS": 10})
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_POLL_SECONDS = 1.0
+    executor._POST_SELL_CASH_POLL_SECONDS = 0.5
+
+    executor.execute_plan({
+        "sell_clear": [sell_data],
+        "reduce": [],
+        "increase": [(buy_data, 100.0)],
+    })
+
+    buy_calls = [call for call in broker.calls if call[0] == buy_data._name]
+    assert buy_calls == [(buy_data._name, 100.0, 9.0)]
+    assert fake_clock["t"] == 9.0
+
+
 @pytest.mark.parametrize("side", ["BUY", "SELL"])
 def test_split_orders_stop_at_deadline_and_keep_accepted_children(fake_clock, monkeypatch, side):
     monkeypatch.setattr(config, "LOT_SIZE", 100)

@@ -1130,6 +1130,36 @@ def test_smart_sell_respects_sellable_position_t1():
     assert len(broker.submitted_orders) == 0, "T+1 拦截后不应发出任何 SELL 委托"
 
 
+def test_smart_sell_position_query_failure_fails_closed_and_alarms(monkeypatch):
+    import live_trader.adapters.base_broker as base_module
+
+    pushed = []
+    monkeypatch.setattr(
+        base_module.runtime_notifications,
+        "push_text",
+        lambda content, level="INFO": pushed.append({"content": content, "level": level}) or True,
+    )
+    broker = MockBroker(initial_cash=100000.0)
+    broker.get_position = lambda _data: (_ for _ in ()).throw(RuntimeError("counter unavailable"))
+
+    ret = broker._smart_sell(_make_data(), shares=5000, price=10.0)
+
+    assert ret is None
+    assert broker.submitted_orders == []
+    assert pushed and pushed[-1]["level"] == "ERROR"
+    assert "position snapshot is unavailable or untrusted" in pushed[-1]["content"]
+
+
+def test_expected_size_position_query_failure_returns_unknown_without_pending_query():
+    broker = MockBroker(initial_cash=100000.0)
+    pending_calls = []
+    broker.get_position = lambda _data: (_ for _ in ()).throw(RuntimeError("position timeout"))
+    broker.get_pending_orders = lambda: pending_calls.append(True) or []
+
+    assert broker.get_expected_size(_make_data()) is None
+    assert pending_calls == []
+
+
 def test_smart_sell_odd_lot_release():
     """
     清仓碎股放行:

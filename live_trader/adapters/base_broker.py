@@ -11,6 +11,7 @@ from common.live_execution_budget import (
     get_live_run_deadline,
     live_run_budget_expired,
 )
+from common.live_runtime import runtime_print
 from common.order_quantity import (
     align_quantity_down,
     decimal_quantity,
@@ -113,11 +114,18 @@ class BaseLiveBroker(ABC):
         供策略层调用 (self.broker.log)。
         在实盘模式下，如果没有传入时间，log.info 会自动使用当前系统时间。
         """
-        # 如果没有传入时间，优先使用当前 Broker 所在的仿真时间
-        if dt is None:
+        # 回测沿用模拟时间；实盘未提供柜台时间时由 log.info 使用当前墙钟时间。
+        if dt is None and not self.is_live:
             dt = getattr(self, '_datetime', None)
 
         log.info(txt, dt=dt)
+
+    def _runtime_log(self, message):
+        """Timestamp live execution diagnostics without changing backtest time semantics."""
+        if self.is_live:
+            runtime_print(message)
+        else:
+            print(message)
 
     # =========================================================
     #  用户只需实现下述原子接口 (The Minimum Set)
@@ -145,11 +153,8 @@ class BaseLiveBroker(ABC):
         获取当前可卖仓位。
         默认实现回退到 get_position().size，适配不区分可卖/总仓位的平台。
         """
-        try:
-            pos = self.get_position(data)
-            return positive_quantity(getattr(pos, 'size', 0) or 0)
-        except Exception:
-            return 0
+        pos = self.get_position(data)
+        return positive_quantity(getattr(pos, 'size', 0) or 0)
 
     @abstractmethod
     def get_current_price(self, data) -> float:
@@ -220,19 +225,19 @@ class BaseLiveBroker(ABC):
         """
         summary = {'total': 0, 'canceled': 0, 'failed': 0, 'skipped': 0}
         if live_run_budget_expired(self):
-            print("[Broker] cleanup_overnight_orders skipped: live run execution budget exhausted.")
+            self._runtime_log("[Broker] cleanup_overnight_orders skipped: live run execution budget exhausted.")
             return summary
         try:
             pending_orders = self.get_pending_orders() or []
         except Exception as e:
             summary['failed'] = 1
-            print(f"[Broker] cleanup_overnight_orders skipped: failed to fetch pending orders ({e})")
+            self._runtime_log(f"[Broker] cleanup_overnight_orders skipped: failed to fetch pending orders ({e})")
             return summary
 
         if getattr(self, '_last_pending_orders_fetch_failed', False):
             summary['failed'] = 1
             err = getattr(self, '_last_pending_orders_fetch_error', None)
-            print(f"[Broker] cleanup_overnight_orders pending fetch untrusted: {err}")
+            self._runtime_log(f"[Broker] cleanup_overnight_orders pending fetch untrusted: {err}")
             return summary
 
         summary['total'] = len(pending_orders)
@@ -242,7 +247,7 @@ class BaseLiveBroker(ABC):
         for index, po in enumerate(pending_orders):
             if live_run_budget_expired(self):
                 summary['skipped'] += len(pending_orders) - index
-                print(
+                self._runtime_log(
                     "[Broker] cleanup_overnight_orders stopped at the live run deadline; "
                     "remaining orders were left unchanged."
                 )
@@ -261,7 +266,7 @@ class BaseLiveBroker(ABC):
                     summary['failed'] += 1
             except Exception as e:
                 summary['failed'] += 1
-                print(f"[Broker] cleanup_overnight_orders cancel failed ({oid}): {e}")
+                self._runtime_log(f"[Broker] cleanup_overnight_orders cancel failed ({oid}): {e}")
 
         return summary
 
@@ -311,7 +316,7 @@ class BaseLiveBroker(ABC):
 
     def order_target_percent(self, data, target, **kwargs):
         if self.is_live and live_run_budget_expired(self):
-            print(f"[Broker Warning] {data._name} target-percent order skipped: live run execution budget exhausted.")
+            self._runtime_log(f"[Broker Warning] {data._name} target-percent order skipped: live run execution budget exhausted.")
             return None
 
         # 1. 原子操作：查价
@@ -336,14 +341,14 @@ class BaseLiveBroker(ABC):
                 f"[Broker Error] {data._name} order skipped because the live pending-order "
                 "snapshot is unavailable or untrusted."
             )
-            print(msg)
+            self._runtime_log(msg)
             runtime_notifications.push_text(msg, level='ERROR')
             return None
         delta_shares = expected_shares - current_size
 
         # 风控拦截：Percent 模式与 Value 模式保持一致
         if data._name in self._risk_locked_symbols and delta_shares > 0:
-            print(f"[Broker Risk Block] 🚫 风控拦截: {data._name} 触发风控，买单已被底层静默吃掉。")
+            self._runtime_log(f"[Broker Risk Block] 🚫 风控拦截: {data._name} 触发风控，买单已被底层静默吃掉。")
             return None
 
         # 4. 决策分发
@@ -359,7 +364,7 @@ class BaseLiveBroker(ABC):
         target: 目标持仓金额 (例如 1000 USD)
         """
         if self.is_live and live_run_budget_expired(self):
-            print(f"[Broker Warning] {data._name} target-value order skipped: live run execution budget exhausted.")
+            self._runtime_log(f"[Broker Warning] {data._name} target-value order skipped: live run execution budget exhausted.")
             return None
 
         # 1. 原子操作：查价
@@ -378,14 +383,14 @@ class BaseLiveBroker(ABC):
                 f"[Broker Error] {data._name} order skipped because the live pending-order "
                 "snapshot is unavailable or untrusted."
             )
-            print(msg)
+            self._runtime_log(msg)
             runtime_notifications.push_text(msg, level='ERROR')
             return None
         delta_shares = expected_shares - current_size
 
         # 风控拦截
         if data._name in self._risk_locked_symbols and delta_shares > 0:
-            print(f"[Broker Risk Block] 🚫 风控拦截: {data._name} 触发风控，买单已被底层静默吃掉。")
+            self._runtime_log(f"[Broker Risk Block] 🚫 风控拦截: {data._name} 触发风控，买单已被底层静默吃掉。")
             return None
 
         # 3. 决策分发
@@ -438,7 +443,7 @@ class BaseLiveBroker(ABC):
         if run_deadline is None:
             run_deadline = math.inf
         if live_run_budget_expired(self, deadline=run_deadline):
-            print(f"[Broker Warning] BUY {data._name} skipped: live run execution budget exhausted.")
+            self._runtime_log(f"[Broker Warning] BUY {data._name} skipped: live run execution budget exhausted.")
             return None
 
         cash = self.get_cash()
@@ -457,7 +462,7 @@ class BaseLiveBroker(ABC):
                     f"[Broker Warning] Buy {data._name} skipped. Cash ({cash:.2f}) "
                     f"insufficient for minimum lot {min_lot}; this is not a LOT_SIZE rounding error."
                 )
-                print(warning_msg)
+                self._runtime_log(warning_msg)
                 runtime_notifications.push_text(warning_msg, level='WARNING')
                 return None
 
@@ -697,7 +702,7 @@ class BaseLiveBroker(ABC):
         if run_deadline is None:
             run_deadline = math.inf
         if live_run_budget_expired(self, deadline=run_deadline):
-            print(f"[Broker Warning] BUY {data._name} skipped: live run execution budget exhausted.")
+            self._runtime_log(f"[Broker Warning] BUY {data._name} skipped: live run execution budget exhausted.")
             return None
 
         raw_shares = shares
@@ -710,10 +715,10 @@ class BaseLiveBroker(ABC):
                          f"当前最小交易单位 (LotSize): {lot_size}\n"
                          f"原因: 原始需求不足一个最小交易单位，订单已自动取消。请检查 LOT_SIZE 配置。")
 
-            print(f"\n{'-' * 30}\n{error_msg}\n{'-' * 30}")
+            self._runtime_log(f"\n{'-' * 30}\n{error_msg}\n{'-' * 30}")
 
             if not runtime_notifications.push_text(error_msg, level='WARNING'):
-                print("[Notification Warning] 无法发送截断警告")
+                self._runtime_log("[Notification Warning] 无法发送截断警告")
 
             return None
 
@@ -731,11 +736,11 @@ class BaseLiveBroker(ABC):
                             lot_size,
                             retries,
                         )
-                        print(
+                        self._runtime_log(
                             f"⚠️ [Broker] 买单 {data._name} 同步提交失败。"
                             f"触发自动降级 {retries + 1}/{max_retries}..."
                         )
-                        print(
+                        self._runtime_log(
                             f"   => {data._name} 尝试数量: {shares} -> {new_shares} "
                             f"({downgrade_reason})"
                         )
@@ -749,9 +754,9 @@ class BaseLiveBroker(ABC):
                                 retry_sync_failure=True,
                                 run_deadline=run_deadline,
                             )
-                        print(f"❌ [Broker] 降级终止: {data._name} 数量已降至 0。")
+                        self._runtime_log(f"❌ [Broker] 降级终止: {data._name} 数量已降至 0。")
                     elif retry_sync_failure:
-                        print(
+                        self._runtime_log(
                             f"❌ [Broker] 降级终止: {data._name} 已达到最大重试次数 "
                             f"{max_retries}，放弃本K。"
                         )
@@ -759,7 +764,7 @@ class BaseLiveBroker(ABC):
 
                 oid = str(getattr(proxy, 'id', '') or '').strip()
                 if not oid:
-                    print(
+                    self._runtime_log(
                         f"[Broker Warning] BUY {data._name} returned proxy without order id. "
                         f"status={getattr(proxy, 'status', 'Unknown')}"
                     )
@@ -783,7 +788,7 @@ class BaseLiveBroker(ABC):
                 order_state = self._read_order_state(proxy)
 
                 if order_state['rejected']:
-                    print(
+                    self._runtime_log(
                         f"[Broker Warning] BUY {data._name} was synchronously rejected "
                         f"by broker. status={getattr(proxy, 'status', 'Unknown')}"
                     )
@@ -792,14 +797,17 @@ class BaseLiveBroker(ABC):
                 if order_state['canceled'] or not (
                     order_state['completed'] or order_state['pending'] or order_state['accepted']
                 ):
-                    print(
+                    self._runtime_log(
                         f"[Broker Warning] BUY {data._name} was not accepted by broker. "
                         f"status={getattr(proxy, 'status', 'Unknown')}"
                     )
                     self.on_order_status(proxy)
                     return None
 
-                log.signal('BUY', data._name, final_submitted_shares, price, tag=tag, dt=self._datetime)
+                log.signal(
+                    'BUY', data._name, final_submitted_shares, price, tag=tag,
+                    dt=None if self.is_live else self._datetime,
+                )
 
                 if order_state['completed']:
                     self.on_order_status(proxy)
@@ -813,7 +821,7 @@ class BaseLiveBroker(ABC):
         if run_deadline is None:
             run_deadline = math.inf
         if live_run_budget_expired(self, deadline=run_deadline):
-            print(f"[Broker Warning] SELL {data._name} skipped: live run execution budget exhausted.")
+            self._runtime_log(f"[Broker Warning] SELL {data._name} skipped: live run execution budget exhausted.")
             return None
 
         lot_size = config.LOT_SIZE
@@ -823,8 +831,14 @@ class BaseLiveBroker(ABC):
         try:
             pos_obj = self.get_position(data)
             current_pos = positive_quantity(getattr(pos_obj, 'size', 0) or 0)
-        except Exception:
-            current_pos = 0
+        except Exception as e:
+            msg = (
+                f"[Broker Error] SELL {data._name} skipped because the broker position "
+                f"snapshot is unavailable or untrusted: {e}"
+            )
+            self._runtime_log(msg)
+            runtime_notifications.push_text(msg, level='ERROR')
+            return None
         if live_run_budget_expired(self, deadline=run_deadline):
             return None
 
@@ -840,15 +854,21 @@ class BaseLiveBroker(ABC):
                 sellable_pos = positive_quantity(sellable_hint or 0)
             else:
                 sellable_pos = positive_quantity(self.get_sellable_position(data) or 0)
-        except Exception:
-            sellable_pos = 0
+        except Exception as e:
+            msg = (
+                f"[Broker Error] SELL {data._name} skipped because the broker sellable-position "
+                f"snapshot is unavailable or untrusted: {e}"
+            )
+            self._runtime_log(msg)
+            runtime_notifications.push_text(msg, level='ERROR')
+            return None
         if live_run_budget_expired(self, deadline=run_deadline):
             return None
         sellable_pos = min(sellable_pos, current_pos)
 
         # T+1 防护：有持仓但不可卖，直接跳过，避免反复触发“仓位不足”拒单。
         if current_pos > 0 and sellable_pos <= 0:
-            print(f"[Broker] T+1 sell guard: {data._name} settled={current_pos}, sellable=0. Skip sell.")
+            self._runtime_log(f"[Broker] T+1 sell guard: {data._name} settled={current_pos}, sellable=0. Skip sell.")
             return None
 
         # 防止做空。你最多只能卖出现有【可卖】持仓！(防止在途买单导致超额卖出)
@@ -906,7 +926,7 @@ class BaseLiveBroker(ABC):
                         if proxy:
                             oid = str(getattr(proxy, 'id', '') or '').strip()
                             if not oid:
-                                print(
+                                self._runtime_log(
                                     f"[Broker Warning] SELL {data._name} returned proxy without order id. "
                                     f"status={getattr(proxy, 'status', 'Unknown')}"
                                 )
@@ -915,7 +935,7 @@ class BaseLiveBroker(ABC):
                             order_state = self._read_order_state(proxy)
                             if order_state['completed'] or order_state['pending'] or order_state['accepted']:
                                 break
-                            print(
+                            self._runtime_log(
                                 f"[Broker Warning] SELL {data._name} was not accepted by broker. "
                                 f"status={getattr(proxy, 'status', 'Unknown')}"
                             )
@@ -934,7 +954,7 @@ class BaseLiveBroker(ABC):
                                 lot_size,
                                 retries,
                             )
-                        print(
+                        self._runtime_log(
                             f"[Broker] SELL {data._name} 同步提交失败/拒绝，"
                             f"当前run内降级重试 {retries + 1}/{max_retries}: "
                             f"{candidate_shares} -> {new_shares} ({downgrade_reason})"
@@ -973,7 +993,7 @@ class BaseLiveBroker(ABC):
 
                     log.signal(
                         'SELL', data._name, final_submitted_shares, price,
-                        tag="实盘信号", dt=self._datetime,
+                        tag="实盘信号", dt=None if self.is_live else self._datetime,
                     )
 
                     if order_state['completed']:
@@ -1021,7 +1041,7 @@ class BaseLiveBroker(ABC):
                             0.0,
                             getattr(self, '_virtual_spent_cash', 0.0) - refund_amount
                         )
-                        print(f"[Broker] ✅ 买单 {symbol} 已成交。已释放虚拟扣款: {refund_amount:.2f}")
+                        self._runtime_log(f"[Broker] ✅ 买单 {symbol} 已成交。已释放虚拟扣款: {refund_amount:.2f}")
                     return proxy
 
                 elif order_state['canceled']:
@@ -1034,7 +1054,7 @@ class BaseLiveBroker(ABC):
                             0.0,
                             getattr(self, '_virtual_spent_cash', 0.0) - refund_amount
                         )
-                        print(f"[Broker] ⚠️ 买单 {symbol} 被撤销。已回退虚拟扣款: {refund_amount:.2f}")
+                        self._runtime_log(f"[Broker] ⚠️ 买单 {symbol} 被撤销。已回退虚拟扣款: {refund_amount:.2f}")
                     return None
 
                 elif order_state['rejected']:
@@ -1059,7 +1079,7 @@ class BaseLiveBroker(ABC):
                                 f"[Broker Warning] BUY {symbol} rejected after its originating live run "
                                 "deadline; virtual cash was refunded and downgrade retry was skipped."
                             )
-                            print(msg)
+                            self._runtime_log(msg)
                             runtime_notifications.push_text(msg, level='ERROR')
                             return None
 
@@ -1077,8 +1097,8 @@ class BaseLiveBroker(ABC):
                                 retries,
                             )
 
-                            print(f"⚠️ [Broker] 买单 {symbol} 被拒绝。触发自动降级 {retries + 1}/{max_retries}...")
-                            print(f"   => {symbol} 尝试数量: {old_shares} -> {new_shares} ({downgrade_reason})")
+                            self._runtime_log(f"⚠️ [Broker] 买单 {symbol} 被拒绝。触发自动降级 {retries + 1}/{max_retries}...")
+                            self._runtime_log(f"   => {symbol} 尝试数量: {old_shares} -> {new_shares} ({downgrade_reason})")
 
                             if new_shares > 0:
                                 # 无状态优先：不入队，拒单后当场按更小数量重提。
@@ -1095,13 +1115,13 @@ class BaseLiveBroker(ABC):
                                 )
 
                                 if not new_proxy:
-                                    print(f"❌ [Broker] 降级发单同步失败，原订单资金已回退。")
+                                    self._runtime_log(f"❌ [Broker] 降级发单同步失败，原订单资金已回退。")
                                 return new_proxy
                             else:
-                                print(f"❌ [Broker] 降级终止: {data._name} 数量已降至 0。")
+                                self._runtime_log(f"❌ [Broker] 降级终止: {data._name} 数量已降至 0。")
                         else:
                             symbol = getattr(buy_info.get('data'), '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
-                            print(f"❌ [Broker] 降级终止: {symbol} 已达到最大重试次数 {max_retries}，放弃本K。")
+                            self._runtime_log(f"❌ [Broker] 降级终止: {symbol} 已达到最大重试次数 {max_retries}，放弃本K。")
                     return None
                 elif not (order_state['pending'] or order_state['accepted']):
                     buy_info = self._active_buys.pop(oid, None)
@@ -1112,7 +1132,7 @@ class BaseLiveBroker(ABC):
                             0.0,
                             getattr(self, '_virtual_spent_cash', 0.0) - refund_amount
                         )
-                        print(
+                        self._runtime_log(
                             f"[Broker] ⚠️ 买单 {symbol} 进入非在途终态({getattr(proxy, 'status', 'Unknown')})。"
                             f"已回退虚拟扣款: {refund_amount:.2f}"
                         )
@@ -1143,7 +1163,11 @@ class BaseLiveBroker(ABC):
         """获取包含在途订单的【预期仓位】，防止底层下单方法出现认知撕裂"""
         if self.is_live and live_run_budget_expired(self):
             return None
-        pos_size = self.get_position(data).size
+        try:
+            pos_size = self.get_position(data).size
+        except Exception as e:
+            self._runtime_log(f"[Broker] 获取预期仓位失败: 持仓快照不可信 ({e})")
+            return None
         if not self.is_live:
             return pos_size
         if live_run_budget_expired(self):
@@ -1159,7 +1183,7 @@ class BaseLiveBroker(ABC):
                 candidate_orders = self.get_pending_orders() or []
                 if getattr(self, '_last_pending_orders_fetch_failed', False):
                     last_error = getattr(self, '_last_pending_orders_fetch_error', None)
-                    print(
+                    self._runtime_log(
                         f"[Broker] 获取预期仓位: 在途订单快照不可信 "
                         f"({attempt}/3, {last_error})"
                     )
@@ -1168,10 +1192,10 @@ class BaseLiveBroker(ABC):
                 break
             except Exception as e:
                 last_error = e
-                print(f"[Broker] 获取预期仓位异常 ({attempt}/3): {e}")
+                self._runtime_log(f"[Broker] 获取预期仓位异常 ({attempt}/3): {e}")
 
         if pending_orders is None:
-            print(f"[Broker] 获取预期仓位失败: 已耗尽在途订单快照重试 ({last_error})")
+            self._runtime_log(f"[Broker] 获取预期仓位失败: 已耗尽在途订单快照重试 ({last_error})")
             return None
 
         try:
@@ -1187,7 +1211,7 @@ class BaseLiveBroker(ABC):
                     if str(po.get('direction', '')).upper() == 'SELL':
                         expected_parts.append(-pending_size)
         except Exception as e:
-            print(f"[Broker] 获取预期仓位异常: {e}")
+            self._runtime_log(f"[Broker] 获取预期仓位异常: {e}")
             return None
         return sum_quantities(expected_parts)
 
@@ -1283,7 +1307,7 @@ class BaseLiveBroker(ABC):
                     or self._virtual_spent_cash > 0
                 )
                 if has_stale_state:
-                    print(f"[Broker] {'New Day' if is_new_day else 'Long Gap'} detected. "
+                    self._runtime_log(f"[Broker] {'New Day' if is_new_day else 'Long Gap'} detected. "
                           f"Resetting stale broker state.")
                     self._reset_stale_state(new_dt=dt)
 
@@ -1302,14 +1326,14 @@ class BaseLiveBroker(ABC):
         清理陈旧/卡死的状态，防止死锁。
         被 set_datetime 内部调用。
         """
-        print(f"[Broker Recovery] Resetting stale state at {new_dt}...")
+        self._runtime_log(f"[Broker Recovery] Resetting stale state at {new_dt}...")
 
         # 1. 清理积压的卖单监控
         # 如果发生了跨日或长中断，旧的卖单监控大概率也失效了，重置以防误判
         if self._pending_sells:
             count = len(self._pending_sells)
             self._pending_sells.clear()
-            print(f"  >>> Auto-cleared {count} pending sell monitors (Reset).")
+            self._runtime_log(f"  >>> Auto-cleared {count} pending sell monitors (Reset).")
 
         # 2. 清理买单跟踪器
         if hasattr(self, '_active_buys'):
@@ -1317,14 +1341,14 @@ class BaseLiveBroker(ABC):
 
         # 3. 清理虚拟占资，避免长中断后出现幽灵冻结资金
         self._virtual_spent_cash = 0.0
-        print("  >>> Broker state reset completed.")
+        self._runtime_log("  >>> Broker state reset completed.")
 
     def force_reset_state(self):
         """
         外部强制重置接口。
         供 Engine 在捕获到 CRITICAL 异常时调用，进行兜底恢复。
         """
-        print("[Broker] Force reset state requested by Engine...")
+        self._runtime_log("[Broker] Force reset state requested by Engine...")
         self._pending_sells.clear()
 
         # 补丁：彻底清空买单追踪器和虚拟账本占资，防止幽灵占资残留
@@ -1334,7 +1358,7 @@ class BaseLiveBroker(ABC):
 
         try:
             self.sync_balance()
-            print(f"  >>> Balance re-synced: {self.get_cash():.2f}")
+            self._runtime_log(f"  >>> Balance re-synced: {self.get_cash():.2f}")
         except Exception as e:
-            print(f"  >>> Warning: Failed to sync balance during reset: {e}")
-        print("[Broker] Force reset state completed.")
+            self._runtime_log(f"  >>> Warning: Failed to sync balance during reset: {e}")
+        self._runtime_log("[Broker] Force reset state completed.")

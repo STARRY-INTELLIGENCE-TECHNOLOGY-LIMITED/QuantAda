@@ -2,6 +2,7 @@ import datetime
 import math
 import os
 import sys
+from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
@@ -17,7 +18,7 @@ from common.live_process_supervisor import (
 )
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
-from common.order_quantity import align_quantity_down, normalize_quantity_step
+from common.order_quantity import align_quantity_down, normalize_quantity_step, quantity_number
 from data_providers.gm_provider import GmDataProvider as UnifiedGmDataProvider
 from live_trader.engine import LiveTrader, on_order_status_callback
 from ..data_bridge.data_warm import DAILY_SCHEDULE_HEALTH_LEAD_SECONDS, SchedulePlanner
@@ -100,7 +101,7 @@ def _resolve_gm_connectivity_retry(
     return True, min(_GM_QUIET_PROBE_SECONDS, seconds_to_wake), wake_at
 
 try:
-    from gm.api import order_target_percent, order_target_value, order_volume, current, get_cash, subscribe, history, OrderType_Market, OrderType_Limit, MODE_LIVE, MODE_BACKTEST, \
+    from gm.api import order_target_percent, order_target_value, order_volume, current, get_cash, get_position as gm_get_position, subscribe, history, OrderType_Market, OrderType_Limit, MODE_LIVE, MODE_BACKTEST, \
         OrderStatus_New, OrderStatus_PartiallyFilled, OrderStatus_Filled, \
         OrderStatus_Canceled, OrderStatus_Rejected, OrderStatus_PendingNew, \
         OrderSide_Buy, OrderSide_Sell
@@ -109,7 +110,7 @@ try:
     OrderStatus_Expired = getattr(gm_api, 'OrderStatus_Expired', object())
 except ImportError:
     print("Warning: 'gm' module not found. GmAdapter core API will not be available.")
-    order_target_percent = order_target_value = get_cash = subscribe = history = OrderType_Market = OrderType_Limit = None
+    order_target_percent = order_target_value = get_cash = gm_get_position = subscribe = history = OrderType_Market = OrderType_Limit = None
     MODE_LIVE = MODE_BACKTEST = None
     OrderStatus_New = OrderStatus_PartiallyFilled = OrderStatus_Filled = None
     OrderStatus_Canceled = OrderStatus_Rejected = OrderStatus_PendingNew = None
@@ -264,7 +265,7 @@ class GmDataProvider(UnifiedGmDataProvider):
         return self.get_data(symbol, start_date, end_date, timeframe, compression)
 
 class GmBrokerAdapter(BaseLiveBroker):
-    """掘金平台的交易执行器实现"""
+    """掘金平台交易执行器（GM session 绑定单一账户）。"""
     _DEFAULT_LIVE_SLIPPAGE = 0.0001
 
     def __init__(self, context, cash_override=None, commission_override=None, slippage_override=None):
@@ -281,17 +282,71 @@ class GmBrokerAdapter(BaseLiveBroker):
             return default
 
     def _find_position(self, symbol):
-        if not hasattr(self._context, 'account'):
-            return None
-        try:
-            positions = self._context.account().positions()
-        except Exception:
-            return None
+        if self.is_live:
+            try:
+                # GM schedule callbacks and QuantAda's bounded settlement wait run
+                # on the SDK poll thread.  The context account cache therefore
+                # cannot consume fill callbacks while that wait is active.  Use
+                # the SDK's synchronous counter query as the live source of truth.
+                positions = self._query_live_positions()
+                self._last_position_snapshot_fetch_failed = False
+                self._last_position_snapshot_fetch_error = None
+            except Exception as e:
+                self._last_position_snapshot_fetch_failed = True
+                self._last_position_snapshot_fetch_error = e
+                raise RuntimeError(f"GM live position query failed: {e}") from e
+        else:
+            if not hasattr(self._context, 'account'):
+                return None
+            try:
+                positions = self._context.account().positions()
+            except Exception:
+                return None
 
         for p in positions:
-            if getattr(p, 'symbol', None) == symbol:
+            position_symbol = p.get('symbol') if isinstance(p, dict) else getattr(p, 'symbol', None)
+            if position_symbol == symbol:
                 return p
         return None
+
+    @staticmethod
+    def _object_field(value, field, default=None):
+        if isinstance(value, dict):
+            return value.get(field, default)
+        return getattr(value, field, default)
+
+    def _ensure_single_live_account(self):
+        """Fail closed if a GM session unexpectedly exposes more than one account."""
+        if not self.is_live or context is None or not hasattr(context, 'accounts'):
+            return
+        try:
+            accounts = list((context.accounts or {}).values())
+        except Exception as e:
+            raise RuntimeError(f"GM account registry query failed: {e}") from e
+        if len(accounts) != 1:
+            raise RuntimeError(
+                "GM session must expose exactly one account; "
+                f"visible_accounts={len(accounts)}"
+            )
+        if not str(self._object_field(accounts[0], 'id', '') or '').strip():
+            raise RuntimeError("GM account registry contains an account without id")
+
+    def _fetch_cash_snapshot(self):
+        self._ensure_single_live_account()
+        try:
+            return get_cash()
+        except Exception as e:
+            raise RuntimeError(f"GM cash query failed: {e}") from e
+
+    def _query_live_positions(self):
+        self._ensure_single_live_account()
+        try:
+            positions = gm_get_position()
+        except Exception as e:
+            raise RuntimeError(f"GM position query failed: {e}") from e
+        if positions is None:
+            raise RuntimeError("GM position snapshot is unavailable")
+        return positions
 
     def _resolve_sellable_volume(self, p, total_size):
         """
@@ -300,15 +355,15 @@ class GmBrokerAdapter(BaseLiveBroker):
         2) available (非挂单冻结仓位)
         3) volume - volume_today (available_now 在回测不可用时的兜底)
         """
-        raw_available_now = getattr(p, 'available_now', None)
+        raw_available_now = self._object_field(p, 'available_now')
         if raw_available_now is not None:
             return min(total_size, self._to_nonnegative_int(raw_available_now, default=0))
 
-        raw_available = getattr(p, 'available', None)
+        raw_available = self._object_field(p, 'available')
         if raw_available is not None:
             return min(total_size, self._to_nonnegative_int(raw_available, default=0))
 
-        raw_volume_today = getattr(p, 'volume_today', None)
+        raw_volume_today = self._object_field(p, 'volume_today')
         if raw_volume_today is not None:
             volume_today = self._to_nonnegative_int(raw_volume_today, default=0)
             return max(0, min(total_size, total_size - volume_today))
@@ -322,7 +377,11 @@ class GmBrokerAdapter(BaseLiveBroker):
     def getvalue(self):
         """获取账户总资产 (NAV)"""
         # get_cash() 返回的是 AccountCash 对象，.nav 即为总资产
-        return get_cash().nav
+        cash = self._fetch_cash_snapshot()
+        nav = cash.get('nav') if isinstance(cash, dict) else getattr(cash, 'nav', None)
+        if nav is None:
+            raise RuntimeError("GM account cash snapshot has no nav field")
+        return nav
 
     def get_pending_orders(self) -> list:
         """掘金：获取在途订单"""
@@ -334,22 +393,138 @@ class GmBrokerAdapter(BaseLiveBroker):
         res = []
         try:
             from gm.api import get_unfinished_orders, OrderSide_Buy
-            orders = get_unfinished_orders()
+            orders = self._query_unfinished_orders_single_account(get_unfinished_orders)
+            if orders is None:
+                # Lightweight SDK/test doubles may not expose the native
+                # per-account query primitives.  The real GM session does.
+                orders = get_unfinished_orders()
             for o in orders:
+                order_id = str(self._object_field(o, 'cl_ord_id', '') or '').strip()
+                symbol = str(self._object_field(o, 'symbol', '') or '').strip()
+                side = self._object_field(o, 'side')
+                if side == OrderSide_Buy:
+                    direction = 'BUY'
+                elif side == OrderSide_Sell:
+                    direction = 'SELL'
+                else:
+                    raise RuntimeError(
+                        f"GM pending order has unknown side: id={order_id!r}, side={side!r}"
+                    )
+
+                raw_volume = self._object_field(o, 'volume', 0)
+                raw_filled_volume = self._object_field(o, 'filled_volume', 0)
+                try:
+                    volume = Decimal(str(raw_volume if raw_volume not in (None, '') else 0))
+                    filled_volume = Decimal(
+                        str(raw_filled_volume if raw_filled_volume not in (None, '') else 0)
+                    )
+                except (InvalidOperation, TypeError, ValueError) as e:
+                    raise RuntimeError(
+                        f"GM pending order has invalid quantity: id={order_id!r}"
+                    ) from e
+                if (
+                    not volume.is_finite()
+                    or not filled_volume.is_finite()
+                    or volume < 0
+                    or filled_volume < 0
+                ):
+                    raise RuntimeError(f"GM pending order has invalid quantity: id={order_id!r}")
+                remaining = volume - filled_volume
+                if not order_id:
+                    raise RuntimeError("GM pending order is missing cl_ord_id")
+                if not symbol:
+                    raise RuntimeError(f"GM pending order is missing symbol: id={order_id!r}")
+                if not remaining.is_finite() or remaining <= 0:
+                    raise RuntimeError(
+                        f"GM pending order has non-positive remaining size: "
+                        f"id={order_id!r}, volume={volume!r}, filled_volume={filled_volume!r}"
+                    )
                 res.append({
-                    'id': str(getattr(o, 'cl_ord_id', '') or ''),
-                    'symbol': o.symbol,
-                    'direction': 'BUY' if o.side == OrderSide_Buy else 'SELL',
+                    'id': order_id,
+                    'symbol': symbol,
+                    'direction': direction,
                     # 未成交数量 = 委托总数 - 已成交数
-                    'size': o.volume - o.filled_volume
+                    'size': quantity_number(remaining),
+                    # GM 官方撤单接口要求订单自身的 account_id；这是 SDK
+                    # 返回的订单元数据，不是可配置的账户路由。
+                    'account_id': self._object_field(o, 'account_id', ''),
                 })
             self._last_pending_orders_fetch_failed = False
             self._last_pending_orders_fetch_error = None
         except Exception as e:
+            # A partially collected list is unsafe: callers may treat a
+            # missing BUY/SELL as proof that it can submit or clean up another
+            # order.  The health flag is the authoritative failure signal, and
+            # returning an empty list prevents accidental direct consumers from
+            # using partial broker truth.
+            res = []
             self._last_pending_orders_fetch_failed = True
             self._last_pending_orders_fetch_error = e
-            print(f"[GmBroker] 获取在途订单失败: {e}")
+            self._runtime_log(f"[GmBroker] 获取在途订单失败: {e}")
         return res
+
+    def _query_unfinished_orders_single_account(self, public_query):
+        """Read the sole GM account without inheriting the SDK's silent skip.
+
+        ``gm.api.get_unfinished_orders`` loops through accounts and continues
+        when one native request fails.  GM is a single-account adapter here, so
+        query that one account directly when the SDK exposes its primitives;
+        this lets the pending health flag distinguish an empty book from a
+        failed request.  ``None`` is reserved for stripped-down test doubles.
+        """
+        if context is None or not self.is_live:
+            return None
+        try:
+            account_values = list((context.accounts or {}).values())
+        except Exception as e:
+            raise RuntimeError(f"GM account registry query failed: {e}") from e
+        if len(account_values) != 1:
+            raise RuntimeError(
+                "GM session must expose exactly one account for pending queries; "
+                f"visible_accounts={len(account_values)}"
+            )
+        account_id = str(self._object_field(account_values[0], 'id', '') or '').strip()
+        if not account_id:
+            raise RuntimeError("GM account registry contains an account without id")
+
+        sdk_globals = getattr(public_query, '__globals__', None)
+        if not isinstance(sdk_globals, dict):
+            raise RuntimeError("GM SDK pending-order query primitives are unavailable")
+        request_cls = sdk_globals.get('GetUnfinishedOrdersReq')
+        query = sdk_globals.get('py_gmi_get_unfinished_orders')
+        status_failed = sdk_globals.get('c_status_fail')
+        orders_cls = sdk_globals.get('Orders')
+        to_dict = sdk_globals.get('protobuf_to_dict')
+        dict_like_order = sdk_globals.get('DictLikeOrder')
+        if not all(callable(item) for item in (request_cls, query, status_failed, orders_cls, to_dict, dict_like_order)):
+            raise RuntimeError("GM SDK pending-order query primitives are unavailable")
+
+        request = request_cls()
+        request.account_id = account_id
+        status, raw_result = query(request.SerializeToString())
+        if status_failed(status, 'py_gmi_get_unfinished_orders'):
+            raise RuntimeError(
+                f"GM pending-order query failed for the sole account={account_id!r}, status={status!r}"
+            )
+        if not raw_result:
+            return []
+
+        parsed = orders_cls()
+        parsed.ParseFromString(raw_result)
+        result_orders = []
+        for raw_order in parsed.data:
+            try:
+                order = to_dict(
+                    raw_order,
+                    including_default_value_fields=True,
+                    dcls=dict_like_order,
+                )
+            except TypeError:
+                order = to_dict(raw_order, including_default_value_fields=True)
+            if isinstance(order, dict) and not order.get('account_id'):
+                order['account_id'] = account_id
+            result_orders.append(order)
+        return result_orders
 
     def cancel_pending_order(self, order_id: str) -> bool:
         """掘金：按委托ID取消在途单（最小兼容实现）"""
@@ -361,18 +536,25 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         try:
             import gm.api as gm_api
-            get_unfinished_orders = getattr(gm_api, 'get_unfinished_orders', None)
-            if not callable(get_unfinished_orders):
+            pending_orders = self.get_pending_orders()
+            if getattr(self, '_last_pending_orders_fetch_failed', False):
+                detail = getattr(self, '_last_pending_orders_fetch_error', None)
+                self._runtime_log(
+                    f"[GmBroker] cancel_pending_order skipped ({oid}): untrusted snapshot ({detail})."
+                )
                 return False
 
-            target = None
-            for o in get_unfinished_orders() or []:
-                if str(getattr(o, 'cl_ord_id', '') or '') == oid:
-                    target = o
-                    break
+            target = next(
+                (po for po in pending_orders if str(po.get('id', '') or '') == oid),
+                None,
+            )
             if target is None:
                 return False
 
+            cancel_payload = {
+                'cl_ord_id': oid,
+                'account_id': str(target.get('account_id', '') or ''),
+            }
             cancel_funcs = [
                 getattr(gm_api, 'order_cancel', None),
                 getattr(gm_api, 'cancel_order', None),
@@ -380,7 +562,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             for fn in cancel_funcs:
                 if not callable(fn):
                     continue
-                for arg in (target, oid):
+                for arg in (cancel_payload, oid):
                     try:
                         fn(arg)
                         return True
@@ -389,10 +571,10 @@ class GmBrokerAdapter(BaseLiveBroker):
                     except Exception:
                         continue
 
-            print(f"[GmBroker] No compatible cancel API found for order {oid}.")
+            self._runtime_log(f"[GmBroker] No compatible cancel API found for order {oid}.")
             return False
         except Exception as e:
-            print(f"[GmBroker] cancel_pending_order failed ({oid}): {e}")
+            self._runtime_log(f"[GmBroker] cancel_pending_order failed ({oid}): {e}")
             return False
 
     # 实盘引擎调用此方法设置当前时间时，我们将其转换为无时区的北京时间
@@ -430,8 +612,57 @@ class GmBrokerAdapter(BaseLiveBroker):
         return {}
 
     # 1. 查钱
+    def _init_cash(self):
+        """Avoid an account query while a live GM session is being constructed.
+
+        The live engine performs an explicit, bounded account-health probe after
+        the SDK session is initialized.  Backtests keep the synchronous base
+        initialization path.
+        """
+        if self.is_live_mode(self._context):
+            return 0.0
+        return super()._init_cash()
+
     def _fetch_real_cash(self):
-        return get_cash().available
+        cash = self._fetch_cash_snapshot()
+        available = cash.get('available') if isinstance(cash, dict) else getattr(cash, 'available', None)
+        if available is None:
+            raise RuntimeError("GM account cash snapshot has no available field")
+        return available
+
+    def is_account_snapshot_trusted(self) -> bool:
+        """Validate that the live GM session exposes current account data.
+
+        A connected SDK can still have no account snapshot during terminal
+        recovery.  The engine must fail closed for that run instead of treating
+        missing cash/positions as a legitimate zero account.
+        """
+        if not self.is_live:
+            return True
+        try:
+            cash = self._fetch_cash_snapshot()
+            available = (
+                cash.get('available') if isinstance(cash, dict)
+                else getattr(cash, 'available', None)
+            )
+            if available is None:
+                raise RuntimeError('GM account cash snapshot has no available field')
+            try:
+                available = float(available)
+            except (TypeError, ValueError, OverflowError) as e:
+                raise RuntimeError('GM account available cash is not numeric') from e
+            if not math.isfinite(available):
+                raise RuntimeError('GM account available cash is not finite')
+            # An empty list is a valid flat account; None means the snapshot was
+            # not returned at all and must not be interpreted as empty holdings.
+            self._query_live_positions()
+            self._last_account_snapshot_fetch_failed = False
+            self._last_account_snapshot_fetch_error = None
+            return True
+        except Exception as e:
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = e
+            return False
 
     # 2. 查持仓
     def get_position(self, data):
@@ -441,8 +672,8 @@ class GmBrokerAdapter(BaseLiveBroker):
         p = self._find_position(data._name)
         if p is not None:
             o = Pos()
-            o.size = self._to_nonnegative_int(getattr(p, 'volume', 0), default=0)
-            o.price = getattr(p, 'vwap', 0.0) or 0.0
+            o.size = self._to_nonnegative_int(self._object_field(p, 'volume', 0), default=0)
+            o.price = self._object_field(p, 'vwap', 0.0) or 0.0
             o.sellable = self._resolve_sellable_volume(p, o.size)
             return o
         return Pos()
@@ -450,7 +681,7 @@ class GmBrokerAdapter(BaseLiveBroker):
     def get_sellable_position(self, data):
         p = self._find_position(data._name)
         if p is not None:
-            total_size = self._to_nonnegative_int(getattr(p, 'volume', 0), default=0)
+            total_size = self._to_nonnegative_int(self._object_field(p, 'volume', 0), default=0)
             return self._resolve_sellable_volume(p, total_size)
         return 0
 
@@ -517,7 +748,9 @@ class GmBrokerAdapter(BaseLiveBroker):
             estimated_cost = volume * freeze_price * cost_multiplier
 
             if freeze_price <= 0:
-                print(f"[GmBroker Warning] 无法获取 {data._name} 的有效价格 (price={price})，拒绝计算并跳过发单。")
+                self._runtime_log(
+                    f"[GmBroker Warning] 无法获取 {data._name} 的有效价格 (price={price})，拒绝计算并跳过发单。"
+                )
                 return None
 
             if estimated_cost > available_cash:
@@ -529,7 +762,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 )
                 min_volume = lot_size
                 if volume < min_volume:
-                    print(
+                    self._runtime_log(
                         f"[GmBroker Warning] Buy {data._name} skipped. "
                         f"Cash ({available_cash:.2f}) insufficient for minimum lot {min_volume} "
                         f"after cash-fit downsize."
@@ -538,23 +771,26 @@ class GmBrokerAdapter(BaseLiveBroker):
 
                 # 仅在发生实质性降仓时打印
                 if old_volume != volume:
-                    print(
-                        f"[GmBroker] Auto-Downsize {data._name}: {old_volume} -> {volume} (Reason: Cash Fit, Mode: {'Live' if self.is_live else 'Backtest'})")
+                    self._runtime_log(
+                        f"[GmBroker] Auto-Downsize {data._name}: {old_volume} -> {volume} "
+                        f"(Reason: Cash Fit, Mode: {'Live' if self.is_live else 'Backtest'})"
+                    )
 
         if volume <= 0: return None
 
         try:
+            self._ensure_single_live_account()
             effect = 1 if side == 'BUY' else 2
 
             ords = order_volume(
                 symbol=data._name, volume=volume, side=gm_side,
                 order_type=order_type,
                 position_effect=effect,
-                price=actual_price
+                price=actual_price,
             )
             return GmOrderProxy(ords[-1], self.is_live, data=data) if ords else None
         except Exception as e:
-            print(f"[GM Error] {e}")
+            self._runtime_log(f"[GM Error] {e}")
             return None
 
     # 5. 将券商的原始订单对象（raw_order）转换为框架标准的 BaseOrderProxy
@@ -839,6 +1075,23 @@ class GmBrokerAdapter(BaseLiveBroker):
             phase = 'quiet' if quiet else 'active'
             key = (str(kind), str(message), phase)
             previous = launch_state.get('connectivity_log')
+            if quiet:
+                # Keep only a short-lived suppression record while maintenance
+                # probing continues.  The first visible recovery log is emitted
+                # when the schedule enters the active window or the session recovers.
+                if previous and previous.get('key') == key:
+                    previous['suppressed'] = int(previous.get('suppressed', 0) or 0) + 1
+                    previous['last_at'] = now_monotonic
+                    launch_state['connectivity_failure_seen'] = True
+                    return False
+                launch_state['connectivity_log'] = {
+                    'key': key,
+                    'last_at': now_monotonic,
+                    'suppressed': 0,
+                }
+                launch_state['connectivity_failure_seen'] = True
+                return False
+
             if previous and previous.get('key') == key:
                 elapsed = now_monotonic - float(previous.get('last_at') or 0.0)
                 if elapsed < _GM_CONNECTIVITY_LOG_INTERVAL_SECONDS:
@@ -883,12 +1136,22 @@ class GmBrokerAdapter(BaseLiveBroker):
                 try:
                     code_int = int(code)
                 except Exception:
-                    code_int = 1200 if "1200" in info_text else None
+                    code_int = next(
+                        (candidate for candidate in (1200, 1201) if str(candidate) in info_text),
+                        None,
+                    )
                 is_market_data_failure = (
-                    "实时行情服务连接失败" in info_text or "行情服务连接失败" in info_text
+                    "实时行情服务连接失败" in info_text
+                    or "行情服务连接失败" in info_text
+                    or "实时行情服务连接断开" in info_text
+                    or "行情服务连接断开" in info_text
                 )
-                if code_int != 1200 or (info_text and not is_market_data_failure):
+                if code_int not in {1200, 1201} or (info_text and not is_market_data_failure):
                     return False
+
+                quiet, _, _ = _connectivity_retry_plan(datetime.datetime.now())
+                if quiet:
+                    return True
 
                 now_ts = time.time()
                 if (
@@ -1144,7 +1407,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                         "gm_trade_service_unavailable",
                         f"[GM Warning] {msg}",
                         quiet,
-                    ):
+                    ) and not quiet:
                         AlarmManager().push_schedule_api_unavailable("GmBroker", msg)
                     return
 
@@ -1248,14 +1511,20 @@ class GmBrokerAdapter(BaseLiveBroker):
                     launch_state['retry_delay_seconds'] = retry_delay
                     launch_state['retry_wake_at'] = wake_at
                     if quiet and wake_at is not None:
+                        seconds_to_wake = max(
+                            0.1,
+                            (pd.Timestamp(wake_at) - pd.Timestamp(now_value)).total_seconds(),
+                        )
                         retry_detail = (
                             f"quiet probe in {retry_delay:.0f}s; aggressive recovery at "
                             f"{pd.Timestamp(wake_at).strftime('%Y-%m-%d %H:%M:%S')}"
                         )
                         report_live_worker_state(
                             "gm_connectivity_quiet_wait",
+                            unhealthy_after_seconds=seconds_to_wake,
                             detail=retry_detail,
                             failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                            refresh_deadline=True,
                         )
                     else:
                         retry_detail = f"retrying in {retry_delay:.0f}s"
@@ -1337,17 +1606,19 @@ class GmBrokerAdapter(BaseLiveBroker):
                                 time.sleep(1)
                                 continue
 
-                            now_ts = time.time()
-                            if (
-                                last_poll_status_log_at is None
-                                or now_ts - last_poll_status_log_at
-                                >= market_data_error_log_interval_seconds
-                            ):
-                                _runtime_print(
-                                    f"[GM Warning] gmi_poll returned transient status {poll_status}; "
-                                    "continuing the SDK event loop."
-                                )
-                                last_poll_status_log_at = now_ts
+                            quiet, _, _ = _connectivity_retry_plan(datetime.datetime.now())
+                            if not quiet:
+                                now_ts = time.time()
+                                if (
+                                    last_poll_status_log_at is None
+                                    or now_ts - last_poll_status_log_at
+                                    >= market_data_error_log_interval_seconds
+                                ):
+                                    _runtime_print(
+                                        f"[GM Warning] gmi_poll returned transient status {poll_status}; "
+                                        "continuing the SDK event loop."
+                                    )
+                                    last_poll_status_log_at = now_ts
                             # Avoid a CPU spin if a particular SDK build returns
                             # immediately while idle. Explicit shutdown/SystemExit
                             # and bounded connection-health callbacks still restart.

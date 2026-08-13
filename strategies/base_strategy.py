@@ -140,13 +140,24 @@ class BaseStrategy(ABC):
         pending_map = {}
         if getattr(self.broker, 'is_live', False) and hasattr(self.broker, 'get_pending_orders'):
             try:
-                for po in self.broker.get_pending_orders():
+                pending_orders = self.broker.get_pending_orders() or []
+                if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+                    detail = getattr(
+                        self.broker,
+                        '_last_pending_orders_fetch_error',
+                        'pending-order snapshot unavailable',
+                    )
+                    raise RuntimeError(f"pending-order snapshot is untrusted: {detail}")
+                for po in pending_orders:
                     sym = str(po['symbol']).upper()
                     if sym not in pending_map:
                         pending_map[sym] = {'BUY': 0.0, 'SELL': 0.0}
                     pending_map[sym][po['direction']] += po['size']
             except Exception as e:
-                self.log(f"获取在途订单异常: {e}")
+                # The engine probes pending state before strategy.next(), but a
+                # second snapshot can still fail here.  Treating that failure as
+                # an empty truth can duplicate an already-pending SELL.
+                raise RuntimeError(f"获取在途订单失败，本轮调仓已中止: {e}") from e
 
         # 辅助查表函数 (支持 IBKR 截断后缀模糊匹配，如 'QQQ.ISLAND' 匹配 'QQQ')
         def get_pending(data_name, direction):

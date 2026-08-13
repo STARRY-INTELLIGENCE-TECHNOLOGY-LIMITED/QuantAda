@@ -173,8 +173,14 @@ class DummyIBForPositions(DummyIBForCash):
     def __init__(self, cash_usd, positions):
         super().__init__(cash_usd=cash_usd)
         self._positions = positions
+        self.req_position_calls = 0
+        self.RequestTimeout = 0
 
     def positions(self):
+        return self._positions
+
+    def reqPositions(self):
+        self.req_position_calls += 1
         return self._positions
 
 
@@ -315,6 +321,38 @@ class DummyIBForAggregateAllSummary(DummyIBForCash):
 
     def accountValues(self, *args, **kwargs):
         return self.accountSummary()
+
+
+class DummyIBForDelayedAccountView(DummyIBForPositions):
+    def __init__(self, account):
+        super().__init__(cash_usd=0.0, positions=[])
+        self.account = account
+        self.summary_calls = []
+
+    def managedAccounts(self):
+        return [self.account]
+
+    def accountSummary(self, account=""):
+        self.summary_calls.append(account)
+        if account:
+            return []
+        return [
+            DummyAccountValue(
+                tag="AvailableFunds",
+                currency="BASE",
+                value="4321",
+                account=self.account,
+            ),
+            DummyAccountValue(
+                tag="TotalCashValue",
+                currency="BASE",
+                value="4321",
+                account=self.account,
+            ),
+        ]
+
+    def accountValues(self, account=""):
+        return self.accountSummary(account)
 
 
 class DummyIBForSubmit(DummyIBForCash):
@@ -646,6 +684,162 @@ def test_ib_fetch_real_cash_uses_aggregate_all_snapshot_when_account_specific_mi
     assert got == pytest.approx(7777.0), "All 聚合快照应作为可用兜底，避免误判 0 资金。"
 
 
+def test_ib_multi_account_rejects_aggregate_all_cash_snapshot(monkeypatch):
+    """An ``All`` account row must not fund a configured child account in a multi-account session."""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U1111111",
+        raising=False,
+    )
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForAggregateAllSummary(
+                managed_accounts=["U1111111", "U2222222"]
+            )
+        )
+    )
+
+    assert broker._fetch_real_cash() == pytest.approx(0.0)
+    assert broker.is_account_snapshot_trusted() is False
+    assert broker._last_account_snapshot_fetch_failed is True
+    assert "aggregate account snapshot" in str(broker._last_account_snapshot_fetch_error)
+
+
+def test_ib_multi_account_rejects_unscoped_cash_snapshot(monkeypatch):
+    """A cash row without an account field is not safely attributable in a multi-account session."""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U1111111",
+        raising=False,
+    )
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForSubmit(managed_accounts=["U1111111", "U2222222"])
+        )
+    )
+
+    assert broker._fetch_real_cash() == pytest.approx(0.0)
+    assert broker.is_account_snapshot_trusted() is False
+    assert "unscoped account snapshot" in str(broker._last_account_snapshot_fetch_error)
+
+
+def test_ib_account_snapshot_falls_back_to_all_rows_when_scoped_view_is_temporarily_empty(monkeypatch):
+    """连接恢复时指定账户缓存可能尚未填充，应从全量视图恢复并精确过滤。"""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U18229362",
+        raising=False,
+    )
+    ib = DummyIBForDelayedAccountView("U18229362")
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=ib))
+
+    assert broker._fetch_real_cash() == pytest.approx(4321.0)
+    assert "U18229362" in ib.summary_calls
+    assert "" in ib.summary_calls
+    assert broker.is_account_snapshot_trusted() is True
+    assert broker._last_account_snapshot_fetch_failed is False
+
+
+def test_ib_account_snapshot_rejects_configured_account_not_visible_to_gateway(monkeypatch):
+    """TCP/API 已连接但目标账号不在 managedAccounts 时必须失败关闭。"""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U18229362",
+        raising=False,
+    )
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForSubmit(managed_accounts=["U99999999"])
+        )
+    )
+
+    assert broker.is_account_snapshot_trusted() is False
+    assert broker._last_account_snapshot_fetch_failed is True
+    assert "not visible" in broker._last_account_snapshot_fetch_error
+
+
+def test_ib_account_snapshot_rejects_multiple_accounts_without_explicit_target(monkeypatch):
+    """Planning must fail before it can combine balances from ambiguous IB accounts."""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "",
+        raising=False,
+    )
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForSubmit(managed_accounts=["U1111111", "U2222222"])
+        )
+    )
+
+    assert broker.is_account_snapshot_trusted() is False
+    assert "multiple IB accounts" in str(broker._last_account_snapshot_fetch_error)
+
+
+def test_ib_account_snapshot_rejects_non_numeric_required_values():
+    class IBWithInvalidAccountValues(DummyIBForCash):
+        def accountSummary(self, *args, **kwargs):
+            return [
+                DummyAccountValue(tag="AvailableFunds", currency="BASE", value="N/A"),
+                DummyAccountValue(tag="TotalCashValue", currency="BASE", value="nan"),
+            ]
+
+        def accountValues(self, *args, **kwargs):
+            return self.accountSummary()
+
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(ib_instance=IBWithInvalidAccountValues(0.0))
+    )
+
+    assert broker.is_account_snapshot_trusted() is False
+    assert broker._last_account_snapshot_fetch_failed is True
+
+
+def test_ib_account_snapshot_marks_missing_or_disconnected_ib_untrusted():
+    missing = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=None))
+    assert missing.is_account_snapshot_trusted() is False
+    assert missing._last_account_snapshot_fetch_failed is True
+    assert "missing" in str(missing._last_account_snapshot_fetch_error)
+
+    disconnected = IBBrokerAdapter(
+        context=types.SimpleNamespace(ib_instance=DummyIBDisconnected())
+    )
+    assert disconnected.is_account_snapshot_trusted() is False
+    assert disconnected._last_account_snapshot_fetch_failed is True
+    assert "not connected" in str(disconnected._last_account_snapshot_fetch_error)
+
+
+def test_ib_account_snapshot_callback_probe_does_not_reenter_position_query(monkeypatch):
+    """IB Event callback 中不能同步 reqPositions 重入正在运行的 event loop。"""
+    ib = DummyIBForPositions(cash_usd=0.0, positions=[])
+
+    def _summary(*_args, **_kwargs):
+        return [
+            DummyAccountValue(tag="AvailableFunds", currency="BASE", value="1000"),
+        ]
+
+    ib.accountSummary = _summary
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=ib))
+    monkeypatch.setattr(IBBrokerAdapter, "_in_async_task", staticmethod(lambda: True))
+
+    assert broker.is_account_snapshot_trusted() is True
+    assert ib.req_position_calls == 0
+
+
 def test_ib_get_cash_dedupes_open_orders_and_local_ledger():
     """
     占资去重回归:
@@ -678,6 +872,22 @@ def test_ib_get_cash_dedupes_open_orders_and_local_ledger():
     assert broker.get_cash() == pytest.approx(expected_cash), (
         "IB get_cash 占资去重异常：应扣减 openTrades 冻结 + 本地额外订单占资。"
     )
+
+
+def test_ib_get_cash_fails_closed_when_pending_snapshot_is_untrusted():
+    """无法确认远端 BUY 占资时不得把账面现金全部暴露给新买单。"""
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(ib_instance=DummyIBForCash(cash_usd=10000.0))
+    )
+
+    def _untrusted_pending():
+        broker._last_pending_orders_fetch_failed = True
+        broker._last_pending_orders_fetch_error = "open-order timeout"
+        return []
+
+    broker.get_pending_orders = _untrusted_pending
+
+    assert broker.get_cash() == 0.0
 
 
 def test_ib_get_current_price_falls_back_to_provider_price_when_no_market_data(monkeypatch):
@@ -888,6 +1098,190 @@ def test_ib_get_position_matches_symbol_suffix_variants():
 
     assert pos.size == pytest.approx(140), "后缀容错失效：EWJ.SMART 必须匹配到 EWJ 持仓。"
     assert pos.price == pytest.approx(92.01), "持仓成本提取异常：应返回 IB 的 avgCost。"
+    assert context.ib_instance.req_position_calls == 1
+    assert context.ib_instance.RequestTimeout == 0, "同步查询后必须恢复 SDK 原超时设置。"
+
+
+def test_ib_get_position_refreshes_stale_wrapper_cache_from_counter():
+    """SELL 对账必须使用 reqPositions 结果，不能继续读取成交前 wrapper 缓存。"""
+    stale = SimpleNamespace(
+        contract=SimpleNamespace(symbol="EWJ", secType="STK", localSymbol="EWJ"),
+        position=140,
+        avgCost=92.01,
+    )
+
+    class IBWithStalePositionCache(DummyIBForPositions):
+        def positions(self):
+            return [stale]
+
+        def reqPositions(self):
+            self.req_position_calls += 1
+            return []
+
+    ib = IBWithStalePositionCache(cash_usd=10000.0, positions=[stale])
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=ib))
+
+    pos = broker.get_position(SimpleNamespace(_name="EWJ.SMART"))
+
+    assert pos.size == 0, "柜台已空仓时不得继续使用成交前的 140 股本地缓存。"
+    assert ib.req_position_calls == 1
+    assert broker._last_position_snapshot_fetch_failed is False
+
+
+def test_ib_get_position_query_failure_is_not_silent_empty_position():
+    """断线/超时必须暴露未知持仓，不能伪装为空仓并放行后续交易。"""
+    ib = DummyIBForPositions(cash_usd=10000.0, positions=[])
+
+    def _raise_timeout():
+        assert ib.RequestTimeout == pytest.approx(3.0)
+        raise TimeoutError("position request timeout")
+
+    ib.reqPositions = _raise_timeout
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=ib))
+
+    with pytest.raises(RuntimeError, match="IB live position query failed"):
+        broker.get_position(SimpleNamespace(_name="EWJ.SMART"))
+
+    assert broker._last_position_snapshot_fetch_failed is True
+    assert "position request timeout" in str(broker._last_position_snapshot_fetch_error)
+    assert ib.RequestTimeout == 0
+
+
+def test_ib_configured_account_rejects_unscoped_position_snapshot(monkeypatch):
+    """A position row without account scope cannot be assigned to a chosen IB account."""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U18229362",
+        raising=False,
+    )
+    ib_positions = [
+        SimpleNamespace(
+            contract=SimpleNamespace(symbol="EWJ", secType="STK", localSymbol="EWJ"),
+            position=140,
+            avgCost=92.01,
+        )
+    ]
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForPositions(cash_usd=10_000.0, positions=ib_positions)
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="no account fields"):
+        broker.get_position(SimpleNamespace(_name="EWJ.SMART"))
+
+    assert broker._last_position_snapshot_fetch_failed is True
+
+
+def test_ib_configured_account_rejects_unscoped_pending_snapshot(monkeypatch):
+    """An open order without account scope must not block/route the selected account."""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U18229362",
+        raising=False,
+    )
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=123, action="BUY"),
+        contract=SimpleNamespace(symbol="EWJ"),
+        orderStatus=SimpleNamespace(status="Submitted", remaining=10),
+    )
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10_000.0, open_trades=[trade])
+        )
+    )
+
+    assert broker.get_pending_orders() == []
+    assert broker._last_pending_orders_fetch_failed is True
+    assert "no account fields" in str(broker._last_pending_orders_fetch_error)
+
+
+def test_ib_configured_account_rejects_mixed_scoped_and_unscoped_position_snapshot(monkeypatch):
+    """A mixed all-account position batch must not silently drop an unscoped target row."""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U18229362",
+        raising=False,
+    )
+    ib_positions = [
+        SimpleNamespace(
+            account="U99999999",
+            contract=SimpleNamespace(symbol="EWJ", secType="STK", localSymbol="EWJ"),
+            position=10,
+            avgCost=90.0,
+        ),
+        SimpleNamespace(
+            contract=SimpleNamespace(symbol="EWJ", secType="STK", localSymbol="EWJ"),
+            position=140,
+            avgCost=92.01,
+        ),
+    ]
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForPositions(cash_usd=10_000.0, positions=ib_positions)
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="contains records without account fields"):
+        broker.get_position(SimpleNamespace(_name="EWJ.SMART"))
+
+    assert broker._last_position_snapshot_fetch_failed is True
+
+
+def test_ib_configured_account_rejects_mixed_scoped_and_unscoped_pending_snapshot(monkeypatch):
+    """A mixed all-client order batch must fail closed rather than omit an unknown row."""
+    import live_trader.adapters.ib_broker as ib_module
+
+    monkeypatch.setattr(
+        ib_module.config,
+        "IBKR_ORDER_ACCOUNT",
+        "U18229362",
+        raising=False,
+    )
+    scoped_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=123, action="BUY", account="U99999999"),
+        contract=SimpleNamespace(symbol="EWJ"),
+        orderStatus=SimpleNamespace(status="Submitted", remaining=10),
+    )
+    unscoped_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=124, action="BUY"),
+        contract=SimpleNamespace(symbol="EWJ"),
+        orderStatus=SimpleNamespace(status="Submitted", remaining=10),
+    )
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(
+            ib_instance=DummyIBForCashWithOpenTrades(
+                cash_usd=10_000.0,
+                open_trades=[scoped_trade, unscoped_trade],
+            )
+        )
+    )
+
+    assert broker.get_pending_orders() == []
+    assert broker._last_pending_orders_fetch_failed is True
+    assert "contains records without account fields" in str(
+        broker._last_pending_orders_fetch_error
+    )
+
+
+def test_ib_get_position_disconnected_does_not_return_stale_cache():
+    ib = DummyIBForPositions(cash_usd=10000.0, positions=[SimpleNamespace(position=140)])
+    ib.isConnected = lambda: False
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=ib))
+
+    with pytest.raises(RuntimeError, match="ib not connected"):
+        broker.get_position(SimpleNamespace(_name="EWJ.SMART"))
+
+    assert broker._last_position_snapshot_fetch_failed is True
 
 
 def test_ib_get_position_filters_by_configured_order_account(monkeypatch):
@@ -925,6 +1319,30 @@ def test_ib_get_position_filters_by_configured_order_account(monkeypatch):
 
     assert pos.size == pytest.approx(140), "应过滤掉非目标账户持仓。"
     assert pos.price == pytest.approx(92.01), "应返回目标账户持仓成本。"
+
+
+def test_ib_get_position_returns_flat_for_target_account_when_only_other_account_has_position(monkeypatch):
+    """A target account can legitimately be flat while another visible account holds the symbol."""
+    ib_positions = [
+        SimpleNamespace(
+            account="U2222222",
+            contract=SimpleNamespace(symbol="EWJ", secType="STK", localSymbol="EWJ"),
+            position=999,
+            avgCost=88.01,
+        ),
+    ]
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(
+        ib_instance=DummyIBForPositions(cash_usd=10_000.0, positions=ib_positions)
+    ))
+
+    import live_trader.adapters.ib_broker as ib_module
+    monkeypatch.setattr(ib_module.config, "IBKR_ORDER_ACCOUNT", "U1111111", raising=False)
+
+    pos = broker.get_position(SimpleNamespace(_name="EWJ.SMART"))
+
+    assert pos.size == 0
+    assert pos.sellable == 0
+    assert broker._last_position_snapshot_fetch_failed is False
 
 
 def test_ib_provider_parse_contract_supports_generic_exchange_suffix():
@@ -1956,6 +2374,47 @@ def test_ib_pending_order_fetch_success_clears_failure_flag():
     assert broker._last_pending_orders_fetch_error is None
 
 
+@pytest.mark.parametrize(
+    "trade",
+    [
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=0, permId=0, action="BUY"),
+            contract=SimpleNamespace(symbol="EWJ"),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=10),
+        ),
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=141, action="BUY"),
+            contract=SimpleNamespace(symbol=""),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=10),
+        ),
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=142, action="HOLD"),
+            contract=SimpleNamespace(symbol="EWJ"),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=10),
+        ),
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=143, action="BUY"),
+            contract=SimpleNamespace(symbol="EWJ"),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=0),
+        ),
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=144, action="BUY"),
+            contract=SimpleNamespace(symbol="EWJ"),
+            orderStatus=SimpleNamespace(status="MysteryState", remaining=10),
+        ),
+    ],
+)
+def test_ib_pending_order_malformed_record_marks_snapshot_untrusted(trade):
+    """Malformed IB pending rows cannot be silently omitted as if no order existed."""
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(
+        ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10_000.0, open_trades=[trade])
+    ))
+
+    assert broker.get_pending_orders() == []
+    assert broker._last_pending_orders_fetch_failed is True
+    assert broker._last_pending_orders_fetch_error is not None
+
+
 def test_ib_get_pending_orders_filters_by_configured_order_account(monkeypatch):
     """
     账户隔离回归:
@@ -2077,6 +2536,19 @@ def test_ib_cancel_pending_order_uses_req_all_open_orders_fallback():
 
     assert ok is True, "应能通过 reqAllOpenOrders 识别并撤销在途单。"
     assert ib.cancel_calls == [order_obj], "撤单应透传原始 order 对象。"
+
+
+def test_ib_cancel_pending_order_returns_false_when_open_order_snapshot_untrusted():
+    ib = DummyIBForAllOpenOrders(
+        cash_usd=10000.0,
+        open_trades=[],
+        all_open_trades=[],
+    )
+    ib.reqAllOpenOrders = lambda: (_ for _ in ()).throw(TimeoutError("open-order timeout"))
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=ib))
+
+    assert broker.cancel_pending_order("902") is False
+    assert ib.cancel_calls == []
 
 
 def test_ib_pending_order_uses_perm_id_when_order_id_missing():
@@ -2408,6 +2880,24 @@ def test_ib_collect_open_trades_skip_req_all_open_orders_in_async_task(monkeypat
     assert ib.req_all_calls == 0, "异步任务中不应触发 reqAllOpenOrders。"
 
 
+def test_ib_running_loop_callback_is_treated_as_nonblocking_context():
+    """ib_insync Event 同步回调没有 Task，也不能重入 IB._run。"""
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+    observed = []
+    try:
+        def _callback():
+            observed.append(IBBrokerAdapter._in_async_task())
+
+        loop.call_soon(_callback)
+        loop.run_until_complete(asyncio.sleep(0))
+    finally:
+        loop.close()
+
+    assert observed == [True]
+
+
 def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch, capsys):
     """
     IBKR 自愈回归:
@@ -2432,6 +2922,7 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
         def __init__(self):
             self.connected = False
             self.connect_calls = 0
+            self.connect_accounts = []
             self.sleep_calls = 0
             self.req_mkt_data_calls = []
             self.orderStatusEvent = DummyEvent()
@@ -2440,8 +2931,9 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
         def isConnected(self):
             return self.connected
 
-        def connect(self, host, port, clientId):
+        def connect(self, host, port, clientId, account=""):
             self.connect_calls += 1
+            self.connect_accounts.append(account)
             self.connected = True
 
         def tickers(self):
@@ -2486,6 +2978,7 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
     monkeypatch.setattr(config, "IBKR_HOST", "127.0.0.1", raising=False)
     monkeypatch.setattr(config, "IBKR_PORT", 7497, raising=False)
     monkeypatch.setattr(config, "IBKR_CLIENT_ID", 7, raising=False)
+    monkeypatch.setattr(config, "IBKR_ORDER_ACCOUNT", "U18229362", raising=False)
     monkeypatch.setattr(mock_ib_insync, "IB", lambda: dummy_ib)
     monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
     monkeypatch.setattr(
@@ -2508,6 +3001,7 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
 
     captured = capsys.readouterr()
     assert dummy_ib.connect_calls == 2
+    assert dummy_ib.connect_accounts == ["U18229362", "U18229362"]
     assert len(dummy_ib.req_mkt_data_calls) == 2, "断线重连后即使旧 ticker 非空，也必须重新订阅行情。"
     assert "IB connection ended. Re-entering recovery mode." in captured.out
     connecting = [kwargs for state, kwargs in health_states if state == "ib_connecting"]

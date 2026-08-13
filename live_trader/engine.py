@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import datetime
 import sys
 import time
 import traceback
@@ -370,7 +371,8 @@ class LiveTrader:
 
 
     def run(self, context):
-        print(f"--- LiveTrader Running at {context.now.strftime('%Y-%m-%d %H:%M:%S')} ---")
+        runtime_log = runtime_print if self.broker.is_live else print
+        runtime_log(f"--- LiveTrader Running at {context.now.strftime('%Y-%m-%d %H:%M:%S')} ---")
         self.broker.set_datetime(context.now)
         if self.broker.is_live:
             begin_live_run_budget(self.broker, self.config, context)
@@ -381,19 +383,19 @@ class LiveTrader:
                     f"Unexpected error in overnight cleanup hook: {e}. "
                     "Continue this run."
                 )
-                print(f"[Engine Warning] {warn_msg}")
+                runtime_log(f"[Engine Warning] {warn_msg}")
                 if hasattr(self, 'alarm_manager') and self.alarm_manager:
                     try:
                         self.alarm_manager.push_text(f"[Engine Warning] {warn_msg}", level='ERROR')
                     except Exception as alarm_err:
-                        print(f"[Engine Warning] failed to push overnight cleanup hook alarm: {alarm_err}")
+                        runtime_log(f"[Engine Warning] failed to push overnight cleanup hook alarm: {alarm_err}")
 
         # 顶层异常捕获，防止策略因单次错误而崩溃
         try:
             # --- 实盘数据热更新逻辑 ---
             # 只有在实盘模式下，每次 schedule 触发 run 时，才需要重新拉取数据
             if self.broker.is_live:
-                print("[Engine] Live Mode: Refreshing data...")
+                runtime_log("[Engine] Live Mode: Refreshing data...")
                 refresh_stats = self._refresh_live_data_with_retry(context)
                 total_feeds = int(refresh_stats.get('total_feeds', 0))
                 updated_feeds = int(refresh_stats.get('updated_feeds', 0))
@@ -408,7 +410,7 @@ class LiveTrader:
                         f"{updated_feeds}/{total_feeds} updated, {failed_feeds} failed "
                         f"after {refresh_attempts} attempts. Skipping this run."
                     )
-                    print(warn_msg)
+                    runtime_log(warn_msg)
                     if hasattr(self, 'alarm_manager'):
                         self.alarm_manager.push_text(
                             (
@@ -422,7 +424,7 @@ class LiveTrader:
 
                 if live_run_budget_expired(self.broker):
                     msg = "[Engine Error] Live run execution budget exhausted during data refresh; skipping strategy."
-                    print(msg)
+                    runtime_log(msg)
                     if hasattr(self, 'alarm_manager') and self.alarm_manager:
                         self.alarm_manager.push_text(msg, level='ERROR')
                     return
@@ -432,7 +434,7 @@ class LiveTrader:
             if not self.broker.datas:
                 recovered = self._recover_data_feeds(context)
                 if not recovered:
-                    print(
+                    runtime_log(
                         "[Engine Warning] No tradable data feeds available after recovery. "
                         "Skipping this run."
                     )
@@ -444,14 +446,53 @@ class LiveTrader:
 
             if self.broker.is_live and live_run_budget_expired(self.broker):
                 msg = "[Engine Error] Live run execution budget exhausted during data recovery; skipping risk and strategy execution."
-                print(msg)
+                runtime_log(msg)
                 if hasattr(self, 'alarm_manager') and self.alarm_manager:
                     self.alarm_manager.push_text(msg, level='ERROR')
                 return
 
+            # Some broker sockets can be connected before their account state is
+            # synchronized.  Adapters that can distinguish this state expose a
+            # short-lived health probe; an unavailable snapshot must never be
+            # interpreted as a legitimate zero-cash/empty-position account.
+            if self.broker.is_live:
+                account_snapshot_probe = getattr(self.broker, 'is_account_snapshot_trusted', None)
+                if callable(account_snapshot_probe):
+                    account_snapshot_trusted = False
+                    account_snapshot_error = None
+                    for attempt in range(1, 4):
+                        if live_run_budget_expired(self.broker):
+                            account_snapshot_error = 'live run execution budget exhausted'
+                            break
+                        try:
+                            if account_snapshot_probe():
+                                account_snapshot_trusted = True
+                                break
+                            account_snapshot_error = getattr(
+                                self.broker,
+                                '_last_account_snapshot_fetch_error',
+                                'account snapshot unavailable',
+                            )
+                        except Exception as e:
+                            account_snapshot_error = e
+                        runtime_print(
+                            f"[Engine Warning] Live account snapshot is unavailable "
+                            f"({attempt}/3): {account_snapshot_error}"
+                        )
+
+                    if not account_snapshot_trusted:
+                        msg = (
+                            "[Engine Error] Live account snapshot remained unavailable "
+                            f"after 3 attempts; skipping this run. detail={account_snapshot_error}"
+                        )
+                        runtime_print(msg)
+                        if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                            self.alarm_manager.push_text(msg, level='ERROR')
+                        return
+
             # 1. 执行风控检查（前置，避免被 pending-order gate 吞掉）
             if self.risk_control and self._check_risk_controls():
-                print("[Engine] 🛡️ 发现风控动作。底层已自动物理上锁，策略流水线继续向下执行...")
+                runtime_log("[Engine] 🛡️ 发现风控动作。底层已自动物理上锁，策略流水线继续向下执行...")
 
             # 2. 检查策略是否有挂单
             strategy_order = getattr(self.strategy, 'order', None)
@@ -467,7 +508,7 @@ class LiveTrader:
                         candidate_orders = self.broker.get_pending_orders() or []
                     except Exception as e:
                         pending_error = e
-                        print(
+                        runtime_log(
                             f"[Engine Warning] Live pending-order query failed "
                             f"({attempt}/3): {e}"
                         )
@@ -477,7 +518,7 @@ class LiveTrader:
                         pending_error = getattr(
                             self.broker, '_last_pending_orders_fetch_error', None
                         )
-                        print(
+                        runtime_log(
                             f"[Engine Warning] Live pending-order snapshot is untrusted "
                             f"({attempt}/3): {pending_error}"
                         )
@@ -492,7 +533,7 @@ class LiveTrader:
                         "[Engine Error] Live pending-order snapshot remained unavailable or "
                         f"untrusted after 3 attempts; skipping this run. detail={pending_error}"
                     )
-                    print(msg)
+                    runtime_log(msg)
                     if hasattr(self, 'alarm_manager') and self.alarm_manager:
                         self.alarm_manager.push_text(msg, level='ERROR')
                     return
@@ -507,22 +548,22 @@ class LiveTrader:
                 # 视为僵尸单并主动清理，防止无人值守时永久锁死。
                 if strategy_order and not has_real_pending and not has_internal_pending:
                     stale_oid = getattr(strategy_order, 'id', 'UNKNOWN')
-                    print(f"[Engine Recovery] Stale strategy.order detected ({stale_oid}). Auto-clearing lock.")
+                    runtime_log(f"[Engine Recovery] Stale strategy.order detected ({stale_oid}). Auto-clearing lock.")
                     self.strategy.order = None
                     strategy_order = None
 
             if strategy_order:
-                print("[Engine] Strategy has a pending order. Notifying and skipping logic.")
+                runtime_log("[Engine] Strategy has a pending order. Notifying and skipping logic.")
                 if self.risk_control:
                     self.risk_control.notify_order(strategy_order)
                 self.strategy.notify_order(strategy_order)
-                print("--- LiveTrader Run Finished (Pending Order) ---")
+                runtime_log("--- LiveTrader Run Finished (Pending Order) ---")
                 return
 
             # 3. 执行策略的 'next'
             if self.broker.is_live and live_run_budget_expired(self.broker):
                 msg = "[Engine Error] Live run execution budget exhausted before strategy execution."
-                print(msg)
+                runtime_log(msg)
                 if hasattr(self, 'alarm_manager') and self.alarm_manager:
                     self.alarm_manager.push_text(msg, level='ERROR')
                 return
@@ -531,7 +572,7 @@ class LiveTrader:
             # 4. 通知策略的新订单
             strategy_order = getattr(self.strategy, 'order', None)  # 重新获取，策略可能已创建新订单
             if strategy_order:
-                print("[Engine] New order created by strategy. Notifying...")
+                runtime_log("[Engine] New order created by strategy. Notifying...")
                 if self.risk_control:
                     self.risk_control.notify_order(strategy_order)
                 self.strategy.notify_order(strategy_order)
@@ -579,9 +620,9 @@ class LiveTrader:
         except Exception:
             pass
 
-        print("--- LiveTrader Run Finished ---")
+        runtime_log("--- LiveTrader Run Finished ---")
         if self.broker.is_live:
-            print(
+            runtime_log(
                 f"[Engine] ⏳ 实盘引擎保持运行中... 预计下一个 K线/调度时间约为: {next_expected_str} (以实际行情或定时任务时区为准)")
 
     def _cleanup_overnight_orders_before_refresh(self, context):
@@ -1371,7 +1412,21 @@ def on_order_status_callback(context, raw_order):
                 exec_price = float(raw_exec_price)
             except Exception:
                 exec_price = 0.0
-            exec_dt = extract_order_execution_dt(order_proxy, fallback=getattr(context, 'now', None))
+            # A live schedule context keeps ``now`` fixed at the trigger slot for
+            # the whole run.  It is not a valid fallback for a later fill callback.
+            exec_dt = extract_order_execution_dt(
+                order_proxy,
+                fallback=None if getattr(broker, 'is_live', False) else getattr(context, 'now', None),
+            )
+            if exec_dt is None and getattr(broker, 'is_live', False):
+                # Some GM order snapshots contain no execution timestamp.  Use
+                # one callback-time wall clock value for both strategy logs and
+                # trade alarms; never reuse the fixed schedule trigger time.
+                exec_dt = datetime.datetime.now().astimezone()
+                try:
+                    setattr(order_proxy, 'execution_dt', exec_dt)
+                except Exception:
+                    pass
 
             # 同一订单同一状态（含成交快照）重复回调去重，防止告警/日志刷屏。
             dedupe_key = order_id if order_id else f"raw:{id(raw_order)}"
@@ -1400,7 +1455,9 @@ def on_order_status_callback(context, raw_order):
                 msg = getattr(raw_order, 'ord_rej_reason_detail', '')  # 尝试获取拒单原因
 
             if is_completed:
-                print(f"[Engine Callback] Notified strategy of order status: {current_status} ({msg})")
+                runtime_print(
+                    f"[Engine Callback] Notified strategy of order status: {current_status} ({msg})"
+                )
             # 如果状态是 "已提交" 但还没 "成交"，且未被拒绝，则推送一条消息
             if (is_pending or is_accepted) and not (is_completed or is_rejected or is_canceled):
                 # 为了防止刷屏，只有当成交量为0时才推送这个"提交确认"
@@ -1413,7 +1470,10 @@ def on_order_status_callback(context, raw_order):
                         pending_sells = getattr(broker, '_pending_sells', set())
                         is_tracked = bool(order_id and (order_id in active_buys or order_id in pending_sells))
                     if not is_tracked:
-                        print(f"[Engine Callback] Skip submitted alarm for untracked order ({order_id or 'UNKNOWN'}).")
+                        runtime_print(
+                            f"[Engine Callback] Skip submitted alarm for untracked order "
+                            f"({order_id or 'UNKNOWN'})."
+                        )
                     else:
                         total_qty = _extract_target_qty(order_proxy, fallback=0)
 
@@ -1474,21 +1534,26 @@ def on_order_status_callback(context, raw_order):
             if is_sell_order and is_completed and order_proxy.executed.size > 0:
                 # 再次确认不是撤单导致的 size>0 (虽然撤单通常 size=0，但为了严谨)
                 if not is_canceled and not is_rejected:
-                    print("[Engine] Sell filled. Syncing broker cash snapshot...")
+                    runtime_print("[Engine] Sell filled. Syncing broker cash snapshot...")
 
                     if hasattr(broker, 'sync_balance'):
                         broker.sync_balance()
-                        print(f"[Debug] Cash after sync: {broker.get_cash():.2f}")
+                        runtime_print(f"[Debug] Cash after sync: {broker.get_cash():.2f}")
 
         except Exception as e:
             # 记录所有未预期的异常，并确保主循环不退出即可。
             import traceback
             error_msg = f"[Engine Callback Error] Unexpected exception: {e}"
+            is_live_callback = bool(
+                getattr(getattr(context, 'strategy_instance', None), 'broker', None)
+                and getattr(context.strategy_instance.broker, 'is_live', False)
+            )
+            callback_log = runtime_print if is_live_callback else print
 
             # 打印醒目的错误日志
-            print(f"\n{'=' * 40}")
-            print(error_msg)
-            print(f"{'=' * 40}")
+            callback_log(f"\n{'=' * 40}")
+            callback_log(error_msg)
+            callback_log(f"{'=' * 40}")
             traceback.print_exc()
 
             # 极端防御：如果遇到未知的严重错误，也可以尝试盲调用一次重置
@@ -1499,14 +1564,14 @@ def on_order_status_callback(context, raw_order):
                     strategy_instance.broker.force_reset_state()
                     if hasattr(strategy_instance, 'strategy') and getattr(strategy_instance.strategy, 'order', None):
                         strategy_instance.strategy.order = None
-                        print("[Engine Callback Recovery] Cleared stale strategy.order after force reset.")
+                        callback_log("[Engine Callback Recovery] Cleared stale strategy.order after force reset.")
             except Exception:
                 # 不抛出异常，让程序继续运行
                 # 这样下一个 Bar 到来时，Broker 会有机会再次自我修正
                 pass
 
     else:
-        print("[Engine Callback Warning] No strategy_instance found in context.")
+        runtime_print("[Engine Callback Warning] No strategy_instance found in context.")
 
 
 def launch_live(broker_name: str, conn_name: str, strategy_path: str, params: dict, **kwargs):

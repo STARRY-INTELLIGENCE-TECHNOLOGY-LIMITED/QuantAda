@@ -36,14 +36,17 @@
 4. 若原生 `orderId` 不稳定或缺失，必须提供可区分、可回查的兜底标识。
 5. 若实时在途查询失败、断连或快照不完整，adapter 可安全返回 `[]`，但必须设置 `_last_pending_orders_fetch_failed=True` 与 `_last_pending_orders_fetch_error`；成功查询必须清零，避免 engine/executor 将“查不到”误判为“无在途”。
 6. 上述失败标记仅用于 live runtime 判断快照可信度；它不是订单意图、不是重试队列，也不得被用于回测路径。回测 broker 应保持同步成交语义，不依赖 live pending-order 状态。
-7. 实盘引擎每轮策略执行前以及基础层 `order_target_percent()` / `order_target_value()` 发单边界都会有界重试检查该快照；重试后仍异常或失败标记为真时必须失败关闭并跳过下单。可信在途数量必须计入目标仓位差额，允许继续执行可确认的剩余计划。回测路径不得查询该快照。
+7. 实盘引擎每轮策略执行前、策略资金/仓位盘点时，以及基础层 `order_target_percent()` / `order_target_value()` 发单边界都会检查该快照；异常或失败标记为真时必须失败关闭并跳过当轮调仓，不得将其解释为空在途。可信在途数量必须计入目标仓位差额，允许继续执行可确认的剩余计划。回测路径不得查询该快照。
+8. 若券商原始在途记录缺失/空 `id`、缺失 `symbol`、方向未知或剩余数量非正/非数值，adapter 必须将整份 pending 快照标记为不可信；不得静默跳过坏记录或把未知方向默认解释为 SELL。
 
 ## 4. Stateless Constraints
 1. 不维护长期本地 fake cash / fake position 作为事实来源。
 2. 不在 adapter 内部自建跨回调拒单重试队列。
-3. 状态查询优先实时向柜台或 SDK 拉取。
-4. 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；adapter 不应自行实现固定 sleep、轮询补买或卖后现金等待状态机。
-5. 为支持通用卖后现金等待，adapter 只需保证:
+3. 状态查询优先实时向柜台或 SDK 拉取。若 adapter 的 schedule/on_bar 与订单回调由同一个 SDK 事件线程串行处理，当前 run 内的 SELL 等待不得以事件缓存持仓作为实时对账依据；应使用同步柜台持仓查询，查询失败时抛出或标记快照不可信，禁止返回静默空仓。基类持仓/可卖仓位查询也不得把 adapter 异常吞成真实的零仓。实盘信号日志不得使用固定的调度 `context.now` 作为默认时间。
+4. 若 SDK/TCP 已连接但账户摘要或持仓订阅尚未同步，adapter 必须将其暴露为当前会话的短生命周期健康失败，不能把空结果静默解释为真实的零现金/空仓；实盘运行应有界重试后跳过当轮。该健康标记不得进入回测/优化路径，也不得保存交易意图。
+5. 多账户 adapter 必须让现金、持仓、pending 与下单使用同一明确账户范围。GM adapter 当前只支持券商会话绑定的单一账户，使用 SDK 默认单账户语义，不增加账户选择配置；IB 等多账户 adapter 仍须按其连接配置明确筛选目标账户。已明确筛选目标账户后，其他账户有仓而目标账户为空是合法的零仓，不得误报为快照故障。
+6. 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；adapter 不应自行实现固定 sleep、轮询补买或卖后现金等待状态机。
+7. 为支持通用卖后现金等待，adapter 只需保证:
 - `get_rebalance_cash()` 或 `get_cash()` 返回当前真实可用于调仓的现金口径
 - `get_current_price(data)` 能返回当前估算价格
 - 卖单返回的 OrderProxy 可被执行器推断单笔委托数量，优先暴露 `submitted_size` / `requested_size`，或让原始对象保留在 `platform_order.volume` / `raw_order.volume` / `trade.order.totalQuantity`

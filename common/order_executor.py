@@ -9,6 +9,7 @@ from common.live_execution_budget import (
     live_run_seconds_remaining,
     sleep_with_live_run_budget,
 )
+from common.live_runtime import runtime_print
 from common.order_quantity import (
     positive_quantity,
     quantity_at_most,
@@ -198,7 +199,11 @@ class OrderExecutor:
 
     def _log(self, txt):
         if self.debug:
-            print(f"[Executor] {txt}")
+            message = f"[Executor] {txt}"
+            if getattr(self.broker, 'is_live', True) is True:
+                runtime_print(message)
+            else:
+                print(message)
 
     def _should_emit_order_warning(self):
         return True
@@ -207,7 +212,10 @@ class OrderExecutor:
         if not self._should_emit_order_warning():
             return
 
-        print(msg)
+        if getattr(self.broker, 'is_live', True) is True:
+            runtime_print(msg)
+        else:
+            print(msg)
         runtime_notifications.push_text(msg, level=level)
 
     def _is_benign_backtest_skip(self):
@@ -274,17 +282,45 @@ class OrderExecutor:
         return self._has_remote_pending_buy(data)
 
     def _has_remote_pending_buy(self, data):
-        if hasattr(self.broker, 'get_pending_orders'):
+        getter = getattr(self.broker, 'get_pending_orders', None)
+        if callable(getter):
             try:
-                for po in self.broker.get_pending_orders() or []:
-                    if not isinstance(po, dict):
-                        continue
-                    if str(po.get('direction', '')).strip().upper() != 'BUY':
-                        continue
-                    if self._symbol_matches_data(po.get('symbol'), data):
-                        return True
-            except Exception:
-                pass
+                pending_orders = getter() or []
+            except Exception as e:
+                # An unavailable pending-order snapshot is not evidence that no
+                # BUY is working.  Fail closed so a transient broker/API outage
+                # cannot cause a duplicate final or rolling BUY submission.
+                # Keep the broker-level health flag in sync even for adapters
+                # that raise before they can set it themselves.  This is a
+                # short-lived snapshot fact, not retained trading intent.
+                try:
+                    self.broker._last_pending_orders_fetch_failed = True
+                    self.broker._last_pending_orders_fetch_error = e
+                except Exception:
+                    pass
+                runtime_print(
+                    f"[Executor] 在途订单查询失败，暂不新增 BUY（保守防重复）: {e}"
+                )
+                return True
+
+            if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+                detail = getattr(
+                    self.broker,
+                    '_last_pending_orders_fetch_error',
+                    'pending snapshot unavailable',
+                )
+                runtime_print(
+                    f"[Executor] 在途订单快照不可信，暂不新增 BUY（保守防重复）: {detail}"
+                )
+                return True
+
+            for po in pending_orders:
+                if not isinstance(po, dict):
+                    continue
+                if str(po.get('direction', '')).strip().upper() != 'BUY':
+                    continue
+                if self._symbol_matches_data(po.get('symbol'), data):
+                    return True
 
         return False
 
@@ -489,16 +525,25 @@ class OrderExecutor:
                 )
                 break
             if check_pending and self._has_pending_buy(data):
+                # ``_has_remote_pending_buy`` deliberately returns True when
+                # the snapshot is untrusted, because callers must not infer
+                # that no BUY exists.  That conservative boolean must never be
+                # reinterpreted below as proof of a real remote pending BUY and
+                # used to allow a final top-up.
+                if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+                    continue
                 allow_top_up = False
                 symbol_key = self._symbol_key(data)
                 if symbol_key in released_target_by_symbol:
                     try:
                         released_target = float(released_target_by_symbol.get(symbol_key, 0.0) or 0.0)
                         target_value = float(target)
-                        allow_top_up = (
-                            released_target < target_value * 0.995
-                            and self._has_remote_pending_buy(data)
-                        )
+                        remote_pending_buy = self._has_remote_pending_buy(data)
+                        if not getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+                            allow_top_up = (
+                                released_target < target_value * 0.995
+                                and remote_pending_buy
+                            )
                     except Exception:
                         allow_top_up = False
                 if not allow_top_up:
@@ -653,17 +698,6 @@ class OrderExecutor:
                 )
                 self._emit_warning(msg, level='ERROR')
                 return False
-            if run_deadline is not None and live_run_budget_expired(
-                self.broker,
-                reserve_seconds=finalization_reserve,
-                deadline=run_deadline,
-            ):
-                msg = (
-                    "[Executor] SELL settlement window ended to preserve finalization time. "
-                    "Accepted partial orders remain active; planned final BUY orders are skipped."
-                )
-                self._emit_warning(msg, level='ERROR')
-                return False
 
             local_pending_ids = set()
             if hasattr(self.broker, '_pending_sells'):
@@ -684,7 +718,7 @@ class OrderExecutor:
                     pending_orders_loaded = True
                 except Exception as e:
                     pending_fetch_failures += 1
-                    print(f"[Executor] 获取在途订单失败，继续基于本地 pending_sells 等待: {e}")
+                    runtime_print(f"[Executor] 获取在途订单失败，继续基于本地 pending_sells 等待: {e}")
                     pending_orders = []
 
             if live_run_budget_expired(self.broker):
@@ -702,7 +736,7 @@ class OrderExecutor:
             elif pending_orders_loaded and pending_fetch_failed:
                 pending_fetch_failures += 1
                 err = getattr(self.broker, '_last_pending_orders_fetch_error', None)
-                print(f"[Executor] 在途订单查询结果不可信，继续基于本地 pending_sells 等待: {err}")
+                runtime_print(f"[Executor] 在途订单查询结果不可信，继续基于本地 pending_sells 等待: {err}")
 
             remote_pending_sell_ids = set()
             remote_has_pending_sell = False
@@ -757,7 +791,7 @@ class OrderExecutor:
                         combined_pending_sell_ids -= reconciled_ids
                         unresolved -= reconciled_ids
                         ids_text = ", ".join(sorted(reconciled_ids))
-                        print(f"[Executor] 卖单终态回调缺失，已通过实时持仓/在途单确认卖出完成: {ids_text}")
+                        runtime_print(f"[Executor] 卖单终态回调缺失，已通过实时持仓/在途单确认卖出完成: {ids_text}")
                         if (
                             hasattr(self.broker, 'sync_balance')
                             and not live_run_budget_expired(self.broker)
@@ -766,7 +800,7 @@ class OrderExecutor:
                                 self.broker.sync_balance()
                                 synced_balance_once = True
                             except Exception as e:
-                                print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
+                                runtime_print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
 
                 stale_local_ids = {oid for oid in tracked_ids if oid in local_pending_ids}
                 if (
@@ -785,7 +819,7 @@ class OrderExecutor:
                     local_pending_ids -= stale_local_ids
                     combined_pending_sell_ids -= stale_local_ids
                     ids_text = ", ".join(sorted(stale_local_ids))
-                    print(f"[Executor] 卖单终态回调延迟，已通过柜台在途单连续为空确认本地 pending 过期: {ids_text}")
+                    runtime_print(f"[Executor] 卖单终态回调延迟，已通过柜台在途单连续为空确认本地 pending 过期: {ids_text}")
                     if (
                         hasattr(self.broker, 'sync_balance')
                         and not live_run_budget_expired(self.broker)
@@ -794,7 +828,7 @@ class OrderExecutor:
                             self.broker.sync_balance()
                             synced_balance_once = True
                         except Exception as e:
-                            print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
+                            runtime_print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
 
             sell_state_clear = not (remote_has_pending_sell or bool(local_pending_ids))
             if (tracked_ids or has_untracked_sell) and not pending_orders_trusted:
@@ -809,7 +843,7 @@ class OrderExecutor:
                         self.broker.sync_balance()
                         synced_balance_once = True
                     except Exception as e:
-                        print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
+                        runtime_print(f"[Executor] 卖单终态后资金同步失败(继续执行): {e}")
 
                 unreconciled_targets = []
                 seen_targets = set()
@@ -841,7 +875,7 @@ class OrderExecutor:
                 if unreconciled_targets:
                     sell_state_clear = False
                     if not reconcile_wait_logged:
-                        print(
+                        runtime_print(
                             "[Executor] SELL pending state cleared but broker positions have not "
                             "yet reached this run's sell targets; continuing bounded reconciliation: "
                             + "; ".join(unreconciled_targets)
@@ -870,6 +904,23 @@ class OrderExecutor:
                         )
                     return True
 
+            # The reserve marks the end of *waiting*, not the end of a final
+            # reconciliation. A fill can arrive exactly as the reserve begins;
+            # first inspect one fresh pending/position snapshot above, then skip
+            # only if the SELL is still not confirmed. Otherwise the remaining
+            # reserve is available for the conservative final BUY submission.
+            if run_deadline is not None and live_run_budget_expired(
+                self.broker,
+                reserve_seconds=finalization_reserve,
+                deadline=run_deadline,
+            ):
+                msg = (
+                    "[Executor] SELL settlement window ended to preserve finalization time. "
+                    "Accepted partial orders remain active; planned final BUY orders are skipped."
+                )
+                self._emit_warning(msg, level='ERROR')
+                return False
+
             elapsed = time.time() - start_ts
 
             if not warn_sent and warn_after > 0 and elapsed >= warn_after:
@@ -877,7 +928,7 @@ class OrderExecutor:
                     f"[Executor] 卖单在 {int(warn_after)} 秒内未全部终态，"
                     f"继续等待并按已确认现金滚动买入。"
                 )
-                print(warn_msg)
+                runtime_print(warn_msg)
                 runtime_notifications.push_text(warn_msg, level='WARNING')
                 warn_sent = True
 
@@ -902,7 +953,7 @@ class OrderExecutor:
                             f"remote_pending={sorted(remote_pending_sell_ids)}, "
                             f"fetch_failures={pending_fetch_failures}"
                         )
-                    print(msg)
+                    runtime_print(msg)
                     runtime_notifications.push_text(msg, level='ERROR')
                 if (
                     hasattr(self.broker, 'sync_balance')
