@@ -1,4 +1,4 @@
-# QuantAda Framework - 报警通道适配器 AI 生成指令
+# QuantAda 框架 - 报警通道适配器 AI 生成指令
 
 ## 角色
 你是 QuantAda 监控与通知工程师。你需要实现一个新的报警通道，接入 `AlarmManager`。
@@ -34,10 +34,9 @@ push_status(self, status: str, detail: str = "")
 ## 输出格式
 1. 输出完整 Python 文件代码。
 2. 给出最小集成步骤:
-- 在 `config.py` 增加 webhook/token 配置
+- 若 webhook/token 是稳定且跨模块复用的公开配置，才在 `config.py` 增加配置；否则由通道模块提供安全默认值，不为局部参数增加 CLI 配置入口
 - 在 `alarms/manager.py` 中注册该通道
 3. 给出一个最小测试片段（直接调用 4 个 push 方法）。
 
 ## 现在开始
 根据我的输入生成代码。
-

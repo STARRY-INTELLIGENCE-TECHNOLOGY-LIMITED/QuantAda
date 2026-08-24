@@ -474,6 +474,33 @@ def test_publish_rankings_respects_print_plan_switch(monkeypatch):
     assert strategy.publish_rankings([]) is False
 
 
+def test_publish_rankings_prefers_runtime_print_plan_snapshot(monkeypatch):
+    """LiveTrader 的本轮 PRINT_PLAN 覆盖不能被模块默认值遮蔽。"""
+    import strategies.base_strategy as strategy_module
+
+    pushed = []
+    monkeypatch.setattr(strategy_module.config, "PRINT_PLAN", False)
+    monkeypatch.setattr(
+        strategy_module.runtime_notifications,
+        "push_plan",
+        lambda content, level="INFO": pushed.append((content, level)) or True,
+    )
+
+    class RuntimeBroker(DummyBroker):
+        @staticmethod
+        def _runtime_setting(name, default=None):
+            return {"PRINT_PLAN": True}.get(name, default)
+
+    data = DummyData("AAPL.SMART")
+    strategy = DummyStrategy(
+        broker=RuntimeBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data]),
+        params={},
+    )
+
+    assert strategy.publish_rankings([(data, 1.0)]) is True
+    assert len(pushed) == 1
+
+
 def test_should_execute_rebalance_respects_rebalance_when_skip(monkeypatch):
     """
     显式调仓信号回归:

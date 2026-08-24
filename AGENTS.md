@@ -27,6 +27,15 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Implement the smallest effective fix.
 - Avoid adding new switches/knobs unless required by clear operational need.
 - Prefer local, targeted edits over broad refactors.
+- Configuration boundary: do not add module-local, broker-specific, one-off, or
+  compatibility settings to `config.py` merely to make them CLI-configurable.
+  Prefer safe defaults owned by the responsible module; if runtime override is
+  genuinely required, register it in the explicit `run.py --config` allowlist.
+  Only stable, cross-module public settings with a clear operational need belong
+  in `config.py`; new settings must update the specs, allowlist, and tests together.
+  Local exceptions are acceptable for personal or small-scope use when their
+  scope and rationale are documented; do not add abstractions for theoretical
+  uniformity without practical benefit.
 
 4. File Responsibility / Cohesion First
 - Keep each file centered on its primary runtime responsibility.
@@ -94,6 +103,10 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Reintroducing `_deferred_orders`, `_buffered_rejected_retries`, or similar queue replay design.
 - Persisting stale intent to force next-day replay of prior-day buy decisions.
 - Expanding state machines without explicit failure evidence and tests.
+- Do not expand `config.py` for a single caller, local default, temporary
+  workaround, or compatibility alias; when a runtime override is genuinely
+  necessary, use a safe default in the responsible module and register an
+  explicit CLI override.
 - Adding base-class methods, config knobs, or compatibility shims for a single current caller or one-off scenario.
 - Extracting one-use local logic into named helpers or wrapper classes without a concrete second use case.
 

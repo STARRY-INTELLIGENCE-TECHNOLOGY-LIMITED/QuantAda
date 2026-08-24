@@ -228,11 +228,28 @@ def _run_main():
     # 覆盖config.py
     if args.config:
         override_config = ast.literal_eval(args.config)
+        if not isinstance(override_config, dict):
+            raise ValueError(
+                "--config 必须是 Python 字典字符串，"
+                f"实际类型为 {type(override_config).__name__}"
+            )
         print(f"\n--- Applying Config Overrides ---")
+        declared_config_keys = {
+            name for name in vars(config)
+            if isinstance(name, str) and name.isupper()
+        }
         for key, value in override_config.items():
-            if hasattr(config, key):
+            # 只允许覆盖 config.py 中已声明的公开配置名称。局部 adapter、
+            # provider 或一次性参数由所属模块提供安全默认值，不通过命令行
+            # 动态扩展 config；拼写错误和过期名称必须明确告警。
+            if isinstance(key, str) and key in declared_config_keys:
                 setattr(config, key, value)
                 print(f"  [Config] Overriding {key} = {value}")
+            else:
+                print(
+                    f"  [配置警告] 未知配置覆盖项，已忽略："
+                    f"{key!r} = {value!r}"
+                )
 
     # 将逗号分隔的字符串转换为列表
     symbol_list = [s.strip() for s in args.symbols.split(',')]

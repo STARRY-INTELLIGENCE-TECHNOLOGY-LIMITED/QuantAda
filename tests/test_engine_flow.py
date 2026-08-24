@@ -443,6 +443,9 @@ def test_backtest_mode_auto_warmup_start_date(monkeypatch):
         "platform": "mock_engine",
         "symbols": ["SHSE.600000"],
         "cash": 100000.0,
+        # 引擎级覆盖值必须优先于模块默认值。这与编程方式调用 LiveTrader
+        # 以及命令行快照使用的是同一条生效配置路径。
+        "ANNUAL_FACTOR": 7,
         "params": {},
     }
 
@@ -453,8 +456,8 @@ def test_backtest_mode_auto_warmup_start_date(monkeypatch):
     calls = engine.data_provider.history_calls
     assert calls, "回测初始化阶段未触发历史数据拉取。"
 
-    expected_warmup_start = (pd.Timestamp("2026-02-01") - pd.Timedelta(days=252)).strftime("%Y-%m-%d")
-    assert calls[0]["start_date"] == expected_warmup_start, "回测预热起点不正确，未按默认窗口前推。"
+    expected_warmup_start = (pd.Timestamp("2026-02-01") - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+    assert calls[0]["start_date"] == expected_warmup_start, "回测预热起点不正确，未按引擎配置窗口前推。"
     assert calls[0]["end_date"] == "20260213", "回测结束日期透传异常。"
 
 
@@ -1694,6 +1697,8 @@ def test_live_run_skips_when_any_refresh_failed_and_risk_not_checked(monkeypatch
     context = MockContext(now=datetime(2026, 2, 17, 9, 30, 0))
     engine.init(context)
     assert len(engine.broker.datas) == 2, "初始化应加载两路数据，用于刷新质量门控测试。"
+    # 下方已覆盖重试行为；这个确定性单测不应在两次尝试之间消耗真实墙钟时间。
+    engine._LIVE_REFRESH_RETRY_SLEEP_SECONDS = 0.0
 
     class DummyRisk:
         def __init__(self):

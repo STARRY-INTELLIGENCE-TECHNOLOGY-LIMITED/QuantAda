@@ -37,6 +37,18 @@ class OrderExecutor:
         self.broker = broker
         self.debug = debug
 
+    def _effective_lot_size(self):
+        """使用券商本轮配置快照进行对账。
+
+        LiveTrader 会把命令行生效配置写入券商对象。回退到模块配置可以
+        兼容轻量券商和回测，同时避免本轮运行期间模块级配置被修改后，
+        意外改变数量容差。
+        """
+        runtime_setting = getattr(self.broker, '_runtime_setting', None)
+        if callable(runtime_setting):
+            return runtime_setting('LOT_SIZE', getattr(config, 'LOT_SIZE', 1))
+        return getattr(config, 'LOT_SIZE', 1)
+
     def execute_plan(self, plan):
         """执行调仓计划：利用 order_target_value 及其内部智能逻辑"""
 
@@ -437,9 +449,18 @@ class OrderExecutor:
         except Exception:
             return None
 
-    def _rolling_buy_pass(self, increase_plan, released_target_by_symbol):
+    def _rolling_buy_pass(
+        self,
+        increase_plan,
+        released_target_by_symbol,
+        terminal_noop_symbols=None,
+    ):
         if live_run_budget_expired(self.broker):
             return 0
+
+        terminal_noop_symbols = (
+            terminal_noop_symbols if terminal_noop_symbols is not None else set()
+        )
 
         candidates = []
         for data, target in increase_plan or []:
@@ -447,6 +468,8 @@ class OrderExecutor:
                 return 0
             symbol_key = self._symbol_key(data)
             if not symbol_key:
+                continue
+            if symbol_key in terminal_noop_symbols:
                 continue
 
             if self._has_pending_buy(data):
@@ -510,6 +533,14 @@ class OrderExecutor:
             if buy_order:
                 submitted += 1
                 released_target_by_symbol[item['symbol_key']] = float(target_value)
+            elif getattr(self.broker, '_last_order_target_skip_reason', None) in {
+                'below_min_lot_delta',
+                'insufficient_cash_for_min_lot',
+                'broker_lot_limit_exceeded',
+            }:
+                # 当前资金/数量边界下，该标的无法产生可执行子单。只记录本轮的
+                # 短期事实，避免轮询再次创建必然失败的委托；其他标的仍可独立重试。
+                terminal_noop_symbols.add(item['symbol_key'])
 
         return submitted
 
@@ -687,6 +718,7 @@ class OrderExecutor:
         synced_balance_once = False
         remote_sell_clear_polls = 0
         rolling_buy_attempted = False
+        rolling_buy_terminal_noops = set()
         reconcile_wait_logged = False
         last_unreconciled_targets = []
 
@@ -775,7 +807,7 @@ class OrderExecutor:
                         if quantity_at_most(
                             current_size,
                             target_size,
-                            getattr(config, 'LOT_SIZE', 1),
+                            self._effective_lot_size(),
                         ):
                             reconciled_ids.add(oid)
 
@@ -863,7 +895,7 @@ class OrderExecutor:
                         or not quantity_at_most(
                             current_size,
                             target_size,
-                            getattr(config, 'LOT_SIZE', 1),
+                            self._effective_lot_size(),
                         )
                     ):
                         symbol = getattr(data, '_name', 'UNKNOWN')
@@ -934,7 +966,16 @@ class OrderExecutor:
 
             can_roll_buy = (warn_after <= 0 or elapsed >= warn_after) and remote_has_pending_sell
             if increase_plan and can_roll_buy and not rolling_buy_attempted:
-                if self._rolling_buy_pass(increase_plan, released_target_by_symbol) > 0:
+                submitted = self._rolling_buy_pass(
+                    increase_plan,
+                    released_target_by_symbol,
+                    rolling_buy_terminal_noops,
+                )
+                # 成功的滚动委托已经被记录为活动委托；在下一次可信的 pending
+                # 快照前再次尝试，可能造成重复加仓。上面只过滤了本轮可确认的
+                # 零手/现金不足/单笔上限等确定性 no-op，因此临时现金/API 失败
+                # 仍可在后续有界轮询中继续尝试。
+                if submitted > 0:
                     rolling_buy_attempted = True
 
             if elapsed >= hard_after:

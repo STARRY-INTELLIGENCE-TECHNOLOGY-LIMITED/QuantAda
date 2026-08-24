@@ -1,4 +1,4 @@
-# QuantAda Specs
+# QuantAda 规范
 
 本目录是 QuantAda 面向 agent / 二次开发的正式规范层。
 

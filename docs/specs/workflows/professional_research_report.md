@@ -1,4 +1,4 @@
-# Professional Research Report Workflow
+# 专业研报工作流
 
 本文件定义面向投资人、合作方、家办、私募或资管机构的专业研报/策略说明/技术白皮书生成规范。
 

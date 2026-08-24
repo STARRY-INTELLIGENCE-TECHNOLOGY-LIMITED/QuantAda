@@ -1,5 +1,7 @@
 import sys
 import datetime
+import threading
+import time
 from unittest.mock import MagicMock
 from types import SimpleNamespace
 
@@ -21,6 +23,8 @@ mock_gm_api.OrderStatus_PendingCancel = 7
 mock_gm_api.OrderStatus_Expired = 8
 mock_gm_api.OrderSide_Buy = 1
 mock_gm_api.OrderSide_Sell = 2
+mock_gm_api.PositionEffect_Open = 1
+mock_gm_api.PositionEffect_Close = 2
 mock_gm_api.OrderType_Market = 11
 mock_gm_api.OrderType_Limit = 12
 
@@ -172,10 +176,41 @@ def test_gm_expired_is_not_pending_and_not_accepted():
     assert not proxy.is_accepted(), "Expired 单不能被视为 accepted。"
 
 
-def test_gm_submit_order_live_limit_with_auto_downsize(monkeypatch):
+def test_gm_order_proxy_reads_dict_order_volume():
+    """轻量 SDK 替身返回普通字典时，基础层仍能按真实委托量记账。"""
+    order = {
+        "cl_ord_id": "GM_DICT_001",
+        "status": mock_gm_api.OrderStatus_New,
+        "side": mock_gm_api.OrderSide_Buy,
+        "volume": 300,
+    }
+
+    proxy = GmOrderProxy(order, is_live=True)
+
+    assert proxy.id == "GM_DICT_001"
+    assert proxy.is_buy()
+    assert proxy.is_accepted()
+    assert proxy.submitted_size == 300
+    assert proxy.requested_size == 300
+
+
+def test_gm_get_current_price_returns_zero_on_quote_failure(monkeypatch):
+    """行情接口异常只能阻止本次下单，不能把异常抛进调度主循环。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    def _raise_current(**kwargs):
+        raise RuntimeError("quote unavailable")
+
+    monkeypatch.setattr(gm_module, "current", _raise_current)
+    broker = GmBrokerAdapter(context=MagicMock())
+
+    assert broker.get_current_price(SimpleNamespace(_name="SHSE.518880")) == 0.0
+
+
+def test_gm_submit_order_live_market_with_auto_downsize(monkeypatch):
     """
     实盘分支测试:
-    - BUY 使用限价单
+    - BUY 使用市价单，并以保护价估算冻结资金
     - 资金不足时自动降仓并按整手取整
     """
     import live_trader.adapters.gm_broker as gm_module
@@ -185,6 +220,7 @@ def test_gm_submit_order_live_limit_with_auto_downsize(monkeypatch):
     # 覆盖导入降级路径下被置空的常量，确保测试聚焦交易逻辑本身。
     monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
     monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
+    monkeypatch.setattr(gm_module, "current", lambda symbols: [{"price": 10.0, "quotes": []}])
 
     def _fake_order_volume(**kwargs):
         order_calls.append(kwargs)
@@ -207,12 +243,14 @@ def test_gm_submit_order_live_limit_with_auto_downsize(monkeypatch):
     assert len(order_calls) == 1, "应实际调用一次 order_volume。"
     call = order_calls[0]
 
-    expected_freeze_price = round(10.0 * (1 + 0.01), 4)  # 实盘 BUY 限价
+    expected_freeze_price = round(10.0 * (1 + 0.01), 4)  # 国内市场市价 BUY 保护价
     expected_cost_multiplier = 1.0 + 0.0003
     expected_volume = int(20300.0 / (expected_freeze_price * expected_cost_multiplier) // 100) * 100
 
-    assert call["order_type"] == mock_gm_api.OrderType_Limit, "实盘应使用限价单。"
-    assert call["price"] == pytest.approx(expected_freeze_price), "实盘 BUY 限价计算不正确。"
+    assert call["order_type"] == mock_gm_api.OrderType_Market, "实盘 BUY 应使用市价单。"
+    assert call["side"] == mock_gm_api.OrderSide_Buy
+    assert call["position_effect"] == mock_gm_api.PositionEffect_Open
+    assert call["price"] == pytest.approx(expected_freeze_price), "实盘 BUY 保护价计算不正确。"
     assert call["volume"] == expected_volume, "GM 实盘二次降仓不应重复计入滑点。"
     assert 0 < call["volume"] < 3000, "该场景应发生实质降仓。"
 
@@ -227,6 +265,8 @@ def test_gm_submit_order_live_default_slippage_matches_launch_default(monkeypatc
     order_calls = []
 
     monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
+    monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
+    monkeypatch.setattr(gm_module, "current", lambda symbols: [{"price": 10.0, "quotes": []}])
     monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
 
     def _fake_order_volume(**kwargs):
@@ -244,7 +284,8 @@ def test_gm_submit_order_live_default_slippage_matches_launch_default(monkeypatc
 
     assert proxy is not None, "默认滑点场景下应成功下单。"
     assert len(order_calls) == 1, "应实际调用一次 order_volume。"
-    assert order_calls[0]["price"] == pytest.approx(10.001), "GM 实盘默认滑点应为 0.0001，而不是 0.01。"
+    assert order_calls[0]["order_type"] == mock_gm_api.OrderType_Market
+    assert order_calls[0]["price"] == pytest.approx(10.001), "GM 实盘默认保护价应体现 0.0001 滑点。"
 
 
 def test_gm_submit_order_logs_when_cash_fit_falls_below_min_lot(monkeypatch, capsys):
@@ -257,6 +298,8 @@ def test_gm_submit_order_logs_when_cash_fit_falls_below_min_lot(monkeypatch, cap
     order_calls = []
 
     monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
+    monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
+    monkeypatch.setattr(gm_module, "current", lambda symbols: [{"price": 10.0, "quotes": []}])
     monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
 
     def _fake_order_volume(**kwargs):
@@ -277,6 +320,85 @@ def test_gm_submit_order_logs_when_cash_fit_falls_below_min_lot(monkeypatch, cap
     assert proxy is None, "不足一手时应直接放弃下单。"
     assert order_calls == [], "不足一手时不应真正调用 order_volume。"
     assert "insufficient for minimum lot" in captured.out, "不足一手时必须输出明确日志。"
+
+
+def test_gm_shse_market_buy_uses_best_ask_as_protection_price(monkeypatch):
+    """沪市 BUY 的市价保护价必须覆盖实时最优卖价，避免伪限价滞留。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    order_calls = []
+    monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
+    monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "current",
+        lambda symbols: [{"price": 9.24, "quotes": [{"ask_p": 9.25, "ask_v": 1000}]}],
+    )
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    def _fake_order_volume(**kwargs):
+        order_calls.append(kwargs)
+        order = DummyGMOrder(status=mock_gm_api.OrderStatus_New, side=kwargs["side"])
+        order.volume = kwargs["volume"]
+        order.cl_ord_id = "GM_BUY_MARKET_ASK"
+        return [order]
+
+    monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
+
+    broker = GmBrokerAdapter(context=MagicMock(), commission_override=0.0003)
+    broker.is_live = True
+    monkeypatch.setattr(broker, "_fetch_real_cash", lambda: 100_000.0)
+
+    proxy = broker._submit_order(
+        data=SimpleNamespace(_name="SHSE.518880"),
+        volume=1000,
+        side="BUY",
+        price=9.24,
+    )
+
+    assert proxy is not None
+    assert order_calls[0]["order_type"] == mock_gm_api.OrderType_Market
+    assert order_calls[0]["price"] == pytest.approx(9.2509)
+    assert proxy.reserved_cash == pytest.approx(1000 * 9.2509 * 1.0003)
+
+
+def test_gm_szse_market_buy_uses_best_ask_as_protection_price(monkeypatch):
+    """深市 BUY 与沪市使用同一市价保护价逻辑。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    order_calls = []
+    monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "current",
+        lambda symbols: [{"price": 10.0, "quotes": [{"ask_p": 10.05, "ask_v": 1000}]}],
+    )
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    def _fake_order_volume(**kwargs):
+        order_calls.append(kwargs)
+        order = DummyGMOrder(status=mock_gm_api.OrderStatus_New, side=kwargs["side"])
+        order.volume = kwargs["volume"]
+        order.cl_ord_id = "GM_SZSE_BUY_MARKET"
+        return [order]
+
+    monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
+
+    broker = GmBrokerAdapter(context=MagicMock(), commission_override=0.0003)
+    broker.is_live = True
+    monkeypatch.setattr(broker, "_fetch_real_cash", lambda: 100_000.0)
+
+    proxy = broker._submit_order(
+        data=SimpleNamespace(_name="SZSE.159915"),
+        volume=1000,
+        side="BUY",
+        price=10.0,
+    )
+
+    assert proxy is not None
+    assert order_calls[0]["order_type"] == mock_gm_api.OrderType_Market
+    assert order_calls[0]["price"] == pytest.approx(10.051)
+    assert proxy.reserved_cash == pytest.approx(1000 * 10.051 * 1.0003)
 
 
 def test_gm_submit_order_backtest_market_mode(monkeypatch):
@@ -365,13 +487,13 @@ def test_gm_secondary_downsize_updates_active_buy_and_virtual_ledger(monkeypatch
     proxy = broker.order_target_value(data=data, target=10000.0)  # expected_shares=1000
 
     assert proxy is not None, "应成功提交降仓后的买单。"
-    assert [call["volume"] for call in order_calls] == [900, 100], (
-        "GM 二次降仓后应继续用剩余预算补足可执行数量。"
+    assert [call["volume"] for call in order_calls] == [900], (
+        "保护价口径下剩余现金不足一手时，不得为了凑目标而超预算补单。"
     )
 
-    assert [item["shares"] for item in broker._active_buys.values()] == [900, 100]
+    assert [item["shares"] for item in broker._active_buys.values()] == [900]
 
-    expected_ledger = 1000 * 10.0 * broker.safety_multiplier
+    expected_ledger = 900 * 10.1 * (1.0 + 0.0003)
     assert broker._virtual_spent_cash == pytest.approx(expected_ledger), (
         "虚拟账本占资应基于真实受理数量计算。"
     )
@@ -383,6 +505,8 @@ def test_gm_live_buy_split_uses_single_batch_cash_budget(monkeypatch):
     monkeypatch.setattr(gm_module.config, "LOT_SIZE", 100)
     monkeypatch.setattr(gm_module.config, "BROKER_LOT_LIMITS", 1000)
     monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
+    monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
+    monkeypatch.setattr(gm_module, "current", lambda symbols: [{"price": 10.0, "quotes": []}])
     monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
 
     order_calls = []
@@ -434,6 +558,7 @@ def test_gm_live_sell_splits_by_broker_lot_limit(monkeypatch):
 
     monkeypatch.setattr(gm_module.config, "LOT_SIZE", 100)
     monkeypatch.setattr(gm_module.config, "BROKER_LOT_LIMITS", 1_000_000)
+    monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
     monkeypatch.setattr(gm_module, "OrderType_Limit", mock_gm_api.OrderType_Limit, raising=False)
     monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
 
@@ -467,17 +592,80 @@ def test_gm_live_sell_splits_by_broker_lot_limit(monkeypatch):
     monkeypatch.setattr(broker, "get_current_price", lambda data: 0.37)
 
     proxy = broker.order_target_value(
-        data=SimpleNamespace(_name="SHSE.512010"),
+        data=SimpleNamespace(_name="SZSE.159915"),
         target=0.0,
     )
 
     assert proxy is not None
     assert [call["volume"] for call in order_calls] == [1_000_000, 486_700]
     assert all(call["side"] == mock_gm_api.OrderSide_Sell for call in order_calls)
+    assert all(call["position_effect"] == mock_gm_api.PositionEffect_Close for call in order_calls)
     assert proxy.batch_order_ids == ("GM_SELL_SPLIT_1", "GM_SELL_SPLIT_2")
     assert proxy.batch_submitted_size == 1_486_700
     assert proxy.batch_submit_failed is False
     assert broker._pending_sells == {"GM_SELL_SPLIT_1", "GM_SELL_SPLIT_2"}
+    assert all(call["order_type"] == mock_gm_api.OrderType_Market for call in order_calls)
+    assert all(call["price"] == pytest.approx(0.37) for call in order_calls), (
+        "国内市场实盘市价 SELL 必须把实时价格作为 GM 要求的保护价传入，"
+        "但 order_type 仍应是 OrderType_Market。"
+    )
+
+
+def test_gm_cn_market_sell_skips_without_protection_price(monkeypatch):
+    """国内市场市价单没有有效保护价时不得提交必然被柜台拒绝的委托。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    order_calls = []
+
+    def _fake_order_volume(**kwargs):
+        order_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    result = broker._submit_order(
+        SimpleNamespace(_name="SZSE.159915"),
+        100,
+        "SELL",
+        0.0,
+    )
+
+    assert result is None
+    assert order_calls == []
+
+
+def test_gm_adapter_final_guard_blocks_oversized_direct_submission(monkeypatch):
+    """即使绕过 BaseLiveBroker，GM 适配器也不能发送超单笔上限的委托。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module.config, "LOT_SIZE", 100)
+    monkeypatch.setattr(gm_module.config, "BROKER_LOT_LIMITS", 1_000_000)
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=10_000_000, nav=10_000_000))
+
+    order_calls = []
+
+    def _fake_order_volume(**kwargs):
+        order_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
+
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+    broker._runtime_config = {"LOT_SIZE": 100, "BROKER_LOT_LIMITS": 1_000_000}
+
+    result = broker._submit_order(
+        SimpleNamespace(_name="SHSE.512010"),
+        1_378_500,
+        "SELL",
+        0.40,
+    )
+
+    assert result is None
+    assert order_calls == [], "超限委托不得抵达 GM order_volume。"
 
 
 def test_gm_sellable_position_prefers_available_now(monkeypatch):
@@ -1848,6 +2036,104 @@ def test_gm_schedule_callback_runs_once_per_schedule_slot(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert run_times == [datetime.datetime(2026, 6, 26, 14, 49, 4)]
     assert captured.out.count("Duplicate schedule callback ignored for slot 2026-06-26 14:45:00") == 1
+
+
+def test_gm_live_schedule_run_is_offloaded_from_sdk_callback_thread(monkeypatch):
+    """SELL 等待期间 GM 仍必须能及时处理拒单/成交回调。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    scheduled_callbacks = []
+    run_started = threading.Event()
+    release_run = threading.Event()
+    run_finished = threading.Event()
+    callback_returned = threading.Event()
+    run_times = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=''):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    class DummyBroker:
+        is_live = True
+        datas = [SimpleNamespace(_name="SHSE.600000")]
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.broker = DummyBroker()
+
+        def init(self, ctx):
+            return None
+
+        def run(self, ctx):
+            run_started.set()
+            try:
+                run_times.append(ctx.now)
+                # 同步执行 schedule 回调会阻塞这里，使模拟 GM 轮询无法返回
+                # 事件分发器。
+                release_run.wait(0.5)
+            finally:
+                run_finished.set()
+
+    def _schedule(schedule_func, date_rule, time_rule):
+        scheduled_callbacks.append(schedule_func)
+
+    def _poll_once_then_stop():
+        fake_context.init_fun(fake_context)
+        fake_context.now = datetime.datetime(2026, 6, 26, 14, 49, 4)
+        started_at = time.monotonic()
+        scheduled_callbacks[-1](fake_context)
+        callback_returned.set()
+        # SDK 可能在回调返回后立即修改共享 context；工作线程必须保留
+        # 原始 slot 时间戳。
+        fake_context.now = datetime.datetime(2026, 6, 26, 14, 50, 0)
+        assert time.monotonic() - started_at < 0.25, (
+            "实盘 schedule 回调不能同步阻塞在 LiveTrader.run 的 SELL 等待中。"
+        )
+        assert run_started.wait(0.5), "后台调仓 worker 未启动。"
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_once_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+
+    fake_gm_api = SimpleNamespace(schedule=_schedule)
+    monkeypatch.setitem(sys.modules, "gm.api", fake_gm_api)
+
+    try:
+        with pytest.raises(StopPhoenix):
+            GmBrokerAdapter.launch(
+                {"token": "token", "strategy_id": "strategy-id", "schedule": "1d:14:45:00"},
+                strategy_path="sample_strategy",
+                params={},
+            )
+    finally:
+        release_run.set()
+        assert callback_returned.is_set()
+        assert run_finished.wait(1.0), "后台调仓 worker 未正常收尾。"
+        assert run_times == [datetime.datetime(2026, 6, 26, 14, 49, 4)]
 
 
 def test_gm_prewarm_callback_runs_once_per_schedule_slot(monkeypatch, capsys):

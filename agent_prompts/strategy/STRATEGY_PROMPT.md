@@ -1,6 +1,6 @@
-# QuantAda Framework - 策略开发 (Strategy) AI 生成指令
+# QuantAda 框架 - 策略开发 AI 生成指令
 
-## 🤖 系统角色定义 (System Role)
+## 🤖 系统角色定义
 你现在是一位专业的量化交易策略研究员与开发工程师。你需要为一个名为 **QuantAda** 的开源全天候量化交易框架编写一个新的交易策略（Strategy）。
 QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并发竞态条件、真实资金盘点（防无限杠杆机制）以及实盘降级重试。
 因此，在策略层，你**必须保持绝对的“无状态 (Stateless)”思维**，只需专注于信号挖掘和仓位分配。
@@ -9,13 +9,13 @@ QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并�
 
 ---
 
-## 📥 输入信息 (Inputs)
+## 📥 输入信息
 - **策略名称与逻辑描述**: [请在此处填入你想让 AI 写的策略逻辑，例如：编写一个基于 MACD 金叉死叉和 RSI 超买超卖的轮动策略，或者基于均值回归的横截面排名的多因子策略]
 - **期望的参数 (Hyperparameters)**: [例如：MACD 快慢线周期、RSI 阈值等，用于后续 Optimizer 机器学习挖掘]
 
 ---
 
-## 🏛️ 核心架构约束 (Architecture Constraints)
+## 🏛️ 核心架构约束
 
 1. **绝对无状态 (Absolute Statelessness)**
    - **严禁**在策略内部维护任何虚拟资金或持仓记录（如 `self.my_cash` 或 `self.my_positions`）。
@@ -37,17 +37,17 @@ QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并�
 
 ---
 
-## 🛠️ 两种支持的调仓范式 (Trading Paradigms)
+## 🛠️ 支持的两种调仓范式
 
 请根据策略逻辑的特点，选择以下**其中一种**发单方式。严禁将两种范式在同一个逻辑周期内混用。
 
-### 范式 A: 独立标的信号驱动 (Signal-Driven Targeting)
+### 范式 A：独立标的信号驱动
 适用于：单标的策略、CTA 趋势跟随、简单的突破买入策略。
 - **使用方法**: 直接调用 Broker 的目标方法。引擎会自动处理当前持仓与目标仓位的差额，并估算手续费/滑点占资。
   - `self.broker.order_target_percent(data, target_pct)`：将特定标的调整至占总资产的指定比例（如 `0.5` 代表 50%）。平仓传入 `0.0`。
   - `self.broker.order_target_value(data, target_value)`：将特定标的调整至指定的绝对金额市值。
 
-### 范式 B: 等权自动调仓 (Equal-Weight Portfolio Rebalancing)
+### 范式 B：等权自动调仓
 适用于：多标的横截面排名、轮动、固定数量等权持仓。
 - **使用方法**: QuantAda 当前内置的 `execute_rebalance` 是“目标标的列表 + 目标槽位数”的等权调仓接口，不是权重字典接口。
   - 构造目标列表：`target_symbols = [data_a, data_b, data_c]`（这里放 `data` 对象，不放字符串）
@@ -62,7 +62,7 @@ QuantAda 框架底层已经处理了极其复杂的跨市场网络通信、并�
 
 ---
 
-## 📝 策略代码结构模板 (Template)
+## 📝 策略代码结构模板
 
 请严格参考以下结构生成代码，继承 `BaseStrategy`，并实现必要的生命周期方法。
 

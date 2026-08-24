@@ -286,6 +286,9 @@ class LiveTrader:
         self.broker = self.BrokerClass(context, cash_override=self.config.get('cash'),
                                        commission_override=self.config.get('commission'),
                                        slippage_override=self.config.get('slippage'))
+        # 数量和风控执行使用本轮命令行生效配置快照。适配器可能在长进程中
+        # 运行，重连恢复期间模块级配置可能被重新加载或修改。
+        self.broker._runtime_config = dict(self.config)
         self.broker._keep_overnight_orders = bool(
             self.config.get(
                 'KEEP_OVERNIGHT_ORDERS',
@@ -873,6 +876,10 @@ class LiveTrader:
                                 timeframe: str, compression: int) -> dict:
         """根据模式获取数据：实盘模式获取预热数据，回测模式获取全部历史"""
         datas = {}
+        annual_factor = self.config.get(
+            'ANNUAL_FACTOR',
+            getattr(config, 'ANNUAL_FACTOR', 252),
+        )
         is_intraday = timeframe in {'Minutes', 'Seconds'}
         try:
             compression_value = max(1, int(compression or 1))
@@ -892,7 +899,7 @@ class LiveTrader:
                 )
                 start_date = (context.now - warmup_delta).strftime('%Y-%m-%d %H:%M:%S')
             else:
-                start_date = (context.now - pd.Timedelta(days=config.ANNUAL_FACTOR)).strftime('%Y-%m-%d')
+                start_date = (context.now - pd.Timedelta(days=annual_factor)).strftime('%Y-%m-%d')
             print(f"[Engine] Live mode data fetch (warm-up): from {start_date} to {end_date}")
         else:
             # 平台回测模式: 默认从 start_date 往前预热，保证长周期指标可用
@@ -900,7 +907,7 @@ class LiveTrader:
             end_date = self.config.get('end_date')
             start_date = raw_start_date
 
-            warmup_days = config.ANNUAL_FACTOR
+            warmup_days = annual_factor
             if raw_start_date and warmup_days > 0:
                 try:
                     warmup_start_ts = pd.to_datetime(raw_start_date) - pd.Timedelta(days=warmup_days)
@@ -957,6 +964,10 @@ class LiveTrader:
         # 获取配置
         timeframe = self.config.get('timeframe', 'Days')
         compression = self.config.get('compression', 1)
+        annual_factor = self.config.get(
+            'ANNUAL_FACTOR',
+            getattr(config, 'ANNUAL_FACTOR', 252),
+        )
         is_intraday = timeframe in {'Minutes', 'Seconds'}
         try:
             compression_value = max(1, int(compression or 1))
@@ -986,7 +997,7 @@ class LiveTrader:
         def _build_incremental_start(existing_df: pd.DataFrame) -> str:
             # 首次/空数据回退到预热窗口
             if existing_df is None or existing_df.empty:
-                warmup_start = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
+                warmup_start = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=annual_factor))
                 return warmup_start.strftime('%Y-%m-%d %H:%M:%S') if is_intraday else warmup_start.strftime('%Y-%m-%d')
 
             last_bar_ts = pd.Timestamp(existing_df.index[-1])
@@ -1000,7 +1011,7 @@ class LiveTrader:
             return start_ts.strftime('%Y-%m-%d')
 
         def _build_window_start() -> str:
-            start_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
+            start_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=annual_factor))
             return start_ts.strftime('%Y-%m-%d %H:%M:%S') if is_intraday else start_ts.strftime('%Y-%m-%d')
 
         # 遍历 Broker 中已有的 DataFeed
@@ -1041,7 +1052,7 @@ class LiveTrader:
                 if hasattr(data_feed, 'p') and hasattr(data_feed.p, 'dataname'):
                     if force_window_rebase:
                         refreshed_df = new_df.sort_index()
-                        cutoff_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
+                        cutoff_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=annual_factor))
                         cutoff_ts = _align_to_index_tz(cutoff_ts, refreshed_df.index)
                         refreshed_df = refreshed_df[refreshed_df.index >= cutoff_ts]
                         if refreshed_df.empty:
@@ -1059,7 +1070,7 @@ class LiveTrader:
                         merged_df = merged_df.sort_index()
 
                         # 保持固定预热窗口，避免数据无限增长
-                        cutoff_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=config.ANNUAL_FACTOR))
+                        cutoff_ts = now_ts - (intraday_window if is_intraday else pd.Timedelta(days=annual_factor))
                         cutoff_ts = _align_to_index_tz(cutoff_ts, merged_df.index)
                         merged_df = merged_df[merged_df.index >= cutoff_ts]
                         data_feed.p.dataname = merged_df

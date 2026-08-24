@@ -18,7 +18,11 @@ class SxscTushareDataProvider(BaseDataProvider):
     __http_url = 'http://221.204.19.233:7172'
     __timeout = 30  # 增加一个默认的请求超时时间
 
-    def __init__(self, token: str = config.SXSC_TUSHARE_TOKEN):
+    def __init__(self, token: str = None):
+        # 在实例化提供者时解析 --config 覆盖值，而不是在 run.py 导入
+        # 本模块时提前固定默认值。
+        if token is None:
+            token = getattr(config, 'SXSC_TUSHARE_TOKEN', None)
         if not token or token == 'your_token_here':
             print("Warning: SXSC Tushare token is not configured. SxscTushareProvider will be skipped.")
             self.token = None

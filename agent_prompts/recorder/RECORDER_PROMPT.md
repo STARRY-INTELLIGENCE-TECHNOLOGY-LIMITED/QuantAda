@@ -1,4 +1,4 @@
-# QuantAda Framework - Recorder 记录器 AI 生成指令
+# QuantAda 框架 - 记录器 AI 生成指令
 
 ## 角色
 你是 QuantAda 可观测性工程师。你需要实现一个新的回测记录器（例如写入 ES、Kafka、S3、审计系统）。
@@ -32,4 +32,3 @@ finish_execution(self, final_value, total_return, sharpe, max_drawdown, annual_r
 
 ## 现在开始
 根据我的输入生成代码。
-

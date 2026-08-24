@@ -29,7 +29,7 @@ def _wait_until(predicate, timeout_sec=2.0):
     while time.time() < deadline:
         if predicate():
             return True
-        time.sleep(0.05)
+        time.sleep(0.01)
     return False
 
 
@@ -42,8 +42,8 @@ def fresh_alarm_manager(monkeypatch):
     monkeypatch.setattr(manager_module.config, "ALARMS_ENABLED", False)
 
     mgr = AlarmManager()
-    # 生产默认 60 秒窗口，异常单测缩短到 1 秒以避免等待过久
-    mgr._exception_aggregation_window_seconds = 1
+    # 生产默认 60 秒窗口，单测只需保留异步 timer 语义，不应等待整秒。
+    mgr._exception_aggregation_window_seconds = 0.05
     yield mgr
 
     timer = getattr(mgr, "_exception_flush_timer", None)
@@ -174,9 +174,9 @@ def test_exception_log_cooldown_merges_counts_across_windows(fresh_alarm_manager
     mgr = fresh_alarm_manager
     fake = FakeAlarmChannel()
     mgr.alarms = [fake]
-    mgr._exception_aggregation_window_seconds = 0.2
-    mgr._cooldown_base_delay_seconds = 0.2
-    mgr._cooldown_max_delay_seconds = 0.4
+    mgr._exception_aggregation_window_seconds = 0.05
+    mgr._cooldown_base_delay_seconds = 0.05
+    mgr._cooldown_max_delay_seconds = 0.1
     mgr._cooldown_reset_window_seconds = 5
 
     error_text = "Code: 1100, Msg: 交易消息服务连接失败"
@@ -185,9 +185,9 @@ def test_exception_log_cooldown_merges_counts_across_windows(fresh_alarm_manager
 
     mgr.push_exception("GM Kernel Error", error_text)
     mgr.push_exception("GM Kernel Error", error_text)
-    time.sleep(0.25)
+    time.sleep(0.06)
     assert len(fake.exception_calls) == 1, "异常冷却期内不应立即推送第二轮重复告警。"
-    assert _wait_until(lambda: len(fake.exception_calls) == 2, timeout_sec=1.5), "异常冷却到期后应推送累计数量。"
+    assert _wait_until(lambda: len(fake.exception_calls) == 2, timeout_sec=0.5), "异常冷却到期后应推送累计数量。"
 
     context, merged_error = fake.exception_calls[1]
     assert "GM Kernel Error" in context, "冷却后异常推送应保留原始模块上下文。"
@@ -392,7 +392,7 @@ def test_schedule_alarm_window_blocks_text_outside_window(monkeypatch, fresh_ala
     )
 
     mgr.push_text("窗口外报警", level="WARNING")
-    time.sleep(0.2)
+    time.sleep(0.02)
     assert fake.text_calls == [], "正式 schedule 窗口外的 text 报警不应推送到 IM。"
 
 
@@ -442,7 +442,7 @@ def test_schedule_alarm_window_blocks_exception_intake_outside_window(monkeypatc
     )
 
     mgr.push_exception("IB Kernel Error", "Error 1100")
-    time.sleep(0.5)
+    time.sleep(0.05)
     assert fake.exception_calls == [], "窗口外异常不应进入 IM 聚合/推送流程。"
 
 
@@ -516,7 +516,7 @@ def test_schedule_alarm_window_still_blocks_non_lifecycle_status_outside_window(
     )
 
     mgr.push_status("INFO", "GM Session Shutdown (Preparing to Restart)")
-    time.sleep(0.2)
+    time.sleep(0.02)
     assert fake.status_calls == [], "普通 INFO 状态不应因为 status 接口而自动绕过报警窗口。"
 
 
@@ -626,9 +626,9 @@ def test_dead_signal_does_not_emit_stopped_again_on_exit(monkeypatch, fresh_alar
     monkeypatch.setattr(manager_module.sys, "exit", lambda code=0: None)
 
     mgr._signal_handler(manager_module.signal.SIGTERM, None)
-    time.sleep(0.1)
+    time.sleep(0.02)
     mgr._on_exit()
-    time.sleep(0.1)
+    time.sleep(0.02)
 
     assert len(fake.status_calls) == 1, "DEAD 已发送后，atexit 不应再补发 STOPPED。"
     status, detail = fake.status_calls[0]

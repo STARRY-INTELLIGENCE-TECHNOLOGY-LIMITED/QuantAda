@@ -2,7 +2,9 @@ import datetime
 import math
 import os
 import sys
+import threading
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -18,7 +20,13 @@ from common.live_process_supervisor import (
 )
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
-from common.order_quantity import align_quantity_down, normalize_quantity_step, quantity_number
+from common import runtime_notifications
+from common.order_quantity import (
+    align_quantity_down,
+    normalize_quantity_step,
+    positive_quantity,
+    quantity_number,
+)
 from data_providers.gm_provider import GmDataProvider as UnifiedGmDataProvider
 from live_trader.engine import LiveTrader, on_order_status_callback
 from ..data_bridge.data_warm import DAILY_SCHEDULE_HEALTH_LEAD_SECONDS, SchedulePlanner
@@ -104,7 +112,7 @@ try:
     from gm.api import order_target_percent, order_target_value, order_volume, current, get_cash, get_position as gm_get_position, subscribe, history, OrderType_Market, OrderType_Limit, MODE_LIVE, MODE_BACKTEST, \
         OrderStatus_New, OrderStatus_PartiallyFilled, OrderStatus_Filled, \
         OrderStatus_Canceled, OrderStatus_Rejected, OrderStatus_PendingNew, \
-        OrderSide_Buy, OrderSide_Sell
+        OrderSide_Buy, OrderSide_Sell, PositionEffect_Open, PositionEffect_Close
     gm_api = sys.modules.get('gm.api')
     OrderStatus_PendingCancel = getattr(gm_api, 'OrderStatus_PendingCancel', object())
     OrderStatus_Expired = getattr(gm_api, 'OrderStatus_Expired', object())
@@ -116,6 +124,7 @@ except ImportError:
     OrderStatus_Canceled = OrderStatus_Rejected = OrderStatus_PendingNew = None
     OrderStatus_PendingCancel = OrderStatus_Expired = None
     OrderSide_Buy = OrderSide_Sell = None
+    PositionEffect_Open = PositionEffect_Close = None
 
 try:
     from gm.api import set_serv_addr, set_token, ADJUST_PREV
@@ -152,18 +161,33 @@ except ImportError:
 class GmOrderProxy(BaseOrderProxy):
     """掘金平台的订单代理具体实现"""
 
+    @staticmethod
+    def _field(order, name, default=None):
+        """兼容 GM 的 DictLikeOrder、普通字典和属性对象。"""
+        if isinstance(order, dict):
+            return order.get(name, default)
+        return getattr(order, name, default)
+
     def __init__(self, order, is_live, data=None):
         self.platform_order = order
         self.is_live = is_live
         self.data = data
+        # 保留该单实际提交的数量，供基础券商进行批次记账和对账。
+        # 不要从批次总量或后续成交快照反推该单数量。
+        raw_volume = (
+            order.get('volume') if isinstance(order, dict)
+            else getattr(order, 'volume', None)
+        )
+        self.submitted_size = raw_volume
+        self.requested_size = raw_volume
 
     @property
     def id(self):
-        return self.platform_order.cl_ord_id
+        return self._field(self.platform_order, 'cl_ord_id', '')
 
     @property
     def status(self):
-        return self.platform_order.status
+        return self._field(self.platform_order, 'status')
 
     @property
     def executed(self):
@@ -176,20 +200,21 @@ class GmOrderProxy(BaseOrderProxy):
         class ExecutedStats:
             def __init__(self, gm_order):
                 # 1. 成交数量
-                self.size = gm_order.filled_volume
+                self.size = GmOrderProxy._field(gm_order, 'filled_volume', 0)
 
                 # 2. 成交均价 (filled_vwap 是掘金的成交均价字段)
-                self.price = gm_order.filled_vwap
+                self.price = GmOrderProxy._field(gm_order, 'filled_vwap', 0.0)
 
                 # 3. 成交金额 (Cost/Value)
                 # 掘金通常有 filled_amount，如果没有则用 数量*均价 计算
-                if hasattr(gm_order, 'filled_amount'):
-                    self.value = gm_order.filled_amount
+                filled_amount = GmOrderProxy._field(gm_order, 'filled_amount', None)
+                if filled_amount is not None:
+                    self.value = filled_amount
                 else:
-                    self.value = gm_order.filled_volume * gm_order.filled_vwap
+                    self.value = self.size * self.price
 
                 # 4. 手续费
-                self.comm = getattr(gm_order, 'commission', 0.0)
+                self.comm = GmOrderProxy._field(gm_order, 'commission', 0.0)
                 self.dt = GmOrderProxy._extract_execution_dt(gm_order)
 
         return ExecutedStats(self.platform_order)
@@ -205,7 +230,7 @@ class GmOrderProxy(BaseOrderProxy):
             'transaction_time',
         )
         for field in candidate_fields:
-            dt = coerce_dt(getattr(order, field, None))
+            dt = coerce_dt(GmOrderProxy._field(order, field))
             if dt is not None:
                 return dt
         return None
@@ -214,20 +239,20 @@ class GmOrderProxy(BaseOrderProxy):
     def is_completed(self) -> bool:
         if self.is_live:
             # 实盘模式：必须是最终成交
-            return self.platform_order.status == OrderStatus_Filled
+            return self.status == OrderStatus_Filled
         else:
             # 回测模式：放行 PendingNew (兼容掘金回测)
             # 因为回测框架不负责实盘的回测，且掘金的下单是异步过程无法实时获取订单状态，因此修改is_completed检查的常量。
             # 在实盘环境下仅触发信号，因此暂且放行OrderStatus_PendingNew挂单状态
-            return self.platform_order.status == OrderStatus_Filled \
-                or self.platform_order.status == OrderStatus_PendingNew
+            return self.status == OrderStatus_Filled \
+                or self.status == OrderStatus_PendingNew
 
-    def is_canceled(self) -> bool: return self.platform_order.status == OrderStatus_Canceled
+    def is_canceled(self) -> bool: return self.status == OrderStatus_Canceled
 
-    def is_rejected(self) -> bool: return self.platform_order.status == OrderStatus_Rejected
+    def is_rejected(self) -> bool: return self.status == OrderStatus_Rejected
 
     def is_pending(self) -> bool:
-        status = self.platform_order.status
+        status = self.status
         # 回测兼容：PendingNew 被上层视为 completed
         if not self.is_live and status == OrderStatus_PendingNew:
             return False
@@ -240,7 +265,7 @@ class GmOrderProxy(BaseOrderProxy):
         return status in active_states
 
     def is_accepted(self) -> bool:
-        status = self.platform_order.status
+        status = self.status
         # 回测兼容：PendingNew 被上层视为 completed
         if not self.is_live and status == OrderStatus_PendingNew:
             return False
@@ -253,10 +278,10 @@ class GmOrderProxy(BaseOrderProxy):
         return status in active_states
 
     def is_buy(self) -> bool:
-        return hasattr(self.platform_order, 'side') and self.platform_order.side == OrderSide_Buy
+        return self._field(self.platform_order, 'side') == OrderSide_Buy
 
     def is_sell(self) -> bool:
-        return hasattr(self.platform_order, 'side') and self.platform_order.side == OrderSide_Sell
+        return self._field(self.platform_order, 'side') == OrderSide_Sell
 
 class GmDataProvider(UnifiedGmDataProvider):
     def get_history(self, symbol: str, start_date: str, end_date: str,
@@ -687,31 +712,132 @@ class GmBrokerAdapter(BaseLiveBroker):
 
     # 3. 查价
     def get_current_price(self, data):
-        ticks = current(symbols=data._name)
-        return ticks[0]['price'] if ticks else 0.0
+        try:
+            ticks = current(symbols=data._name) or []
+            if not ticks:
+                return 0.0
+            tick = ticks[0]
+            price = self._object_field(tick, 'price', 0.0)
+            price = float(price or 0.0)
+            return price if math.isfinite(price) and price > 0 else 0.0
+        except Exception as e:
+            self._runtime_log(f"[GmBroker 警告] 获取 {data._name} 当前价格失败：{e}")
+            return 0.0
 
     # 4. 发单
     def _submit_order(self, data, volume, side, price):
         gm_side = OrderSide_Buy if side == 'BUY' else OrderSide_Sell
 
+        # BaseLiveBroker 通常会在进入适配器前拆分买卖数量。这里保留适配器
+        # 最终熔断边界：无论是过期调用方、自定义策略还是重连期间的配置竞争，
+        # 都不能把 GM 柜台必然拒绝的超限数量发送出去。
+        if self.is_live:
+            configured_limit = positive_quantity(
+                self._runtime_setting('BROKER_LOT_LIMITS', 0)
+            )
+            if configured_limit > 0:
+                lot_size = normalize_quantity_step(
+                    self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
+                )
+                effective_limit = align_quantity_down(configured_limit, lot_size)
+                requested_volume = positive_quantity(volume)
+                if effective_limit <= 0 or requested_volume > effective_limit:
+                    self._last_order_target_skip_reason = 'broker_lot_limit_exceeded'
+                    message = (
+                        f"[GmBroker 错误] {side} {data._name} 已在本地拦截："
+                        f"请求数量={requested_volume}，单笔上限={effective_limit}，"
+                        f"LOT_SIZE={lot_size}。未向 GM 发送超限委托。"
+                    )
+                    self._runtime_log(message)
+                    runtime_notifications.push_text(message, level='ERROR')
+                    return None
+
         # === 核心分歧逻辑 ===
         # 回测 (Backtest): 使用 市价单 (Market)。
         #   尽可能和backtester回测结果对齐，券商回测的唯一作用是：测试代码有没有 Bug（会不会报错）。 至于它跑出来的收益率是 59% 还是 86%，已经不重要。
         #   理由: 掘金回测引擎的市价单能以 Open 价成交，还原真实低开红利。限价单在回测中可能以 Limit 价成交，导致低开时买贵。
-        # 实盘 (Live): 使用 限价单 (Limit)。backtester的真实结果，如果gm_broker实盘用市价则第二天成交、大幅降低收益
-        #   理由: 实盘中限价单能以最优价成交，且能避免市价单导致的巨额资金冻结。
+        # 实盘 BUY/SELL 均使用市价单：调仓的目标是尽快完成换仓，不把最新成交价
+        # 微调后伪装成限价单，避免买一/卖一偏离最新价时订单长时间留在柜台。
+        # GM 的 order_volume() 中，国内市场市价单的 price 是保护价，不会把订单
+        # 变回限价单；该保护价同时也是柜台可能冻结资金的上限估算。
+        # 实盘 SELL 使用市价单：清仓是调仓的前置动作，按最新成交价微调后的
+        # 限价单在 ETF 的最小价位单位内往往仍等于最新价，若买一价更低就会
+        # 留在柜台等待，直接挤占本轮有限的终态确认窗口。
 
         if self.is_live:
-            # --- 实盘逻辑 (Limit) ---
             slippage = self._slippage_override if self._slippage_override is not None else self._DEFAULT_LIVE_SLIPPAGE
+            try:
+                slippage = max(0.0, float(slippage))
+            except (TypeError, ValueError, OverflowError):
+                slippage = self._DEFAULT_LIVE_SLIPPAGE
+
+            commission = self._commission_override if self._commission_override is not None else 0.0003
+            try:
+                commission = max(0.0, float(commission))
+            except (TypeError, ValueError, OverflowError):
+                commission = 0.0003
+
             if side == 'BUY':
-                actual_price = price * (1 + slippage)
-                actual_price = float(round(actual_price, 4))  # 保留精度
-                freeze_price = actual_price  # 实盘按委托价冻结
+                # --- 实盘买入逻辑（市价 + 保护价）---
+                try:
+                    base_price = float(price)
+                except (TypeError, ValueError, OverflowError):
+                    base_price = 0.0
+                if not math.isfinite(base_price) or base_price <= 0:
+                    self._last_order_target_skip_reason = 'invalid_buy_price'
+                    self._runtime_log(
+                        f"[GmBroker 警告] BUY {data._name} 缺少有效价格：price={price!r}，跳过发单。"
+                    )
+                    return None
+
+                # 国内市场市价 BUY 的 price 是保护价，至少覆盖当前最优卖价。
+                # 仅使用最新成交价上浮极小滑点仍可能低于卖一，等价于把市价单
+                # 人为限制成难以成交的委托。行情查询失败时退回带滑点的最新价，
+                # 不因一次盘口短暂缺失而放弃本次已通过价格检查的买单。
+                protection_price = base_price * (1.0 + slippage)
+                try:
+                    ticks = current(symbols=data._name) or []
+                    tick = ticks[0] if ticks else None
+                    quotes = self._object_field(tick, 'quotes', []) if tick is not None else []
+                    if isinstance(quotes, dict):
+                        quotes = [quotes]
+                    for quote in quotes or []:
+                        ask_price = self._object_field(quote, 'ask_p', 0.0)
+                        try:
+                            ask_price = float(ask_price)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        if math.isfinite(ask_price) and ask_price > 0:
+                            protection_price = max(
+                                protection_price,
+                                ask_price * (1.0 + slippage),
+                            )
+                            break
+                except Exception:
+                    # get_current_price 已经成功提供了基准价；盘口快照失败时
+                    # 使用该基准价保护，不把可恢复的报价问题升级为拒绝下单。
+                    pass
+
+                freeze_price = float(round(protection_price, 4))
+                actual_price = freeze_price
+                order_type = OrderType_Market
             else:
-                actual_price = price * (1 - slippage)
-                actual_price = float(round(actual_price, 4))
-            order_type = OrderType_Limit
+                # --- 实盘卖出逻辑（市价）---
+                # GM 的 order_volume() 中 price 对市价单表示保护限价，不是把
+                # 委托改成限价单。使用本次实时行情作为卖出保护价，既满足
+                # 柜台协议，也不会把卖单固定在上一次的限价逻辑上。
+                try:
+                    actual_price = float(price)
+                except (TypeError, ValueError, OverflowError):
+                    actual_price = 0.0
+                if not math.isfinite(actual_price) or actual_price <= 0:
+                    self._runtime_log(
+                        f"[GmBroker 警告] 国内市价 SELL 缺少有效保护价："
+                        f"{data._name} price={price!r}，跳过发单。"
+                    )
+                    return None
+                freeze_price = 0
+                order_type = OrderType_Market
 
         else:
             # --- 回测逻辑 (Market) ---
@@ -741,8 +867,7 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             # 实盘下 freeze_price 已含滑点，此处仅补手续费，避免重复计入滑点。
             if self.is_live:
-                comm = self._commission_override if self._commission_override is not None else 0.0003
-                cost_multiplier = 1.0 + comm
+                cost_multiplier = 1.0 + commission
             else:
                 cost_multiplier = self.safety_multiplier
             estimated_cost = volume * freeze_price * cost_multiplier
@@ -755,13 +880,16 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             if estimated_cost > available_cash:
                 old_volume = volume
-                lot_size = normalize_quantity_step(getattr(config, 'LOT_SIZE', 100) or 1)
+                lot_size = normalize_quantity_step(
+                    self._runtime_setting('LOT_SIZE', getattr(config, 'LOT_SIZE', 100)) or 1
+                )
                 volume = align_quantity_down(
                     available_cash / (freeze_price * cost_multiplier),
                     lot_size,
                 )
                 min_volume = lot_size
                 if volume < min_volume:
+                    self._last_order_target_skip_reason = 'insufficient_cash_for_min_lot'
                     self._runtime_log(
                         f"[GmBroker Warning] Buy {data._name} skipped. "
                         f"Cash ({available_cash:.2f}) insufficient for minimum lot {min_volume} "
@@ -780,7 +908,7 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         try:
             self._ensure_single_live_account()
-            effect = 1 if side == 'BUY' else 2
+            effect = PositionEffect_Open if side == 'BUY' else PositionEffect_Close
 
             ords = order_volume(
                 symbol=data._name, volume=volume, side=gm_side,
@@ -788,7 +916,20 @@ class GmBrokerAdapter(BaseLiveBroker):
                 position_effect=effect,
                 price=actual_price,
             )
-            return GmOrderProxy(ords[-1], self.is_live, data=data) if ords else None
+            if not ords:
+                return None
+
+            proxy = GmOrderProxy(ords[-1], self.is_live, data=data)
+            # 市价保护价可能高于策略查到的最新成交价。把实际冻结估算传给
+            # 基类，确保虚拟占资、拆单预算和拒单退款使用同一口径。
+            submitted_volume = positive_quantity(getattr(proxy, 'submitted_size', None))
+            if submitted_volume <= 0:
+                submitted_volume = positive_quantity(volume)
+            if side == 'BUY':
+                proxy.reserved_cash = submitted_volume * freeze_price * cost_multiplier
+                proxy.cash_price = freeze_price
+                proxy.cash_cost_multiplier = cost_multiplier
+            return proxy
         except Exception as e:
             self._runtime_log(f"[GM Error] {e}")
             return None
@@ -1051,6 +1192,11 @@ class GmBrokerAdapter(BaseLiveBroker):
             'consecutive_init_failures': 0,
             'connectivity_log': None,
             'connectivity_failure_seen': False,
+            # GM 在处理订单状态事件的同一线程中调用 schedule 回调。实盘运行
+            # 可能进行数分钟的有界 SELL 对账，因此必须把调仓派发到工作线程，
+            # 并保证同一时间只有一个调度槽位在执行。
+            'scheduled_run_lock': threading.Lock(),
+            'scheduled_run_thread': None,
         }
 
         effective_prewarm_lead_seconds = (
@@ -1332,10 +1478,48 @@ class GmBrokerAdapter(BaseLiveBroker):
 
                                 schedule(schedule_func=_run_prewarm, date_rule=rule_type, time_rule=prewarm_time_rule)
 
+                            def _run_scheduled_worker(now_snapshot, slot_key):
+                                """在 GM 回调线程之外执行一个实盘调度槽位。
+
+                                ``LiveTrader.run`` 等待 SELL 结算时，SDK 事件循环
+                                仍必须持续处理订单状态回调。回调启动工作线程前
+                                会复制触发时间，避免 GM 随事件循环推进而修改共享
+                                context 导致本轮时间漂移。
+                                """
+                                run_context = SimpleNamespace(
+                                    now=now_snapshot,
+                                    strategy_instance=trader,
+                                    use_schedule=True,
+                                )
+                                try:
+                                    trader.run(run_context)
+                                except Exception as e:
+                                    _runtime_print(
+                                        f"[GmBroker 错误] 调度 slot {slot_key} 执行失败：{e}"
+                                    )
+                                    try:
+                                        AlarmManager().push_exception(
+                                            "GmBroker 调度运行",
+                                            e,
+                                        )
+                                    except Exception as alarm_error:
+                                        _runtime_print(
+                                            f"[GmBroker 警告] 调度运行告警发送失败：{alarm_error}"
+                                        )
+                                finally:
+                                    with launch_state['scheduled_run_lock']:
+                                        current_thread = launch_state.get('scheduled_run_thread')
+                                        if current_thread is threading.current_thread():
+                                            launch_state['scheduled_run_thread'] = None
+
                             def _run_scheduled(schedule_ctx):
+                                slot_key = None
+                                now_snapshot = (
+                                    getattr(schedule_ctx, 'now', None)
+                                    or datetime.datetime.now()
+                                )
                                 if parsed_schedule:
-                                    now_value = getattr(schedule_ctx, 'now', None) or datetime.datetime.now()
-                                    now_ts = pd.Timestamp(now_value)
+                                    now_ts = pd.Timestamp(now_snapshot)
                                     slot_dt = SchedulePlanner.resolve_current_schedule_slot(now_ts, parsed_schedule)
                                     if slot_dt is not None:
                                         slot_ts = pd.Timestamp(slot_dt)
@@ -1349,6 +1533,27 @@ class GmBrokerAdapter(BaseLiveBroker):
                                                 launch_state['last_schedule_skip_log_key'] = slot_key
                                             return
                                         launch_state['last_schedule_run_key'] = slot_key
+
+                                # 只有 GM 实盘会话使用该回调路径；回测和轻量
+                                # 测试替身继续保持同步语义。
+                                if getattr(getattr(trader, 'broker', None), 'is_live', False) is True:
+                                    with launch_state['scheduled_run_lock']:
+                                        previous_thread = launch_state.get('scheduled_run_thread')
+                                        if previous_thread is not None and previous_thread.is_alive():
+                                            _runtime_print(
+                                                "[GmBroker 警告] 上一个调度运行仍在执行，"
+                                                f"已跳过 slot {slot_key or '未知'}。"
+                                            )
+                                            return
+                                        worker = threading.Thread(
+                                            target=_run_scheduled_worker,
+                                            args=(now_snapshot, slot_key),
+                                            name=f"quantada-gm-run-{slot_key or 'unknown'}",
+                                            daemon=True,
+                                        )
+                                        launch_state['scheduled_run_thread'] = worker
+                                    worker.start()
+                                    return
 
                                 trader.run(schedule_ctx)
 

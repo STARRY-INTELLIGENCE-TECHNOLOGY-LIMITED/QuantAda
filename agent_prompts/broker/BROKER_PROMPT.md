@@ -1,18 +1,18 @@
-# QuantAda Framework - 券商适配器 (Broker Adapter) AI 生成指令
+# QuantAda 框架 - 券商适配器 AI 生成指令
 
-## 🤖 系统角色定义 (System Role)
+## 🤖 系统角色定义
 你现在是一位拥有 10 年经验的企业级量化交易系统架构师。你需要为一个名为 **QuantAda** 的开源全天候量化交易框架编写一个新的底层券商适配器（Broker Adapter）。
 请仔细阅读以下【输入信息】与【接口契约】，并严格生成健壮、符合类型提示（Type Hints）的 Python 代码。
 
 ---
 
-## 📥 输入信息 (Inputs)
+## 📥 输入信息
 - **目标券商名称**: [请在此处填入券商名称，例如：Longbridge / Futubull / Charles Schwab]
 - **目标券商 API 文档**: [请在此处粘贴或上传该券商的官方 Python SDK 文档、发单接口、资产查询接口、状态流转等]
 
 ---
 
-## 🏛️ 核心架构约束 (Architecture Constraints)
+## 🏛️ 核心架构约束
 
 1. **继承基类**: 你的主类必须命名为 `[BrokerName]Broker`，并且严格继承自 `live_trader.adapters.base_broker.BaseLiveBroker`。
 2. **模块装载契约**: `live_trader.engine.LiveTrader` 会在同一个 adapter 模块中同时反射 Broker 和 DataProvider。因此输出文件中除了 `[BrokerName]Broker` 外，还必须同时暴露一个 `BaseDataProvider` 子类（可为薄封装），并兼容 `get_history(...)` 调用。
@@ -23,7 +23,7 @@
 
 ---
 
-## 🛑 必须实现的接口契约 (Required Interface Contracts)
+## 🛑 必须实现的接口契约
 
 你必须严格实现以下 `@abstractmethod`，严禁修改方法签名：
 
@@ -68,7 +68,7 @@
 
 ---
 
-## ⚙️ 与当前框架一致的执行语义 (必须遵守)
+## ⚙️ 与当前框架一致的执行语义（必须遵守）
 1. 买单拒绝后的降级重提由 `BaseLiveBroker.on_order_status` 统一处理（默认最多 10 次：前 5 次 `LOT_SIZE` 阶梯降级 + 后 5 次几何降级）；适配器不要额外叠加自己的“拒单队列”。
 2. 禁止实现或依赖以下旧机制: `process_deferred_orders`、`reconcile_buffered_retries`、`_deferred_orders`、`_buffered_rejected_retries`。
 3. 若券商返回 `Inactive/Cancelled/Rejected/Expired/Suspended` 等语义有差异，必须在 `BaseOrderProxy` 中准确映射，否则会破坏统一降级流程或造成本地 pending 永久等待。
@@ -85,10 +85,13 @@
 12. 通过 `run.py --connect` 运行时，通用父进程监督器负责进程级保活与探活；worker 进入 broker SDK 前必须推送一次 `STARTED`，同一 worker 进程内不得重复发送；adapter 应在 native SDK 初始化/连接阶段上报短生命周期健康状态和有界超时。监督器发现 worker 退出、heartbeat 停滞或健康期限超时后，以原始命令冷启动并记录退出码/信号；连接维护等降噪策略必须通过结构化故障类别传递，不得解析状态或原因文本。受监督 worker 的内部重启不重复推 `STOPPED` / `DEAD`；操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。配置 `1d` schedule 时，每个自然日在正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`。GM 维护期连接故障可在该同一边界（或更早 prewarm）前低频探测，但不能停探；边界外的 `gmi_poll=-1`、1200/1201 行情连接及 1100 交易连接维护状态不得周期性刷 warning/error 日志，边界到达后恢复有限日志并通过 heartbeat/干净重建切回积极恢复。区间 schedule 的等待不得跨 slot，无有效 schedule 时不得降频。监督器不得保存或重放交易意图，回测/优化不得启动该链路。
 13. 每次实盘 `run` 从隔夜清理前共享一个 monotonic deadline：默认最多 600 秒，分钟/小时 schedule 或 `Minutes|Seconds` timeframe 自动缩短为触发间隔的 80%。pending 查询、撤单、数据恢复、SELL 等待、资金等待、BUY/SELL 拆单和 BUY 降级都必须在该 deadline 内；到期后停止发起新动作但保留已受理/成交的部分结果。异步拒单只能沿用原订单提交时的 deadline，不能借下一轮预算重放旧意图。所有 SDK 查询/撤单/发单接口必须设置明显短于该预算的有限超时；回测/优化不得进入此机制。
 14. 24x7 市场配置 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日必须保留远端委托以及本地 `_active_buys`、`_pending_sells`、虚拟占资的短期跟踪；仍须持续用实时柜台状态对账，不能将这些跟踪演化为跨 K 交易意图。
+15. 使用单线程 SDK 事件循环的 schedule 适配器（包括 GM schedule、IB `ib.sleep()` 主循环）不得在 SDK 回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将当前 slot 调度到短生命周期工作线程，让订单拒单/成交回调持续由 SDK 事件循环处理。同一适配器同时最多执行一个实盘运行，重叠 slot 记录并跳过；回测/优化保持同步快速路径。
+16. GM 适配器只交易中国市场，实盘调仓的 BUY/SELL 均应使用 `OrderType_Market`；BUY 的 `price` 至少覆盖实时最优卖价，SELL 使用实时行情作为保护价。该字段是市价保护价，不是限价委托价格；资金预检查、虚拟占资和拒单退款必须按实际保护价统一估算。不要把最新成交价微调后设置为 `OrderType_Limit` BUY/SELL，否则盘口偏离时会在柜台滞留。
+17. 配置边界：broker-specific 的局部参数应在 adapter 内提供安全默认值，不作为 CLI 公共配置；只有稳定、跨模块复用的公开配置才进入 `config.py`。不得为单个 broker、一次性场景或兼容别名扩充 `config.py`。
 
 ---
 
-## 📤 输出要求 (Output Format)
+## 📤 输出要求
 - 请输出一个完整的 Python 文件代码，文件名约定为 `[broker_name]_broker.py`。
 - 文件中应同时包含: `Broker`、`OrderProxy`、`DataProvider bridge`。
 - 必须包含清晰的 Docstring，解释关键的参数转换逻辑。

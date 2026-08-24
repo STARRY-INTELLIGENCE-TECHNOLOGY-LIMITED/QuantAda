@@ -1,4 +1,4 @@
-# QuantAda Framework - 优化指标函数 AI 生成指令
+# QuantAda 框架 - 优化指标函数 AI 生成指令
 
 ## 角色
 你是 QuantAda 参数优化专家。你要实现一个可被 `--metric` 调用的评分函数，用于 Optuna 优化。
@@ -36,4 +36,3 @@ def evaluate(stats, strat=None, args=None) -> float:
 
 ## 现在开始
 根据我的输入生成指标代码与命令。
-

@@ -1,4 +1,4 @@
-# QuantAda Framework - 数据源适配器 AI 生成指令
+# QuantAda 框架 - 数据源适配器 AI 生成指令
 
 ## 角色
 你是 QuantAda 数据层架构工程师。你需要为框架生成一个可直接接入的数据源适配器。

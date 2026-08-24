@@ -1,5 +1,24 @@
 from types import SimpleNamespace
 
+import pytest
+
+
+def test_order_executor_reconciliation_uses_broker_runtime_lot_size(monkeypatch):
+    import common.order_executor as executor_module
+
+    class Broker:
+        is_live = True
+        _runtime_config = {"LOT_SIZE": 100}
+
+        @staticmethod
+        def _runtime_setting(name, default=None):
+            return Broker._runtime_config.get(name, default)
+
+    monkeypatch.setattr(executor_module.config, "LOT_SIZE", 1)
+    executor = executor_module.OrderExecutor(Broker())
+
+    assert executor._effective_lot_size() == 100
+
 
 def test_calculate_plan_does_not_push_without_runtime_context(monkeypatch):
     import common.rebalancer as rebalancer_module
@@ -213,6 +232,66 @@ def test_order_executor_warns_after_5m_but_keeps_waiting_until_sell_settles(monk
     assert pushed[0]["level"] == "WARNING"
     assert "300 秒内未全部终态" in pushed[0]["content"]
     assert "继续等待并按已确认现金滚动买入" in pushed[0]["content"]
+
+
+@pytest.mark.parametrize(
+    "skip_reason",
+    ["below_min_lot_delta", "insufficient_cash_for_min_lot", "broker_lot_limit_exceeded"],
+)
+def test_order_executor_does_not_repeat_deterministic_rolling_buy_noop(monkeypatch, skip_reason):
+    """确定性 BUY no-op 本轮只尝试一次，不能按轮询频率刷屏。"""
+    import common.order_executor as executor_module
+
+    clock = {"t": 0.0}
+
+    monkeypatch.setattr(executor_module.time, "time", lambda: clock["t"])
+    monkeypatch.setattr(
+        executor_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("t", clock["t"] + float(seconds)),
+    )
+
+    buy_data = SimpleNamespace(_name="SHSE.518880")
+
+    class DummyBroker:
+        is_live = True
+        safety_multiplier = 1.0
+
+        def __init__(self):
+            self._pending_sells = {"SELL_1"}
+            self.buy_calls = []
+
+        def get_position(self, data):
+            return SimpleNamespace(size=0, price=10.0)
+
+        def get_current_price(self, data):
+            return 10.0
+
+        def get_rebalance_cash(self):
+            return 1000.0
+
+        def order_target_value(self, data, target):
+            if data._name == buy_data._name:
+                self.buy_calls.append(float(target))
+                self._last_order_target_skip_reason = skip_reason
+                return None  # 模拟零手、现金不足或单笔上限拦截
+            return SimpleNamespace(id="SELL_1", platform_order=SimpleNamespace(volume=100))
+
+        def get_pending_orders(self):
+            return [{"id": "SELL_1", "symbol": "SHSE.512010", "direction": "SELL", "size": 100}]
+
+    broker = DummyBroker()
+    executor = executor_module.OrderExecutor(broker)
+    executor._SELL_SETTLE_WARN_SECONDS = 1.0
+    executor._SELL_SETTLE_HARD_SECONDS = 5.0
+
+    settled = executor._wait_sells_settled(
+        submitted_sell_ids={"SELL_1"},
+        increase_plan=[(buy_data, 1000.0)],
+    )
+
+    assert settled is False
+    assert len(broker.buy_calls) == 1, "确定性 no-op 滚动买单不得在每次 pending 轮询中重复提交。"
 
 
 def test_order_executor_clears_local_pending_sell_when_remote_sell_empty(monkeypatch):

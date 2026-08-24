@@ -1,6 +1,7 @@
 import sys
 import types
 import datetime
+import threading
 
 import pandas as pd
 import pytest
@@ -390,6 +391,7 @@ def test_ib_status_translation_accuracy():
     cancelled = IBOrderProxy(DummyIBTrade(status="Cancelled"), data=None)
     api_cancelled = IBOrderProxy(DummyIBTrade(status="ApiCancelled"), data=None)
     inactive = IBOrderProxy(DummyIBTrade(status="Inactive"), data=None)
+    rejected = IBOrderProxy(DummyIBTrade(status="Rejected"), data=None)
 
     assert pre_submitted.is_pending(), "状态映射错误：PreSubmitted 必须是 pending，避免漏管在途单！"
     assert not pre_submitted.is_completed(), "状态映射错误：PreSubmitted 不能被视为 completed！"
@@ -411,6 +413,27 @@ def test_ib_status_translation_accuracy():
     # Inactive 在当前实现中归类为 rejected，不允许停留在 pending
     assert inactive.is_rejected(), "状态映射错误：Inactive 必须被安全映射为 rejected/canceled 终态！"
     assert not inactive.is_pending(), "致命错误：Inactive 不能被视为 pending，否则可能导致状态机卡死！"
+    assert rejected.is_rejected(), "状态映射错误：Rejected 必须被安全映射为 rejected 终态！"
+    assert not rejected.is_pending(), "Rejected 不能被视为 pending，否则可能导致状态机卡死！"
+
+
+def test_ib_get_current_price_returns_zero_when_quote_query_raises():
+    """IB 行情对象异常时，适配器应安全返回 0 以阻止本次下单。"""
+    context = types.SimpleNamespace(ib_instance=DummyIBForCash(cash_usd=0.0))
+    broker = IBBrokerAdapter(context=context)
+
+    class BrokenTicker:
+        def marketPrice(self):
+            raise RuntimeError("ticker unavailable")
+
+    broker._tickers = {"AAPL": BrokenTicker()}
+    # 该用例只验证 ticker 异常的安全边界；不要让真实 provider 兜底网络调用
+    # 把单测拖成几十秒。
+    broker._try_get_delayed_quote = lambda _symbol: 0.0
+    broker._fallback_price_from_sources = lambda _symbol: (0.0, [])
+    broker._alarm_no_price = lambda _symbol, _sources: None
+
+    assert broker.get_current_price(SimpleNamespace(_name="AAPL")) == 0.0
 
 
 def test_ib_partial_fill_handling():
@@ -635,6 +658,9 @@ def test_ib_fetch_real_cash_zero_with_known_managed_account_no_id_error_alarm(mo
     0 资金提示回归:
     当账号已在 managedAccounts 中时，不应再推送“账号ID可能错误”告警。
     """
+    # BaseLiveBroker 会在构造期间探测现金；在实例化前替换重试等待，
+    # 使本测试只验证账户归属且保持快速。
+    monkeypatch.setattr(IBBrokerAdapter, "_sleep_ib", lambda _self, _seconds: 0.0)
     context = types.SimpleNamespace(
         ib_instance=DummyIBForManagedAccountNoSnapshot(managed_accounts=["DUO932692"])
     )
@@ -1004,11 +1030,14 @@ def test_ib_augment_live_data_source_appends_ibkr_fallback():
     assert IBBrokerAdapter._augment_live_data_source("ibkr") == "ibkr"
 
 
-def test_ib_fetch_smart_value_falls_back_to_base_when_fx_missing():
+def test_ib_fetch_smart_value_falls_back_to_base_when_fx_missing(monkeypatch):
     """
     汇率兜底回归:
     若非 USD 货币无法换汇，但券商提供 BASE 汇总，必须回退 BASE，避免低估资金。
     """
+    # BaseLiveBroker 会在构造期间探测现金；本测试只检查 BASE 回退逻辑，
+    # 因此跳过生产路径中的账户摘要重试等待。
+    monkeypatch.setattr(IBBrokerAdapter, "_sleep_ib", lambda _self, _seconds: 0.0)
     context = types.SimpleNamespace(ib_instance=DummyIBForMissingFx())
     broker = IBBrokerAdapter(context=context)
 
@@ -2015,6 +2044,32 @@ def test_ib_stock_fractional_sell_disabled_even_with_crypto_lot_size(monkeypatch
     )
 
 
+def test_ib_order_constraints_prefer_runtime_config_snapshot(monkeypatch):
+    """长生命周期运行中，当前引擎快照应覆盖模块级 IB 默认值。"""
+    context = types.SimpleNamespace(ib_instance=DummyIBForSubmit())
+    broker = IBBrokerAdapter(context=context)
+
+    import live_trader.adapters.ib_broker as ib_module
+    monkeypatch.setattr(
+        ib_module,
+        "MarketOrder",
+        lambda action, qty: SimpleNamespace(action=action, totalQuantity=qty, account=""),
+    )
+    monkeypatch.setattr(ib_module.config, "IBKR_ORDER_ACCOUNT", "", raising=False)
+    monkeypatch.setattr(ib_module.config, "IBKR_ALLOW_FRACTIONAL_SELL", False, raising=False)
+    broker._runtime_config = {
+        "IBKR_ORDER_ACCOUNT": "U1234567",
+        "IBKR_ALLOW_FRACTIONAL_SELL": True,
+    }
+
+    data = SimpleNamespace(_name="AAPL.SMART")
+    proxy = broker._submit_order(data=data, volume=0.6441, side="SELL", price=100.0)
+
+    assert proxy is not None
+    assert context.ib_instance.last_order.account == "U1234567"
+    assert context.ib_instance.last_order.totalQuantity == pytest.approx(0.6441)
+
+
 @pytest.mark.parametrize("side", ["BUY", "SELL"])
 def test_ib_crypto_submit_preserves_fractional_quantity_without_stock_switch(monkeypatch, side):
     context = types.SimpleNamespace(ib_instance=DummyIBForSubmit())
@@ -3015,6 +3070,111 @@ def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch,
         for item in connecting
     )
     assert all("failure_kind" not in item for item in running)
+
+
+def test_ib_schedule_run_is_offloaded_from_event_loop_thread(monkeypatch):
+    """SELL 等待期间 IB 事件循环仍必须能处理订单回调。"""
+    import config
+    import live_trader.engine as engine_module
+    import live_trader.adapters.ib_broker as ib_module
+
+    run_started = threading.Event()
+    run_finished = threading.Event()
+    release_run = threading.Event()
+
+    class StopLaunch(BaseException):
+        pass
+
+    class DummyEvent:
+        def __iadd__(self, handler):
+            return self
+
+    class DummyIB:
+        def __init__(self):
+            self.connected = False
+            self.sleep_calls = 0
+            self.orderStatusEvent = DummyEvent()
+
+        def isConnected(self):
+            return self.connected
+
+        def connect(self, host, port, clientId, account=""):
+            self.connected = True
+
+        def tickers(self):
+            return [SimpleNamespace(symbol="AAPL")]
+
+        def qualifyContracts(self, contract):
+            return [contract]
+
+        def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False):
+            return SimpleNamespace(symbol=getattr(contract, "symbol", "AAPL"))
+
+        def sleep(self, seconds):
+            self.sleep_calls += 1
+            if self.sleep_calls == 1:
+                return
+            raise StopLaunch()
+
+        def disconnect(self):
+            self.connected = False
+
+    class DummyBroker:
+        is_live = True
+        datas = [SimpleNamespace(_name="AAPL.SMART")]
+        _tickers = {}
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.data_provider = SimpleNamespace()
+            self.broker = DummyBroker()
+
+        def init(self, ctx):
+            return None
+
+        def run(self, ctx):
+            run_started.set()
+            release_run.wait(1.0)
+            run_finished.set()
+
+    dummy_ib = DummyIB()
+    monkeypatch.setattr(config, "IBKR_HOST", "127.0.0.1", raising=False)
+    monkeypatch.setattr(config, "IBKR_PORT", 7497, raising=False)
+    monkeypatch.setattr(config, "IBKR_CLIENT_ID", 7, raising=False)
+    monkeypatch.setattr(config, "LIVE_SCHEDULE_PREWARM_LEAD", 0, raising=False)
+    monkeypatch.setattr(mock_ib_insync, "IB", lambda: dummy_ib)
+    monkeypatch.setattr(engine_module, "LiveTrader", DummyTrader)
+    monkeypatch.setattr(
+        ib_module,
+        "report_live_worker_state",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        ib_module.SchedulePlanner,
+        "should_trigger_schedule",
+        staticmethod(lambda **kwargs: (True, 0.0, "2026-08-23 15:45:00")),
+    )
+    monkeypatch.setattr(
+        IBBrokerAdapter,
+        "parse_contract",
+        staticmethod(lambda symbol: SimpleNamespace(symbol=symbol)),
+    )
+
+    try:
+        with pytest.raises(StopLaunch):
+            IBBrokerAdapter.launch(
+                {"schedule": "1d:15:45:00"},
+                strategy_path="sample_strategy",
+                params={},
+                symbols=["AAPL.SMART"],
+            )
+
+        assert run_started.is_set(), "调度 worker 未启动。"
+        assert not run_finished.is_set(), "事件循环退出前调仓不应在回调线程同步完成。"
+    finally:
+        release_run.set()
+        assert run_finished.wait(1.0), "调度 worker 未正常收尾。"
 
 
 def test_ib_trade_update_forwards_without_adapter_cash_wait(monkeypatch):

@@ -12,7 +12,11 @@ class TiingoDataProvider(BaseDataProvider):
 
     PRIORITY = 50
 
-    def __init__(self, token: str = config.TIINGO_TOKEN):
+    def __init__(self, token: str = None):
+        # ``run.py --config`` 在提供者模块加载之后才解析；不要在函数默认
+        # 参数中捕获覆盖前的 token。
+        if token is None:
+            token = getattr(config, 'TIINGO_TOKEN', None)
         if not token or token == 'your_token_here':
             print("Warning: TIINGO_KEY not found in config. TiingoProvider unavailable.")
             self.client = None

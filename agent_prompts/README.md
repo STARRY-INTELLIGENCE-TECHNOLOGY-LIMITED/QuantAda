@@ -1,6 +1,6 @@
-# QuantAda Agent Prompts
+# QuantAda AI 代理提示词
 
-本目录用于“复制即用”的 agent/codegen Prompt 模板，目标是降低接口对接与命令编排成本。
+本目录用于“复制即用”的 AI 代码生成提示词模板，目标是降低接口对接与命令编排成本。
 
 重要说明:
 1. `docs/specs/*` 是更正式的规范层。

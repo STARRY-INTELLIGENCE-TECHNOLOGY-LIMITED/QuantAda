@@ -1,4 +1,4 @@
-# QuantAda Framework - 风控模块 AI 生成指令
+# QuantAda 框架 - 风控模块 AI 生成指令
 
 ## 角色
 你是 QuantAda 风控工程师。你要实现一个可插拔的风控模块，用 `--risk` 动态挂载。
@@ -42,4 +42,3 @@ python .\run.py sample_macd_cross_strategy --symbols=SHSE.600519 --risk=<your_ri
 
 ## 现在开始
 根据我的输入输出代码。
-

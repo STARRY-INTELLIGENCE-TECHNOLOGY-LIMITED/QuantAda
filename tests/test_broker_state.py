@@ -165,6 +165,32 @@ def test_live_buy_splits_by_configured_broker_lot_limit(monkeypatch):
     assert set(broker._active_buys) == {"ORDER_1", "ORDER_2"}
 
 
+def test_live_split_uses_effective_runtime_config_snapshot(monkeypatch):
+    """CLI 覆盖值应优先于模块默认值，且同样作用于 SELL 拆单。"""
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 0)
+    broker = MockBroker(initial_cash=1000.0)
+    broker._runtime_config = {"LOT_SIZE": 100, "BROKER_LOT_LIMITS": 1_000_000}
+    broker.mock_position = 1_378_500
+    data = _make_data("SHSE.512010")
+
+    proxy = broker.order_target_value(data, target=0.0)
+
+    assert proxy is not None
+    assert [order["volume"] for order in broker.submitted_orders] == [1_000_000, 378_500]
+
+
+def test_live_lot_limit_below_lot_is_terminal_noop(monkeypatch):
+    """单笔上限小于一手时应立即跳过，并给执行器确定性原因。"""
+    monkeypatch.setattr(config, "LOT_SIZE", 100)
+    monkeypatch.setattr(config, "BROKER_LOT_LIMITS", 50)
+    broker = MockBroker(initial_cash=10_000.0)
+    data = _make_data("SHSE.512010")
+
+    assert broker.order_target_value(data, target=1_000.0) is None
+    assert broker.submitted_orders == []
+    assert broker._last_order_target_skip_reason == "broker_lot_limit_exceeded"
+
+
 def test_live_buy_aligns_total_before_tail_submission(capsys):
     broker = MockBroker(initial_cash=10_000.0)
     data = _make_data("SHSE.512010")

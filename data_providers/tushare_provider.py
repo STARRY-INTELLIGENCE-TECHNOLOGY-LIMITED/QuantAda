@@ -11,7 +11,12 @@ class TushareDataProvider(BaseDataProvider):
     """
     PRIORITY = 20
 
-    def __init__(self, token: str = config.TUSHARE_TOKEN):
+    def __init__(self, token: str = None):
+        # 在实例化时解析默认值。``run.py`` 在导入提供者模块之后才应用
+        # --config；如果使用 ``config.TUSHARE_TOKEN`` 作为函数默认参数，
+        # 旧值会在导入时被冻结，从而静默忽略命令行覆盖。
+        if token is None:
+            token = getattr(config, 'TUSHARE_TOKEN', None)
         if not token or token == 'your_token_here':
             print("Warning: Tushare token is not configured. Tushare provider will be skipped.")
             self.pro = None

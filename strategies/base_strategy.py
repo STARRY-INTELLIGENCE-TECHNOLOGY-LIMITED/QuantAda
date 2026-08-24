@@ -115,7 +115,7 @@ class BaseStrategy(ABC):
         推送策略侧排名快照。
         live 模式即时推送；backtest 模式只保留同 key 的最后一条，随回测结束统一 flush。
         """
-        if not getattr(config, 'PRINT_PLAN', False):
+        if not self._print_plan_enabled():
             return False
 
         content = format_ranked_candidates_markdown(
@@ -127,6 +127,13 @@ class BaseStrategy(ABC):
         if getattr(self.broker, 'is_live', False):
             return runtime_notifications.push_plan(content, level=level)
         return runtime_notifications.defer_plan(content, level=level, key=key)
+
+    def _print_plan_enabled(self):
+        """优先从当前券商运行快照读取 PRINT_PLAN。"""
+        runtime_setting = getattr(self.broker, '_runtime_setting', None)
+        if callable(runtime_setting):
+            return bool(runtime_setting('PRINT_PLAN', getattr(config, 'PRINT_PLAN', False)))
+        return bool(getattr(config, 'PRINT_PLAN', False))
 
     def get_strategy_isolated_capital(self):
         """
@@ -394,7 +401,7 @@ class BaseStrategy(ABC):
             select_top_k=top_k,
             rebalance_threshold=rebalance_threshold
         )
-        if getattr(config, 'PRINT_PLAN', False):
+        if self._print_plan_enabled():
             plan_md_str = PortfolioRebalancer._log_plan(
                 plan,
                 current_positions,

@@ -1,7 +1,9 @@
 import asyncio
+import copy
 import datetime
 import math
 import re
+import threading
 import time
 from decimal import Decimal, InvalidOperation
 
@@ -96,7 +98,7 @@ class IBOrderProxy(BaseOrderProxy):
         return self.trade.orderStatus.status in ['Cancelled', 'ApiCancelled']
 
     def is_rejected(self) -> bool:
-        return self.trade.orderStatus.status == 'Inactive'  # 或者是 Rejected
+        return self.trade.orderStatus.status in {'Inactive', 'Rejected'}
 
     def is_pending(self) -> bool:
         return self.trade.orderStatus.status in ['Submitted', 'PreSubmitted', 'PendingSubmit', 'ApiPending', 'PendingCancel']
@@ -192,7 +194,9 @@ class IBBrokerAdapter(BaseLiveBroker):
         return ''
 
     def _configured_order_account(self) -> str:
-        return self._normalize_account(getattr(config, 'IBKR_ORDER_ACCOUNT', ''))
+        return self._normalize_account(
+            self._runtime_setting('IBKR_ORDER_ACCOUNT', getattr(config, 'IBKR_ORDER_ACCOUNT', ''))
+        )
 
     @staticmethod
     def _is_aggregate_account_marker(account: str) -> bool:
@@ -1794,66 +1798,83 @@ class IBBrokerAdapter(BaseLiveBroker):
         获取标的当前价格。
         增强版：支持休市期间使用 Close/Last 价格兜底，防止无法计算下单数量。
         """
-        if not hasattr(self, 'ib') or not self.ib or not self.ib.isConnected():
-            return 0.0
+        try:
+            if not hasattr(self, 'ib') or not self.ib or not self.ib.isConnected():
+                return 0.0
 
-        symbol = data._name
-        ticker = self._tickers.get(symbol)
+            symbol = data._name
+            ticker = self._tickers.get(symbol)
 
-        # 1. 如果缓存里没有 ticker (防御性逻辑，防止动态添加的标的没订阅)
-        if not ticker:
-            # print(f"[IB Debug] Ticker not found for {symbol}, requesting subscription...")
-            contract = self.parse_contract(symbol)
-            self.ib.qualifyContracts(contract)
-            # snapshot=False 建立流式订阅
-            ticker = self.ib.reqMktData(contract, '', False, False)
-            self._tickers[symbol] = ticker
+            # 1. 如果缓存里没有 ticker（防御性逻辑，防止动态添加的标的没订阅）
+            if not ticker:
+                contract = self.parse_contract(symbol)
+                self.ib.qualifyContracts(contract)
+                # snapshot=False 建立流式订阅
+                ticker = self.ib.reqMktData(contract, '', False, False)
+                self._tickers[symbol] = ticker
 
-            import time
-            start_time = time.time()
-            while time.time() - start_time < 1.0:
-                if self._sleep_ib(0.01) <= 0:
-                    break
-                if ticker.marketPrice() == ticker.marketPrice() and ticker.marketPrice() > 0:
-                    break
+                import time
+                start_time = time.time()
+                while time.time() - start_time < 1.0:
+                    if self._sleep_ib(0.01) <= 0:
+                        break
+                    candidate = self._extract_price_from_ticker(ticker)
+                    if candidate > 0:
+                        break
 
-        # 2. 获取价格 (优先 marketPrice)
-        price = ticker.marketPrice()
+            # 2. 获取价格（优先 marketPrice）
+            try:
+                price = ticker.marketPrice()
+            except Exception:
+                price = 0.0
 
-        # 如果 marketPrice 无效 (NaN/0/-1)，先尝试切换 delayed 行情并重取。
-        if not (price and 0 < price == price):
-            delayed_price = self._try_get_delayed_quote(symbol)
-            ticker = self._tickers.get(symbol, ticker)
-            if delayed_price > 0:
-                self._runtime_log(f"[IB Warning] {symbol} realtime quote invalid. Using DELAYED price: {delayed_price}")
-                price = delayed_price
-
-        # 如果仍无效，尝试使用 close 或 last
-        # 这种情况常见于盘前盘后、休市或停牌
-        if not (price and 0 < price == price):
-            # 优先用昨日收盘价 (Close)
-            if ticker.close and ticker.close > 0:
-                self._runtime_log(
-                    f"[IB Debug] {symbol} marketPrice invalid ({price}). Using CLOSE price for execution: {ticker.close}")
-                price = ticker.close
-            # 其次用最后成交价 (Last)
-            elif ticker.last and ticker.last > 0:
-                self._runtime_log(f"[IB Debug] {symbol} marketPrice invalid. Using LAST price: {ticker.last}")
-                price = ticker.last
-            else:
-                # 无实时价时，从非 CSV 数据源按优先级兜底获取
-                fallback_price, tried_sources = self._fallback_price_from_sources(symbol)
-                if fallback_price > 0:
+            # 如果 marketPrice 无效（NaN/0/-1），先尝试切换 delayed 行情并重取。
+            if not (price and 0 < price == price):
+                delayed_price = self._try_get_delayed_quote(symbol)
+                ticker = self._tickers.get(symbol, ticker)
+                if delayed_price > 0:
                     self._runtime_log(
-                        f"[IB Warning] No valid price (Market/Close/Last) for {symbol}. "
-                        f"Using provider price: {fallback_price}"
+                        f"[IB Warning] {symbol} realtime quote invalid. "
+                        f"Using DELAYED price: {delayed_price}"
                     )
-                    price = fallback_price
-                else:
-                    self._alarm_no_price(symbol, tried_sources)
-                    price = 0.0
+                    price = delayed_price
 
-        return price
+            # 如果仍无效，尝试使用 close 或 last；这常见于盘前盘后、休市或停牌。
+            if not (price and 0 < price == price):
+                close = getattr(ticker, 'close', 0.0) or 0.0
+                last = getattr(ticker, 'last', 0.0) or 0.0
+                if close and close > 0:
+                    self._runtime_log(
+                        f"[IB Debug] {symbol} marketPrice invalid ({price}). "
+                        f"Using CLOSE price for execution: {close}"
+                    )
+                    price = close
+                elif last and last > 0:
+                    self._runtime_log(
+                        f"[IB Debug] {symbol} marketPrice invalid. Using LAST price: {last}"
+                    )
+                    price = last
+                else:
+                    # 无实时价时，从非 CSV 数据源按优先级兜底获取。
+                    fallback_price, tried_sources = self._fallback_price_from_sources(symbol)
+                    if fallback_price > 0:
+                        self._runtime_log(
+                            f"[IB Warning] No valid price (Market/Close/Last) for {symbol}. "
+                            f"Using provider price: {fallback_price}"
+                        )
+                        price = fallback_price
+                    else:
+                        self._alarm_no_price(symbol, tried_sources)
+                        price = 0.0
+
+            try:
+                price = float(price)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return price if math.isfinite(price) and price > 0 else 0.0
+        except Exception as e:
+            self._runtime_log(f"[IB 警告] 获取 {getattr(data, '_name', 'UNKNOWN')} 当前价格失败：{e}")
+            return 0.0
 
     def _resolve_runtime_config(self) -> dict:
         try:
@@ -1926,7 +1947,11 @@ class IBBrokerAdapter(BaseLiveBroker):
             compression = 1
         data_source = cfg.get('data_source')
 
-        now_ts = pd.Timestamp(getattr(self._context, 'now', None) or datetime.datetime.now())
+        now_ts = pd.Timestamp(
+            getattr(self, '_datetime', None)
+            or getattr(self._context, 'now', None)
+            or datetime.datetime.now()
+        )
         start_date, end_date = self._build_price_window(now_ts, timeframe, compression)
 
         providers = self._collect_price_providers(data_source=data_source)
@@ -1951,7 +1976,11 @@ class IBBrokerAdapter(BaseLiveBroker):
         return 0.0, tried
 
     def _alarm_no_price(self, symbol: str, tried_sources: list):
-        now = getattr(self._context, 'now', None) or datetime.datetime.now()
+        now = (
+            getattr(self, '_datetime', None)
+            or getattr(self._context, 'now', None)
+            or datetime.datetime.now()
+        )
         try:
             now = pd.Timestamp(now)
         except Exception:
@@ -1994,7 +2023,12 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         # 默认禁用 API 小数股卖单，避免在不支持分数股的 IB 账户触发 10243 拒单。
         # 如账户已确认支持，可显式在 config 中开启 IBKR_ALLOW_FRACTIONAL_SELL=True。
-        allow_fractional_sell = bool(getattr(config, 'IBKR_ALLOW_FRACTIONAL_SELL', False))
+        allow_fractional_sell = bool(
+            self._runtime_setting(
+                'IBKR_ALLOW_FRACTIONAL_SELL',
+                getattr(config, 'IBKR_ALLOW_FRACTIONAL_SELL', False),
+            )
+        )
         contract_type = str(getattr(contract, 'secType', '') or '').upper()
         should_use_fractional = (
             raw_volume > 0
@@ -2027,8 +2061,8 @@ class IBBrokerAdapter(BaseLiveBroker):
                 self._warn_missing_order_account_for_schedule_scope(known_accounts)
                 return None
 
-        # 使用市价单 (MarketOrder) 或 限价单 (LimitOrder)
-        # 此处简单起见使用市价单
+        # IB 调仓统一使用市价单。price 只用于框架的数量/资金估算，
+        # 不会作为限价字段发送给 IB，避免把普通调仓意外变成挂单。
         order = MarketOrder(action, volume_final)
         if configured_account:
             # 透传 IB 订单 account 字段；留空时由 IB 默认使用主账户路由。
@@ -2236,6 +2270,37 @@ class IBBrokerAdapter(BaseLiveBroker):
         last_schedule_run_key = None
         last_prewarm_run_key = None
         is_first_connect = True
+        scheduled_run_lock = threading.Lock()
+        scheduled_run_thread = None
+
+        def _run_scheduled_worker(now_snapshot, slot_key):
+            """在 IB 事件循环之外执行调仓，避免阻塞订单回调。"""
+            nonlocal scheduled_run_thread
+            run_context = copy.copy(ctx)
+            run_context.now = now_snapshot
+            run_context.strategy_instance = trader
+            run_context.use_schedule = True
+            try:
+                trader.run(run_context)
+                next_run = SchedulePlanner.resolve_next_schedule_slot(
+                    now_snapshot + datetime.timedelta(seconds=1),
+                    parsed_schedule,
+                )
+                next_run_text = (
+                    next_run.strftime('%Y-%m-%d %H:%M:%S')
+                    if next_run is not None else '无后续调度槽位'
+                )
+                _runtime_print(f">>> Run Finished. Next run: {next_run_text}")
+            except Exception as e:
+                _runtime_print(f"[Schedule Error] 调度 slot {slot_key or '未知'} 执行失败: {e}")
+                try:
+                    AlarmManager().push_exception("IBBroker 调度运行", e)
+                except Exception as alarm_error:
+                    _runtime_print(f"[IBBroker Warning] 调度运行告警发送失败: {alarm_error}")
+            finally:
+                with scheduled_run_lock:
+                    if scheduled_run_thread is threading.current_thread():
+                        scheduled_run_thread = None
 
         # --- 3. 进入“不死鸟”主循环 ---
         while True:
@@ -2427,17 +2492,23 @@ class IBBrokerAdapter(BaseLiveBroker):
                                 _runtime_print(
                                     f">>> ⏰ Schedule Triggered: {schedule_rule} (Delta: {delta:.2f}s) <<<"
                                 )
-
-                                # === 触发策略运行 ===
-                                trader.run(ctx)
-
-                                # === 更新状态锁 ===
                                 last_schedule_run_key = schedule_slot_key
-                                next_run = SchedulePlanner.resolve_next_schedule_slot(
-                                    now + datetime.timedelta(seconds=1),
-                                    parsed_schedule,
-                                )
-                                _runtime_print(f">>> Run Finished. Next run: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+                                with scheduled_run_lock:
+                                    previous_thread = scheduled_run_thread
+                                    if previous_thread is not None and previous_thread.is_alive():
+                                        _runtime_print(
+                                            "[IBBroker Warning] 上一个调度运行仍在执行，"
+                                            f"已跳过 slot {schedule_slot_key or '未知'}。"
+                                        )
+                                        continue
+                                    worker = threading.Thread(
+                                        target=_run_scheduled_worker,
+                                        args=(pd.Timestamp(ctx.now), schedule_slot_key),
+                                        name=f"quantada-ib-run-{schedule_slot_key or 'unknown'}",
+                                        daemon=True,
+                                    )
+                                    scheduled_run_thread = worker
+                                worker.start()
 
                         except Exception as e:
                             _runtime_print(f"[Schedule Error] Check failed: {e}")

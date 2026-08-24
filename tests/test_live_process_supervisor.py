@@ -350,7 +350,7 @@ def test_supervisor_restarts_worker_after_health_deadline(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(supervisor, "RESTART_BACKOFF_SECONDS", (0.0,))
     monkeypatch.setattr(supervisor, "HEALTH_MONITOR_INTERVAL_SECONDS", 0.02)
-    monkeypatch.setattr(supervisor, "HEALTH_KILL_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(supervisor, "HEALTH_KILL_GRACE_SECONDS", 0.05)
 
     result = supervisor.supervise_live_process(
         [sys.executable, "-u", "-c", script]
@@ -377,7 +377,7 @@ def test_supervisor_restarts_worker_after_stale_heartbeat(monkeypatch, tmp_path)
     monkeypatch.setattr(supervisor, "RESTART_BACKOFF_SECONDS", (0.0,))
     monkeypatch.setattr(supervisor, "HEARTBEAT_STALE_SECONDS", 0.2)
     monkeypatch.setattr(supervisor, "HEALTH_MONITOR_INTERVAL_SECONDS", 0.02)
-    monkeypatch.setattr(supervisor, "HEALTH_KILL_GRACE_SECONDS", 0.5)
+    monkeypatch.setattr(supervisor, "HEALTH_KILL_GRACE_SECONDS", 0.05)
 
     result = supervisor.supervise_live_process(
         [sys.executable, "-u", "-c", script]
@@ -396,6 +396,8 @@ def test_run_main_prints_config_override_values_directly(monkeypatch, capsys):
         "--config",
         "{'GM_TOKEN':'secret','BROKER_ENVIRONMENTS': {'gm_broker': {'real': {'token': 'secret'}}}}",
     ])
+    monkeypatch.setattr(run.config, "GM_TOKEN", "original-token", raising=False)
+    monkeypatch.setattr(run.config, "BROKER_ENVIRONMENTS", {}, raising=False)
     monkeypatch.setattr(run.config, "DB_ENABLED", False, raising=False)
     monkeypatch.setattr(run.config, "HTTP_LOG_URL", None, raising=False)
     monkeypatch.setattr(run, "run_backtest", lambda **kwargs: None)
@@ -408,6 +410,43 @@ def test_run_main_prints_config_override_values_directly(monkeypatch, capsys):
         "  [Config] Overriding BROKER_ENVIRONMENTS = "
         "{'gm_broker': {'real': {'token': 'secret'}}}"
     ) in output
+
+
+def test_run_main_reports_unknown_config_override(monkeypatch, capsys):
+    """拼写错误/局部配置名不能再静默造成“配置不响应”。"""
+    import run
+
+    monkeypatch.setattr(sys, "argv", [
+        "run.py",
+        "dummy_strategy",
+        "--config",
+        (
+            "{'BROKER_LOT_LIMIT': 1000000, "
+            "'IBKR_ALLOW_FRACTIONAL_SELL': True}"
+        ),
+    ])
+    monkeypatch.setattr(run.config, "DB_ENABLED", False, raising=False)
+    monkeypatch.setattr(run, "run_backtest", lambda **kwargs: None)
+
+    run._run_main()
+
+    output = capsys.readouterr().out
+    assert "未知配置覆盖项，已忽略：'BROKER_LOT_LIMIT'" in output
+    assert "未知配置覆盖项，已忽略：'IBKR_ALLOW_FRACTIONAL_SELL'" in output
+
+
+def test_run_main_rejects_non_mapping_config_override(monkeypatch):
+    import run
+
+    monkeypatch.setattr(sys, "argv", [
+        "run.py",
+        "dummy_strategy",
+        "--config",
+        "['LOT_SIZE']",
+    ])
+
+    with pytest.raises(ValueError, match="--config 必须是 Python 字典字符串"):
+        run._run_main()
 
 
 def test_run_main_centralizes_supervised_worker_operator_stop(monkeypatch):

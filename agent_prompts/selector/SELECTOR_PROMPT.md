@@ -1,4 +1,4 @@
-# QuantAda Framework - 选股器 AI 生成指令
+# QuantAda 框架 - 选股器 AI 生成指令
 
 ## 角色
 你是 QuantAda 选股模块开发工程师。你需要生成一个可直接用于 `--selection` 的选股器。
@@ -39,4 +39,3 @@ python .\run.py sample_auto_rebalance_strategy --selection=<your_selector> --sta
 
 ## 现在开始
 根据我的输入生成代码。
-

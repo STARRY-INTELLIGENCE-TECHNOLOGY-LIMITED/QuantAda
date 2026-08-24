@@ -127,6 +127,18 @@ class BaseLiveBroker(ABC):
         else:
             print(message)
 
+    def _runtime_setting(self, name, default=None):
+        """读取本轮配置快照；没有快照时回退到 ``config``。
+
+        实盘启动器会把命令行生效配置复制到引擎。数量决策始终优先使用
+        该快照，可以避免长进程重连或模块级配置变更静默丢失
+        ``LOT_SIZE``/``BROKER_LOT_LIMITS``。
+        """
+        runtime_config = getattr(self, '_runtime_config', None)
+        if isinstance(runtime_config, dict) and name in runtime_config:
+            return runtime_config[name]
+        return getattr(config, name, default)
+
     # =========================================================
     #  用户只需实现下述原子接口 (The Minimum Set)
     # =========================================================
@@ -315,6 +327,7 @@ class BaseLiveBroker(ABC):
         return {}
 
     def order_target_percent(self, data, target, **kwargs):
+        self._last_order_target_skip_reason = None
         if self.is_live and live_run_budget_expired(self):
             self._runtime_log(f"[Broker Warning] {data._name} target-percent order skipped: live run execution budget exhausted.")
             return None
@@ -356,6 +369,7 @@ class BaseLiveBroker(ABC):
             return self._smart_buy(data, delta_shares, price, target, **kwargs)
         elif delta_shares < 0:
             return self._smart_sell(data, abs(delta_shares), price, **kwargs)
+        self._last_order_target_skip_reason = 'target_already_met'
         return None
 
     def order_target_value(self, data, target, **kwargs):
@@ -363,6 +377,7 @@ class BaseLiveBroker(ABC):
         按目标市值金额下单
         target: 目标持仓金额 (例如 1000 USD)
         """
+        self._last_order_target_skip_reason = None
         if self.is_live and live_run_budget_expired(self):
             self._runtime_log(f"[Broker Warning] {data._name} target-value order skipped: live run execution budget exhausted.")
             return None
@@ -399,6 +414,7 @@ class BaseLiveBroker(ABC):
             return self._smart_buy_value(data, delta_shares, price, target, **kwargs)
         elif delta_shares < 0:
             return self._smart_sell(data, abs(delta_shares), price, **kwargs)
+        self._last_order_target_skip_reason = 'target_already_met'
         return None
 
     # =========================================================
@@ -413,7 +429,7 @@ class BaseLiveBroker(ABC):
         if not self.is_live:
             return 0
 
-        raw_limit = getattr(config, 'BROKER_LOT_LIMITS', 0)
+        raw_limit = self._runtime_setting('BROKER_LOT_LIMITS', 0)
         configured_limit = positive_quantity(raw_limit)
         if raw_limit not in (None, '', 0, 0.0, '0') and configured_limit <= 0:
             log.warning(
@@ -429,6 +445,7 @@ class BaseLiveBroker(ABC):
         normalized_lot = normalize_quantity_step(lot_size)
         chunk_limit = self._align_shares_down(configured_limit, normalized_lot)
         if chunk_limit <= 0:
+            self._last_order_target_skip_reason = 'broker_lot_limit_exceeded'
             log.warning(
                 f"[Broker] BROKER_LOT_LIMITS={configured_limit} is below "
                 f"LOT_SIZE={normalized_lot}; {side} {data._name} skipped.",
@@ -458,6 +475,7 @@ class BaseLiveBroker(ABC):
             shares = min(shares, max_shares)
             min_lot = normalize_quantity_step(lot_size)
             if decimal_quantity(shares, absolute=True) < decimal_quantity(min_lot, absolute=True):
+                self._last_order_target_skip_reason = 'insufficient_cash_for_min_lot'
                 warning_msg = (
                     f"[Broker Warning] Buy {data._name} skipped. Cash ({cash:.2f}) "
                     f"insufficient for minimum lot {min_lot}; this is not a LOT_SIZE rounding error."
@@ -544,7 +562,11 @@ class BaseLiveBroker(ABC):
                     if submitted_shares <= 0:
                         return first_proxy
                     if use_batch_cash_budget:
-                        submitted_cost = submitted_shares * price * self.safety_multiplier
+                        submitted_cost = self._reserved_cash_for_proxy(
+                            proxy,
+                            submitted_shares,
+                            price,
+                        )
                         self._buy_batch_cash_budget = max(
                             0.0,
                             self._buy_batch_cash_budget - submitted_cost,
@@ -562,12 +584,12 @@ class BaseLiveBroker(ABC):
 
     def _smart_buy(self, data, shares, price, target_pct, **kwargs):
         """智能买入 (Percent模式)：资金检查 + 自动降级"""
-        lot_size = config.LOT_SIZE
+        lot_size = self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
         return self._smart_buy_core(data, shares, price, lot_size)
 
     def _smart_buy_value(self, data, shares, price, target_value, **kwargs):
         """智能买入 (Value模式)：资金检查 + 自动降级"""
-        lot_size = config.LOT_SIZE
+        lot_size = self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
         return self._smart_buy_core(data, shares, price, lot_size)
 
     def _infer_submitted_shares(self, proxy, fallback_shares):
@@ -606,6 +628,32 @@ class BaseLiveBroker(ABC):
                 return min(val, fallback)
 
         return fallback
+
+    def _reserved_cash_for_proxy(self, proxy, shares, price):
+        """读取适配器按实际保护价估算的买单占资。
+
+        适配器若没有提供该字段，沿用基础层的价格与安全倍率估算；
+        这样不会破坏其他券商，同时允许市价保护价高于策略基准价时
+        保持虚拟账本、拆单预算和退款口径一致。
+        """
+        try:
+            reserved_cash = float(getattr(proxy, 'reserved_cash', 0.0) or 0.0)
+            if math.isfinite(reserved_cash) and reserved_cash > 0:
+                return reserved_cash
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return positive_quantity(shares) * float(price) * self.safety_multiplier
+
+    def _reserved_cash_for_buy_info(self, buy_info):
+        try:
+            reserved_cash = float(buy_info.get('reserved_cash', 0.0) or 0.0)
+            if math.isfinite(reserved_cash) and reserved_cash > 0:
+                return reserved_cash
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            pass
+        return positive_quantity(buy_info.get('shares', 0)) * float(
+            buy_info.get('price', 0.0) or 0.0
+        ) * self.safety_multiplier
 
     @staticmethod
     def _read_order_state(proxy):
@@ -710,6 +758,7 @@ class BaseLiveBroker(ABC):
 
         # lot取整异常
         if raw_shares > 0 >= shares:
+            self._last_order_target_skip_reason = 'below_min_lot_delta'
             error_msg = (f"🚨 [Broker Warning] {data._name} 订单取整后数量为0！\n"
                          f"原始需求: {format_quantity(raw_shares)}\n"
                          f"当前最小交易单位 (LotSize): {lot_size}\n"
@@ -729,6 +778,16 @@ class BaseLiveBroker(ABC):
             with self._ledger_lock:
                 proxy = self._submit_order(data, shares, 'BUY', price)
                 if not proxy:
+                    # 资金连一手都买不起、或数量本身小于最小交易单位时，
+                    # 继续做 10 次降级只会重复同一个必然失败的请求；
+                    # 这类短期事实交给执行器本轮过滤，不进入重试风暴。
+                    if getattr(self, '_last_order_target_skip_reason', None) in {
+                        'insufficient_cash_for_min_lot',
+                        'below_min_lot_delta',
+                        'invalid_buy_price',
+                        'broker_lot_limit_exceeded',
+                    }:
+                        return None
                     max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
                     if retry_sync_failure and retries < max_retries:
                         new_shares, downgrade_reason = self._next_order_downgrade(
@@ -771,19 +830,23 @@ class BaseLiveBroker(ABC):
                     return None
 
                 final_submitted_shares = self._infer_submitted_shares(proxy, shares)
+                reserved_cash = self._reserved_cash_for_proxy(
+                    proxy,
+                    final_submitted_shares,
+                    price,
+                )
                 # 注册到活跃买单库，记录当前的参数和重试次数。
                 self._active_buys[oid] = {
                     'data': data,
                     'shares': final_submitted_shares,
                     'price': price,
+                    'reserved_cash': reserved_cash,
                     'lot_size': lot_size,
                     'retries': retries,
                     'retry_sync_failure': retry_sync_failure,
                     'run_deadline': run_deadline,
                 }
-                self._virtual_spent_cash += (
-                    final_submitted_shares * price * self.safety_multiplier
-                )
+                self._virtual_spent_cash += reserved_cash
 
                 order_state = self._read_order_state(proxy)
 
@@ -824,7 +887,7 @@ class BaseLiveBroker(ABC):
             self._runtime_log(f"[Broker Warning] SELL {data._name} skipped: live run execution budget exhausted.")
             return None
 
-        lot_size = config.LOT_SIZE
+        lot_size = self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
 
         # 获取当前【真实的已结算仓位】
         pos_obj = None
@@ -1035,7 +1098,7 @@ class BaseLiveBroker(ABC):
                     # 买单终态(Filled): 物理现金已结算，必须回退本地虚拟预扣，避免双重扣减可用资金
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
-                        refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
+                        refund_amount = self._reserved_cash_for_buy_info(buy_info)
                         symbol = getattr(buy_info.get('data'), '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
                         self._virtual_spent_cash = max(
                             0.0,
@@ -1048,7 +1111,7 @@ class BaseLiveBroker(ABC):
                     # 撤单防御：精准回退被冻结的虚拟预扣资金
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
-                        refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
+                        refund_amount = self._reserved_cash_for_buy_info(buy_info)
                         symbol = getattr(buy_info.get('data'), '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
                         self._virtual_spent_cash = max(
                             0.0,
@@ -1064,7 +1127,7 @@ class BaseLiveBroker(ABC):
                         max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
 
                         # A. 退回上一笔订单预扣的虚拟资金 (使用动态滑点)
-                        refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
+                        refund_amount = self._reserved_cash_for_buy_info(buy_info)
                         self._virtual_spent_cash = max(0.0, getattr(self, '_virtual_spent_cash', 0.0) - refund_amount)
 
                         run_deadline = buy_info.get('run_deadline')
@@ -1126,7 +1189,7 @@ class BaseLiveBroker(ABC):
                 elif not (order_state['pending'] or order_state['accepted']):
                     buy_info = self._active_buys.pop(oid, None)
                     if buy_info:
-                        refund_amount = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
+                        refund_amount = self._reserved_cash_for_buy_info(buy_info)
                         symbol = getattr(buy_info.get('data'), '_name', None) or getattr(getattr(proxy, 'data', None), '_name', 'Unknown')
                         self._virtual_spent_cash = max(
                             0.0,
