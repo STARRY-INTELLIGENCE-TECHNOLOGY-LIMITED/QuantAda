@@ -19,7 +19,7 @@ class PortfolioRebalancer:
         生成调仓计划
         :param current_positions: 当前持仓字典 {data_object: market_value}
         :param target_symbols: 目标持仓列表 [data_object]
-        :param total_capital: 分配给这些标的的总资金 (已扣除 SGOV 等保留资金)
+        :param total_capital: 分配给这些标的的总资金（不含标的池外持仓）
         :param select_top_k: 目标份数
         :param rebalance_threshold: 调仓阈值 (默认 0.05 即 5%)。只有当持仓偏离目标超过此比例时才触发平衡操作。
         :return: 交易计划字典 {'sell_clear': [], 'reduce': [], 'increase': [], 'target_val_per_stock': float}"""

@@ -61,7 +61,7 @@ LIVE_SCHEDULE_ALARM_WINDOW = '0:0'
 
 
 # --- 数据源配置 ---
-# Tushare API Token
+# Tushare API 令牌。
 # 请到 https://tushare.pro/user/token 免费注册获取
 TUSHARE_TOKEN = 'your_token_here'
 
@@ -72,7 +72,7 @@ SXSC_TUSHARE_TOKEN = 'your_token_here'
 # 掘金API Token 格式： TOKEN[|HOST:PORT]
 GM_TOKEN = 'your_token_here|host:port'
 
-# Tiingo API Token
+# Tiingo API 令牌。
 TIINGO_TOKEN = 'your_token_here'
 
 

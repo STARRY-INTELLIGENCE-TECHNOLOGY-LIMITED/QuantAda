@@ -222,11 +222,28 @@ class LiveTrader:
         if self._data_manager is None:
             self._data_manager = DataManager()
 
+        self._bind_shared_ib_to_data_manager(self._data_manager)
+
         if not isinstance(self._data_manager, _DataManagerProxy):
             self._data_manager = _DataManagerProxy(self._data_manager, specified_sources=data_source)
 
         self.data_provider = _DataManagerProvider(self._data_manager, specified_sources=data_source)
         print(f"[Engine] Live data source override: {data_source}")
+
+    def _bind_shared_ib_to_data_manager(self, data_manager):
+        """让所有已发现的 IB provider 复用 adapter 所拥有的 IB 会话。"""
+        if data_manager is None:
+            return
+
+        shared_ib = getattr(self.data_provider, 'ib', None)
+        if shared_ib is None:
+            shared_ib = getattr(getattr(self, 'broker', None), 'ib', None)
+        if shared_ib is None:
+            return
+
+        for provider in getattr(data_manager, 'providers', ()) or ():
+            if provider.__class__.__name__ == 'IbkrDataProvider':
+                provider.ib = shared_ib
 
     def init(self, context):
         print("--- LiveTrader Engine Initializing ---")
@@ -454,10 +471,7 @@ class LiveTrader:
                     self.alarm_manager.push_text(msg, level='ERROR')
                 return
 
-            # Some broker sockets can be connected before their account state is
-            # synchronized.  Adapters that can distinguish this state expose a
-            # short-lived health probe; an unavailable snapshot must never be
-            # interpreted as a legitimate zero-cash/empty-position account.
+            # 某些 broker socket 可能已连接但账户状态尚未同步；能区分该状态的 adapter 会暴露短生命周期健康探针，快照不可用时绝不能解释为真实零现金/空仓账户。
             if self.broker.is_live:
                 account_snapshot_probe = getattr(self.broker, 'is_account_snapshot_trusted', None)
                 if callable(account_snapshot_probe):
@@ -837,6 +851,7 @@ class LiveTrader:
         if self.selector_class:
             if self._data_manager is None:
                 self._data_manager = DataManager()
+            self._bind_shared_ib_to_data_manager(self._data_manager)
 
             selector_instance = self.selector_class(data_manager=self._data_manager)
             raw_symbols = selector_instance.run_selection()
@@ -1423,16 +1438,13 @@ def on_order_status_callback(context, raw_order):
                 exec_price = float(raw_exec_price)
             except Exception:
                 exec_price = 0.0
-            # A live schedule context keeps ``now`` fixed at the trigger slot for
-            # the whole run.  It is not a valid fallback for a later fill callback.
+            # live schedule context 会在整个 run 中固定为触发 slot 的 ``now``；它不能作为后续成交 callback 的有效回退时间。
             exec_dt = extract_order_execution_dt(
                 order_proxy,
                 fallback=None if getattr(broker, 'is_live', False) else getattr(context, 'now', None),
             )
             if exec_dt is None and getattr(broker, 'is_live', False):
-                # Some GM order snapshots contain no execution timestamp.  Use
-                # one callback-time wall clock value for both strategy logs and
-                # trade alarms; never reuse the fixed schedule trigger time.
+                # 某些 GM 订单快照没有成交时间戳；策略日志和交易告警统一使用本次 callback 的墙钟时间，不能重复使用固定的 schedule 触发时间。
                 exec_dt = datetime.datetime.now().astimezone()
                 try:
                     setattr(order_proxy, 'execution_dt', exec_dt)

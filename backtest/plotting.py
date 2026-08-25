@@ -7,7 +7,7 @@ PORTFOLIO_PLOT_SCOPES = {'portfolio', 'portfolio_equity', 'portfolio_drawdown'}
 
 
 class _PlotWithBottomMargin(btplot.Plot):
-    """Backtrader-native plotter with extra bottom space for x-axis dates."""
+    """Backtrader 原生绘图器，并为横轴日期增加底部空间。"""
 
     def __init__(self, bottom_margin=None, force_bottom_xaxis=False, defer_show=False,
                  figid_offset=0, **kwargs):
@@ -107,7 +107,7 @@ def _configure_matplotlib_window() -> None:
     try:
         import matplotlib
 
-        # Keep the native toolbar visible for screenshots, pan and zoom.
+        # 保留原生 toolbar，便于截图、平移和缩放。
         matplotlib.rcParams['toolbar'] = 'toolbar2'
     except Exception:
         pass

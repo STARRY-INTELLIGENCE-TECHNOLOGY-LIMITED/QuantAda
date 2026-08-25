@@ -53,9 +53,12 @@ def _ensure_registries(strategy):
         strategy._fast_dict_registry = {}
 
 
-def _normalize_series_index(series):
+def _normalize_series_index(series, preserve_timezone=False):
     if hasattr(series.index, 'tz') and series.index.tz is not None:
-        series.index = series.index.tz_localize(None)
+        if not preserve_timezone:
+            series.index = series.index.tz_localize(None)
+        else:
+            series.index = pd.to_datetime(series.index)
     else:
         series.index = pd.to_datetime(series.index)
     return series
@@ -68,7 +71,10 @@ def register_indicator(strategy, data_name, indicator_name, series):
         strategy._indicator_registry[data_name] = {}
         strategy._fast_dict_registry[data_name] = {}
 
-    series = _normalize_series_index(series)
+    series = _normalize_series_index(
+        series,
+        preserve_timezone=bool(getattr(strategy.broker, 'is_live', False)),
+    )
     strategy._indicator_registry[data_name][indicator_name] = series
 
     if getattr(strategy.broker, 'is_live', False):
@@ -137,7 +143,20 @@ def get_indicator(strategy, data, indicator_name, current_dt):
     if is_live_mode:
         series = strategy._indicator_registry.get(data_name, {}).get(indicator_name)
         if series is not None:
-            return series.asof(current_dt)
+            # 将查询时间归一化到指标序列的时区；实盘序列保留时区信息，无时区序列继续使用原有的本地墙上时间语义，不截断秒级以下精度。
+            try:
+                lookup_dt = pd.Timestamp(current_dt)
+                series_tz = getattr(getattr(series, 'index', None), 'tz', None)
+                if series_tz is not None:
+                    if lookup_dt.tzinfo is None:
+                        lookup_dt = lookup_dt.tz_localize(series_tz)
+                    else:
+                        lookup_dt = lookup_dt.tz_convert(series_tz)
+                elif lookup_dt.tzinfo is not None:
+                    lookup_dt = lookup_dt.tz_localize(None)
+            except (TypeError, ValueError, OverflowError):
+                lookup_dt = current_dt
+            return series.asof(lookup_dt)
         return None
 
     data_dt = data.datetime.datetime(0)

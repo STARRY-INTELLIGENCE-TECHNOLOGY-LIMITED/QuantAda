@@ -563,7 +563,7 @@ class OptimizationJob:
 
         self.data_manager = DataManager()
 
-        # Selection Logic
+        # 选股逻辑。
         self.target_symbols = []
         if self.args.selection:
             print(f"\n--- Running Selection Phase: {self.args.selection} ---")
@@ -1178,7 +1178,7 @@ class OptimizationJob:
                 split_dt = anchor_dt
                 train_end_dt = split_dt
 
-            # Train Start = Split Point - Train Roll
+            # 训练开始 = Split Point - Train Roll。
             train_offset = parse_period_string(train_roll)
             train_start_dt = split_dt - train_offset
 
@@ -1935,7 +1935,7 @@ class OptimizationJob:
             if start_dt > end_dt:
                 continue
 
-            # Skip tiny edge windows; they add noise and burn CPU for little value.
+            # 跳过过小的边缘窗口；它们会增加噪声并消耗 CPU，收益很低。
             available_dates = all_index[(all_index >= start_dt) & (all_index <= end_dt)]
             if len(available_dates) < 60:
                 continue

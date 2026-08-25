@@ -356,11 +356,10 @@ def _run_main():
 
 
 def main():
-    """Run CLI entrypoint and centralize supervised-worker shutdown."""
+    """运行 CLI 入口，并集中处理受监督 worker 的关闭。"""
 
     if is_live_worker_process():
-        # Install before argument/config/SDK initialization so an operator stop
-        # cannot escape through an early startup exception path.
+        # 在参数、配置和 SDK 初始化前安装，避免 operator stop 从早期启动异常路径中逃逸。
         start_live_worker_heartbeat()
         install_live_worker_operator_stop_handler()
 

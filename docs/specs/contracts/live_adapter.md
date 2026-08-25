@@ -30,6 +30,9 @@
 6. 数量字段 `volume`、持仓 `.size`、pending `size`、`executed.size` 允许整数或小数。`LOT_SIZE` 和 `BROKER_LOT_LIMITS` 均为十进制正数语义；adapter 不得无条件转为 `int`，只可在目标券商/合约明确要求整数时做最终转换。
 7. 基础层拆单是第一道边界；适配器的最终 `_submit_order()` 入口也必须按本轮有效配置再次拒绝超出 `BROKER_LOT_LIMITS` 的请求，不能让超限数量抵达券商 API。有效配置应优先读取实盘运行的配置快照，避免长进程重连时模块级默认值覆盖命令行覆盖值。
 8. GM 适配器只服务中国市场，实盘调仓的 BUY/SELL 均使用 `OrderType_Market`。BUY 的 `price` 应至少覆盖实时最优卖价，SELL 使用实时行情作为保护价；该字段是市价保护价，不会把订单变回限价单。资金预检查、虚拟占资和拒单退款均按本次保护价估算。回测仍使用同步市价语义。
+9. IBKR `CRYPTO`（PAXOS）合约的历史数据使用 `AGGTRADES`；市价委托必须使用合约要求的现金数量精度
+   （USD 分）并设置明确的有效期（当前为 `IOC`），不得同时发送非零 `totalQuantity`。订单代理应通过
+   `submitted_size` 保留基础层所需的币数量，不能因柜台现金数量委托的 wire 数量为零而误判未受理。
 
 ## 3. 在途委托契约
 1. `get_pending_orders()` 返回项必须包含:
@@ -43,7 +46,11 @@
 5. 若实时在途查询失败、断连或快照不完整，adapter 可安全返回 `[]`，但必须设置 `_last_pending_orders_fetch_failed=True` 与 `_last_pending_orders_fetch_error`；成功查询必须清零，避免 engine/executor 将“查不到”误判为“无在途”。
 6. 上述失败标记仅用于 live runtime 判断快照可信度；它不是订单意图、不是重试队列，也不得被用于回测路径。回测 broker 应保持同步成交语义，不依赖 live pending-order 状态。
 7. 实盘引擎每轮策略执行前、策略资金/仓位盘点时，以及基础层 `order_target_percent()` / `order_target_value()` 发单边界都会检查该快照；异常或失败标记为真时必须失败关闭并跳过当轮调仓，不得将其解释为空在途。可信在途数量必须计入目标仓位差额，允许继续执行可确认的剩余计划。回测路径不得查询该快照。
-8. 若券商原始在途记录缺失/空 `id`、缺失 `symbol`、方向未知或剩余数量非正/非数值，adapter 必须将整份 pending 快照标记为不可信；不得静默跳过坏记录或把未知方向默认解释为 SELL。
+8. 若券商原始在途记录缺失/空 `id`、缺失 `symbol`、方向未知、剩余数量为负或非数值，或剩余数量
+   为零但缺少可验证证据，adapter 必须将整份 pending 快照标记为不可信；不得静默跳过坏记录或
+   把未知方向默认解释为 SELL。已知非终态但短暂报告 `remaining=0` 时，只有同时提供正的
+   `totalQuantity` 与 `filled` 才可判断：`filled >= totalQuantity` 安全排除，`filled < totalQuantity`
+   按 `totalQuantity-filled` 保守计入在途；缺少该证据仍必须失败关闭。
 
 ## 4. 无状态约束
 1. 不维护长期本地 fake cash / fake position 作为事实来源。

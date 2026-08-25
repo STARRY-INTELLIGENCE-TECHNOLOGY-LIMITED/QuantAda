@@ -11,7 +11,7 @@ _SCHEDULE_BUDGET_RATIO = 0.8
 
 
 def resolve_live_run_budget_seconds(runtime_config=None, context=None):
-    """Return a bounded run budget, shortened for frequent schedules."""
+    """返回有界 run 预算；高频 schedule 会自动缩短预算。"""
     runtime_config = runtime_config or {}
     raw_max = runtime_config.get(
         'LIVE_RUN_MAX_EXECUTION_SECONDS',

@@ -1,4 +1,7 @@
+import asyncio
+import inspect
 import math
+import threading
 from datetime import datetime
 
 import pandas as pd
@@ -36,6 +39,8 @@ class IbkrDataProvider(BaseDataProvider):
         self.host = config.IBKR_HOST
         self.port = config.IBKR_PORT
         self.client_id = config.IBKR_CLIENT_ID
+        self._ib_event_loop = None
+        self._ib_event_loop_thread_id = None
 
         if ib_instance:
             self.ib = ib_instance
@@ -44,6 +49,85 @@ class IbkrDataProvider(BaseDataProvider):
             self.ib = IB()
         else:
             self.ib = None
+        self._attach_ib_loop_metadata(self.ib)
+
+    def _attach_ib_loop_metadata(self, ib, source=None):
+        """替换 IB 实例时保留 launcher 所拥有的事件循环。"""
+        if ib is None:
+            return None
+        source = source if source is not None else ib
+        event_loop = getattr(source, '_quantada_event_loop', None)
+        if event_loop is None:
+            event_loop = self._ib_event_loop
+        owner_thread_id = getattr(source, '_quantada_event_loop_thread_id', None)
+        if owner_thread_id is None:
+            owner_thread_id = self._ib_event_loop_thread_id
+
+        self._ib_event_loop = event_loop
+        self._ib_event_loop_thread_id = owner_thread_id
+        if event_loop is not None:
+            try:
+                ib._quantada_event_loop = event_loop
+            except Exception:
+                pass
+        if owner_thread_id is not None:
+            try:
+                ib._quantada_event_loop_thread_id = owner_thread_id
+            except Exception:
+                pass
+        return ib
+
+    def _call_ib(self, method_name: str, *args, **kwargs):
+        """在 SDK 所属事件循环线程中调用 ib_insync API；实盘 strategy run 在 IB 轮询线程之外执行，
+        launcher 会把所属 loop 挂到共享 IB 实例上。
+
+        方法通过对应 async API 将请求投递回该 loop，避免工作线程产生未 await 协程。
+        """
+        method = getattr(self.ib, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"IB.{method_name} is unavailable")
+
+        event_loop = getattr(self.ib, '_quantada_event_loop', None)
+        if event_loop is None:
+            event_loop = self._ib_event_loop
+        owner_thread_id = getattr(self.ib, '_quantada_event_loop_thread_id', None)
+        if owner_thread_id is None:
+            owner_thread_id = self._ib_event_loop_thread_id
+        if (
+            event_loop is not None
+            and owner_thread_id is not None
+            and threading.get_ident() != owner_thread_id
+        ):
+            if event_loop.is_closed():
+                raise RuntimeError(f"IB event loop is closed; cannot run {method_name}")
+            async_method = getattr(self.ib, f"{method_name}Async", None)
+            if not callable(async_method):
+                raise RuntimeError(
+                    f"IB.{method_name}Async is unavailable for cross-thread call"
+                )
+            awaitable = async_method(*args, **kwargs)
+            if not inspect.isawaitable(awaitable):
+                raise RuntimeError(
+                    f"IB.{method_name}Async did not return an awaitable"
+                )
+            try:
+                future = asyncio.run_coroutine_threadsafe(awaitable, event_loop)
+            except Exception:
+                close = getattr(awaitable, 'close', None)
+                if callable(close):
+                    close()
+                raise
+            try:
+                try:
+                    wait_timeout = float(kwargs.get('timeout', 8.0)) + 1.0
+                except (TypeError, ValueError, OverflowError):
+                    wait_timeout = 9.0
+                return future.result(timeout=max(1.0, wait_timeout))
+            except TimeoutError:
+                future.cancel()
+                raise
+
+        return method(*args, **kwargs)
 
     def _connect(self):
         """确保连接处于活动状态 (带静默降级、防幽灵占用与自愈重建)"""
@@ -52,6 +136,7 @@ class IbkrDataProvider(BaseDataProvider):
             try:
                 from ib_insync import IB
                 self.ib = IB()
+                self._attach_ib_loop_metadata(self.ib)
             except ImportError:
                 return False
 
@@ -70,7 +155,9 @@ class IbkrDataProvider(BaseDataProvider):
             max_retries = 5  # 减少重试次数，5次足够了
             for attempt in range(max_retries):
                 try:
-                    self.ib.connect(self.host, self.port, clientId=self.client_id)
+                    self._call_ib(
+                        'connect', self.host, self.port, clientId=self.client_id
+                    )
                     return True
                 except Exception as e:
                     err_msg = repr(e)
@@ -90,7 +177,9 @@ class IbkrDataProvider(BaseDataProvider):
                         # print(f"[IBKR] 自动修复：事件循环关闭，正在重建实例...")
                         try:
                             from ib_insync import IB
+                            previous_ib = self.ib
                             self.ib = IB()
+                            self._attach_ib_loop_metadata(self.ib, source=previous_ib)
                         except:
                             pass
                         time.sleep(1)
@@ -157,12 +246,12 @@ class IbkrDataProvider(BaseDataProvider):
         # 1. 尝试标准化合约 (获取准确的 localSymbol, exchange 等)
         # 这一步是可选的，但在实盘中非常重要，可以防止歧义
         try:
-            details = self.ib.reqContractDetails(contract)
+            details = self._call_ib('reqContractDetails', contract)
             if not details:
                 print(f"[IBKR] Symbol not found: {symbol}")
                 return None
             contract = details[0].contract
-            # print(f"[IBKR] Resolved contract: {contract.localSymbol} @ {contract.exchange}")
+            # 可按需打印已解析合约：localSymbol 与 exchange。
         except Exception as e:
             print(f"[IBKR] Error resolving contract {symbol}: {e}")
             return None
@@ -174,6 +263,9 @@ class IbkrDataProvider(BaseDataProvider):
             what_to_show = 'ADJUSTED_LAST'
         elif contract.secType == 'CASH':
             what_to_show = 'MIDPOINT'
+        elif contract.secType == 'CRYPTO':
+            # IBKR 的 PAXOS 加密合约不接受 ``TRADES``；历史 K 线使用聚合成交流。
+            what_to_show = 'AGGTRADES'
 
         # 3. 处理时间参数
         # ADJUSTED_LAST 不支持指定 endDateTime，必须为空
@@ -251,7 +343,8 @@ class IbkrDataProvider(BaseDataProvider):
 
             for mode, use_rth, timeout_sec, attempt in request_plan:
                 try:
-                    bars = self.ib.reqHistoricalData(
+                    bars = self._call_ib(
+                        'reqHistoricalData',
                         contract,
                         endDateTime=req_end_date,  # 动态调整
                         durationStr=duration_str,

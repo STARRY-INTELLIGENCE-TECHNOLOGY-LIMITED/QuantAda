@@ -59,6 +59,42 @@ def test_live_indicator_lookup_uses_series_asof_without_fast_dict_cache():
     assert strategy._fast_dict_registry["AAA"] == {}
 
 
+def test_live_indicator_lookup_normalizes_python_datetime_microseconds():
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    series = pd.Series([1.0, 2.0, 3.0], index=idx)
+    strategy = _DummyStrategy(_DummyBroker(is_live=True, indicator_cache_obj={}))
+    data = SimpleNamespace(_name="AAA")
+
+    indicator_cache.register_indicator(strategy, "AAA", "score", series)
+
+    got = indicator_cache.get_indicator(
+        strategy,
+        data,
+        "score",
+        pd.Timestamp("2024-01-02 12:34:56.789123").to_pydatetime(),
+    )
+
+    assert got == 2.0
+
+
+def test_live_indicator_lookup_converts_current_time_to_series_timezone():
+    idx = pd.date_range("2024-01-02 14:30:00", periods=2, freq="min", tz="UTC")
+    series = pd.Series([1.0, 2.0], index=idx)
+    strategy = _DummyStrategy(_DummyBroker(is_live=True, indicator_cache_obj={}))
+    data = SimpleNamespace(_name="AAA")
+
+    indicator_cache.register_indicator(strategy, "AAA", "score", series)
+
+    got = indicator_cache.get_indicator(
+        strategy,
+        data,
+        "score",
+        pd.Timestamp("2024-01-02 09:30:30", tz="America/New_York"),
+    )
+
+    assert got == 1.0
+
+
 def test_get_cached_indicator_series_reuses_optimizer_cache_only_offline():
     idx = pd.date_range("2024-01-01", periods=3, freq="D")
     dataframe = pd.DataFrame({"close": [1.0, 2.0, 3.0]}, index=idx)

@@ -107,7 +107,7 @@ def _auto_request_id(base_cmd, workdir, args, env_overrides):
 def _validate_args(clean_args, allowlist):
     if not allowlist:
         return None
-    # Always allow these internal flags.
+    # 这些内部 flag 始终允许通过。
     allowlist = set(allowlist)
     allowlist.update({"--no_plot"})
 

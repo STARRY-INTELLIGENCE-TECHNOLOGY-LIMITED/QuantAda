@@ -57,7 +57,7 @@ class MCPClient:
         if params is not None:
             req["params"] = params
         self._send(req)
-        # simple blocking wait
+        # 简单的阻塞等待。
         start = time.time()
         while time.time() - start < 10:
             with self._lock:
@@ -85,19 +85,19 @@ class MCPClient:
 
 
 def main():
-    # Example: MCP_BACKTEST_SERVER_CMD="python -m mcp_backtest_server"
+    # 示例：MCP_BACKTEST_SERVER_CMD="python -m mcp_backtest_server"。
     cmd_str = os.getenv("MCP_BACKTEST_SERVER_CMD", "python -m mcp_backtest_server")
     cmd = shlex.split(cmd_str, posix=(os.name != "nt"))
     client = MCPClient(cmd)
 
-    # Initialize
+    # 初始化。
     print(client.request("initialize", {"protocolVersion": "2025-03-26"}))
     client.notify("notifications/initialized")
 
-    # List tools
+    # 列出工具。
     print(client.request("tools/list"))
 
-    # Start a backtest run (example args)
+    # 启动一次回测 run（示例参数）。
     run_args = {
         "name": "backtest_run",
         "arguments": {
@@ -108,7 +108,7 @@ def main():
     run_resp = client.request("tools/call", run_args)
     print(run_resp)
 
-    # Poll status
+    # 轮询状态。
     job = None
     try:
         content = run_resp["result"]["content"][0]["text"]

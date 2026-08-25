@@ -711,7 +711,7 @@ def test_ib_fetch_real_cash_uses_aggregate_all_snapshot_when_account_specific_mi
 
 
 def test_ib_multi_account_rejects_aggregate_all_cash_snapshot(monkeypatch):
-    """An ``All`` account row must not fund a configured child account in a multi-account session."""
+    """多账户会话中的 ``All`` 账户记录不得为配置的子账户提供资金。"""
     import live_trader.adapters.ib_broker as ib_module
 
     monkeypatch.setattr(
@@ -735,7 +735,7 @@ def test_ib_multi_account_rejects_aggregate_all_cash_snapshot(monkeypatch):
 
 
 def test_ib_multi_account_rejects_unscoped_cash_snapshot(monkeypatch):
-    """A cash row without an account field is not safely attributable in a multi-account session."""
+    """多账户会话中没有 account 字段的现金记录不能安全归属。"""
     import live_trader.adapters.ib_broker as ib_module
 
     monkeypatch.setattr(
@@ -797,7 +797,7 @@ def test_ib_account_snapshot_rejects_configured_account_not_visible_to_gateway(m
 
 
 def test_ib_account_snapshot_rejects_multiple_accounts_without_explicit_target(monkeypatch):
-    """Planning must fail before it can combine balances from ambiguous IB accounts."""
+    """规划必须在合并含糊的 IB 账户余额前失败关闭。"""
     import live_trader.adapters.ib_broker as ib_module
 
     monkeypatch.setattr(
@@ -850,7 +850,7 @@ def test_ib_account_snapshot_marks_missing_or_disconnected_ib_untrusted():
 
 
 def test_ib_account_snapshot_callback_probe_does_not_reenter_position_query(monkeypatch):
-    """IB Event callback 中不能同步 reqPositions 重入正在运行的 event loop。"""
+    """IB Event callback 中不能同步 reqPositions，避免重入正在运行的 event loop。"""
     ib = DummyIBForPositions(cash_usd=0.0, positions=[])
 
     def _summary(*_args, **_kwargs):
@@ -1177,7 +1177,7 @@ def test_ib_get_position_query_failure_is_not_silent_empty_position():
 
 
 def test_ib_configured_account_rejects_unscoped_position_snapshot(monkeypatch):
-    """A position row without account scope cannot be assigned to a chosen IB account."""
+    """没有账户范围的持仓记录不能分配给选定的 IB 账户。"""
     import live_trader.adapters.ib_broker as ib_module
 
     monkeypatch.setattr(
@@ -1206,7 +1206,7 @@ def test_ib_configured_account_rejects_unscoped_position_snapshot(monkeypatch):
 
 
 def test_ib_configured_account_rejects_unscoped_pending_snapshot(monkeypatch):
-    """An open order without account scope must not block/route the selected account."""
+    """没有账户范围的 open order 不得阻塞或路由到选定账户。"""
     import live_trader.adapters.ib_broker as ib_module
 
     monkeypatch.setattr(
@@ -1232,7 +1232,7 @@ def test_ib_configured_account_rejects_unscoped_pending_snapshot(monkeypatch):
 
 
 def test_ib_configured_account_rejects_mixed_scoped_and_unscoped_position_snapshot(monkeypatch):
-    """A mixed all-account position batch must not silently drop an unscoped target row."""
+    """混合全账户持仓批次不得静默丢弃无范围的目标记录。"""
     import live_trader.adapters.ib_broker as ib_module
 
     monkeypatch.setattr(
@@ -1267,7 +1267,7 @@ def test_ib_configured_account_rejects_mixed_scoped_and_unscoped_position_snapsh
 
 
 def test_ib_configured_account_rejects_mixed_scoped_and_unscoped_pending_snapshot(monkeypatch):
-    """A mixed all-client order batch must fail closed rather than omit an unknown row."""
+    """混合全 client 订单批次必须失败关闭，不能省略未知记录。"""
     import live_trader.adapters.ib_broker as ib_module
 
     monkeypatch.setattr(
@@ -1351,7 +1351,7 @@ def test_ib_get_position_filters_by_configured_order_account(monkeypatch):
 
 
 def test_ib_get_position_returns_flat_for_target_account_when_only_other_account_has_position(monkeypatch):
-    """A target account can legitimately be flat while another visible account holds the symbol."""
+    """其他可见账户持有标的时，目标账户合法地保持空仓。"""
     ib_positions = [
         SimpleNamespace(
             account="U2222222",
@@ -1434,6 +1434,7 @@ def test_ib_crypto_seconds_history_uses_bounded_24x7_request(monkeypatch):
     assert captured["durationStr"] == "601 S"
     assert captured["barSizeSetting"] == "5 secs"
     assert captured["endDateTime"] == "20260227 09:30:10"
+    assert captured["whatToShow"] == "AGGTRADES"
     assert captured["useRTH"] is False
     assert captured["timeout"] == pytest.approx(2.0)
 
@@ -2053,7 +2054,7 @@ def test_ib_order_constraints_prefer_runtime_config_snapshot(monkeypatch):
     monkeypatch.setattr(
         ib_module,
         "MarketOrder",
-        lambda action, qty: SimpleNamespace(action=action, totalQuantity=qty, account=""),
+        lambda action, qty: SimpleNamespace(action=action, totalQuantity=qty, account="", tif=""),
     )
     monkeypatch.setattr(ib_module.config, "IBKR_ORDER_ACCOUNT", "", raising=False)
     monkeypatch.setattr(ib_module.config, "IBKR_ALLOW_FRACTIONAL_SELL", False, raising=False)
@@ -2102,7 +2103,10 @@ def test_ib_crypto_submit_preserves_fractional_quantity_without_stock_switch(mon
     )
 
     assert proxy is not None
-    assert context.ib_instance.last_order.totalQuantity == pytest.approx(0.25000001)
+    assert context.ib_instance.last_order.totalQuantity == 0
+    assert context.ib_instance.last_order.cashQty == pytest.approx(25000.0)
+    assert context.ib_instance.last_order.tif == "IOC"
+    assert proxy.submitted_size == pytest.approx(0.25000001)
 
 
 def test_ib_cooperative_sleep_is_capped_by_live_run_deadline(monkeypatch):
@@ -2132,7 +2136,12 @@ def test_ib_submit_order_uses_configured_order_account(monkeypatch):
     monkeypatch.setattr(
         ib_module,
         "MarketOrder",
-        lambda action, qty: SimpleNamespace(action=action, totalQuantity=qty, account=""),
+        lambda action, qty: SimpleNamespace(action=action, totalQuantity=qty, account="", tif=""),
+    )
+    monkeypatch.setattr(
+        broker,
+        "parse_contract",
+        lambda symbol: SimpleNamespace(symbol="AAPL", secType="STK"),
     )
     monkeypatch.setattr(
         ib_module.config,
@@ -2148,6 +2157,7 @@ def test_ib_submit_order_uses_configured_order_account(monkeypatch):
     assert context.ib_instance.last_order.account == "U1234567", (
         "配置子账户时，应透传到 MarketOrder.account。"
     )
+    assert context.ib_instance.last_order.tif == "DAY"
 
 
 def test_ib_submit_order_uses_default_account_when_config_empty(monkeypatch):
@@ -2429,6 +2439,37 @@ def test_ib_pending_order_fetch_success_clears_failure_flag():
     assert broker._last_pending_orders_fetch_error is None
 
 
+def test_ib_filled_trade_with_stale_nonterminal_status_is_not_pending():
+    """刚成交的订单可能在一次回调中携带 Submitted+remaining=0。"""
+    open_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=1401, action="BUY", totalQuantity=9),
+        contract=SimpleNamespace(symbol="XLE"),
+        orderStatus=SimpleNamespace(status="Submitted", remaining=0, filled=9),
+    )
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(
+        ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10_000.0, open_trades=[open_trade])
+    ))
+
+    assert broker.get_pending_orders() == []
+    assert broker._last_pending_orders_fetch_failed is False
+
+
+def test_ib_pending_submit_with_zero_remaining_uses_requested_quantity():
+    """IB 发布首次成交更新前，PendingSubmit 可能报告 remaining=0。"""
+    open_trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=1402, action="BUY", totalQuantity=9),
+        contract=SimpleNamespace(symbol="XLE"),
+        orderStatus=SimpleNamespace(status="PendingSubmit", remaining=0, filled=0),
+    )
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(
+        ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10_000.0, open_trades=[open_trade])
+    ))
+
+    pending = broker.get_pending_orders()
+    assert pending[0]["size"] == 9
+    assert broker._last_pending_orders_fetch_failed is False
+
+
 @pytest.mark.parametrize(
     "trade",
     [
@@ -2460,7 +2501,44 @@ def test_ib_pending_order_fetch_success_clears_failure_flag():
     ],
 )
 def test_ib_pending_order_malformed_record_marks_snapshot_untrusted(trade):
-    """Malformed IB pending rows cannot be silently omitted as if no order existed."""
+    """格式错误的 IB pending 记录不能静默省略并伪装成无订单。"""
+    broker = IBBrokerAdapter(context=types.SimpleNamespace(
+        ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10_000.0, open_trades=[trade])
+    ))
+
+    assert broker.get_pending_orders() == []
+    assert broker._last_pending_orders_fetch_failed is True
+    assert broker._last_pending_orders_fetch_error is not None
+
+
+@pytest.mark.parametrize(
+    "trade",
+    [
+        # 看似完成的滞后回调仍须先校验身份，才能从 pending 快照中省略。
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=0, permId=0, action="BUY", totalQuantity=9),
+            contract=SimpleNamespace(symbol="EWJ"),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=0, filled=9),
+        ),
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=145, action="BUY", totalQuantity=9),
+            contract=SimpleNamespace(symbol=""),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=0, filled=9),
+        ),
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=146, action="", totalQuantity=9),
+            contract=SimpleNamespace(symbol="EWJ"),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=0, filled=9),
+        ),
+        SimpleNamespace(
+            order=SimpleNamespace(orderId=147, action="BUY", totalQuantity=9),
+            contract=SimpleNamespace(symbol="EWJ"),
+            orderStatus=SimpleNamespace(status="Submitted", remaining=-1, filled=9),
+        ),
+    ],
+)
+def test_ib_completed_looking_malformed_pending_record_marks_snapshot_untrusted(trade):
+    """完成证据不能掩盖缺少 id、symbol 或 action 的记录。"""
     broker = IBBrokerAdapter(context=types.SimpleNamespace(
         ib_instance=DummyIBForCashWithOpenTrades(cash_usd=10_000.0, open_trades=[trade])
     ))
@@ -2951,6 +3029,238 @@ def test_ib_running_loop_callback_is_treated_as_nonblocking_context():
         loop.close()
 
     assert observed == [True]
+
+
+def test_ib_cross_thread_snapshot_query_is_marshaled_to_owner_loop():
+    """调度 worker 必须在 SDK loop 上等待 IB 快照。"""
+    import asyncio
+
+    loop_ready = threading.Event()
+    owner = {}
+
+    def _run_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        owner["loop"] = loop
+        owner["thread_id"] = threading.get_ident()
+        loop_ready.set()
+        loop.run_forever()
+        loop.close()
+
+    loop_thread = threading.Thread(target=_run_loop, name="ib-test-loop", daemon=True)
+    loop_thread.start()
+    assert loop_ready.wait(1.0)
+
+    class AsyncSnapshotIB:
+        def __init__(self):
+            self.async_calls = 0
+            self.sync_calls = 0
+            self.qualify_async_calls = 0
+            self.history_async_calls = 0
+
+        def accountSummary(self, *_args, **_kwargs):
+            self.sync_calls += 1
+            raise AssertionError("worker must not call the synchronous IB wrapper")
+
+        def qualifyContracts(self, *_args, **_kwargs):
+            raise AssertionError("worker must not call synchronous qualifyContracts")
+
+        def reqHistoricalData(self, *_args, **_kwargs):
+            raise AssertionError("worker must not call synchronous reqHistoricalData")
+
+        async def accountSummaryAsync(self, *_args, **_kwargs):
+            self.async_calls += 1
+            await asyncio.sleep(0)
+            return ["snapshot"]
+
+        async def qualifyContractsAsync(self, *_args, **_kwargs):
+            self.qualify_async_calls += 1
+            await asyncio.sleep(0)
+            return ["qualified"]
+
+        async def reqHistoricalDataAsync(self, *_args, **_kwargs):
+            self.history_async_calls += 1
+            await asyncio.sleep(0)
+            return ["bars"]
+
+    ib = AsyncSnapshotIB()
+    broker = object.__new__(IBBrokerAdapter)
+    broker.ib = ib
+    broker._ib_event_loop = owner["loop"]
+    broker._ib_event_loop_thread_id = owner["thread_id"]
+
+    result = []
+    errors = []
+
+    def _worker_query():
+        try:
+            result.append(broker._bounded_sync_query("accountSummary"))
+            result.append(broker._bounded_sync_query("qualifyContracts", "contract"))
+            result.append(
+                broker._bounded_sync_query(
+                    "reqHistoricalData", "contract", timeout=0.1
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_worker_query, name="quantada-ib-run-test")
+    worker.start()
+    worker.join(2.0)
+    try:
+        assert not worker.is_alive(), "cross-thread snapshot query must be bounded"
+        assert errors == []
+        assert result == [["snapshot"], ["qualified"], ["bars"]]
+        assert ib.async_calls == 1
+        assert ib.sync_calls == 0
+        assert ib.qualify_async_calls == 1
+        assert ib.history_async_calls == 1
+    finally:
+        owner["loop"].call_soon_threadsafe(owner["loop"].stop)
+        loop_thread.join(1.0)
+
+
+def test_ib_provider_cross_thread_history_query_is_marshaled_to_owner_loop():
+    """IB fallback 历史数据请求必须使用相同的 owner-loop bridge。"""
+    import asyncio
+
+    loop_ready = threading.Event()
+    owner = {}
+
+    def _run_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        owner["loop"] = loop
+        owner["thread_id"] = threading.get_ident()
+        loop_ready.set()
+        loop.run_forever()
+        loop.close()
+
+    loop_thread = threading.Thread(target=_run_loop, name="ib-provider-test-loop", daemon=True)
+    loop_thread.start()
+    assert loop_ready.wait(1.0)
+
+    class AsyncHistoryIB:
+        def isConnected(self):
+            return False
+
+        def reqContractDetails(self, *_args, **_kwargs):
+            raise AssertionError("worker must not call synchronous history wrappers")
+
+        async def reqContractDetailsAsync(self, *_args, **_kwargs):
+            await asyncio.sleep(0)
+            return ["details"]
+
+    ib = AsyncHistoryIB()
+    ib._quantada_event_loop = owner["loop"]
+    ib._quantada_event_loop_thread_id = owner["thread_id"]
+    provider = IbkrDataProvider(ib_instance=ib)
+    result = []
+    errors = []
+
+    def _worker_query():
+        try:
+            result.append(provider._call_ib("reqContractDetails", object()))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_worker_query, name="quantada-ib-provider-test")
+    worker.start()
+    worker.join(2.0)
+    try:
+        assert not worker.is_alive()
+        assert errors == []
+        assert result == [["details"]]
+    finally:
+        owner["loop"].call_soon_threadsafe(owner["loop"].stop)
+        loop_thread.join(1.0)
+
+
+def test_ib_provider_rebuild_preserves_owner_loop_metadata():
+    """Provider 重建 IB 实例后，run worker 仍必须可以使用它。"""
+    import data_providers.ibkr_provider as provider_module
+
+    class FakeIB:
+        def __init__(self):
+            self._quantada_event_loop = None
+            self._quantada_event_loop_thread_id = None
+
+        def isConnected(self):
+            return False
+
+    loop = object()
+    old_ib = FakeIB()
+    old_ib._quantada_event_loop = loop
+    old_ib._quantada_event_loop_thread_id = 12345
+    provider = provider_module.IbkrDataProvider(ib_instance=old_ib)
+    new_ib = FakeIB()
+
+    provider._attach_ib_loop_metadata(new_ib, source=old_ib)
+
+    assert new_ib._quantada_event_loop is loop
+    assert new_ib._quantada_event_loop_thread_id == 12345
+    assert provider._ib_event_loop is loop
+    assert provider._ib_event_loop_thread_id == 12345
+
+
+def test_ib_price_provider_reuses_runtime_manager_and_shared_session(monkeypatch):
+    """价格 fallback 不得创建第二个 DataManager/IB client。"""
+    import live_trader.adapters.ib_broker as ib_module
+
+    class IbkrDataProvider:
+        def __init__(self):
+            self.ib = None
+
+    shared_ib = object()
+    provider = IbkrDataProvider()
+    manager = SimpleNamespace(providers=[provider])
+    context = SimpleNamespace(
+        strategy_instance=SimpleNamespace(_data_manager=manager),
+    )
+    broker = object.__new__(IBBrokerAdapter)
+    broker._context = context
+    broker._price_data_manager = None
+    broker.ib = shared_ib
+
+    def _unexpected_manager():
+        raise AssertionError("价格 fallback 必须复用 LiveTrader 的 DataManager")
+
+    monkeypatch.setattr(ib_module, "DataManager", _unexpected_manager)
+
+    selected = broker._collect_price_providers()
+
+    assert broker._price_data_manager is manager
+    assert provider.ib is shared_ib
+    assert selected == [("ibkr", provider)]
+
+
+def test_ib_cross_thread_sleep_does_not_call_ib_sleep(monkeypatch):
+    """worker 等待不得在 loop 外创建 ib_insync 协程。"""
+    import live_trader.adapters.ib_broker as ib_module
+
+    class SleepIB:
+        def __init__(self):
+            self.calls = 0
+
+        def sleep(self, _seconds):
+            self.calls += 1
+            raise AssertionError("IB.sleep 必须留在 SDK owner 线程")
+
+    ib = SleepIB()
+    broker = object.__new__(IBBrokerAdapter)
+    broker.ib = ib
+    broker._ib_event_loop = object()
+    broker._ib_event_loop_thread_id = threading.get_ident()
+    slept = []
+    monkeypatch.setattr(ib_module.time, "sleep", lambda seconds: slept.append(seconds))
+
+    worker = threading.Thread(target=lambda: broker._sleep_ib(0.25))
+    worker.start()
+    worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert ib.calls == 0
+    assert slept == [pytest.approx(0.25)]
 
 
 def test_ib_launch_resubscribes_after_disconnect_with_stale_tickers(monkeypatch, capsys):

@@ -45,7 +45,7 @@ def _resolve_gm_connectivity_retry(
     prewarm_lead_seconds=0.0,
     active_after_seconds=600.0,
 ):
-    """Return ``(quiet, retry_delay, wake_at)`` for GM connectivity recovery."""
+    """返回 GM 连接恢复所需的 ``(quiet, retry_delay, wake_at)``。"""
 
     if not parsed_schedule:
         return False, _GM_AGGRESSIVE_RETRY_SECONDS, None
@@ -309,10 +309,9 @@ class GmBrokerAdapter(BaseLiveBroker):
     def _find_position(self, symbol):
         if self.is_live:
             try:
-                # GM schedule callbacks and QuantAda's bounded settlement wait run
-                # on the SDK poll thread.  The context account cache therefore
-                # cannot consume fill callbacks while that wait is active.  Use
-                # the SDK's synchronous counter query as the live source of truth.
+                # GM schedule callback 和 QuantAda 的有界结算等待都运行在 SDK poll 线程上。
+                # 等待期间 context 账户缓存无法消费成交 callback。
+                # 使用 SDK 同步柜台查询作为 live 事实来源。
                 positions = self._query_live_positions()
                 self._last_position_snapshot_fetch_failed = False
                 self._last_position_snapshot_fetch_error = None
@@ -341,7 +340,7 @@ class GmBrokerAdapter(BaseLiveBroker):
         return getattr(value, field, default)
 
     def _ensure_single_live_account(self):
-        """Fail closed if a GM session unexpectedly exposes more than one account."""
+        """GM 会话意外暴露多个账户时安全失败。"""
         if not self.is_live or context is None or not hasattr(context, 'accounts'):
             return
         try:
@@ -420,8 +419,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             from gm.api import get_unfinished_orders, OrderSide_Buy
             orders = self._query_unfinished_orders_single_account(get_unfinished_orders)
             if orders is None:
-                # Lightweight SDK/test doubles may not expose the native
-                # per-account query primitives.  The real GM session does.
+                # 轻量 SDK/测试桩可能不暴露 native 的逐账户查询 primitive，真实 GM session 会暴露。
                 orders = get_unfinished_orders()
             for o in orders:
                 order_id = str(self._object_field(o, 'cl_ord_id', '') or '').strip()
@@ -477,11 +475,8 @@ class GmBrokerAdapter(BaseLiveBroker):
             self._last_pending_orders_fetch_failed = False
             self._last_pending_orders_fetch_error = None
         except Exception as e:
-            # A partially collected list is unsafe: callers may treat a
-            # missing BUY/SELL as proof that it can submit or clean up another
-            # order.  The health flag is the authoritative failure signal, and
-            # returning an empty list prevents accidental direct consumers from
-            # using partial broker truth.
+            # 部分收集的列表不安全：调用方可能把缺少 BUY/SELL 解释为可以提交或清理另一笔订单。
+            # health flag 是权威失败信号，返回空列表可阻止直接消费者误用部分 broker 事实。
             res = []
             self._last_pending_orders_fetch_failed = True
             self._last_pending_orders_fetch_error = e
@@ -489,13 +484,9 @@ class GmBrokerAdapter(BaseLiveBroker):
         return res
 
     def _query_unfinished_orders_single_account(self, public_query):
-        """Read the sole GM account without inheriting the SDK's silent skip.
+        """读取唯一 GM 账户，不继承 SDK 的静默跳过行为。
 
-        ``gm.api.get_unfinished_orders`` loops through accounts and continues
-        when one native request fails.  GM is a single-account adapter here, so
-        query that one account directly when the SDK exposes its primitives;
-        this lets the pending health flag distinguish an empty book from a
-        failed request.  ``None`` is reserved for stripped-down test doubles.
+        ``gm.api.get_unfinished_orders`` 会遍历账户，某个 native 请求失败时仍继续执行。这里的 GM adapter 只有单账户，因此 SDK 暴露对应 primitive 时直接查询该账户，让 pending health flag 能区分空订单簿和请求失败；``None`` 只保留给精简测试桩。
         """
         if context is None or not self.is_live:
             return None
@@ -638,11 +629,9 @@ class GmBrokerAdapter(BaseLiveBroker):
 
     # 1. 查钱
     def _init_cash(self):
-        """Avoid an account query while a live GM session is being constructed.
+        """构造 live GM session 时避免查询账户。
 
-        The live engine performs an explicit, bounded account-health probe after
-        the SDK session is initialized.  Backtests keep the synchronous base
-        initialization path.
+        live engine 在 SDK session 初始化后执行显式且有界的账户健康探针；回测保留 base 的同步初始化路径。
         """
         if self.is_live_mode(self._context):
             return 0.0
@@ -656,11 +645,9 @@ class GmBrokerAdapter(BaseLiveBroker):
         return available
 
     def is_account_snapshot_trusted(self) -> bool:
-        """Validate that the live GM session exposes current account data.
+        """校验 live GM session 是否暴露当前账户数据。
 
-        A connected SDK can still have no account snapshot during terminal
-        recovery.  The engine must fail closed for that run instead of treating
-        missing cash/positions as a legitimate zero account.
+        SDK 已连接时，在 terminal 恢复阶段仍可能没有账户快照；engine 必须让本轮安全失败，不能把缺失现金/持仓当成合法零账户。
         """
         if not self.is_live:
             return True
@@ -678,8 +665,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 raise RuntimeError('GM account available cash is not numeric') from e
             if not math.isfinite(available):
                 raise RuntimeError('GM account available cash is not finite')
-            # An empty list is a valid flat account; None means the snapshot was
-            # not returned at all and must not be interpreted as empty holdings.
+            # 空列表是合法空仓；None 表示根本没有返回快照，不能解释为空仓持有。
             self._query_live_positions()
             self._last_account_snapshot_fetch_failed = False
             self._last_account_snapshot_fetch_error = None
@@ -1132,8 +1118,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                         fn()
                         called.append(name)
                     except TypeError:
-                        # Some versions may expose functions with required args;
-                        # those are not safe to guess here.
+                        # 某些版本可能暴露要求参数的函数，不能在这里猜测参数。
                         continue
                     except SystemExit:
                         raise
@@ -1222,9 +1207,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             key = (str(kind), str(message), phase)
             previous = launch_state.get('connectivity_log')
             if quiet:
-                # Keep only a short-lived suppression record while maintenance
-                # probing continues.  The first visible recovery log is emitted
-                # when the schedule enters the active window or the session recovers.
+                # maintenance 探测期间只保留短生命周期抑制记录；schedule 进入活动窗口或会话恢复时才输出第一条可见恢复日志。
                 if previous and previous.get('key') == key:
                     previous['suppressed'] = int(previous.get('suppressed', 0) or 0) + 1
                     previous['last_at'] = now_monotonic
@@ -1762,8 +1745,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 _runtime_print("[Phoenix] Entering Event Loop (Ctrl+C to stop)...")
 
                 try:
-                    # GM's official run() loop intentionally ignores gmi_poll's
-                    # return value. Session lifecycle is reported by callbacks.
+                    # GM 官方 run() loop 有意忽略 gmi_poll 返回值，会话生命周期由 callback 报告。
                     while True:
                         try:
                             poll_status = gmi_poll()
@@ -1824,9 +1806,8 @@ class GmBrokerAdapter(BaseLiveBroker):
                                         "continuing the SDK event loop."
                                     )
                                     last_poll_status_log_at = now_ts
-                            # Avoid a CPU spin if a particular SDK build returns
-                            # immediately while idle. Explicit shutdown/SystemExit
-                            # and bounded connection-health callbacks still restart.
+                            # 某些 SDK 版本空闲时会立即返回，需避免 CPU 空转。
+                            # 显式 shutdown/SystemExit 和有界连接健康 callback 仍会触发重启。
                             time.sleep(0.05)
                             continue
 

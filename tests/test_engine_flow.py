@@ -319,6 +319,128 @@ def test_live_data_source_override_uses_data_manager(monkeypatch):
     )
 
 
+def test_live_data_source_override_reuses_shared_ib_provider_session(monkeypatch):
+    """IB fallback provider 不得打开第二个 clientId 会话。"""
+    import live_trader.engine as engine_module
+
+    captured = {}
+
+    class AdapterProvider(DummyDataProvider):
+        def __init__(self):
+            self.ib = None
+
+    class IbkrDataProvider(DummyDataProvider):
+        def __init__(self):
+            self.ib = None
+
+    class StubDataManager:
+        def __init__(self):
+            self.provider = IbkrDataProvider()
+            self.providers = [self.provider]
+            captured["manager"] = self
+
+        def get_data(self, symbol: str, **kwargs) -> pd.DataFrame:
+            return DummyDataProvider().get_data(
+                symbol,
+                kwargs.get("start_date"),
+                kwargs.get("end_date"),
+                kwargs.get("timeframe", "Days"),
+                kwargs.get("compression", 1),
+            )
+
+    monkeypatch.setattr(engine_module, "DataManager", StubDataManager)
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, AdapterProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    engine = LiveTrader(
+        {
+            "strategy_name": "CounterStrategy",
+            "platform": "mock_engine",
+            "symbols": ["AAPL"],
+            "params": {},
+            "data_source": "tiingo",
+        }
+    )
+    shared_ib = object()
+    engine.data_provider.ib = shared_ib
+    engine.init(MockContext(now=datetime(2026, 2, 17, 9, 30, 0)))
+
+    assert captured["manager"].provider.ib is shared_ib
+
+
+def test_selector_data_manager_reuses_shared_ib_provider_session(monkeypatch):
+    """Selector 创建的 DataManager 必须复用 adapter 的 IB 会话。"""
+    import live_trader.engine as engine_module
+
+    captured = {}
+
+    class AdapterProvider(DummyDataProvider):
+        def __init__(self):
+            self.ib = None
+
+    class IbkrDataProvider(DummyDataProvider):
+        def __init__(self):
+            self.ib = None
+
+    class StubDataManager:
+        def __init__(self):
+            self.provider = IbkrDataProvider()
+            self.providers = [self.provider]
+            captured["manager"] = self
+
+        def get_data(self, symbol: str, **kwargs) -> pd.DataFrame:
+            return DummyDataProvider().get_data(
+                symbol,
+                kwargs.get("start_date"),
+                kwargs.get("end_date"),
+                kwargs.get("timeframe", "Days"),
+                kwargs.get("compression", 1),
+            )
+
+    class Selector:
+        def __init__(self, data_manager):
+            captured["selector_manager"] = data_manager
+
+        def run_selection(self):
+            return ["AAPL"]
+
+    monkeypatch.setattr(engine_module, "DataManager", StubDataManager)
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, AdapterProvider),
+    )
+
+    def _resolve_class(name, _paths):
+        return Selector if name == "Selector" else CounterStrategy
+
+    monkeypatch.setattr(engine_module, "get_class_from_name", _resolve_class)
+
+    engine = LiveTrader(
+        {
+            "strategy_name": "CounterStrategy",
+            "selection_name": "Selector",
+            "platform": "mock_engine",
+            "symbols": [],
+            "params": {},
+        }
+    )
+    shared_ib = object()
+    engine.data_provider.ib = shared_ib
+    engine.init(MockContext(now=datetime(2026, 2, 17, 9, 30, 0)))
+
+    assert captured["selector_manager"] is captured["manager"]
+    assert captured["manager"].provider.ib is shared_ib
+
+
 def test_live_data_source_override_applies_to_selector(monkeypatch):
     """
     选股 data_source 覆盖回归:

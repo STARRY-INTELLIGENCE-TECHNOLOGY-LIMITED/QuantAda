@@ -34,7 +34,7 @@ class OrderProxy:
                                                          self._order.Rejected]
 
     def getstatusname(self):
-        """Delegates call to the original backtrader order object."""
+        """将调用转发给原始 backtrader 订单对象。"""
         return self._order.getstatusname()
 
     @property
@@ -42,7 +42,7 @@ class OrderProxy:
 
     @property
     def data(self):
-        """Exposes the data feed associated with the order."""
+        """暴露订单关联的 data feed。"""
         return self._order.data
 
 

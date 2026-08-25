@@ -217,7 +217,7 @@ class TiingoDataProvider(BaseDataProvider):
             return None
 
         # 原始盘中 -> 与日线一致的复权口径：
-        # raw -> adj -> post
+        # raw -> adj -> post 数据处理阶段。
         raw_to_adj_price_factor = 1.0
         raw_to_adj_volume_factor = 1.0
         post_scale = 1.0

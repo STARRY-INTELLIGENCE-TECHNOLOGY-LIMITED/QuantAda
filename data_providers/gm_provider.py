@@ -44,14 +44,14 @@ class GmDataProvider(BaseDataProvider):
                     self.token = token
                     if set_token: set_token(token)
 
-                # print(f"[GmDataProvider] Token set from config: {self.token[:4]}****")
+                # 可按需打印从 config 读取的 token 前缀。
             except Exception as e:
                 print(f"[GmDataProvider] Error parsing config token: {e}")
 
         # 2. 如果没有有效配置，启用外部托管模式 (被动模式)
         #    这样 LiveTrader 在 engine.py 里无参实例化时，不会导致 Provider 失效
         if not self.token:
-            # print("[GmDataProvider] No valid token in config. Assuming global set_token() is called externally.")
+            # 可按需打印：config 没有有效 token，默认由外部全局 set_token() 提供。
             self.token = "EXTERNAL_MODE"
             self.is_external_mode = True
 
@@ -179,6 +179,6 @@ class GmDataProvider(BaseDataProvider):
             else:
                 df = pd.concat([df, today_bar])
 
-            # print(f"[GmDataProvider] Stitched real-time bar for {symbol}")
+            # 可按需打印已为 {symbol} 拼接实时 K 线。
 
         return df

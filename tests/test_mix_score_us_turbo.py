@@ -23,8 +23,8 @@ def test_evaluate_applies_consistency_penalty_from_stats():
 
     score = evaluate(stats)
 
-    # Base: 30*2 + 60/10 + 10 bonus = 76
-    # Penalty: -10 * ((0.40 - 0.20) / 0.40) = -5
+    # 基础分：30*2 + 60/10 + 10 bonus = 76。
+    # 惩罚分：-10 * ((0.40 - 0.20) / 0.40) = -5。
     assert score == pytest.approx(71.0)
 
 

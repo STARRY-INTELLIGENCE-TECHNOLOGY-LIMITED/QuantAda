@@ -60,7 +60,7 @@ def get_class_from_name(name_string: str, search_paths: list):
             return obj
         except (ImportError, AttributeError, ValueError) as e_class:
             # 导入失败，尝试 Case 2
-            # Case 2: 'my_package.my_module_file' (snake_case)
+            # 情况 2：'my_package.my_module_file'（snake_case）。
             # 假设用户提供了模块名，我们推断类名 (e.g., MyModuleFile)
             try:
                 module_name = name_string

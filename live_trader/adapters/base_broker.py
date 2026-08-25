@@ -121,7 +121,7 @@ class BaseLiveBroker(ABC):
         log.info(txt, dt=dt)
 
     def _runtime_log(self, message):
-        """Timestamp live execution diagnostics without changing backtest time semantics."""
+        """为 live execution 诊断添加时间戳，不改变回测时间语义。"""
         if self.is_live:
             runtime_print(message)
         else:
@@ -572,8 +572,7 @@ class BaseLiveBroker(ABC):
                             self._buy_batch_cash_budget - submitted_cost,
                         )
                     remaining = subtract_quantities(remaining, submitted_shares)
-                    # Backtests execute the planned order synchronously. Adapter-side
-                    # partial acceptance must not create a live-style tail-order loop.
+                    # 回测会同步执行计划订单；adapter 的部分受理不能创建 live 风格的尾单循环。
                     if not self.is_live:
                         remaining = 0
 
@@ -623,8 +622,7 @@ class BaseLiveBroker(ABC):
             raw = _read_path(proxy, path)
             val = positive_quantity(raw)
             if val > 0:
-                # An adapter may downsize before submission, but it cannot
-                # legitimately accept more than this base-layer request.
+                # adapter 可以在提交前降仓，但不能合法地受理超过 base layer 请求的数量。
                 return min(val, fallback)
 
         return fallback
@@ -1064,7 +1062,7 @@ class BaseLiveBroker(ABC):
                     else:
                         self._pending_sells.add(oid)
                     remaining = subtract_quantities(remaining, final_submitted_shares)
-                    # Keep backtests and optimizations single-submit and non-blocking.
+            # 保持回测和 optimization 单次提交且不阻塞。
                     if not self.is_live:
                         remaining = 0
 

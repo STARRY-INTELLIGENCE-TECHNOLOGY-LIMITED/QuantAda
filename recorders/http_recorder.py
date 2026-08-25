@@ -19,8 +19,7 @@ class HttpRecorder(BaseRecorder):
         }
         # 实际生产中建议使用异步或队列，避免 HTTP 请求阻塞回测速度
         try:
-            # print(f"Sending HTTP log to {self.endpoint_url}...")
-            # requests.post(self.endpoint_url, json=payload, headers=self.headers, timeout=1)
+            # 可按需打印发送目标，并调用 requests.post 发送 HTTP 日志。
             pass
         except Exception as e:
             print(f"HttpRecorder Error: {e}")
@@ -31,5 +30,5 @@ class HttpRecorder(BaseRecorder):
             'final_value': final_value,
             'sharpe': sharpe
         }
-        # requests.post(...)
+        # 调用 requests.post(...)。
         print(f"HTTP Recorder: Backtest finished, data sent to {self.endpoint_url}")

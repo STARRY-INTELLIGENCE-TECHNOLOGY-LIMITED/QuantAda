@@ -6,7 +6,7 @@ _DEFAULT_STEP = Decimal('1')
 
 
 def decimal_quantity(value, *, absolute=False) -> Decimal:
-    """Convert broker quantities through their decimal text representation."""
+    """通过十进制文本表示转换 broker 数量。"""
     try:
         quantity = value if isinstance(value, Decimal) else Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
@@ -17,7 +17,7 @@ def decimal_quantity(value, *, absolute=False) -> Decimal:
 
 
 def quantity_number(value):
-    """Return integral quantities as int and fractional quantities as float."""
+    """整数数量返回 int，小数数量返回 float。"""
     quantity = decimal_quantity(value)
     if quantity == quantity.to_integral_value():
         return int(quantity)
@@ -69,7 +69,7 @@ def sum_quantities(values):
 
 
 def quantity_chunk_plan(total, limit):
-    """Return (order count, final order quantity) without materializing every chunk."""
+    """返回（订单数量、最后一笔数量），不展开保存每个拆单片段。"""
     quantity = decimal_quantity(total, absolute=True)
     chunk = decimal_quantity(limit, absolute=True)
     if quantity <= 0:

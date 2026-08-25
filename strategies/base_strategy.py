@@ -161,9 +161,7 @@ class BaseStrategy(ABC):
                         pending_map[sym] = {'BUY': 0.0, 'SELL': 0.0}
                     pending_map[sym][po['direction']] += po['size']
             except Exception as e:
-                # The engine probes pending state before strategy.next(), but a
-                # second snapshot can still fail here.  Treating that failure as
-                # an empty truth can duplicate an already-pending SELL.
+                # engine 会在 strategy.next() 前探测 pending 状态，但此处的第二次快照仍可能失败；把失败当成空快照会重复提交已在途的 SELL。
                 raise RuntimeError(f"获取在途订单失败，本轮调仓已中止: {e}") from e
 
         # 辅助查表函数 (支持 IBKR 截断后缀模糊匹配，如 'QQQ.ISLAND' 匹配 'QQQ')
@@ -355,6 +353,7 @@ class BaseStrategy(ABC):
         from common.order_executor import OrderExecutor
         from common.rebalancer import PortfolioRebalancer
 
+        # 仅在 strategy 配置的标的池内解析目标；标的池外持仓有意不受管理，不会意外成为调仓目标。
         symbol_map = {}
         for data in getattr(self.broker, 'datas', []) or []:
             full_name = str(getattr(data, '_name', '') or '').strip().upper()
@@ -366,12 +365,20 @@ class BaseStrategy(ABC):
         resolved_targets = []
         seen_targets = set()
         unknown_targets = []
+        aliased_targets = []
         for raw_target in target_symbols or []:
             raw_name = getattr(raw_target, '_name', raw_target)
             full_name = str(raw_name or '').strip().upper()
             if not full_name:
                 continue
-            resolved = symbol_map.get(full_name) or symbol_map.get(full_name.split('.')[0])
+            resolved = symbol_map.get(full_name)
+            if resolved is None:
+                # 为保障离席运行：selector 返回同一证券但 venue 后缀不同时，保留历史 base symbol fallback，使用已加载的标的池对象继续计划。
+                # 这是带告警的兼容路径，不应因此丢弃整轮计划。
+                base_name = full_name.split('.')[0]
+                resolved = symbol_map.get(base_name)
+                if resolved is not None and '.' in full_name:
+                    aliased_targets.append((str(raw_name), str(getattr(resolved, '_name', resolved))))
             if resolved is None:
                 unknown_targets.append(str(raw_name))
                 continue
@@ -390,7 +397,22 @@ class BaseStrategy(ABC):
             self.log(msg)
             runtime_notifications.push_text(msg, level='WARNING')
 
-        # 1. 底层框架全自动盘点真实可用资金 (已完美无视所有豁免底仓)
+        if aliased_targets:
+            alias_msg = (
+                "[Rebalance Warning] 检测到标的池后缀别名，按兼容策略继续使用已加载标的执行本轮计划；"
+                "这是为离席运行保留的容错设计，不会因此丢弃本轮调仓。"
+                f" aliases={aliased_targets}"
+            )
+            self.log(alias_msg)
+            # 同一 strategy run 中每种别名映射只首次推送 IM，避免每个 bar 重复告警。
+            warning_key = tuple(sorted(aliased_targets))
+            warned_aliases = getattr(self, '_rebalance_alias_warning_keys', set())
+            if warning_key not in warned_aliases:
+                runtime_notifications.push_text(alias_msg, level='WARNING')
+                warned_aliases.add(warning_key)
+                self._rebalance_alias_warning_keys = warned_aliases
+
+        # 1. 底层框架只盘点当前策略标的池内的真实资金与持仓。
         allocatable_capital, current_positions = self.get_strategy_isolated_capital()
 
         # 2. 生成调仓计划

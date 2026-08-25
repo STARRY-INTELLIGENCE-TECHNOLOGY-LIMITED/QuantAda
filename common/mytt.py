@@ -210,7 +210,7 @@ def FORCAST(S, N):  # 返回S序列N周期回线性回归后的预测值， jqz1
     xy_sum = np.correlate(arr, x, mode='valid')
     slope = (N * xy_sum - x_sum * y_sum) / denom
     y_mean = y_sum / N
-    # y_hat(x=N-1) = mean + slope * ((N-1) - mean(x))
+    # y_hat(x=N-1) = mean + slope * ((N-1) - mean(x))。
     out[N - 1:] = y_mean + slope * ((N - 1) - (x_sum / N))
     return out
 
@@ -268,7 +268,8 @@ def CROSS(S1, S2):
 
 
 def LONGCROSS(S1, S2, N):  # 两条线维持一定周期后交叉,S1在N周期内都小于S2,本周期从S1下方向上穿过S2时返回1,否则返回0
-    return np.array(np.logical_and(LAST(S1 < S2, N, 1), (S1 > S2)), dtype=bool)  # N=1时等同于CROSS(S1, S2)
+    # N=1 时等同于 CROSS(S1, S2)。
+    return np.array(np.logical_and(LAST(S1 < S2, N, 1), (S1 > S2)), dtype=bool)
 
 
 def VALUEWHEN(S, X):  # 当S条件成立时,取X的当前值,否则取VALUEWHEN的上个成立时的X值   by jqz1226
@@ -508,7 +509,7 @@ def DSMA(X, N):  # 偏差自适应移动平均线   type: (np.ndarray, int) -> n
 
 
 def SUMBARSFAST(X, A):
-    # type: (np.ndarray, Optional[np.ndarray, float, int]) -> np.ndarray
+    # 类型标注：(np.ndarray, Optional[np.ndarray, float, int]) -> np.ndarray。
     """
     通达信SumBars函数的Python实现  by jqz1226
     SumBars函数将X向前累加，直到大于等于A, 返回这个区间的周期数。例如SUMBARS(VOL, CAPITAL),求完全换手的周期数。
@@ -575,7 +576,9 @@ def SAR(HIGH, LOW, N=10, S=2, M=20):
     return sar_x
 
 
-def TDX_SAR(High, Low, iAFStep=2, iAFLimit=20):  # type: (np.ndarray, np.ndarray, int, int) -> np.ndarray
+def TDX_SAR(
+    High, Low, iAFStep=2, iAFLimit=20
+):  # type: (np.ndarray, np.ndarray, int, int) -> np.ndarray
     """  通达信SAR算法,和通达信SAR对比完全一致   by: jqz1226, 2021-12-18
     :param High: 最高价序列
     :param Low: 最低价序列
@@ -629,7 +632,7 @@ def TDX_SAR(High, Low, iAFStep=2, iAFLimit=20):  # type: (np.ndarray, np.ndarray
                 ep = High[i]
                 af = af_step
                 SarX[i] = min(Low[i], Low[i - 1])
-    # end for
+    # for 循环结束。
     return SarX
 
 

@@ -68,7 +68,7 @@ def test_strategy_isolated_capital_prefers_rebalance_cash(monkeypatch):
 
     allocatable, current_positions = strategy.get_strategy_isolated_capital()
 
-    # managed_market_value = 3 * 100 = 300
+    # 受管市值 managed_market_value = 3 * 100 = 300。
     assert allocatable == pytest.approx(500.0), "策略分配资金应采用 rebalance_cash + managed_value。"
     assert len(current_positions) == 1, "应识别到 1 个受管持仓。"
 
@@ -83,7 +83,7 @@ def test_strategy_isolated_capital_fallbacks_to_get_cash_on_rebalance_error(monk
 
     allocatable, _ = strategy.get_strategy_isolated_capital()
 
-    # fallback: get_cash + managed_market_value = 1000 + 300
+    # fallback：get_cash + 受管市值 managed_market_value = 1000 + 300。
     assert allocatable == pytest.approx(1300.0), "rebalance 口径异常时应回退到 get_cash 口径。"
 
 
@@ -111,7 +111,7 @@ def test_strategy_isolated_capital_backtest_ignores_pending_orders(monkeypatch):
 
 
 def test_strategy_isolated_capital_live_fails_closed_on_untrusted_pending_snapshot():
-    """Live capital planning must not reinterpret an unavailable pending snapshot as empty."""
+    """Live 资金规划不得把不可用的 pending 快照重新解释为空快照。"""
     broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0)
 
     def _untrusted_pending():
@@ -724,3 +724,114 @@ def test_execute_rebalance_resolves_same_symbol_target_to_managed_data(monkeypat
 
     assert len(calculate_calls) == 1
     assert calculate_calls[0]["target_symbols"] == [managed]
+
+
+def test_execute_rebalance_aliases_venue_suffix_with_unattended_warning(monkeypatch):
+    """Venue 别名保留现有计划路径，但只推送一次 IM 告警。"""
+    import common.order_executor as order_executor_module
+    import common.rebalancer as rebalancer_module
+
+    pushed = []
+    calculate_calls = []
+
+    class DummyExecutor:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def execute_plan(self, plan):
+            return None
+
+    def fake_calculate_plan(**kwargs):
+        calculate_calls.append(kwargs)
+        return {"sell_clear": [], "reduce": [], "increase": [], "target_per_stock": 0.0}
+
+    monkeypatch.setattr(
+        rebalancer_module.PortfolioRebalancer,
+        "calculate_plan",
+        staticmethod(fake_calculate_plan),
+    )
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(
+        "strategies.base_strategy.runtime_notifications.push_text",
+        lambda content, level="INFO": pushed.append((content, level)) or True,
+    )
+
+    managed = DummyData("AAPL.SMART")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[managed])
+    strategy = DummyStrategy(broker=broker, params={})
+
+    strategy.execute_rebalance(
+        target_symbols=[SimpleNamespace(_name="AAPL.ARCA")],
+        top_k=1,
+        rebalance_threshold=0.2,
+        rebalance_when="next",
+    )
+
+    assert calculate_calls[0]["target_symbols"] == [managed]
+    assert len(pushed) == 1
+    assert pushed[0][1] == "WARNING"
+    assert "兼容策略" in pushed[0][0]
+
+
+def test_positions_outside_symbol_pool_are_ignored_by_default(monkeypatch):
+    """不在 strategy 标的池中的账户持仓默认保持不受管理。"""
+    import common.order_executor as order_executor_module
+    import common.rebalancer as rebalancer_module
+
+    managed = DummyData("TLT.ARCA")
+    target = DummyData("XLE.ARCA")
+    outside_pool = DummyData("SPY.ARCA")
+
+    class PoolBroker(DummyBroker):
+        def __init__(self):
+            super().__init__(
+                cash=600.0,
+                rebalance_cash=600.0,
+                datas=[managed, target],
+            )
+            self.positions = {
+                managed: SimpleNamespace(size=4.0, price=100.0),
+                target: SimpleNamespace(size=0.0, price=100.0),
+                outside_pool: SimpleNamespace(size=7.0, price=100.0),
+            }
+
+        def getposition(self, data):
+            return self.positions[data]
+
+        def get_current_price(self, data):
+            return 100.0
+
+    captured = {}
+
+    class RecordingExecutor:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def execute_plan(self, plan):
+            captured["plan"] = plan
+
+    real_calculate_plan = rebalancer_module.PortfolioRebalancer.calculate_plan
+    monkeypatch.setattr(
+        rebalancer_module.PortfolioRebalancer,
+        "calculate_plan",
+        staticmethod(lambda **kwargs: (captured.update(kwargs) or real_calculate_plan(**kwargs))),
+    )
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", RecordingExecutor)
+
+    broker = PoolBroker()
+    strategy = DummyStrategy(broker=broker, params={})
+    allocatable, current_positions = strategy.get_strategy_isolated_capital()
+
+    assert allocatable == pytest.approx(1000.0)
+    assert current_positions == {managed: pytest.approx(400.0)}
+
+    strategy.execute_rebalance(
+        target_symbols=[target],
+        top_k=1,
+        rebalance_threshold=0.0,
+        rebalance_when="next",
+    )
+
+    assert outside_pool not in captured["current_positions"]
+    assert outside_pool not in captured["plan"]["sell_clear"]
+    assert captured["plan"]["sell_clear"] == [managed]

@@ -299,12 +299,8 @@ class OrderExecutor:
             try:
                 pending_orders = getter() or []
             except Exception as e:
-                # An unavailable pending-order snapshot is not evidence that no
-                # BUY is working.  Fail closed so a transient broker/API outage
-                # cannot cause a duplicate final or rolling BUY submission.
-                # Keep the broker-level health flag in sync even for adapters
-                # that raise before they can set it themselves.  This is a
-                # short-lived snapshot fact, not retained trading intent.
+                # pending 快照不可用不代表没有 BUY 在途；必须安全失败，避免临时 broker/API 故障导致重复提交最终或滚动 BUY。
+                # 即使 adapter 在设置健康标记前抛异常，也要同步 broker 层健康标记；这是短生命周期快照事实，不是持久化交易意图。
                 try:
                     self.broker._last_pending_orders_fetch_failed = True
                     self.broker._last_pending_orders_fetch_error = e
@@ -556,11 +552,8 @@ class OrderExecutor:
                 )
                 break
             if check_pending and self._has_pending_buy(data):
-                # ``_has_remote_pending_buy`` deliberately returns True when
-                # the snapshot is untrusted, because callers must not infer
-                # that no BUY exists.  That conservative boolean must never be
-                # reinterpreted below as proof of a real remote pending BUY and
-                # used to allow a final top-up.
+                # ``_has_remote_pending_buy`` 在快照不可信时有意返回 True，调用方不能据此推断没有 BUY。
+                # 该保守布尔值不能在下方重新解释成真实远端 pending BUY 的证据，也不能用来放行最终补单。
                 if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
                     continue
                 allow_top_up = False
@@ -936,11 +929,8 @@ class OrderExecutor:
                         )
                     return True
 
-            # The reserve marks the end of *waiting*, not the end of a final
-            # reconciliation. A fill can arrive exactly as the reserve begins;
-            # first inspect one fresh pending/position snapshot above, then skip
-            # only if the SELL is still not confirmed. Otherwise the remaining
-            # reserve is available for the conservative final BUY submission.
+            # reserve 表示等待结束，而不是最终对账结束；成交可能恰好在 reserve 开始时到达。
+            # 先检查上方的一次最新 pending/position 快照，仅当 SELL 仍未确认时跳过；否则剩余 reserve 可用于保守提交最终 BUY。
             if run_deadline is not None and live_run_budget_expired(
                 self.broker,
                 reserve_seconds=finalization_reserve,

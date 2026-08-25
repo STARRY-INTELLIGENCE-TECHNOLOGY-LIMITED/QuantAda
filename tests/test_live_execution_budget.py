@@ -219,7 +219,7 @@ def test_sell_and_cash_wait_share_deadline_and_preserve_final_buy_window(fake_cl
 
 
 def test_sell_settled_at_finalization_boundary_still_submits_final_buy(fake_clock, monkeypatch):
-    """A fresh counter snapshot at the reserve boundary must not lose a filled SELL."""
+    """reserve 边界处的最新柜台快照不得漏掉已成交的 SELL。"""
     sell_data = SimpleNamespace(_name="SPY.ARCA")
     buy_data = SimpleNamespace(_name="EWJ.ARCA")
 

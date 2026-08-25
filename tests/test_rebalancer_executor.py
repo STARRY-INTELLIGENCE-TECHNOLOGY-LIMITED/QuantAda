@@ -1379,7 +1379,7 @@ def test_order_executor_blocks_buy_when_remote_pending_snapshot_is_untrusted():
 
 
 def test_order_executor_does_not_top_up_after_rolling_buy_when_second_pending_snapshot_fails(monkeypatch):
-    """A failed second pending read must not turn a conservative guard into a BUY top-up."""
+    """第二次 pending 查询失败时，保守 guard 不得变成 BUY 补单。"""
     import common.order_executor as executor_module
 
     data = SimpleNamespace(_name="EWJ.ARCA")
@@ -1389,9 +1389,7 @@ def test_order_executor_does_not_top_up_after_rolling_buy_when_second_pending_sn
 
         def __init__(self):
             self.calls = []
-            # The rolling order was accepted earlier in this run. Its local
-            # callback tracker may already have cleared, so the first remote
-            # snapshot is the evidence used by final-buy reconciliation.
+            # rolling order 已在本次 run 早先被受理，本地 callback tracker 可能已经清理，因此第一次远端快照是最终 BUY 对账使用的证据。
             self._active_buys = {}
             self._last_pending_orders_fetch_failed = False
             self._last_pending_orders_fetch_error = None

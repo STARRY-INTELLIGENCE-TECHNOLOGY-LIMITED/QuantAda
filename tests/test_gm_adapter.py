@@ -984,7 +984,7 @@ def test_gm_pending_order_fetch_success_clears_failure_flag(monkeypatch):
     ],
 )
 def test_gm_pending_order_malformed_record_marks_snapshot_untrusted(monkeypatch, pending):
-    """A malformed in-flight order must invalidate the whole GM snapshot."""
+    """格式错误的在途订单必须使整份 GM 快照失效。"""
     import live_trader.adapters.gm_broker as gm_module
 
     monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))

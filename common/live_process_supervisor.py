@@ -30,9 +30,7 @@ from typing import Iterable, Optional
 from common.live_runtime import runtime_print
 
 
-# These are intentionally fixed operational safeguards.  They are not trading
-# configuration knobs and are kept here so live/backtest configuration cannot
-# accidentally alter process recovery semantics.
+# 这些是有意固定的运行安全阈值，不是交易配置项；集中放在这里可避免 live/backtest 配置意外改变进程恢复语义。
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 HEARTBEAT_STALE_SECONDS = 90.0
 HEALTH_MONITOR_INTERVAL_SECONDS = 2.0
@@ -57,13 +55,13 @@ _operator_stop_requested = False
 
 
 class LiveWorkerFailureKind(str, Enum):
-    """Structured failure categories propagated across worker generations."""
+    """跨 worker generation 传递的结构化故障类别。"""
 
     CONNECTIVITY = "connectivity"
 
 
 class LiveWorkerOperatorStop(BaseException):
-    """Escape broker SDK recovery loops for an explicit operator shutdown."""
+    """在 operator 明确关闭时跳出 broker SDK 恢复循环。"""
 
 
 def _coerce_failure_kind(value) -> Optional[LiveWorkerFailureKind]:
@@ -76,31 +74,31 @@ def _coerce_failure_kind(value) -> Optional[LiveWorkerFailureKind]:
 
 
 def is_live_worker_process() -> bool:
-    """Return whether the current process is the supervised trading worker."""
+    """返回当前进程是否为受监督的交易 worker。"""
 
     return os.environ.get(WORKER_ENV, "").strip() == "1"
 
 
 def get_previous_live_worker_failure() -> str:
-    """Return the parent supervisor's last restart reason, if any."""
+    """返回父 supervisor 最近一次重启原因，没有则返回空值。"""
 
     return str(os.environ.get(PREVIOUS_FAILURE_ENV, "") or "").strip()
 
 
 def get_previous_live_worker_failure_kind() -> Optional[LiveWorkerFailureKind]:
-    """Return the structured category supplied by the parent supervisor."""
+    """返回父 supervisor 提供的结构化故障类别。"""
 
     return _coerce_failure_kind(os.environ.get(PREVIOUS_FAILURE_KIND_ENV))
 
 
 def is_live_worker_restart() -> bool:
-    """Return whether this worker was started after a prior worker failure."""
+    """返回当前 worker 是否在上一个 worker 故障后启动。"""
 
     return bool(get_previous_live_worker_failure())
 
 
 class _WorkerHeartbeat:
-    """Thread-safe heartbeat snapshot writer used only by a worker process."""
+    """仅供 worker 进程使用的线程安全 heartbeat 快照写入器。"""
 
     def __init__(self, path: str, interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS):
         self.path = os.path.abspath(path)
@@ -169,8 +167,7 @@ class _WorkerHeartbeat:
                 {
                     "state": state_text,
                     "detail": str(detail or "")[-800:],
-                    # Once shutdown is explicitly marked, a late callback
-                    # must not turn it back into an unexpected exit.
+                    # shutdown 明确标记后，迟到的 callback 不得将其重新变成意外退出。
                     "expected_exit": bool(expected_exit) or bool(
                         self._snapshot.get("expected_exit")
                     ),
@@ -207,9 +204,7 @@ class _WorkerHeartbeat:
                 os.replace(self.tmp_path, self.path)
                 return
             except (OSError, ValueError):
-                # Windows can briefly reject replace while the parent has the
-                # old file open.  Retry state transitions before falling back
-                # to the parent's stale-heartbeat recovery.
+                # Windows 在父进程占用旧文件时可能短暂拒绝 replace；先重试状态写入，再回退到父进程的 stale-heartbeat 恢复。
                 try:
                     if os.path.exists(self.tmp_path):
                         os.unlink(self.tmp_path)
@@ -220,7 +215,7 @@ class _WorkerHeartbeat:
 
 
 def start_live_worker_heartbeat() -> bool:
-    """Start the worker heartbeat when the process was launched by the supervisor."""
+    """进程由 supervisor 启动时开启 worker heartbeat。"""
 
     global _worker_heartbeat
     if not is_live_worker_process():
@@ -238,7 +233,7 @@ def start_live_worker_heartbeat() -> bool:
 
 
 def install_live_worker_operator_stop_handler() -> bool:
-    """Reserve SIGINT for graceful operator shutdown in supervised workers."""
+    """在受监督 worker 中保留 SIGINT，用于 operator 优雅关闭。"""
 
     global _operator_stop_requested
     if not is_live_worker_process():
@@ -260,7 +255,7 @@ def install_live_worker_operator_stop_handler() -> bool:
 
 
 def stop_live_worker_heartbeat() -> None:
-    """Stop the heartbeat thread (primarily useful for tests and clean shutdown)."""
+    """停止 heartbeat 线程，主要用于测试和干净关闭。"""
 
     global _worker_heartbeat
     with _heartbeat_lock:
@@ -278,14 +273,9 @@ def report_live_worker_state(
     failure_kind: Optional[LiveWorkerFailureKind] = None,
     refresh_deadline=False,
 ) -> bool:
-    """Publish a short-lived live SDK health state to the parent supervisor.
+    """向父 supervisor 发布短生命周期的 live SDK 健康状态。
 
-    ``unhealthy_after_seconds`` is a bounded deadline for the state.  Passing
-    ``None`` means the state is considered healthy until another report arrives.
-    ``failure_kind`` is metadata for the next generation's alarm policy; it is
-    never inferred from the human-readable state or detail fields.
-    The value is deliberately scoped to the current worker run and never stores
-    orders, positions, or trading intent.
+    ``unhealthy_after_seconds`` 是该状态的有界期限，传入 ``None`` 表示在下一次报告前持续视为健康。``failure_kind`` 是下一代 worker 告警策略的元数据，不从人类可读的 state/detail 文本推断；该值只属于当前 worker run，不保存订单、持仓或交易意图。
     """
 
     heartbeat = _worker_heartbeat
@@ -303,7 +293,7 @@ def report_live_worker_state(
 
 
 def mark_live_worker_expected_exit(detail: str = "worker completed normally") -> bool:
-    """Mark a normal worker return so the parent does not restart it."""
+    """标记 worker 正常返回，避免父进程重启它。"""
 
     heartbeat = _worker_heartbeat
     if heartbeat is None:
@@ -323,12 +313,9 @@ def request_live_worker_restart(
     *,
     failure_kind: Optional[LiveWorkerFailureKind] = None,
 ) -> None:
-    """Ask the supervisor for a clean process restart.
+    """请求 supervisor 执行干净的进程重启。
 
-    Direct adapter users (without the supervisor) retain their existing
-    in-process Phoenix behavior; only a supervised worker exits with the
-    reserved restart code. ``failure_kind`` travels separately from the
-    diagnostic reason so policy never depends on text matching.
+    不经过 supervisor 的直接 adapter 调用仍保留原有进程内 Phoenix 行为；只有受监督 worker 才以保留退出码退出。``failure_kind`` 与诊断原因分开传递，策略不依赖文本匹配。
     """
 
     if not is_live_worker_process():
@@ -348,7 +335,7 @@ def request_live_worker_restart(
 
 
 def read_live_worker_heartbeat(path: str):
-    """Read a heartbeat snapshot, returning ``None`` for an incomplete read."""
+    """读取 heartbeat 快照；读取不完整时返回 ``None``。"""
 
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -367,7 +354,7 @@ def evaluate_live_worker_health(
     worker_pid=None,
     worker_id=None,
 ):
-    """Return a concise failure reason, or ``None`` while the worker is healthy."""
+    """返回简洁故障原因；worker 健康时返回 ``None``。"""
 
     if snapshot is None:
         if now_monotonic - started_monotonic >= HEARTBEAT_STALE_SECONDS:
@@ -433,7 +420,7 @@ def _describe_exit(code) -> str:
 
 
 def _stop_child(process, reason: str, *, operator_stop: bool = False) -> None:
-    """Stop a child, escalating when a native call ignores the first signal."""
+    """停止子进程；native 调用忽略首个信号时逐级升级处理。"""
 
     try:
         if operator_stop:
@@ -476,11 +463,9 @@ def _stop_child(process, reason: str, *, operator_stop: bool = False) -> None:
 
 
 def supervise_live_process(command: Optional[Iterable[str]] = None) -> int:
-    """Run and supervise the current live command until a normal stop.
+    """运行并监督当前 live command，直到正常停止。
 
-    The function is called only by the non-worker parent.  A child that exits
-    unexpectedly, misses heartbeats, or exceeds an adapter health deadline is
-    restarted with the original command line and a bounded backoff.
+    该函数只由非 worker 父进程调用；子进程意外退出、heartbeat 丢失或超过 adapter 健康期限时，将使用原始命令行和有界 backoff 重启。
     """
 
     if is_live_worker_process():
@@ -509,8 +494,7 @@ def supervise_live_process(command: Optional[Iterable[str]] = None) -> int:
             previous_handlers[sig] = signal.getsignal(sig)
             signal.signal(sig, _request_stop)
         except (ValueError, OSError):
-            # Supervisors created outside the main thread cannot install
-            # process signal handlers; the child still gets normal monitoring.
+            # 在主线程之外创建的 supervisor 不能安装进程信号处理器；子进程仍可正常接受监控。
             continue
 
     generation = 0
@@ -574,8 +558,7 @@ def supervise_live_process(command: Optional[Iterable[str]] = None) -> int:
 
                 snapshot = read_live_worker_heartbeat(heartbeat_path)
                 if snapshot is not None and snapshot.get("worker_id") != worker_id:
-                    # A previous generation may still be visible briefly on
-                    # platforms where replacing an open file is delayed.
+                    # 在替换打开文件存在延迟的平台上，上一代 generation 可能短暂可见。
                     snapshot = None
                 if snapshot is not None:
                     last_snapshot = snapshot
@@ -588,10 +571,8 @@ def supervise_live_process(command: Optional[Iterable[str]] = None) -> int:
                         last_logged_state = state
 
                 if return_code is not None:
-                    # A short-lived worker can exit between its final
-                    # expected-exit write and the parent's next poll.  Give
-                    # an atomic heartbeat replace a bounded chance to become
-                    # visible before classifying a zero exit as unexpected.
+                    # 短生命周期 worker 可能在写入 expected-exit 与父进程下一次轮询之间退出。
+                    # 在将零退出判为意外前，给原子 heartbeat replace 一个有界机会变得可见。
                     if return_code == 0 and not (
                         last_snapshot
                         and last_snapshot.get("worker_id") == worker_id

@@ -12,7 +12,10 @@ except ImportError:
 from live_trader.engine import LiveTrader, on_order_status_callback
 
 # 2. 定义交易配置 (与回测时的命令行参数几乎完全对应)
-# 对应命令为：python ./run.py ReverseTraderMultipleActionsStrategy --selection=ReverseTraderMultipleActionsSelector --cash=500000 --start_date=20230101
+# 对应命令：python ./run.py ReverseTraderMultipleActionsStrategy
+# --selection=ReverseTraderMultipleActionsSelector
+# --cash=500000
+# --start_date=20230101
 config = {
     'platform': 'gm',  # 指定平台为掘金
 

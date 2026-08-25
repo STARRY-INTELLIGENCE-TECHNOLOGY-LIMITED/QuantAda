@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import datetime
+import inspect
 import math
 import re
 import threading
@@ -130,7 +131,7 @@ class IBDataProvider(IbkrDataProvider):
 
 
 class IBBrokerAdapter(BaseLiveBroker):
-    """Interactive Brokers 适配器"""
+    """Interactive Brokers 适配器。"""
     _PENDING_STATUSES = {
         'PENDINGSUBMIT',
         'APIPENDING',
@@ -148,6 +149,19 @@ class IBBrokerAdapter(BaseLiveBroker):
     def __init__(self, context, cash_override=None, commission_override=None, slippage_override=None):
         # 从 context 中获取由 launch 注入的 ib 实例
         self.ib: IB = getattr(context, 'ib_instance', None)
+        # ``launch`` 在自身事件循环线程中驱动 ib_insync，调度 run 转移到工作线程执行；保存该事件循环以便把工作线程的阻塞快照请求投递回 SDK 线程。
+        # 避免调用工作线程中不存在的 ``IB._run``。
+        self._ib_event_loop = getattr(context, 'ib_event_loop', None)
+        if self._ib_event_loop is None and self.ib is not None:
+            self._ib_event_loop = getattr(self.ib, '_quantada_event_loop', None)
+        self._ib_event_loop_thread_id = getattr(context, 'ib_event_loop_thread_id', None)
+        if self._ib_event_loop_thread_id is None and self.ib is not None:
+            self._ib_event_loop_thread_id = getattr(
+                self.ib, '_quantada_event_loop_thread_id', None
+            )
+        if self._ib_event_loop_thread_id is None:
+            # 对于单元测试 adapter 及直接构造 broker 的调用方，若 launch 未显式提供 SDK loop owner，则默认当前线程就是所属线程。
+            self._ib_event_loop_thread_id = threading.get_ident()
         self._tickers = {}  # 缓存实时行情 snapshot
         self._fx_tickers = {}  # 缓存汇率行情
         # 最后已知有效汇率缓存 (Last Known Good Rate)
@@ -216,10 +230,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 has_account_info = True
             paired.append((item, account))
 
-        # Requested account-summary views from older IB builds can omit the
-        # account field. They remain compatible only after the target account
-        # has been verified as the sole visible account; otherwise an unscoped
-        # row could be aggregate cash from another account.
+        # 较旧 IB 版本的指定账户摘要可能没有 account 字段；只有确认目标账户是唯一可见账户时才能兼容，否则无范围记录可能是其他账户的聚合现金。
         if not has_account_info:
             known_accounts = {
                 account
@@ -314,6 +325,12 @@ class IBBrokerAdapter(BaseLiveBroker):
                 try:
                     if getter_name == 'accountSummary' and not self._in_async_task():
                         rows = self._bounded_sync_query(getter_name)
+                    elif getter_name == 'accountSummary':
+                        # order-status callback 在 ib_insync 活动 loop 中执行；调用 ``accountSummary()`` 会重入
+                        # ``IB._run``。
+                        # 该调用还会产生未 await 的协程。
+                        # 因此改读 wrapper 缓存，下一次调度 worker 再执行有界新查询。
+                        rows = self._cached_account_summary_rows()
                     else:
                         rows = getter()
                     for item in rows or []:
@@ -327,6 +344,21 @@ class IBBrokerAdapter(BaseLiveBroker):
                     break
 
         return (accounts, debug) if with_debug else accounts
+
+    def _cached_account_summary_rows(self, account: str = ''):
+        """返回 ib_insync wrapper 缓存中已有的账户摘要记录。"""
+        summary_cache = getattr(getattr(self.ib, 'wrapper', None), 'acctSummary', {})
+        if isinstance(summary_cache, dict):
+            rows = list(summary_cache.values())
+        else:
+            rows = list(summary_cache or [])
+        target = self._normalize_account(account)
+        if target:
+            rows = [
+                row for row in rows
+                if self._extract_account_from_obj(row) == target
+            ]
+        return rows
 
     def _warn_missing_order_account_for_schedule_scope(self, known_accounts):
         alarm_key = self._live_alarm.schedule_key(
@@ -357,8 +389,11 @@ class IBBrokerAdapter(BaseLiveBroker):
         try:
             if configured_account:
                 try:
-                    if method_name == 'accountSummary' and not self._in_async_task():
-                        rows = self._bounded_sync_query(method_name, configured_account)
+                    if method_name == 'accountSummary':
+                        if self._in_async_task():
+                            rows = self._cached_account_summary_rows(configured_account)
+                        else:
+                            rows = self._bounded_sync_query(method_name, configured_account)
                     else:
                         rows = method(configured_account)
                     attempts_log.append(
@@ -370,8 +405,11 @@ class IBBrokerAdapter(BaseLiveBroker):
                     # 按账户精确过滤，避免把“尚未同步”误判成空账户。
                     if rows:
                         return rows
-                    if method_name == 'accountSummary' and not self._in_async_task():
-                        all_rows = self._bounded_sync_query(method_name)
+                    if method_name == 'accountSummary':
+                        if self._in_async_task():
+                            all_rows = self._cached_account_summary_rows()
+                        else:
+                            all_rows = self._bounded_sync_query(method_name)
                     else:
                         all_rows = method()
                     attempts_log.append(
@@ -379,16 +417,22 @@ class IBBrokerAdapter(BaseLiveBroker):
                     )
                     return list(all_rows or [])
                 except TypeError:
-                    if method_name == 'accountSummary' and not self._in_async_task():
-                        rows = self._bounded_sync_query(method_name)
+                    if method_name == 'accountSummary':
+                        if self._in_async_task():
+                            rows = self._cached_account_summary_rows()
+                        else:
+                            rows = self._bounded_sync_query(method_name)
                     else:
                         rows = method()
                     attempts_log.append(
                         f"{method_name}() [fallback]{note} -> {len(rows or [])}"
                     )
                     return list(rows or [])
-            if method_name == 'accountSummary' and not self._in_async_task():
-                rows = self._bounded_sync_query(method_name)
+            if method_name == 'accountSummary':
+                if self._in_async_task():
+                    rows = self._cached_account_summary_rows()
+                else:
+                    rows = self._bounded_sync_query(method_name)
             else:
                 rows = method()
             attempts_log.append(f"{method_name}(){note} -> {len(rows or [])}")
@@ -398,12 +442,9 @@ class IBBrokerAdapter(BaseLiveBroker):
             return []
 
     def is_account_snapshot_trusted(self) -> bool:
-        """Return whether the current live IB session exposes a usable account snapshot.
+        """判断当前 live IB 会话是否暴露可用账户快照。
 
-        A connected socket alone is insufficient: ``IB.connect`` can succeed while
-        account updates are still unavailable (or the configured account is not
-        visible in this Gateway session).  The engine uses this short-lived health
-        check to fail closed for the current run and retry on the next schedule.
+        socket 已连接并不充分：``IB.connect`` 成功时账户更新可能仍未完成，或配置账户在当前 Gateway 会话中不可见。engine 使用该短生命周期健康检查在本轮安全失败，并在下一次 schedule 重试。
         """
         if not self.ib:
             self._last_account_snapshot_fetch_failed = True
@@ -457,12 +498,10 @@ class IBBrokerAdapter(BaseLiveBroker):
         )
         if account_values_valid:
             if self._in_async_task():
-                # The live schedule loop runs synchronously outside the IB event
-                # loop, where reqPositions is safe and required.  An order-status
-                # callback, however, executes inside that loop: blocking
-                # IB._run would re-enter it.  The already-loaded, validated
-                # account snapshot is enough for this transient callback probe;
-                # the next schedule run still performs the fresh position query.
+                # live schedule loop 在 IB event loop 外同步执行，此处 reqPositions 安全且必要。
+                # order-status callback 也在该 loop 内执行。
+                # 阻塞 IB._run 会重入 loop。
+                # 已加载且校验过的账户快照足以完成临时探针，下一次 schedule 再查询最新持仓。
                 self._last_account_snapshot_fetch_failed = False
                 self._last_account_snapshot_fetch_error = None
                 return True
@@ -710,13 +749,9 @@ class IBBrokerAdapter(BaseLiveBroker):
         return filtered
 
     def _filter_execution_account_scoped_items(self, items, account_getter, source_name):
-        """Filter order/position facts without accepting an unknown account scope.
+        """过滤订单/持仓事实，不接受未知账户范围。
 
-        Account-summary calls can be scoped by their request argument and may
-        legitimately omit an account field in older IB API views.  Open orders
-        and positions have no equivalent request scope here: with
-        ``IBKR_ORDER_ACCOUNT`` configured, a record without its own account
-        field cannot safely be attributed to the target account.
+        账户摘要请求可以通过参数指定范围，旧版 IB API 视图可能合法省略 account 字段；但 open orders 和 positions 没有等价请求范围，因此配置 ``IBKR_ORDER_ACCOUNT`` 时，缺少自身 account 字段的记录不能安全归属到目标账户。
         """
         scoped_account = self._configured_order_account()
         raw_items = list(items or [])
@@ -732,12 +767,9 @@ class IBBrokerAdapter(BaseLiveBroker):
                 f"IB {source_name} snapshot has no account fields while "
                 f"IBKR_ORDER_ACCOUNT={scoped_account!r} is configured"
             )
-        # ``reqPositions`` and ``reqAllOpenOrders`` are all-account requests.
-        # Once a target account is configured, a mixed batch where even one
-        # record has no account field cannot be safely partitioned: that row
-        # may belong to the target account and silently dropping it would make
-        # a non-empty position/order look absent.  Reject the whole snapshot
-        # instead of returning a partial truth.
+        # ``reqPositions`` 和 ``reqAllOpenOrders`` 都是全账户请求。配置目标账户后，只要批次中有一条记录缺少 account 字段，就不能安全拆分。
+        # 该记录可能属于目标账户，静默丢弃会把非空持仓/订单伪装为空。
+        # 因此拒绝整份快照，而不是返回部分事实。
         if any(not account for _, account in paired):
             raise RuntimeError(
                 f"IB {source_name} snapshot contains records without account fields while "
@@ -746,7 +778,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         return [item for item, account in paired if account == scoped_account]
 
     def _bounded_sync_query(self, method_name: str, *args, **kwargs):
-        """Run one blocking ib_insync snapshot request within the current run budget."""
+        """在当前 run 预算内执行一次有界的阻塞式 ib_insync 快照请求。"""
         if self._in_async_task():
             raise RuntimeError(f"{method_name} is unavailable inside an active async task")
 
@@ -758,6 +790,44 @@ class IBBrokerAdapter(BaseLiveBroker):
         if remaining <= 0:
             raise TimeoutError("live run execution budget exhausted")
         timeout = min(_IB_SYNC_QUERY_TIMEOUT_SECONDS, remaining)
+
+        # IB 事件循环由 launcher 线程拥有，调度 strategy run 在 worker 线程执行；工作线程不可直接调用 ib_insync 同步方法。
+        # 必须使用 owner loop 上的对应 async API。
+        # 沿用当前 run 的有界预算等待结果。
+        owner_thread_id = self._ib_event_loop_thread_id
+        event_loop = self._ib_event_loop
+        if (
+            event_loop is not None
+            and owner_thread_id is not None
+            and threading.get_ident() != owner_thread_id
+        ):
+            if event_loop.is_closed():
+                raise RuntimeError(f"IB event loop is closed; cannot run {method_name}")
+
+            async_method = getattr(self.ib, f"{method_name}Async", None)
+            if not callable(async_method):
+                raise RuntimeError(
+                    f"IB.{method_name}Async is unavailable for cross-thread query"
+                )
+
+            awaitable = async_method(*args, **kwargs)
+            if not inspect.isawaitable(awaitable):
+                raise RuntimeError(
+                    f"IB.{method_name}Async did not return an awaitable"
+                )
+            try:
+                future = asyncio.run_coroutine_threadsafe(awaitable, event_loop)
+            except Exception:
+                # ``run_coroutine_threadsafe`` 可能拒绝已关闭或已停止的 loop；显式关闭协程，避免 Python 再产生未 await 警告。
+                close = getattr(awaitable, 'close', None)
+                if callable(close):
+                    close()
+                raise
+            try:
+                return future.result(timeout=timeout)
+            except TimeoutError:
+                future.cancel()
+                raise
 
         had_timeout_attr = hasattr(self.ib, 'RequestTimeout')
         previous_timeout = getattr(self.ib, 'RequestTimeout', None)
@@ -909,9 +979,9 @@ class IBBrokerAdapter(BaseLiveBroker):
             return 0.0
 
         # 3. 与本地占资做去重合并:
-        # - active_buys_total: 基于 _active_buys 逐单估算的本地占资
-        # - local_virtual_total: 与 _virtual_spent_cash 取大，兼容异常恢复场景
-        # - overlap_cost: 已被 openTrades 成功估算覆盖的本地订单成本
+        # - active_buys_total：基于 _active_buys 逐单估算的本地占资
+        # - local_virtual_total：与 _virtual_spent_cash 取大，兼容异常恢复场景
+        # - overlap_cost：已被 openTrades 成功估算覆盖的本地订单成本
         # 最终占资 = openTrades 冻结 + (本地占资 - 重叠部分)
         active_buys_total = 0.0
         overlap_cost = 0.0
@@ -978,10 +1048,10 @@ class IBBrokerAdapter(BaseLiveBroker):
     def _in_async_task() -> bool:
         try:
             loop = asyncio.get_running_loop()
-            # ib_insync dispatches ordinary Event callbacks directly via
-            # loop.call_soon(). Those callbacks have no current Task, yet calling
-            # a synchronous ``IB._run`` query from them would still re-enter the
-            # already-running loop. Treat either form as non-blocking context.
+            # ib_insync 会通过 loop.call_soon() 直接分发普通 Event callback；这些 callback 没有当前 Task。
+            # 从其中调用同步 ``IB._run`` 仍会重入 loop。
+            # 这些 callback 运行时 loop 已经处于活动状态。
+            # 因此两种情况都视为不可阻塞上下文。
             return loop.is_running()
         except RuntimeError:
             return False
@@ -1030,7 +1100,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             return None
         try:
             contract = self.parse_contract(symbol)
-            self.ib.qualifyContracts(contract)
+            self._bounded_sync_query('qualifyContracts', contract)
             ticker = self.ib.reqMktData(contract, '', False, False)
             self._tickers[symbol] = ticker
             return ticker
@@ -1142,7 +1212,9 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         try:
             if hasattr(self.ib, 'reqOpenOrders'):
-                self.ib.reqOpenOrders()
+                if self._in_async_task():
+                    raise RuntimeError("reqOpenOrders is unavailable inside an active async task")
+                self._bounded_sync_query('reqOpenOrders')
         except Exception as e:
             self._runtime_log(f"[IBBroker] reqOpenOrders bind attempt failed: {e}")
 
@@ -1190,12 +1262,42 @@ class IBBrokerAdapter(BaseLiveBroker):
         if wait_s <= 0:
             return 0.0
 
-        if hasattr(self, 'ib') and self.ib and hasattr(self.ib, 'sleep') and not self._in_async_task():
+        # ``IB.sleep`` 会先创建 asyncio 协程，再向 ib_insync 获取当前 loop；调度 worker 有意不创建 loop。
+        # 从该线程调用会产生未 await 警告且等待无法完成。
+        # 因此跨线程或无 loop 时使用普通 sleep，只有 SDK owner 线程才调用 ``IB.sleep``。
+        current_thread_id = threading.get_ident()
+        owner_thread_id = getattr(self, '_ib_event_loop_thread_id', None)
+        on_owner_thread = owner_thread_id is None or current_thread_id == owner_thread_id
+        if (
+            on_owner_thread
+            and hasattr(self, 'ib')
+            and self.ib
+            and hasattr(self.ib, 'sleep')
+            and not self._in_async_task()
+        ):
+            sleep_loop = getattr(self, '_ib_event_loop', None)
+            temporary_loop = False
+            if sleep_loop is None:
+                # 避免使用已弃用的 ``asyncio.get_event_loop()`` 回退路径（新版 Python 还可能创建无人拥有的 loop）。
+                # 直接构造的 broker 仍可能合法地拥有当前线程，因此为同步兼容路径临时创建一个 loop。
+                policy_local = getattr(asyncio.get_event_loop_policy(), '_local', None)
+                sleep_loop = getattr(policy_local, '_loop', None)
+                if sleep_loop is None or sleep_loop.is_closed():
+                    sleep_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(sleep_loop)
+                    temporary_loop = True
             try:
                 self.ib.sleep(wait_s)
                 return wait_s
             except Exception:
                 pass
+            finally:
+                if temporary_loop:
+                    try:
+                        asyncio.set_event_loop(None)
+                    except Exception:
+                        pass
+                    sleep_loop.close()
         time.sleep(wait_s)
         return wait_s
 
@@ -1274,8 +1376,8 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         can_refresh_all = hasattr(self.ib, 'reqAllOpenOrders')
         if can_refresh_all:
-            # ib_insync 在异步回调任务中直接 reqAllOpenOrders 可能触发
-            # "This event loop is already running"，该场景退化为用本地可见缓存。
+            # ib_insync 在异步 callback 中直接调用 reqAllOpenOrders 可能触发 loop 已运行错误。
+            # 此时退化为使用本地可见缓存。
             if self._in_async_task():
                 can_refresh_all = False
                 cache_age = time.monotonic() - self._req_all_open_orders_last_ts
@@ -1360,16 +1462,8 @@ class IBBrokerAdapter(BaseLiveBroker):
                             f"IB pending trade has unknown non-terminal status: {raw_status!r}"
                         )
 
-                raw_remaining = getattr(status, 'remaining', None)
-                try:
-                    remaining = Decimal(str(raw_remaining))
-                except (InvalidOperation, TypeError, ValueError) as e:
-                    raise RuntimeError("IB pending trade has invalid remaining quantity") from e
-                if not remaining.is_finite() or remaining <= 0:
-                    raise RuntimeError(
-                        f"IB pending trade has non-positive remaining quantity: {raw_remaining!r}"
-                    )
-
+                # 在允许省略非终态 ``remaining=0`` 记录前先校验订单身份和方向；IB 可能发送滞后的完成回调。
+                # 数量看似完成的坏记录仍必须安全失败关闭，不能静默把潜在在途单变成空快照。
                 matched_data = self._find_data_for_contract(contract)
                 symbol = (
                     str(getattr(matched_data, '_name', '') or '').strip()
@@ -1390,6 +1484,46 @@ class IBBrokerAdapter(BaseLiveBroker):
                     raise RuntimeError(
                         f"IB pending trade has unknown action: id={oid!r}, action={action!r}"
                     )
+
+                raw_remaining = getattr(status, 'remaining', None)
+                try:
+                    remaining = Decimal(str(raw_remaining))
+                except (InvalidOperation, TypeError, ValueError) as e:
+                    raise RuntimeError("IB pending trade has invalid remaining quantity") from e
+                if not remaining.is_finite() or remaining < 0:
+                    raise RuntimeError(
+                        f"IB pending trade has invalid remaining quantity: {raw_remaining!r}"
+                    )
+                if remaining == 0:
+                    # IB 可能短暂发布滞后的非终态（例如 ``Submitted``），此时 ``remaining`` 已经为零。
+                    # 若 filled 与 requested 数量证明已完成，可以从 pending 快照中省略。
+                    # 缺少证据的坏记录必须失败关闭，不能把真实在途单误判为不存在。
+                    try:
+                        filled = Decimal(str(getattr(status, 'filled', None)))
+                        requested = Decimal(str(getattr(order, 'totalQuantity', None)))
+                    except (InvalidOperation, TypeError, ValueError):
+                        filled = requested = Decimal('NaN')
+                    if (
+                        filled.is_finite()
+                        and requested.is_finite()
+                        and requested > 0
+                        and filled >= requested
+                    ):
+                        continue
+                    if (
+                        filled.is_finite()
+                        and requested.is_finite()
+                        and requested > 0
+                        and 0 <= filled < requested
+                    ):
+                        # PendingSubmit 可能在首次状态更新前报告 remaining=0；使用 requested-filled 作为 pending 数量。
+                        # 保持安全失败语义，不把订单当作不存在。
+                        remaining = requested - filled
+                    else:
+                        raise RuntimeError(
+                            f"IB pending trade has non-positive remaining quantity: {raw_remaining!r}"
+                        )
+
                 res.append({
                     'id': oid,
                     'symbol': symbol,
@@ -1492,8 +1626,8 @@ class IBBrokerAdapter(BaseLiveBroker):
 
     @staticmethod
     def is_live_mode(context) -> bool:
-        # IB Adapter 只要被调用基本都是为了实盘 (paper or live)
-        # 回测建议使用 Backtrader 原生或 CSV
+        # IB adapter 只要被调用，基本都是为了实盘（paper 或 live）。
+        # 回测建议使用 Backtrader 原生接口或 CSV。
         return True
 
     @staticmethod
@@ -1647,7 +1781,7 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         contract = Forex(pair_symbol)
         if not in_loop:
-            self.ib.qualifyContracts(contract)
+            self._bounded_sync_query('qualifyContracts', contract)
         ticker = self.ib.reqMktData(contract, '', False, False)
         self._fx_tickers[pair_symbol] = ticker
         if not in_loop:
@@ -1680,7 +1814,8 @@ class IBBrokerAdapter(BaseLiveBroker):
                 retry_not_before = self._fx_rate_retry_not_before.get(pair_symbol)
                 if not retry_not_before or now_utc >= retry_not_before:
                     try:
-                        bars = self.ib.reqHistoricalData(
+                        bars = self._bounded_sync_query(
+                            'reqHistoricalData',
                             Forex(pair_symbol), endDateTime='', durationStr='2 D',
                             barSizeSetting='1 day', whatToShow='MIDPOINT', useRTH=False,
                             timeout=3.0
@@ -1728,9 +1863,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         try:
             if not self.ib.isConnected():
                 raise RuntimeError("ib not connected")
-            # positions() only exposes ib_insync's wrapper cache. During the
-            # synchronous SELL settlement loop that cache can lag a fill, so
-            # explicitly request a fresh counter snapshot before reconciliation.
+            # positions() 只暴露 ib_insync wrapper 缓存；同步 SELL 结算循环中该缓存可能滞后于成交，因此对账前显式请求最新柜台快照。
             positions = list(self._bounded_sync_query('reqPositions') or [])
             self._last_position_snapshot_fetch_failed = False
             self._last_position_snapshot_fetch_error = None
@@ -1808,7 +1941,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             # 1. 如果缓存里没有 ticker（防御性逻辑，防止动态添加的标的没订阅）
             if not ticker:
                 contract = self.parse_contract(symbol)
-                self.ib.qualifyContracts(contract)
+                self._bounded_sync_query('qualifyContracts', contract)
                 # snapshot=False 建立流式订阅
                 ticker = self.ib.reqMktData(contract, '', False, False)
                 self._tickers[symbol] = ticker
@@ -1901,8 +2034,21 @@ class IBBrokerAdapter(BaseLiveBroker):
         return 0.0
 
     def _collect_price_providers(self, data_source: str = None):
-        if self._price_data_manager is None:
+        # 优先复用 LiveTrader 已拥有的 DataManager；重新创建 manager 会实例化另一个 IbkrDataProvider/IB client。
+        # 尤其在 delayed price 预热期间，可能因相同 clientId 触发 IB error 326。
+        strategy_instance = getattr(getattr(self, '_context', None), 'strategy_instance', None)
+        runtime_manager = getattr(strategy_instance, '_data_manager', None)
+        if runtime_manager is not None:
+            self._price_data_manager = runtime_manager
+        elif self._price_data_manager is None:
             self._price_data_manager = DataManager()
+
+        # 直接构造的 broker 仍可能需要创建 manager；此时将其中的 IBKR provider 绑定到 adapter 的共享会话。
+        # 避免 fallback 打开第二个 socket/clientId。
+        shared_ib = getattr(self, 'ib', None)
+        for provider in getattr(self._price_data_manager, 'providers', ()) or ():
+            if provider.__class__.__name__ == 'IbkrDataProvider' and shared_ib is not None:
+                provider.ib = shared_ib
 
         providers = list(self._price_data_manager.providers or [])
         allowed = None
@@ -2064,12 +2210,39 @@ class IBBrokerAdapter(BaseLiveBroker):
         # IB 调仓统一使用市价单。price 只用于框架的数量/资金估算，
         # 不会作为限价字段发送给 IB，避免把普通调仓意外变成挂单。
         order = MarketOrder(action, volume_final)
+        if contract_type == 'STK':
+            # TWS order preset 可能把空 TIF 隐式改为 DAY 后拒绝 API 订单（IB error 10349）。
+            # 在 adapter 边界显式设置普通交易时段 stock 策略。
+            order.tif = 'DAY'
+        if contract_type == 'CRYPTO':
+            # PAXOS crypto order 即使传入小数币数量也要求 cashQty（IB error 10289）。
+            # cash 数量订单不能同时携带非零 totalQuantity（IB error 10293）。
+            # cashQty 必须按美分对齐（IB error 10317），并显式设置 IOC TIF，否则空默认值会触发 error 10052。
+            order.tif = 'IOC'
+            try:
+                cash_quantity = round(float(raw_volume) * float(price), 2)
+            except (TypeError, ValueError, OverflowError):
+                cash_quantity = 0.0
+            if not math.isfinite(cash_quantity) or cash_quantity <= 0:
+                self._last_order_target_skip_reason = 'crypto_cash_quantity_below_minimum'
+                self._runtime_log(
+                    f"[IB Warning] {data._name} crypto cash quantity is below the "
+                    "USD 0.01 minimum; order skipped."
+                )
+                return None
+            order.cashQty = cash_quantity
+            order.totalQuantity = 0
         if configured_account:
             # 透传 IB 订单 account 字段；留空时由 IB 默认使用主账户路由。
             order.account = configured_account
 
         trade = self.ib.placeOrder(contract, order)
-        return IBOrderProxy(trade, data=data)
+        proxy = IBOrderProxy(trade, data=data)
+        if contract_type == 'CRYPTO':
+            # wire order 有意将 totalQuantity 设为 0，但 base layer 仍需要 requested asset quantity。
+            # 该数量用于本次调用的现金记账和拆单记录。
+            proxy.submitted_size = raw_volume
+        return proxy
 
     @staticmethod
     def _should_trigger_daily_schedule(now: datetime.datetime, target_h: int, target_m: int, target_s: int,
@@ -2187,11 +2360,33 @@ class IBBrokerAdapter(BaseLiveBroker):
             _runtime_print(f">>> 🔥 Prewarm enabled: trigger {prewarm_lead_seconds:.0f}s before schedule")
         # 1. 创建全局唯一的 IB 实例
         ib = IB()
+        # ib_insync 会把同步 ``IB._run`` 调用绑定到 SDK 连接线程的 asyncio loop；调度 run 在独立 worker 中执行。
+        # 显式发布 owner loop，以安全转发跨线程快照请求。
+        try:
+            ib_event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            policy_local = getattr(asyncio.get_event_loop_policy(), '_local', None)
+            ib_event_loop = getattr(policy_local, '_loop', None)
+            if ib_event_loop is None or ib_event_loop.is_closed():
+                ib_event_loop = None
+        if ib_event_loop is None:
+            ib_event_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(ib_event_loop)
+        ib_event_loop_thread_id = threading.get_ident()
+        try:
+            ib._quantada_event_loop = ib_event_loop
+            ib._quantada_event_loop_thread_id = ib_event_loop_thread_id
+        except Exception:
+            pass
 
         # 2. 预初始化 Engine Context
+        context_ib_event_loop = ib_event_loop
+        context_ib_event_loop_thread_id = ib_event_loop_thread_id
         class Context:
             now = None
             ib_instance = ib
+            ib_event_loop = context_ib_event_loop
+            ib_event_loop_thread_id = context_ib_event_loop_thread_id
             strategy_instance = None
 
         ctx = Context()
@@ -2260,8 +2455,7 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         # 注册回调
         def on_trade_update(trade):
-            # Broker state must observe terminal updates immediately. Post-sell
-            # cash propagation is bounded centrally by OrderExecutor.
+            # Broker state 必须立即观察终态更新；SELL 后现金传递由 OrderExecutor 统一有界处理。
             on_order_status_callback(ctx, trade)
 
         ib.orderStatusEvent += on_trade_update
@@ -2315,11 +2509,8 @@ class IBBrokerAdapter(BaseLiveBroker):
                             detail="IB connect has not completed",
                             failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
                         )
-                        # Passing the configured account at connect time is important
-                        # for multi-account Gateway sessions: ib_insync otherwise
-                        # initializes only its default/first account subscription.
-                        # Keep a TypeError fallback for older test doubles/SDKs that
-                        # do not expose the ``account`` keyword.
+                        # 多账户 Gateway 会话必须在连接时传入配置账户，否则 ib_insync 可能只初始化默认/第一个账户订阅。
+                        # 对不支持 ``account`` 关键字的旧 SDK 或测试桩保留 TypeError 回退。
                         order_account = str(getattr(config, 'IBKR_ORDER_ACCOUNT', '') or '').strip()
                         try:
                             if order_account:
@@ -2354,9 +2545,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                                 )
                         except Exception as bind_err:
                             _runtime_print(f"[System Warning] manual-order bind setup failed: {bind_err}")
-                        # Do not let the first schedule run treat an account-sync
-                        # gap as a legitimate zero-cash account.  The next loop/run
-                        # retries the broker snapshot without persisting intent.
+                        # 不要让首次 schedule 将账户同步间隙当成真实零现金账户；下一轮 loop/run 会重试 broker 快照，不持久化交易意图。
                         try:
                             if (
                                 hasattr(trader.broker, 'is_account_snapshot_trusted')
