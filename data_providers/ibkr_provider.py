@@ -1,5 +1,3 @@
-import asyncio
-import inspect
 import math
 import threading
 from datetime import datetime
@@ -10,10 +8,11 @@ try:
     from ib_insync import IB, Stock, Forex, Crypto, ContFuture, util
 except ImportError:
     print("Warning: 'ib_insync' not installed. IbkrProvider will not work.")
-    IB = object  # Mock for class definition
+    IB = object  # 用于类定义的模拟对象
 
 import config
 from common.ib_symbol_parser import resolve_ib_contract_spec
+from common.ib_event_loop import call_async_on_owner_loop
 from data_providers.base_provider import BaseDataProvider
 
 
@@ -100,32 +99,18 @@ class IbkrDataProvider(BaseDataProvider):
         ):
             if event_loop.is_closed():
                 raise RuntimeError(f"IB event loop is closed; cannot run {method_name}")
-            async_method = getattr(self.ib, f"{method_name}Async", None)
-            if not callable(async_method):
-                raise RuntimeError(
-                    f"IB.{method_name}Async is unavailable for cross-thread call"
-                )
-            awaitable = async_method(*args, **kwargs)
-            if not inspect.isawaitable(awaitable):
-                raise RuntimeError(
-                    f"IB.{method_name}Async did not return an awaitable"
-                )
             try:
-                future = asyncio.run_coroutine_threadsafe(awaitable, event_loop)
-            except Exception:
-                close = getattr(awaitable, 'close', None)
-                if callable(close):
-                    close()
-                raise
-            try:
-                try:
-                    wait_timeout = float(kwargs.get('timeout', 8.0)) + 1.0
-                except (TypeError, ValueError, OverflowError):
-                    wait_timeout = 9.0
-                return future.result(timeout=max(1.0, wait_timeout))
-            except TimeoutError:
-                future.cancel()
-                raise
+                wait_timeout = float(kwargs.get('timeout', 8.0)) + 1.0
+            except (TypeError, ValueError, OverflowError):
+                wait_timeout = 9.0
+            return call_async_on_owner_loop(
+                self.ib,
+                method_name,
+                event_loop,
+                args=args,
+                kwargs=kwargs,
+                timeout=max(1.0, wait_timeout),
+            )
 
         return method(*args, **kwargs)
 

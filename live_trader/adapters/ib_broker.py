@@ -1,7 +1,6 @@
 import asyncio
 import copy
 import datetime
-import inspect
 import math
 import re
 import threading
@@ -26,6 +25,7 @@ from common.live_execution_budget import live_run_seconds_remaining
 from common.live_runtime import runtime_print
 from common.log import coerce_dt
 from common.ib_symbol_parser import resolve_ib_contract_spec
+from common.ib_event_loop import call_async_on_owner_loop
 from common.order_quantity import positive_quantity, quantity_number
 import config
 from data_providers.csv_provider import CsvDataProvider
@@ -37,6 +37,23 @@ from .base_broker import BaseLiveBroker, BaseOrderProxy
 
 _IB_SDK_HEALTH_DEADLINE_SECONDS = 180.0
 _IB_SYNC_QUERY_TIMEOUT_SECONDS = 3.0
+
+
+def _disable_ib_account_summary_auto_resubscribe(ib):
+    """避免 ib_insync 在每个 1102 事件上累加账户摘要订阅。
+
+    ib_insync 的默认 ``IB._onError`` 会在每次 connectivity-restored(1102) 回调中直接调用 ``reqAccountSummaryAsync``。该请求是持续订阅，
+    IBKR 每个 API client 只允许少量并发订阅；多次 1102 后会返回 322，随后 Gateway 常直接重置 API socket。QuantAda 会在下一次账户健康探针中按需重新取快照，因此不需要这个无界自动重订阅。
+    """
+    error_event = getattr(ib, 'errorEvent', None)
+    default_handler = getattr(ib, '_onError', None)
+    if error_event is None or not callable(default_handler):
+        return False
+    try:
+        error_event -= default_handler
+        return True
+    except Exception:
+        return False
 
 
 class IBOrderProxy(BaseOrderProxy):
@@ -352,6 +369,21 @@ class IBBrokerAdapter(BaseLiveBroker):
             rows = list(summary_cache.values())
         else:
             rows = list(summary_cache or [])
+        target = self._normalize_account(account)
+        if target:
+            rows = [
+                row for row in rows
+                if self._extract_account_from_obj(row) == target
+            ]
+        return rows
+
+    def _cached_account_value_rows(self, account: str = ''):
+        """返回连接初始化时建立的账户更新缓存，避免重复创建 summary 订阅。"""
+        values_cache = getattr(getattr(self.ib, 'wrapper', None), 'accountValues', {})
+        if isinstance(values_cache, dict):
+            rows = list(values_cache.values())
+        else:
+            rows = list(values_cache or [])
         target = self._normalize_account(account)
         if target:
             rows = [
@@ -702,10 +734,22 @@ class IBBrokerAdapter(BaseLiveBroker):
             'filtered_rows': 0,
         }
 
+        # ``IB.connect`` 已经为配置账户或唯一账户建立账户更新订阅。优先使用该实时缓存，
+        # 不再新建 ``accountSummaryAsync`` 订阅：IBKR 限制账户摘要订阅数量，ib_insync
+        # 的 1102 自动重订阅还可能在多次连接恢复后累积订阅。
         if not in_loop:
-            source_data = self._query_account_rows(
-                'accountSummary', configured_account, debug_info['summary_attempts']
-            )
+            cached_values = self._cached_account_value_rows(configured_account)
+            if cached_values:
+                source_data = cached_values
+                debug_info['values_attempts'].append(
+                    f"wrapper.accountValues({configured_account}) -> {len(cached_values)}"
+                )
+
+        if not in_loop:
+            if not source_data:
+                source_data = self._query_account_rows(
+                    'accountSummary', configured_account, debug_info['summary_attempts']
+                )
             if not source_data and self._sleep_ib(0.5) > 0:
                 source_data = self._query_account_rows(
                     'accountSummary', configured_account, debug_info['summary_attempts'], note=' [retry]'
@@ -751,7 +795,8 @@ class IBBrokerAdapter(BaseLiveBroker):
     def _filter_execution_account_scoped_items(self, items, account_getter, source_name):
         """过滤订单/持仓事实，不接受未知账户范围。
 
-        账户摘要请求可以通过参数指定范围，旧版 IB API 视图可能合法省略 account 字段；但 open orders 和 positions 没有等价请求范围，因此配置 ``IBKR_ORDER_ACCOUNT`` 时，缺少自身 account 字段的记录不能安全归属到目标账户。
+        账户摘要请求可以通过参数指定范围，旧版 IB API 视图可能合法省略 account字段；但 open orders 和 positions 没有等价请求范围。因此配置
+        ``IBKR_ORDER_ACCOUNT`` 时，缺少自身 account 字段的记录不能安全归属到目标账户。
         """
         scoped_account = self._configured_order_account()
         raw_items = list(items or [])
@@ -804,30 +849,14 @@ class IBBrokerAdapter(BaseLiveBroker):
             if event_loop.is_closed():
                 raise RuntimeError(f"IB event loop is closed; cannot run {method_name}")
 
-            async_method = getattr(self.ib, f"{method_name}Async", None)
-            if not callable(async_method):
-                raise RuntimeError(
-                    f"IB.{method_name}Async is unavailable for cross-thread query"
-                )
-
-            awaitable = async_method(*args, **kwargs)
-            if not inspect.isawaitable(awaitable):
-                raise RuntimeError(
-                    f"IB.{method_name}Async did not return an awaitable"
-                )
-            try:
-                future = asyncio.run_coroutine_threadsafe(awaitable, event_loop)
-            except Exception:
-                # ``run_coroutine_threadsafe`` 可能拒绝已关闭或已停止的 loop；显式关闭协程，避免 Python 再产生未 await 警告。
-                close = getattr(awaitable, 'close', None)
-                if callable(close):
-                    close()
-                raise
-            try:
-                return future.result(timeout=timeout)
-            except TimeoutError:
-                future.cancel()
-                raise
+            return call_async_on_owner_loop(
+                self.ib,
+                method_name,
+                event_loop,
+                args=args,
+                kwargs=kwargs,
+                timeout=timeout,
+            )
 
         had_timeout_attr = hasattr(self.ib, 'RequestTimeout')
         previous_timeout = getattr(self.ib, 'RequestTimeout', None)
@@ -1086,7 +1115,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         if not callable(switcher):
             return False
         try:
-            switcher(3)  # delayed
+            switcher(3)  # 延迟行情
             self._delayed_market_data_enabled = True
             reason_msg = f" ({reason})" if reason else ""
             self._runtime_log(f"[IB Warning] Realtime quote unavailable, switched to delayed market data{reason_msg}.")
@@ -2360,6 +2389,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             _runtime_print(f">>> 🔥 Prewarm enabled: trigger {prewarm_lead_seconds:.0f}s before schedule")
         # 1. 创建全局唯一的 IB 实例
         ib = IB()
+        _disable_ib_account_summary_auto_resubscribe(ib)
         # ib_insync 会把同步 ``IB._run`` 调用绑定到 SDK 连接线程的 asyncio loop；调度 run 在独立 worker 中执行。
         # 显式发布 owner loop，以安全转发跨线程快照请求。
         try:

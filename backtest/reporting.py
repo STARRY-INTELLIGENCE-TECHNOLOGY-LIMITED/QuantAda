@@ -3,7 +3,7 @@ from common.formatters import format_with_spec
 
 def format_backtest_results_report(metrics, attribution_report=None):
     """
-    Build the terminal report for a completed backtest.
+    为已完成的回测构造终端报告。
     """
     if not metrics:
         return "Backtest generated no valid performance metrics."

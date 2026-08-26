@@ -861,7 +861,7 @@ class Backtester:
 
     def get_closed_trades(self):
         """
-        Return the closed-trade list exposed by the backtest stack, if present.
+        返回回测引擎暴露的已平仓交易列表（如果存在）。
         """
         candidates = [getattr(self, "closed_trades", None)]
         if getattr(self, "results", None):

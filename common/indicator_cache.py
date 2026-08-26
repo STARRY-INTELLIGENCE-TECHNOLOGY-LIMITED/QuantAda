@@ -1,9 +1,7 @@
-"""
-Indicator registry and cache helpers for strategy runtime.
+"""策略运行时的指标注册表和缓存辅助函数。
 
-BaseStrategy owns the public strategy API. This module owns the mechanics for
-normalizing indicator series, building fast backtest lookup dictionaries, and
-sharing immutable indicator series across optimizer trials.
+BaseStrategy 负责公开的策略 API。本模块负责规范化指标序列、构造快速回测
+查询字典，并在优化试验之间共享不可变的指标序列。
 """
 
 from collections import OrderedDict
@@ -13,11 +11,10 @@ import pandas as pd
 
 class BoundedIndicatorCache(OrderedDict):
     """
-    Small LRU cache for optimizer-only indicator series and lookup dictionaries.
+    仅供优化器使用的指标序列和查询字典 LRU 缓存。
 
-    Optimizer trials can generate many parameter-specific series. A plain dict
-    grows with trial count, so long training runs can exhaust memory even when
-    the source OHLCV data is small.
+    优化试验可能生成大量参数专属序列。普通字典会随试验次数增长，
+    即使源 OHLCV 数据很小，长时间训练仍可能耗尽内存。
     """
 
     DEFAULT_MAX_ENTRIES = 512

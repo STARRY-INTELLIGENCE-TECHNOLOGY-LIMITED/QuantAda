@@ -489,8 +489,8 @@ def XSII(CLOSE, HIGH, LOW, N=102, M=7):  # 薛斯通道II
 # ------------------------工具函数---------------------------------------------
 def DSMA(X, N):  # 偏差自适应移动平均线   type: (np.ndarray, int) -> np.ndarray
     """
-    Deviation Scaled Moving Average (DSMA)    Python by: jqz1226, 2021-12-27
-    Referred function from myTT: SUM, DMA
+    偏差缩放移动平均线（DSMA），Python 作者：jqz1226，2021-12-27
+    参考 myTT 中的函数：SUM、DMA
     """
     a1 = math.exp(- 1.414 * math.pi * 2 / N)
     b1 = 2 * a1 * math.cos(1.414 * math.pi * 2 / N)

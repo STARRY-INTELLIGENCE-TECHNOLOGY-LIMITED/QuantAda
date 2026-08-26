@@ -30,11 +30,10 @@ def _clean_symbol(value):
 
 def calculate_trade_attribution(closed_trades):
     """
-    Aggregate closed trades by symbol.
+    按标的汇总已平仓交易。
 
-    PnL contribution uses abs(total_net_pnl) as denominator when the whole
-    account is net losing, so profitable symbols stay positive and losing
-    symbols stay negative in attribution tables.
+    当账户整体净亏损时，PnL 贡献率使用 ``abs(total_net_pnl)`` 作为分母，
+    使归因表中的盈利标的保持正值、亏损标的保持负值。
     """
     grouped = defaultdict(lambda: {
         "symbol": "UNKNOWN",
@@ -104,9 +103,9 @@ def calculate_trade_attribution(closed_trades):
 
 def calculate_winning_trade_mae(closed_trades):
     """
-    Calculate MAE for trades that closed with positive PnL.
+    计算最终以正 PnL 平仓的交易的 MAE。
 
-    MAE follows the requested formula:
+    MAE 遵循约定公式：
     lowest_price_during_trade / entry_price - 1
     """
     maes = []

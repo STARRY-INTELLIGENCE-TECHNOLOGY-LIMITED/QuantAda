@@ -81,7 +81,7 @@ def _build_gm_broker(symbol: str, notional: float):
         from gm.csdk.c_sdk import gmi_init, gmi_set_mode, py_gmi_set_strategy_id
         from gm.model.storage import context
         from live_trader.adapters.gm_broker import GmBrokerAdapter
-    except Exception as exc:  # pragma: no cover - depends on optional SDK
+    except Exception as exc:  # pragma: no cover - 依赖可选 SDK
         raise BrokerUnavailable(f"GM SDK is unavailable: {exc}") from exc
 
     token = os.getenv("QUANTADA_GM_TOKEN") or os.getenv("GM_TOKEN")
@@ -136,7 +136,7 @@ def _build_ib_broker(symbol: str, notional: float):
     try:
         from ib_insync import IB
         from live_trader.adapters.ib_broker import IBBrokerAdapter
-    except Exception as exc:  # pragma: no cover - depends on optional SDK
+    except Exception as exc:  # pragma: no cover - 依赖可选 SDK
         raise BrokerUnavailable(f"IBKR SDK is unavailable: {exc}") from exc
 
     import config

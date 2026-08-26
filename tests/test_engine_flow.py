@@ -189,7 +189,7 @@ def _force_lot_size(monkeypatch):
 
 def test_full_day_engine_lifecycle(monkeypatch):
     """
-    E2E Red Team Test:
+    端到端红队测试：
     还原完整日内链路: 09:35 买入 -> 10:00 撤单并回调 -> 14:45 清仓。
     """
     import live_trader.engine as engine_module

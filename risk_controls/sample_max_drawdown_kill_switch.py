@@ -67,7 +67,7 @@ class SampleMaxDrawdownKillSwitch(BaseRiskControl):
     def _safe_getvalue(self):
         try:
             value = self.broker.getvalue()
-        except Exception as exc:  # pragma: no cover - defensive guard
+        except Exception as exc:  # pragma: no cover - 防御性保护
             self._log_once(f"[RiskControl] getvalue failed: {exc}")
             return None
 

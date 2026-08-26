@@ -1,8 +1,7 @@
-"""
-Optimizer package public API.
+"""优化器包的公开 API。
 
-The runtime implementation lives in optimizer.runtime. This package-level
-module keeps the CLI import compact while avoiding the old common.* ownership.
+运行时实现位于 optimizer.runtime。本包级模块保持 CLI 导入简洁，
+同时避免恢复旧的 common.* 归属关系。
 """
 
 from .runtime import (

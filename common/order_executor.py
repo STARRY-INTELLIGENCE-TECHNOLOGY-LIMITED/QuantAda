@@ -19,7 +19,7 @@ from common.order_quantity import (
 
 class OrderExecutor:
     """
-    Executes a rebalance plan against a live broker.
+    对实盘券商执行调仓计划。
     """
     _SELL_SETTLE_WARN_SECONDS = 300.0
     _SELL_SETTLE_HARD_SECONDS = 600.0

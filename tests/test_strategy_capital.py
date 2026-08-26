@@ -189,8 +189,8 @@ def test_should_execute_rebalance_weekly_blocks_same_week(monkeypatch):
     data = DummyData(
         "AAPL.SMART",
         index=[
-            datetime(2026, 4, 20, 14, 45, 0),  # Monday
-            datetime(2026, 4, 21, 14, 45, 0),  # Tuesday
+            datetime(2026, 4, 20, 14, 45, 0),  # 星期一
+            datetime(2026, 4, 21, 14, 45, 0),  # 星期二
         ],
     )
     broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
@@ -207,8 +207,8 @@ def test_should_execute_rebalance_weekly_allows_new_week(monkeypatch):
     data = DummyData(
         "AAPL.SMART",
         index=[
-            datetime(2026, 4, 24, 14, 45, 0),  # Friday
-            datetime(2026, 4, 27, 14, 45, 0),  # Next Monday
+            datetime(2026, 4, 24, 14, 45, 0),  # 星期五
+            datetime(2026, 4, 27, 14, 45, 0),  # 下周一
         ],
     )
     broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])

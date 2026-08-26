@@ -1,8 +1,6 @@
-"""
-Process elevation helpers for optimizer runtime.
+"""优化器运行时的进程提权辅助函数。
 
-The optimizer provides the worker-count policy; this module owns platform
-checks, relaunch commands, and environment propagation.
+优化器负责 worker 数量策略；本模块负责平台检查、重新启动命令和环境变量传递。
 """
 
 import base64
@@ -54,7 +52,7 @@ def _build_windows_powershell_start_info():
 
 def is_process_elevated():
     """
-    Cross-platform administrator/root check.
+    跨平台检查当前进程是否具有管理员或 root 权限。
     """
     if sys.platform.startswith("win"):
         try:
@@ -170,8 +168,7 @@ def relaunch_unix_with_sudo():
 
 def request_optimizer_elevation_if_needed(args, resolve_worker_count):
     """
-    Return True when an elevated relaunch was triggered and the current process
-    should stop.
+    如果已触发提权重启并且当前进程应退出，则返回 True。
     """
     if not should_try_auto_elevation(args, resolve_worker_count):
         return False

@@ -656,11 +656,10 @@ class BaseLiveBroker(ABC):
     @staticmethod
     def _read_order_state(proxy):
         """
-        Safely read the common order-state contract from a broker proxy.
+        安全读取券商订单代理的通用订单状态契约。
 
-        A broken adapter method must not make a synchronous terminal/rejected
-        order look accepted by accident. Unknown states therefore default to
-        False and are handled conservatively by submit finalization.
+        适配器方法异常时，不能把同步终态或拒单误判为已接受。未知状态默认
+        为 False，并由提交收尾逻辑按保守方式处理。
         """
         try:
             completed = bool(proxy.is_completed())

@@ -1,9 +1,17 @@
-"""可选的 paper-account 调仓 smoke 测试。普通单元测试必须独立于 GM/IB 桌面软件，因此测试要求 CI 或
-``QUANTADA_RUN_LIVE_REBALANCE_TESTS=0`` 时跳过，本地运行时还必须能访问配置的 paper endpoint 并提供账户凭证。
+"""可选的 paper-account 调仓 smoke 测试。
 
-worker 在子进程中运行，这是有意设计：单元测试可能安装 fake ``gm`` 模块，而 live smoke 必须在干净解释器中加载真实 SDK。默认模式只生成真实账户调仓计划，并用 recorder 替换最终发单；只有设置 ``QUANTADA_LIVE_REBALANCE_EXECUTE=1`` 才会提交 paper order。
+普通单元测试必须独立于 GM/IB 桌面软件，因此测试要求 CI 或设置
+``QUANTADA_RUN_LIVE_REBALANCE_TESTS=0`` 时跳过；本地运行时还必须能访问配置的
+paper endpoint 并提供账户凭证。
 
-IBKR execution 执行有界往返；GM execution 只有在设置 ``QUANTADA_LIVE_REBALANCE_ALLOW_UNFLAT_GM=1``、明确接受 A-share T+1 无法当日清仓时才启用。
+worker 在子进程中运行，这是有意设计：单元测试可能安装 fake ``gm`` 模块，
+而 live smoke 必须在干净解释器中加载真实 SDK。默认模式只生成真实账户调仓计划，
+并用 recorder 替换最终发单；只有设置
+``QUANTADA_LIVE_REBALANCE_EXECUTE=1`` 才会提交 paper order。
+
+IBKR execution 执行有界往返；GM execution 只有在设置
+``QUANTADA_LIVE_REBALANCE_ALLOW_UNFLAT_GM=1``、明确接受 A-share T+1 无法当日
+清仓时才启用。
 """
 
 from __future__ import annotations

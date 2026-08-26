@@ -5,10 +5,9 @@ import pandas as pd
 
 class LiveAlarmDeduper:
     """
-    Live alarm/log de-duplication helper.
+    实盘告警和日志去重辅助类。
 
-    It only owns de-duplication keys and schedule-scoped key construction.
-    Message formatting and delivery stay with the caller.
+    这里只负责去重键和按调度范围构造键，消息格式化与发送由调用方负责。
     """
 
     def __init__(self, max_keys=5000):

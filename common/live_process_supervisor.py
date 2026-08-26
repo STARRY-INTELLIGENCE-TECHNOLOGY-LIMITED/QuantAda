@@ -1,16 +1,8 @@
-"""
-Process-level supervision for long-running live trading commands.
+"""长时间运行的实盘命令的进程级监督器。
 
-Broker SDKs are often backed by native code.  A retry loop inside the same
-Python process cannot recover from a native ``exit``, a segfault, a deadlock,
-or an SDK call that never returns.  This module keeps the supervisor small and
-broker-agnostic: the parent process owns restart policy while the child owns
-all trading state and SDK objects.
+券商 SDK 经常依赖原生代码。同一 Python 进程内的重试循环无法恢复原生 ``exit``、段错误、死锁或永不返回的 SDK 调用。本模块保持监督器精简且与券商无关：父进程负责重启策略，子进程负责交易状态和 SDK 对象。
 
-The heartbeat is deliberately a file rather than a socket or a Python queue.
-It works for a command started through ``nohup``, survives SDK thread layouts,
-and gives the parent a useful diagnostic snapshot when it has to terminate a
-stuck worker.
+心跳有意使用文件，而不是 socket 或 Python 队列。它适用于通过 ``nohup`` 启动的命令，能够适应 SDK 的线程布局，并在父进程终止卡死 worker 时提供有用的诊断快照。
 """
 
 from __future__ import annotations
@@ -275,7 +267,7 @@ def report_live_worker_state(
 ) -> bool:
     """向父 supervisor 发布短生命周期的 live SDK 健康状态。
 
-    ``unhealthy_after_seconds`` 是该状态的有界期限，传入 ``None`` 表示在下一次报告前持续视为健康。``failure_kind`` 是下一代 worker 告警策略的元数据，不从人类可读的 state/detail 文本推断；该值只属于当前 worker run，不保存订单、持仓或交易意图。
+    ``unhealthy_after_seconds`` 是状态的有界期限，``None`` 表示下次报告前持续视为健康。``failure_kind`` 是 worker 告警策略的元数据，不从可读的 state/detail 文本推断；该值只属于当前 worker run，不保存订单、持仓或意图。
     """
 
     heartbeat = _worker_heartbeat
@@ -315,7 +307,7 @@ def request_live_worker_restart(
 ) -> None:
     """请求 supervisor 执行干净的进程重启。
 
-    不经过 supervisor 的直接 adapter 调用仍保留原有进程内 Phoenix 行为；只有受监督 worker 才以保留退出码退出。``failure_kind`` 与诊断原因分开传递，策略不依赖文本匹配。
+    不经过 supervisor 的直接 adapter 调用仍保留进程内 Phoenix 行为；只有受监督 worker 才以保留退出码退出。``failure_kind`` 与诊断原因分开传递，策略不依赖文本匹配。
     """
 
     if not is_live_worker_process():

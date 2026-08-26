@@ -1,13 +1,12 @@
 """
-QuantAda Heuristic Parallel Bayesian Optimizer
+QuantAda 启发式并行贝叶斯优化器
 -------------------------------------------------------------------
 Copyright (c) 2026 Starry Intelligence Technology Limited. All rights reserved.
 
-This module implements the Entropy-Based Computational Budgeting and
-Mix-Score evaluation mechanism described in our IEEE Access research.
+本模块实现 IEEE Access 研究中描述的基于熵的计算预算和 Mix-Score 评估机制。
 
-Author: Xingchen Lin (ceo@starryint.hk)
-Grant: SIT-2026-Q1
+作者：Xingchen Lin (ceo@starryint.hk)
+项目：SIT-2026-Q1
 -------------------------------------------------------------------
 QuantAda 启发式并行贝叶斯优化器
 ===============================
@@ -1895,10 +1894,10 @@ class OptimizationJob:
 
     def _infer_yearly_validation_windows(self):
         """
-        Build natural-year validation windows from already loaded raw data.
+        根据已经加载的原始数据构造自然年度验证窗口。
 
-        This intentionally does not fetch provider data. It is a diagnostic
-        report for the optimizer summary, so it must preserve Tiingo quota.
+        本函数有意不请求数据提供者，只生成优化器摘要所需的诊断报告，
+        因此必须保留 Tiingo 配额。
         """
         indexes = []
         for df in getattr(self, "raw_datas", {}).values():
@@ -2105,7 +2104,7 @@ class OptimizationJob:
 
     def _run_recent_3y_backtest(self, final_params):
         """
-        Backward-compatible alias for callers still using the old method name.
+        为仍使用旧方法名的调用方保留兼容别名。
         """
         return self._run_main_eval_backtest(final_params)
 

@@ -486,7 +486,10 @@ class GmBrokerAdapter(BaseLiveBroker):
     def _query_unfinished_orders_single_account(self, public_query):
         """读取唯一 GM 账户，不继承 SDK 的静默跳过行为。
 
-        ``gm.api.get_unfinished_orders`` 会遍历账户，某个 native 请求失败时仍继续执行。这里的 GM adapter 只有单账户，因此 SDK 暴露对应 primitive 时直接查询该账户，让 pending health flag 能区分空订单簿和请求失败；``None`` 只保留给精简测试桩。
+        ``gm.api.get_unfinished_orders`` 会遍历账户，某个 native 请求失败时仍
+        继续执行。GM adapter 只有单账户，因此 SDK 暴露对应 primitive 时直接
+        查询该账户，让 pending health flag 区分空订单簿和请求失败；``None``
+        只保留给精简测试桩。
         """
         if context is None or not self.is_live:
             return None
@@ -1079,12 +1082,11 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         def _apply_gm_connection_config():
             """
-            Re-apply GM global connection settings before every SDK init attempt.
+            在每次 SDK 初始化前重新应用 GM 全局连接配置。
 
-            GM SDK keeps part of its connection state process-wide. If the first
-            init happens while the terminal/broker is unavailable, re-binding the
-            token/server on each Phoenix session keeps later retries equivalent
-            to a fresh process start.
+            GM SDK 的部分连接状态属于进程全局。如果首次初始化时终端或券商
+            不可用，每次 Phoenix 会话重新绑定 token/server，后续重试才能
+            保持与全新进程启动等价。
             """
             if serv_addr and set_serv_addr:
                 set_serv_addr(serv_addr)
@@ -1093,9 +1095,10 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         def _soft_reset_gm_sdk(reason, status=None, log_result=True):
             """
-            Best-effort cleanup for GM SDK process-global state after init/poll
-            failure. Function names differ across gm versions, so this probes
-            both module globals and gm.csdk.c_sdk dynamically.
+            初始化或 poll 失败后尽力清理 GM SDK 的进程全局状态。
+
+            不同 GM 版本暴露的函数名可能不同，因此同时动态探测模块全局和
+            ``gm.csdk.c_sdk``。
             """
             reset_names = (
                 'gmi_close', 'gmi_stop', 'gmi_uninit', 'gmi_exit',
@@ -1139,9 +1142,9 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         def _hard_reexec_current_process(reason):
             """
-            Last-resort self-healing: replace the current Python process with a
-            fresh one. This matches the manual kill/re-run recovery path while
-            preserving nohup file descriptors.
+            最后的自愈手段：用全新进程替换当前 Python 进程。
+
+            这与手工 kill 后重新运行的恢复路径一致，同时保留 nohup 文件描述符。
             """
             _runtime_print(f"[Phoenix] {reason}. Re-exec current Python process to clear GM SDK state...")
 

@@ -3120,6 +3120,122 @@ def test_ib_cross_thread_snapshot_query_is_marshaled_to_owner_loop():
         loop_thread.join(1.0)
 
 
+def test_ib_cross_thread_future_api_is_invoked_on_owner_loop():
+    """reqPositionsAsync 等 Future API 不能在 worker 线程创建 asyncio.Future。"""
+    import asyncio
+
+    loop_ready = threading.Event()
+    owner = {}
+
+    def _run_loop():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        owner["loop"] = loop
+        owner["thread_id"] = threading.get_ident()
+        loop_ready.set()
+        loop.run_forever()
+        loop.close()
+
+    loop_thread = threading.Thread(target=_run_loop, name="ib-future-test-loop", daemon=True)
+    loop_thread.start()
+    assert loop_ready.wait(1.0)
+
+    class FutureSnapshotIB:
+        def reqPositions(self, *_args, **_kwargs):
+            raise AssertionError("worker must not call synchronous reqPositions")
+
+        def reqPositionsAsync(self):
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(["positions"])
+            return future
+
+    ib = FutureSnapshotIB()
+    broker = object.__new__(IBBrokerAdapter)
+    broker.ib = ib
+    broker._ib_event_loop = owner["loop"]
+    broker._ib_event_loop_thread_id = owner["thread_id"]
+
+    result = []
+    errors = []
+
+    def _worker_query():
+        try:
+            result.append(broker._bounded_sync_query("reqPositions"))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_worker_query, name="quantada-ib-run-future-test")
+    worker.start()
+    worker.join(2.0)
+    try:
+        assert not worker.is_alive()
+        assert errors == []
+        assert result == [["positions"]]
+    finally:
+        owner["loop"].call_soon_threadsafe(owner["loop"].stop)
+        loop_thread.join(1.0)
+
+
+def test_ib_disables_unbounded_account_summary_resubscribe():
+    """1102 恢复事件不能由 ib_insync 默认处理器重复创建摘要订阅。"""
+    import live_trader.adapters.ib_broker as ib_module
+
+    class Event:
+        def __init__(self):
+            self.handlers = []
+
+        def __isub__(self, handler):
+            self.handlers.remove(handler)
+            return self
+
+    class FakeIB:
+        def __init__(self):
+            self.errorEvent = Event()
+            self._onError = lambda *_args: None
+            self.errorEvent.handlers.append(self._onError)
+
+    ib = FakeIB()
+    assert ib_module._disable_ib_account_summary_auto_resubscribe(ib) is True
+    assert ib.errorEvent.handlers == []
+
+
+def test_ib_account_values_cache_is_preferred_over_new_summary_request():
+    """已有 account updates 时不得再创建受限的 account summary 订阅。"""
+    import live_trader.adapters.ib_broker as ib_module
+
+    account = "U1234567"
+    cached = [
+        DummyAccountValue("AvailableFunds", "BASE", "4321", account=account),
+        DummyAccountValue("TotalCashValue", "BASE", "4321", account=account),
+    ]
+
+    class IBWithAccountUpdates(DummyIBForCash):
+        def __init__(self):
+            super().__init__(cash_usd=0.0)
+            self.wrapper = SimpleNamespace(
+                accountValues={(account, "AvailableFunds", "BASE", ""): cached[0],
+                               (account, "TotalCashValue", "BASE", ""): cached[1]},
+                acctSummary={},
+            )
+            self.summary_calls = 0
+
+        def managedAccounts(self):
+            return [account]
+
+        def accountSummary(self, *_args, **_kwargs):
+            self.summary_calls += 1
+            raise AssertionError("account updates cache should avoid summary request")
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(ib_module.config, "IBKR_ORDER_ACCOUNT", account, raising=False)
+        broker = IBBrokerAdapter(context=types.SimpleNamespace(ib_instance=IBWithAccountUpdates()))
+        assert broker._fetch_real_cash() == pytest.approx(4321.0)
+        assert broker.ib.summary_calls == 0
+    finally:
+        monkeypatch.undo()
+
+
 def test_ib_provider_cross_thread_history_query_is_marshaled_to_owner_loop():
     """IB fallback 历史数据请求必须使用相同的 owner-loop bridge。"""
     import asyncio
@@ -3147,9 +3263,10 @@ def test_ib_provider_cross_thread_history_query_is_marshaled_to_owner_loop():
         def reqContractDetails(self, *_args, **_kwargs):
             raise AssertionError("worker must not call synchronous history wrappers")
 
-        async def reqContractDetailsAsync(self, *_args, **_kwargs):
-            await asyncio.sleep(0)
-            return ["details"]
+        def reqContractDetailsAsync(self, *_args, **_kwargs):
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(["details"])
+            return future
 
     ib = AsyncHistoryIB()
     ib._quantada_event_loop = owner["loop"]

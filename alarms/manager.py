@@ -318,8 +318,8 @@ class AlarmManager:
         # 2. 信号监听 (Ctrl+C, Kill)
         # 注意：在 Windows 下某些信号可能受限，但在 Linux/Docker 中很有效
         try:
-            signal.signal(signal.SIGINT, self._signal_handler)  # Ctrl+C
-            signal.signal(signal.SIGTERM, self._signal_handler)  # Kill
+            signal.signal(signal.SIGINT, self._signal_handler)  # 中断信号
+            signal.signal(signal.SIGTERM, self._signal_handler)  # 终止信号
         except ValueError:
             # 说明可能不在主线程运行，跳过信号注册
             pass

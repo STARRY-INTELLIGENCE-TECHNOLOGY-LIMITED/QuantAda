@@ -1,9 +1,7 @@
-"""
-Async terminal output logging utilities.
+"""异步终端输出日志工具。
 
-This module keeps stdout/stderr tee mechanics out of optimizer orchestration.
-The optimizer decides the run name; this module only owns path construction,
-environment propagation, and non-blocking terminal/file fan-out.
+本模块将 stdout/stderr 的 tee 机制与优化器编排隔离。优化器决定运行名称，
+本模块只负责路径构造、环境变量传递以及非阻塞的终端/文件分流。
 """
 
 import atexit
@@ -23,10 +21,10 @@ _TERMINAL_LOG_TEE = None
 
 def configure_text_stream_error_handling(streams=None, errors="backslashreplace"):
     """
-    Keep console output from crashing on Windows legacy encodings.
+    防止 Windows 旧编码导致终端输出崩溃。
 
-    UTF-8 log files still receive the original text. This only changes how
-    stdout/stderr degrade when the active terminal cannot encode a character.
+    UTF-8 日志文件仍接收原始文本；本函数只改变当前终端无法编码字符时
+    stdout/stderr 的降级方式。
     """
     target_streams = streams if streams is not None else (sys.stdout, sys.stderr)
     for stream in target_streams:
@@ -71,10 +69,10 @@ def set_optimizer_terminal_log_path(log_file):
 
 class _AsyncTerminalLogTee:
     """
-    Non-blocking terminal tee.
+    非阻塞终端 tee。
 
-    Writes continue to the original stdout/stderr immediately. File persistence
-    happens on a bounded background queue so disk IO cannot throttle trials.
+    输出会立即继续写入原始 stdout/stderr；文件持久化通过有界后台队列完成，
+    避免磁盘 IO 限制优化试验速度。
     """
 
     def __init__(self, log_file, queue_size=10000):

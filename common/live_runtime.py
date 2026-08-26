@@ -3,11 +3,10 @@ import datetime
 
 def runtime_print(message, now=None):
     """
-    Print long-running live runtime messages with a local timestamp.
+    为长时间运行的实盘消息添加本地时间戳后输出。
 
-    This is intentionally tiny and side-effect-free so broker launch loops can
-    share timestamped diagnostics without moving broker-specific recovery logic
-    into BaseLiveBroker.
+    本函数保持轻量且无副作用，供券商启动循环共享带时间戳的诊断能力，
+    不把券商专属的恢复逻辑移动到 BaseLiveBroker。
     """
     ts = now or datetime.datetime.now()
     if hasattr(ts, "to_pydatetime"):

@@ -3,7 +3,7 @@ import math
 
 class ClosedTradeTracker:
     """
-    Tracks completed Backtrader round trips for attribution diagnostics.
+    跟踪已完成的 Backtrader 往返交易，用于归因诊断。
     """
 
     def __init__(self, owner):

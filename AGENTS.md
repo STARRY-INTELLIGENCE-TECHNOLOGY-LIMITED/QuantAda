@@ -129,6 +129,12 @@ When user asks for rapid code generation or new module scaffolding, agents must 
 - Prioritize actionable outcomes over long theory.
 - Challenge complexity creep politely; default to simpler robust design.
 
+## 6.5) Code Comment Rules
+- 代码注释和 Docstring 统一使用中文；第三方 API/协议名称、类名、方法名和标准错误文本可保留英文。
+- 注释和 Docstring 的每一行最多 200 个字符，按 Unicode 字符逐个计数。
+  中文一个字算一个字符，不按字节数或显示宽度换算。
+- 该限制只约束注释和 Docstring，不限制代码行。
+
 ## 7) Decision Ownership
 - AI can propose and rank with high weight.
 - Final GO/HOLD/KILL decisions remain human-owned.

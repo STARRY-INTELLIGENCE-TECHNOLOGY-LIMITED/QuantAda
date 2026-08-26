@@ -1,8 +1,6 @@
-"""
-Runtime notification boundary.
+"""运行时通知边界。
 
-Core trading modules should emit notification intent through this module
-instead of importing IM alarm implementations directly.
+核心交易模块应通过本模块发出通知意图，不要直接导入 IM 告警实现。
 """
 
 _DEFERRED_PLAN_KEY = "plan"
