@@ -1,5 +1,7 @@
 version: '3.8'
 
+# 只持久化 settings 配置，不要覆盖整个 Jts 安装目录，否则会遮住镜像内置的离线 jars。
+
 services:
   # === 实例 1：模拟盘 (Paper) ===
   ib-paper:
@@ -12,7 +14,8 @@ services:
       - TWS_PASSWORD=${IB_PASS_PAPER}
       - TRADING_MODE=paper
       - READ_ONLY_API=no
-      - TWS_SETTINGS_PATH=/home/ibgateway/Jts
+      - TWS_PATH=/home/ibgateway/Jts
+      - TWS_SETTINGS_PATH=/home/ibgateway/settings
       - VNC_SERVER_PASSWORD=${VNC_PASS_PAPER}
       - TIME_ZONE=Asia/Hong_Kong
       - 'AUTO_RESTART_TIME=08:30 AM'
@@ -21,7 +24,7 @@ services:
       - TWOFA_EXIT_INTERVAL=600
       - BYPASS_WARNING=yes
     volumes:
-      - ib_paper_jts:/home/ibgateway/Jts
+      - ib_paper_jts:/home/ibgateway/settings
     logging:
       driver: "json-file"
       options:
@@ -29,9 +32,8 @@ services:
         max-file: "3"
     networks:
       ib_net:
-        # 为了安全，请使用 autossh 或 临时 ssh -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 -L 5900:172.20.0.10:5900 root@IP 建立隧道，但注意本机端口不要冲突
+        # 为了安全，请使用 autossh 或临时 ssh 隧道建立 VNC 连接，不要公开 VNC 端口。
         ipv4_address: 172.20.0.10
-
 
   # === 实例 2：实盘 1 (Live 1) ===
   ib-live1:
@@ -44,7 +46,8 @@ services:
       - TWS_PASSWORD=${IB_PASS_LIVE1}
       - TRADING_MODE=live
       - READ_ONLY_API=no
-      - TWS_SETTINGS_PATH=/home/ibgateway/Jts
+      - TWS_PATH=/home/ibgateway/Jts
+      - TWS_SETTINGS_PATH=/home/ibgateway/settings
       - VNC_SERVER_PASSWORD=${VNC_PASS_LIVE1}
       - TIME_ZONE=Asia/Hong_Kong
       - 'AUTO_RESTART_TIME=08:30 AM'
@@ -53,7 +56,7 @@ services:
       - TWOFA_EXIT_INTERVAL=600
       - BYPASS_WARNING=yes
     volumes:
-      - ib_live1_jts:/home/ibgateway/Jts
+      - ib_live1_jts:/home/ibgateway/settings
     logging:
       driver: "json-file"
       options:
@@ -74,7 +77,8 @@ services:
 #      - TWS_PASSWORD=${IB_PASS_LIVE2}
 #      - TRADING_MODE=live
 #      - READ_ONLY_API=no
-#      - TWS_SETTINGS_PATH=/home/ibgateway/Jts
+#      - TWS_PATH=/home/ibgateway/Jts
+#      - TWS_SETTINGS_PATH=/home/ibgateway/settings
 #      - VNC_SERVER_PASSWORD=${VNC_PASS_LIVE2}
 #      - TIME_ZONE=Asia/Hong_Kong
 #      - 'AUTO_RESTART_TIME=08:30 AM'
@@ -83,12 +87,12 @@ services:
 #      - TWOFA_EXIT_INTERVAL=600
 #      - BYPASS_WARNING=yes
 #    volumes:
-#      - ib_live2_jts:/home/ibgateway/Jts
+#      - ib_live2_jts:/home/ibgateway/settings
 #    logging:
-#          driver: "json-file"
-#          options:
-#            max-size: "10m"
-#            max-file: "3"
+#      driver: "json-file"
+#      options:
+#        max-size: "10m"
+#        max-file: "3"
 #    networks:
 #      ib_net:
 #        ipv4_address: 172.20.0.12

@@ -213,3 +213,10 @@ __marimo__/
 log/
 logs/
 gmcache/
+
+# IBC 实例配置包含 IBKR 凭据；仓库只保留 config.sample.ini。
+ib_gateway/ibc_windows/config-*.ini
+ib_gateway/ibc_windows/**/config-*.ini
+ib_gateway/ibc_windows/settings/
+ib_gateway/ibc_windows/Logs/
+ib_gateway/ib_docker/.env

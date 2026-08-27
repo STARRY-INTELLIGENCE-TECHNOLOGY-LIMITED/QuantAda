@@ -1,0 +1,33 @@
+# 请放置于：
+# /etc/systemd/system/ib-tunnel.service
+#
+# 执行前先配置 SSH 公钥免密登录，并把最后一行的目标主机替换为实际地址。
+# 启动服务：systemctl start ib-tunnel
+# 开机自启动：systemctl enable ib-tunnel
+[Unit]
+Description=Autossh Tunnel for IBKR
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=root
+Environment="AUTOSSH_GATETIME=0"
+ExecStart=/usr/bin/autossh -M 0 -N \
+    -o "StrictHostKeyChecking=no" \
+    -o "UserKnownHostsFile=/dev/null" \
+    -o "BatchMode=yes" \
+    -o "ExitOnForwardFailure=yes" \
+    -o "ServerAliveInterval=60" \
+    -o "ServerAliveCountMax=3" \
+    -L 4001:172.20.0.11:4003 \
+    -L 5901:172.20.0.11:5900 \
+    -L 4002:172.20.0.10:4004 \
+    -L 5902:172.20.0.10:5900 \
+    -L 5001:172.20.0.12:4003 \
+    -L 5903:172.20.0.12:5900 \
+    root@券商平台运行IP
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
