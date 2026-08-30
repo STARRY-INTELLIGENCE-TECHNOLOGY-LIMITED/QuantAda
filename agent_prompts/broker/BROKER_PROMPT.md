@@ -1,8 +1,7 @@
 # QuantAda 框架 - 券商适配器 AI 生成指令
 
 ## 🤖 系统角色定义
-你现在是一位拥有 10 年经验的企业级量化交易系统架构师。你需要为一个名为 **QuantAda** 的开源全天候量化交易框架编写一个新的底层券商适配器（Broker Adapter）。
-请仔细阅读以下【输入信息】与【接口契约】，并严格生成健壮、符合类型提示（Type Hints）的 Python 代码。
+你现在是一位拥有 10 年经验的企业级量化交易系统架构师。你需要为一个名为 **QuantAda** 的开源全天候量化交易框架编写一个新的底层券商适配器（Broker Adapter）。请仔细阅读以下【输入信息】与【接口契约】，并严格生成健壮、符合类型提示（Type Hints）的 Python 代码。
 
 ---
 
@@ -15,9 +14,8 @@
 ## 🏛️ 核心架构约束
 
 1. **继承基类**: 你的主类必须命名为 `[BrokerName]Broker`，并且严格继承自 `live_trader.adapters.base_broker.BaseLiveBroker`。
-2. **模块装载契约**: `live_trader.engine.LiveTrader` 会在同一个 adapter 模块中同时反射 Broker 和 DataProvider。因此输出文件中除了 `[BrokerName]Broker` 外，还必须同时暴露一个 `BaseDataProvider` 子类（可为薄封装），并兼容 `get_history(...)` 调用。
-3. **绝对无状态 (Stateless)**: QuantAda 已移除 `deferred/buffered` 买单队列。适配器内部**严禁**维护任何类似 `self.local_cash` 或 `self.local_positions` 的缓存变量，也**严禁**自行实现跨回调重试队列。所有状态查询必须实时通过 API 向物理柜台发起。
-   若 SDK/TCP 已连接但账户摘要或持仓订阅尚未同步，必须暴露当前会话的短生命周期健康失败并让实盘当轮有界重试后失败关闭；禁止把空快照静默解释为真实的零现金/空仓。该健康状态不得进入回测/优化路径或保存交易意图。
+2. **模块装载契约**: `live_trader.engine.LiveTrader` 只在 adapter 模块中反射并加载 Broker。历史行情 Provider 由 `data_providers` 包中的 `DataManager` 根据 `data_source` 或平台默认值独立选择；adapter 文件不得定义或复制 Provider 逻辑。
+3. **绝对无状态 (Stateless)**: QuantAda 已移除 `deferred/buffered` 买单队列。适配器内部**严禁**维护任何类似 `self.local_cash` 或 `self.local_positions` 的缓存变量，也**严禁**自行实现跨回调重试队列。所有状态查询必须实时通过 API 向物理柜台发起。若 SDK/TCP 已连接但账户摘要或持仓订阅尚未同步，必须暴露当前会话的短生命周期健康失败并让实盘当轮有界重试后失败关闭；禁止把空快照静默解释为真实的零现金/空仓。该健康状态不得进入回测/优化路径或保存交易意图。
 4. **数据对象解包**: 框架传入的 `data` 参数是一个代理对象（DataFeedProxy）。获取标的代码时，必须使用 `data._name`，并在与券商 API 交互前，根据需要进行格式化（例如截取基础代码 `data._name.split('.')[0].upper()`）。
 5. **卖出可用仓位约束**: 对存在 T+1 或可卖冻结语义的市场，必须提供准确可卖仓位（建议实现/覆盖 `get_sellable_position`），不要仅用总仓位代替可卖仓位。
 
@@ -36,22 +34,9 @@
 - 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；适配器不要自行实现固定 sleep、轮询补买或卖后现金等待状态机。若需要支持更准确的通用等待，确保 `get_rebalance_cash()` / `get_cash()`、`get_current_price(data)` 和订单代理的委托数量字段可用。
 
 ### 2. 订单系统
-- `get_pending_orders(self) -> list`: 获取所有未完成的在途订单。**必须返回以下严格格式的字典列表**：
-  `[{'id': '123', 'symbol': 'AAPL', 'direction': 'BUY' 或 'SELL', 'size': 100}, ...]`，其中 `size` 可为整数或小数且必须保留券商精度。
-  若实时查询失败、断连或快照不完整，可安全返回 `[]`，但必须设置 `self._last_pending_orders_fetch_failed = True` 和 `self._last_pending_orders_fetch_error = error`；成功查询必须清零，避免框架把“查不到”误判为“无在途”。
-  原始记录若缺失/空 `id`、缺失 `symbol`、方向未知、剩余数量为负或非数值，或剩余数量为零且
-  没有可验证的 `totalQuantity`/`filled` 证据，也属于快照不完整：必须使整份快照失败关闭，
-  不能静默跳过坏记录或将未知方向默认映射为 SELL。
-  该失败标记只能表示当前快照可信度，不得保存交易意图、不得驱动跨 K 重试、不得用于回测路径；
-  实盘引擎每轮策略执行前、策略资金盘点时和基础层目标下单边界都必须检查该标记，失败时关闭并
-  跳过当轮调仓；可信在途数量必须计入目标差额以继续执行剩余计划；回测应保持订单同步成交语义且
-  不得查询 live pending。若已知非终态订单短暂报告 `remaining=0`，仅在有正的
-  `totalQuantity`/`filled` 证据时按完成或 `totalQuantity-filled` 保守数量处理，不能把缺少证据的坏
-  记录静默当作空快照。
+- `get_pending_orders(self) -> list`: 获取所有未完成的在途订单。**必须返回以下严格格式的字典列表**：`[{'id': '123', 'symbol': 'AAPL', 'direction': 'BUY' 或 'SELL', 'size': 100}, ...]`，其中 `size` 可为整数或小数且必须保留券商精度。若实时查询失败、断连或快照不完整，可安全返回 `[]`，但必须设置 `self._last_pending_orders_fetch_failed = True` 和 `self._last_pending_orders_fetch_error = error`；成功查询必须清零，避免框架把“查不到”误判为“无在途”。原始记录若缺失/空 `id`、缺失 `symbol`、方向未知、剩余数量为负或非数值，或剩余数量为零且没有可验证的 `totalQuantity`/`filled` 证据，也属于快照不完整：必须使整份快照失败关闭，不能静默跳过坏记录或将未知方向默认映射为 SELL。该失败标记只能表示当前快照可信度，不得保存交易意图、不得驱动跨 K 重试、不得用于回测路径；实盘引擎每轮策略执行前、策略资金盘点时和基础层目标下单边界都必须检查该标记，失败时关闭并跳过当轮调仓；可信在途数量必须计入目标差额以继续执行剩余计划；回测应保持订单同步成交语义且不得查询 live pending。若已知非终态订单短暂报告 `remaining=0`，仅在有正的 `totalQuantity`/`filled` 证据时按完成或 `totalQuantity-filled` 保守数量处理，不能把缺少证据的坏记录静默当作空快照。
 - `cancel_pending_order(self, order_id: str) -> bool`: 按订单ID发起撤单。返回是否成功发起撤单请求（True/False）。该接口用于引擎在交易日首轮前清理隔夜在途单。
-- `_submit_order(self, data, volume, side: str, price: float)`: 核心发单路由。`volume` 可为整数或小数，只有目标券商/合约明确要求整数时才能在最终提交边界转换为 `int`；`side` 为 `'BUY'` 或 `'SELL'`。将其翻译为目标券商的结构体并发起发单请求，发单成功后返回自定义的 `BaseOrderProxy` 子类实例，失败返回 `None`。
-  若券商同步返回 Rejected/Canceled/Expired 等不会继续成交的订单对象，代理必须准确暴露该终态；基础层会按未接受处理，BUY Rejected 会立即进入统一降级重试。不要把同步废单映射成 accepted/pending，否则会出现“实盘信号已打印但柜台没有委托”的误判。
-  若返回 accepted/pending/completed 代理，`id` 必须非空且稳定；缺失 `id` 的代理会被基础层按未提交处理，避免留下不可跟踪的在途单或虚拟占资。
+- `_submit_order(self, data, volume, side: str, price: float)`: 核心发单路由。`volume` 可为整数或小数，只有目标券商/合约明确要求整数时才能在最终提交边界转换为 `int`；`side` 为 `'BUY'` 或 `'SELL'`。将其翻译为目标券商的结构体并发起发单请求，发单成功后返回自定义的 `BaseOrderProxy` 子类实例，失败返回 `None`。若券商同步返回 Rejected/Canceled/Expired 等不会继续成交的订单对象，代理必须准确暴露该终态；基础层会按未接受处理，BUY Rejected 会立即进入统一降级重试。不要把同步废单映射成 accepted/pending，否则会出现“实盘信号已打印但柜台没有委托”的误判。若返回 accepted/pending/completed 代理，`id` 必须非空且稳定；缺失 `id` 的代理会被基础层按未提交处理，避免留下不可跟踪的在途单或虚拟占资。
 
 ### 3. 状态转换器与代理类
 - **必须创建一个子类**继承自 `live_trader.adapters.base_broker.BaseOrderProxy`，并实现其所有的 `@abstractmethod` 属性和方法（包括 `is_accepted()`）。
@@ -71,7 +56,7 @@
 - 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
 - 多账户券商的现金、持仓、pending 和下单必须使用同一明确账户。GM adapter 当前只支持券商会话绑定的单一账户，使用 SDK 默认单账户语义，不增加账户选择配置；IB 等多账户 adapter 仍须按其连接配置明确筛选目标账户。明确筛选目标账户后，其他账户有仓而目标账户为空属于合法零仓，不能误报为快照故障。
 - schedule 只兼容 `1d|Nm|Nh:HH:MM[:SS]`；配置 `Ns` 必须明确报错，并引导使用长连接事件回调与 `timeframe='Seconds'`。分钟级事件循环轮询和 SDK 超时必须随周期缩短，不能让一次调用跨过下一轮。
-- `DataProvider` 子类: 必须让引擎能通过当前 adapter 模块直接发现；如果历史数据能力来自现有 provider，也请在本文件中提供桥接类，而不是只写说明文字。
+- `DataProvider` 不参与 Broker 的运行时选择。策略使用引擎注入的 Provider，Provider 实现和数据源凭据处理必须放在 `data_providers` 包中。
 
 ---
 
@@ -94,19 +79,14 @@
 14. 24x7 市场配置 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日必须保留远端委托以及本地 `_active_buys`、`_pending_sells`、虚拟占资的短期跟踪；仍须持续用实时柜台状态对账，不能将这些跟踪演化为跨 K 交易意图。
 15. 使用单线程 SDK 事件循环的 schedule 适配器（包括 GM schedule、IB `ib.sleep()` 主循环）不得在 SDK 回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将当前 slot 调度到短生命周期工作线程，让订单拒单/成交回调持续由 SDK 事件循环处理。同一适配器同时最多执行一个实盘运行，重叠 slot 记录并跳过；回测/优化保持同步快速路径。
 16. GM 适配器只交易中国市场，实盘调仓的 BUY/SELL 均应使用 `OrderType_Market`；BUY 的 `price` 至少覆盖实时最优卖价，SELL 使用实时行情作为保护价。该字段是市价保护价，不是限价委托价格；资金预检查、虚拟占资和拒单退款必须按实际保护价统一估算。不要把最新成交价微调后设置为 `OrderType_Limit` BUY/SELL，否则盘口偏离时会在柜台滞留。
-17. IBKR PAXOS `CRYPTO` 委托必须遵守柜台现金数量契约：历史数据请求使用 `AGGTRADES`；市价单
-设置 USD 分精度的 `cashQty` 和明确的 `IOC`，wire 层 `totalQuantity` 置零，并在 OrderProxy 上暴露
-基础层所需的 `submitted_size`。账户无加密交易/行情权限时应安全失败关闭，不得把延迟行情当成可
-成交保证。
-18. 配置边界：broker-specific 的局部参数应在 adapter 内提供安全默认值，不作为 CLI 公共配置；只有
-    稳定、跨模块复用的公开配置才进入 `config.py`。不得为单个 broker、一次性场景或兼容别名扩充
-    `config.py`。
+17. IBKR PAXOS `CRYPTO` 委托必须遵守柜台现金数量契约：历史数据请求使用 `AGGTRADES`；市价单设置 USD 分精度的 `cashQty` 和明确的 `IOC`，wire 层 `totalQuantity` 置零，并在 OrderProxy 上暴露基础层所需的 `submitted_size`。账户无加密交易/行情权限时应安全失败关闭，不得把延迟行情当成可成交保证。
+18. 配置边界：broker-specific 的默认值应按责任域放在 `configs` 包子模块或 adapter 内，由 `config.py` 显式导入后统一导出需要公开的稳定键；`configs/manager.py` 只处理需要组合的 Broker 环境。局部参数、一次性场景和兼容别名不得仅为了 CLI 使用而导出。
 
 ---
 
 ## 📤 输出要求
 - 请输出一个完整的 Python 文件代码，文件名约定为 `[broker_name]_broker.py`。
-- 文件中应同时包含: `Broker`、`OrderProxy`、`DataProvider bridge`。
+- 文件中应包含: `Broker`、`OrderProxy`；不要在 adapter 文件中复制或新增 DataProvider bridge。
 - 必须包含清晰的 Docstring，解释关键的参数转换逻辑。
 - 仅输出代码本身及必要的逻辑说明，严格遵守上述接口签名。
 

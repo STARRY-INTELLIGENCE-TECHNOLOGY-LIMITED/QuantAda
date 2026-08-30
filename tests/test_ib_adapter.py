@@ -1028,6 +1028,24 @@ def test_ib_augment_live_data_source_appends_ibkr_fallback():
     assert IBBrokerAdapter._augment_live_data_source("tiingo") == "tiingo,ibkr"
     assert IBBrokerAdapter._augment_live_data_source("tiingo, ibkr") == "tiingo,ibkr"
     assert IBBrokerAdapter._augment_live_data_source("ibkr") == "ibkr"
+    assert IBBrokerAdapter._augment_live_data_source("ib") == "ibkr"
+
+
+def test_ib_price_provider_selection_normalizes_platform_aliases():
+    """IB 价格兜底应将 ib 别名解析为实际的 ibkr Provider。"""
+    class IbkrDataProvider:
+        pass
+
+    broker = object.__new__(IBBrokerAdapter)
+    broker._context = None
+    broker.ib = None
+    broker._price_data_manager = types.SimpleNamespace(
+        providers=[IbkrDataProvider()],
+    )
+
+    selected = broker._collect_price_providers(data_source="ib")
+
+    assert [name for name, _provider in selected] == ["ibkr"]
 
 
 def test_ib_fetch_smart_value_falls_back_to_base_when_fx_missing(monkeypatch):

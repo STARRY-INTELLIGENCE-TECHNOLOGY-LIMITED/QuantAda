@@ -25,9 +25,10 @@ pip install -r requirements.txt
 
 ### 2) 配置
 
-在 `config.py` 至少配置一个数据源 Token（常用 `TUSHARE_TOKEN`）：
+`config.py` 保留框架核心配置；数据源凭据在 `configs/providers.py` 中配置，并由统一入口平铺导出。至少配置一个数据源 Token（常用 `TUSHARE_TOKEN`）：
 
 ```python
+# configs/providers.py
 TUSHARE_TOKEN = "your_token_here"
 ```
 
@@ -36,6 +37,22 @@ TUSHARE_TOKEN = "your_token_here"
 ```python
 DB_ENABLED = True
 DB_URL = "sqlite:///quantada_logs.db"
+```
+
+配置按责任域拆分，但运行时仍由 `config.py` 平铺导出，现有代码和 `--config` 用法无需区分配置来源。`configs/manager.py` 只负责合并 Broker 连接环境并提供报警状态判断：
+
+| 配置文件 | 主要配置项 | 用途 |
+| --- | --- | --- |
+| `config.py` | `LOT_SIZE`、`DATA_PATH`、`LOG`、`PRINT_PLAN`、`KEEP_OVERNIGHT_ORDERS` | 框架、回测和通用执行 |
+| `configs/providers.py` | `TUSHARE_TOKEN`、`SXSC_TUSHARE_TOKEN`、`TIINGO_TOKEN` | 历史行情 Provider |
+| `configs/alarms.py` | `ALARMS_ENABLED`、`DINGTALK_WEBHOOK`、`WECOM_WEBHOOK`、`ALARM_LEVEL` | 报警通道 |
+| `configs/gm.py` | `GM_TOKEN`、`GM_BROKER_ENVIRONMENTS` | GM Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['gm_broker']`） |
+| `configs/ibkr.py` | `IBKR_HOST`、`IBKR_PORT`、`IBKR_CLIENT_ID`、`IBKR_ORDER_ACCOUNT`、`IB_BROKER_ENVIRONMENTS` | IBKR Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['ib_broker']`） |
+
+不要把真实 Token、密码或 Webhook 提交到公开仓库；运行时也可使用 `--config` 覆盖合并后的公共键，例如：
+
+```bash
+python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --data_source=tiingo --config "{'PRINT_PLAN': True}"
 ```
 
 ### 3) 基础回测示例
@@ -77,7 +94,7 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 
 ### 6) 连接实盘/仿真
 
-先在 `config.py` 配置 `BROKER_ENVIRONMENTS`，再通过 `--connect=broker:env` 启动：
+在 `config.py` 统一入口（Broker 默认连接值位于 `configs/gm.py`、`configs/ibkr.py`）配置 `BROKER_ENVIRONMENTS`，再通过 `--connect=broker:env` 启动：
 
 ```bash
 python run.py sample_macd_cross_strategy --connect=gm_broker:sim

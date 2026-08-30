@@ -38,7 +38,7 @@
    - `{'KEEP_OVERNIGHT_ORDERS': False}`: 交易日首轮前清理隔夜在途委托（默认推荐）
    - `{'KEEP_OVERNIGHT_ORDERS': True}`: 保留隔夜在途委托；24x7 币市应使用该值
    - 币市数量精度通过正小数配置，例如 `{'LOT_SIZE': 0.00000001, 'BROKER_LOT_LIMITS': 0.1, 'KEEP_OVERNIGHT_ORDERS': True}`；不得把数量参数改写为整数
-8. `--config` 只接受 `config.py` 中已声明的公共大写键；局部 adapter/provider 参数使用所属模块的安全默认值，不要为了生成命令而虚构配置键或扩充 `config.py`。旧名称/拼写错误会明确打印警告并被忽略，生成命令时必须使用当前键名。
+8. `--config` 接受统一 `config.py` 入口显式导出的公共大写键；用户不需要区分配置来源。局部 adapter/provider 参数使用所属模块的安全默认值，不要为了生成命令而虚构配置键或公开一次性参数。旧名称/拼写错误会明确打印警告并被忽略，生成命令时必须使用当前键名。
 9. 当 `mode=optimize` 时，框架会自动将终端滚动输出异步归档到 `.data/optimizer`；不要要求用户手动传任何内部日志路径参数。
 10. 当需要查看月度收益热力图时，使用 `--plot_scope monthly_heatmap`；也可和组合图逗号组合，例如 `--plot_scope portfolio_equity,portfolio_drawdown,monthly_heatmap`。
 

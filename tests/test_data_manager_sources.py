@@ -1,7 +1,40 @@
 import pandas as pd
 
 from data_providers.base_provider import BaseDataProvider
-from data_providers.manager import DataManager
+from data_providers.manager import DataManager, resolve_platform_default_source
+
+
+def test_platform_default_data_source_is_owned_by_data_providers():
+    assert resolve_platform_default_source("ib") == "ibkr"
+    assert resolve_platform_default_source("ib_broker") == "ibkr"
+    assert resolve_platform_default_source("gm") == "gm"
+    assert resolve_platform_default_source("unknown") == ""
+
+
+def test_data_manager_normalizes_platform_source_aliases():
+    assert DataManager._split_source_names("ib tiingo") == ["ibkr", "tiingo"]
+    assert DataManager._split_source_names("gmi") == ["gmi"]
+
+
+def test_data_manager_applies_runtime_token_only_to_selected_provider():
+    class GmDataProvider:
+        is_external_mode = True
+        token = "EXTERNAL_MODE"
+
+    class OtherDataProvider:
+        is_external_mode = True
+        token = "EXTERNAL_MODE"
+
+    gm_provider = GmDataProvider()
+    other_provider = OtherDataProvider()
+    manager = object.__new__(DataManager)
+    manager.providers = [gm_provider, other_provider]
+
+    assert manager.apply_runtime_token("runtime-token", specified_sources="gm") is True
+    assert gm_provider.token == "runtime-token"
+    assert gm_provider.is_external_mode is False
+    assert other_provider.token == "EXTERNAL_MODE"
+    assert other_provider.is_external_mode is True
 
 
 def test_data_manager_parses_comma_separated_sources(monkeypatch):

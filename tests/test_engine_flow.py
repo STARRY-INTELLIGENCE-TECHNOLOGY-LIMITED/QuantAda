@@ -8,6 +8,7 @@ import pytest
 
 import config
 from data_providers.base_provider import BaseDataProvider
+from live_trader.adapters.base_broker import BaseLiveBroker
 from live_trader.engine import LiveTrader
 from risk_controls.base_risk_control import BaseRiskControl
 from strategies.base_strategy import BaseStrategy
@@ -254,6 +255,154 @@ def test_full_day_engine_lifecycle(monkeypatch):
     sell_orders = [o for o in engine.broker.submitted_orders if o["side"] == "SELL"]
     assert len(sell_orders) >= 1, "收盘阶段未触发清仓卖单，目标仓位归零链路失效！"
     assert sell_orders[-1]["volume"] == 1000, "清仓卖单数量异常，应与当前真实持仓 1000 股对齐！"
+
+
+def test_adapter_loader_accepts_broker_only_module(monkeypatch):
+    """adapter 只提供 Broker 时，加载器不应再强制要求同模块存在 Provider。"""
+    import live_trader.engine as engine_module
+
+    module_name = "live_trader.adapters.broker_only_broker"
+    fake_module = ModuleType(module_name)
+
+    class BrokerOnly(BaseLiveBroker):
+        pass
+
+    BrokerOnly.__module__ = module_name
+    fake_module.BrokerOnly = BrokerOnly
+
+    original_import = engine_module.importlib.import_module
+
+    def _import(name, package=None):
+        if name == ".adapters.broker_only_broker" and package == engine_module.__package__:
+            return fake_module
+        return original_import(name, package=package)
+
+    monkeypatch.setattr(engine_module.importlib, "import_module", _import)
+
+    trader = object.__new__(LiveTrader)
+    broker_cls = trader._load_adapter_classes("broker_only")
+
+    assert broker_cls is BrokerOnly
+
+
+@pytest.mark.parametrize("platform", ["ib", "gm"])
+def test_builtin_adapters_are_loaded_without_provider_class(platform):
+    """内置交易适配器不应因 Provider 不参与引擎选择而加载失败。"""
+    trader = object.__new__(LiveTrader)
+    broker_cls = trader._load_adapter_classes(platform)
+
+    assert broker_cls.__name__ in {"IBBrokerAdapter", "GmBrokerAdapter"}
+
+
+def test_default_live_source_check_uses_provider_alias_normalization():
+    assert LiveTrader._is_default_live_source("ib", "ib") is True
+    assert LiveTrader._is_default_live_source("ib_broker", "ibkr") is True
+    assert LiveTrader._is_default_live_source("gm", "gm_broker") is True
+    assert LiveTrader._is_default_live_source("ib", "ib,tiingo") is False
+
+
+def test_broker_only_adapter_uses_engine_selected_data_manager(monkeypatch):
+    """Broker-only adapter 配合显式 data_source 时，应由引擎创建 DataManager bridge。"""
+    import live_trader.engine as engine_module
+
+    captured = {}
+
+    class StubDataManager:
+        def __init__(self):
+            captured["manager"] = self
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     specified_sources=None, timeframe="Days", compression=1,
+                     refresh=False):
+            captured["source"] = specified_sources
+            idx = pd.date_range("2026-02-15", periods=3, freq="D")
+            return pd.DataFrame(
+                {
+                    "open": [10.0, 10.1, 10.2],
+                    "high": [10.2, 10.3, 10.4],
+                    "low": [9.8, 9.9, 10.0],
+                    "close": [10.0, 10.1, 10.2],
+                    "volume": [10000, 10000, 10000],
+                },
+                index=idx,
+            )
+
+    monkeypatch.setattr(engine_module, "DataManager", StubDataManager)
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: MockEngineBroker,
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    engine = LiveTrader(
+        {
+            "strategy_name": "CounterStrategy",
+            "platform": "mock_engine",
+            "symbols": ["AAPL"],
+            "data_source": "tiingo",
+            "params": {},
+        }
+    )
+    engine.init(MockContext(now=datetime(2026, 2, 17, 9, 30, 0)))
+
+    assert captured["source"] == "tiingo"
+    assert engine.data_provider.__class__.__name__ == "_DataManagerProvider"
+    assert [data._name for data in engine.broker.datas] == ["AAPL"]
+
+
+def test_broker_only_adapter_uses_platform_default_data_source(monkeypatch):
+    """未指定 data_source 时，平台默认值也应由 data_providers 解析。"""
+    import live_trader.engine as engine_module
+
+    captured = {}
+
+    class StubDataManager:
+        def __init__(self):
+            captured["manager"] = self
+
+        def get_data(self, symbol, specified_sources=None, **kwargs):
+            captured["source"] = specified_sources
+            idx = pd.date_range("2026-02-15", periods=3, freq="D")
+            return pd.DataFrame(
+                {
+                    "open": [10.0, 10.1, 10.2],
+                    "high": [10.2, 10.3, 10.4],
+                    "low": [9.8, 9.9, 10.0],
+                    "close": [10.0, 10.1, 10.2],
+                    "volume": [10000, 10000, 10000],
+                },
+                index=idx,
+            )
+
+    monkeypatch.setattr(engine_module, "DataManager", StubDataManager)
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: MockEngineBroker,
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: CounterStrategy,
+    )
+
+    engine = LiveTrader(
+        {
+            "strategy_name": "CounterStrategy",
+            "platform": "ib",
+            "symbols": ["AAPL"],
+            "params": {},
+        }
+    )
+    engine.init(MockContext(now=datetime(2026, 2, 17, 9, 30, 0)))
+
+    assert captured["source"] == "ibkr"
+    assert [data._name for data in engine.broker.datas] == ["AAPL"]
 
 
 def test_live_data_source_override_uses_data_manager(monkeypatch):

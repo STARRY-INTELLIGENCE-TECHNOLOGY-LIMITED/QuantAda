@@ -1,6 +1,7 @@
 import importlib
 import inspect
 import datetime
+import re
 import sys
 import time
 import traceback
@@ -23,8 +24,7 @@ from common.live_execution_budget import (
 from common.live_runtime import runtime_print
 from common.log import extract_order_execution_dt, format_dt, warning as log_warning
 from common.order_quantity import format_quantity, quantity_number
-from data_providers.base_provider import BaseDataProvider
-from data_providers.manager import DataManager
+from data_providers.manager import DataManager, normalize_source_name, resolve_platform_default_source
 from live_trader.adapters.base_broker import BaseLiveBroker
 from live_trader.data_bridge.data_warm import SchedulePlanner
 from live_trader.data_bridge.provider_bridge import _DataManagerProvider, _DataManagerProxy
@@ -103,12 +103,19 @@ class LiveTrader:
         self.user_config = config
         platform = config.get('platform', 'gm')
 
-        # 2. 动态加载对应的 Broker 和 DataProvider 类
+        # 2. 动态加载对应的 Broker；Provider 由引擎和 data_providers 独立选择。
         print(f"[Engine] Loading adapter for platform: {platform}...")
-        self.BrokerClass, DataProviderClass = self._load_adapter_classes(platform)
+        loaded_classes = self._load_adapter_classes(platform)
+        # 兼容旧的编程式测试/调用可能返回 (Broker, Provider) 二元组；正式加载器只返回 Broker。
+        if isinstance(loaded_classes, (tuple, list)):
+            self.BrokerClass = loaded_classes[0]
+            provider_class = loaded_classes[1] if len(loaded_classes) > 1 else None
+        else:
+            self.BrokerClass = loaded_classes
+            provider_class = None
 
-        # 3. 实例化组件
-        self.data_provider = DataProviderClass()
+        # 3. 兼容旧 adapter 中的薄 Provider bridge；新 adapter 可以只暴露 Broker。
+        self.data_provider = provider_class() if provider_class else None
 
         self.strategy_class = None
         self.selector_class = None
@@ -117,6 +124,8 @@ class LiveTrader:
         self.config = None
         self.risk_control = None
         self._data_manager = None
+        self._selected_data_source = None
+        self._runtime_context = None
         self._resolved_symbols = None
         # 分钟级数据的“每日全量重基准”执行记录（按 symbol 维度）
         self._intraday_rebase_done_on = {}
@@ -125,8 +134,9 @@ class LiveTrader:
 
     def _load_adapter_classes(self, platform: str):
         """
-        根据平台名称动态加载对应的模块和类
-        约定: platform='ib' -> 模块='live_trader.adapters.ib_broker'
+        根据平台名称动态加载对应的 Broker。
+
+        返回 Broker 类。Provider 由 ``data_providers.DataManager`` 独立选择。
         """
         # 处理模块名称约定 (例如 ib -> ib_broker)
         module_name = platform if platform.endswith('_broker') else f"{platform}_broker"
@@ -141,34 +151,17 @@ class LiveTrader:
                 f"无法加载平台 '{platform}' 的适配器模块 ({module_name}.py)。请确保文件存在于 adapters 目录下。\n错误信息: {e}")
 
         broker_cls = None
-        provider_cls = None
-
-        # 遍历模块成员，自动查找符合条件的类
-        # 过滤条件: 必须是定义在该模块中的类 (排除 import 进来的)，且继承自基类
+        # 仅查找定义在当前模块中的 Broker，Provider 不再参与 adapter 反射。
         for name, obj in inspect.getmembers(mod, inspect.isclass):
-            # 查找 Broker 类
             if issubclass(obj, BaseLiveBroker) and obj is not BaseLiveBroker:
-                # 确保只加载当前模块定义的，防止加载了从其他地方 import 的基类
                 if obj.__module__ == mod.__name__:
                     broker_cls = obj
-
-            # 查找 DataProvider 类
-            # 注意：有些 Provider 可能是在 adapter 文件中定义的，也可能是 import 的
-            # 这里我们放宽限制，只要该模块有这个类且符合接口即可
-            if issubclass(obj, BaseDataProvider) and obj is not BaseDataProvider:
-                if obj.__module__ == mod.__name__:
-                    provider_cls = obj
 
         if not broker_cls:
             raise ValueError(f"在模块 {module_name} 中未找到继承自 BaseLiveBroker 的类。")
 
-        if not provider_cls:
-            # 如果 adapter 文件中没有定义 Provider，尝试容错或使用通用 Provider
-            # 但通常我们要求 Adapter 必须提供配套的数据源封装
-            raise ValueError(f"在模块 {module_name} 中未找到继承自 BaseDataProvider 的类。")
-
-        print(f"[Engine] Adapter loaded: Broker={broker_cls.__name__}, Provider={provider_cls.__name__}")
-        return broker_cls, provider_cls
+        print(f"[Engine] Adapter loaded: Broker={broker_cls.__name__}; Provider=engine-selected")
+        return broker_cls
 
     @staticmethod
     def _resolve_risk_params(raw_risk_params, risk_name: str):
@@ -196,39 +189,50 @@ class LiveTrader:
 
     @staticmethod
     def _is_default_live_source(platform: str, data_source: str) -> bool:
-        plat = str(platform or '').strip().lower()
-        ds = str(data_source or '').strip().lower()
-        if not plat or not ds:
-            return False
-        if plat in {'ib', 'ibkr'} and ds in {'ib', 'ibkr'}:
-            return True
-        if plat in {'gm', 'gmi'} and ds in {'gm', 'gmi'}:
-            return True
-        return False
+        default_source = resolve_platform_default_source(platform)
+        raw = str(data_source or '').strip().lower()
+        source_names = [
+            normalize_source_name(source)
+            for source in re.split(r"[,\s]+", raw)
+            if source
+        ]
+        return bool(default_source and len(source_names) == 1 and source_names[0] == default_source)
 
     def _maybe_override_live_data_provider(self):
         data_source = self._normalize_data_source(self.config.get('data_source'))
-        if not data_source:
+        platform = self.config.get('platform', '')
+
+        # 保留旧 adapter 的默认 Provider；新 adapter 没有 bridge 时由 data_providers
+        # 中的 DataManager 负责选择平台默认数据源。
+        if not data_source and self.data_provider is not None:
+            self._selected_data_source = None
             return
 
-        platform = self.config.get('platform', '')
-        if self._is_default_live_source(platform, data_source):
+        if data_source and self._is_default_live_source(platform, data_source) and self.data_provider is not None:
+            self._selected_data_source = data_source
             print(
                 f"[Engine] Live data_source '{data_source}' matches default provider for {platform}. "
                 "Using adapter provider."
             )
             return
 
+        if not data_source:
+            data_source = resolve_platform_default_source(platform)
+        self._selected_data_source = data_source or None
+
         if self._data_manager is None:
             self._data_manager = DataManager()
 
         self._bind_shared_ib_to_data_manager(self._data_manager)
 
-        if not isinstance(self._data_manager, _DataManagerProxy):
+        if data_source and not isinstance(self._data_manager, _DataManagerProxy):
             self._data_manager = _DataManagerProxy(self._data_manager, specified_sources=data_source)
 
         self.data_provider = _DataManagerProvider(self._data_manager, specified_sources=data_source)
-        print(f"[Engine] Live data source override: {data_source}")
+        if data_source:
+            print(f"[Engine] Live data source selected by engine: {data_source}")
+        else:
+            print("[Engine] Live data source selected by engine: provider chain")
 
     def _bind_shared_ib_to_data_manager(self, data_manager):
         """让所有已发现的 IB provider 复用 adapter 所拥有的 IB 会话。"""
@@ -238,6 +242,9 @@ class LiveTrader:
         shared_ib = getattr(self.data_provider, 'ib', None)
         if shared_ib is None:
             shared_ib = getattr(getattr(self, 'broker', None), 'ib', None)
+        if shared_ib is None:
+            runtime_context = getattr(self, '_runtime_context', None)
+            shared_ib = getattr(runtime_context, 'ib_instance', None)
         if shared_ib is None:
             return
 
@@ -264,6 +271,10 @@ class LiveTrader:
 
         # 合并配置：平台配置为默认，用户配置有更高优先级
         self.config = {**platform_config, **self.user_config}
+        self._runtime_context = context
+
+        # Provider 由引擎按 data_source/平台默认值选择，不再要求 adapter 提供 bridge。
+        self._maybe_override_live_data_provider()
 
         # 从掘金 context 中动态提取 run() 方法传入的 token 并注入到 data_provider
         if hasattr(context, 'token') and context.token:
@@ -274,20 +285,34 @@ class LiveTrader:
 
             self.config['token'] = raw_token
 
-            # 覆盖 DataProvider 的外部模式状态，使其获得正确的 Token
+            # 覆盖 DataProvider 的外部模式状态，使其获得正确的 Token。
+            token_applied = False
             if getattr(self.data_provider, 'is_external_mode', False) or getattr(self.data_provider, 'token',
                                                                                  None) == 'EXTERNAL_MODE':
                 self.data_provider.token = raw_token
                 self.data_provider.is_external_mode = False
+                token_applied = True
+
+            # 新版 Provider 由 DataManager 管理，继续支持 GM 的外部托管令牌。
+            manager_token_applier = getattr(self._data_manager, 'apply_runtime_token', None)
+            if callable(manager_token_applier):
+                try:
+                    token_applied = bool(
+                        manager_token_applier(
+                            raw_token,
+                            specified_sources=self._selected_data_source,
+                        )
+                    ) or token_applied
+                except Exception as e:
+                    print(f"[Engine Warning] Failed to apply context token to data providers: {e}")
+
+            if token_applied:
                 try:
                     from gm.api import set_token
                     set_token(raw_token)
                     print(f"[Engine] Token correctly loaded and cleaned from context: {raw_token[:6]}***")
                 except ImportError:
                     pass
-
-        # 兼容实盘 data_source 覆盖：允许使用指定数据源替换默认 Provider
-        self._maybe_override_live_data_provider()
 
         data_source_cfg = self.config.get('data_source')
         data_source_label = data_source_cfg if data_source_cfg else 'default'
@@ -299,7 +324,7 @@ class LiveTrader:
         if self.config.get('selection_name'):
             self.selector_class = get_class_from_name(self.config['selection_name'], ['stock_selectors'])
 
-        # 后续流程使用 self.config
+        # 保持原有初始化顺序，并在 Broker 已建立后再次绑定可能由 Broker 持有的共享会话。
         self.broker = self.BrokerClass(context, cash_override=self.config.get('cash'),
                                        commission_override=self.config.get('commission'),
                                        slippage_override=self.config.get('slippage'))
@@ -312,6 +337,9 @@ class LiveTrader:
                 getattr(config, 'KEEP_OVERNIGHT_ORDERS', False),
             )
         )
+        if self._data_manager is not None:
+            self._bind_shared_ib_to_data_manager(self._data_manager)
+
         symbols = self._determine_symbols()
         if not symbols: raise ValueError("No symbols to trade.")
 

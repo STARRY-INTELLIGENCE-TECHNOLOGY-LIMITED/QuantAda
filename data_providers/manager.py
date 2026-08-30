@@ -11,6 +11,27 @@ from .base_provider import BaseDataProvider
 from .csv_provider import CsvDataProvider
 
 
+_PLATFORM_DEFAULT_SOURCES = {
+    'ib': 'ibkr',
+    'ibkr': 'ibkr',
+    'ib_broker': 'ibkr',
+    'gm': 'gm',
+    'gm_broker': 'gm',
+}
+
+
+def resolve_platform_default_source(platform: str) -> str:
+    """解析实盘平台对应的默认数据源名称。"""
+    normalized = str(platform or '').strip().lower()
+    return _PLATFORM_DEFAULT_SOURCES.get(normalized, '')
+
+
+def normalize_source_name(source: str) -> str:
+    """将平台或 Provider 别名规范化为 DataManager 使用的名称。"""
+    normalized = str(source or '').strip().lower()
+    return _PLATFORM_DEFAULT_SOURCES.get(normalized, normalized)
+
+
 class DataManager:
     def __init__(self):
         self.providers = self.auto_discover_and_sort_providers()
@@ -32,7 +53,31 @@ class DataManager:
         raw = str(specified_sources).strip().lower()
         if not raw:
             return []
-        return [s for s in re.split(r"[,\s]+", raw) if s]
+        return [normalize_source_name(s) for s in re.split(r"[,\s]+", raw) if s]
+
+    def apply_runtime_token(self, token: str, specified_sources: str = None) -> bool:
+        """将外部运行时令牌注入选中的托管数据源。"""
+        raw_token = str(token or '').strip()
+        if not raw_token:
+            return False
+
+        allowed_sources = set(self._split_source_names(specified_sources))
+        applied = False
+        for provider in self.providers:
+            provider_name = provider.__class__.__name__.replace('DataProvider', '').lower()
+            if allowed_sources and provider_name not in allowed_sources:
+                continue
+            is_external = bool(getattr(provider, 'is_external_mode', False))
+            is_placeholder = getattr(provider, 'token', None) == 'EXTERNAL_MODE'
+            if not (is_external or is_placeholder):
+                continue
+            try:
+                provider.token = raw_token
+                provider.is_external_mode = False
+                applied = True
+            except Exception:
+                continue
+        return applied
 
     def auto_discover_and_sort_providers(self, provider_dir=None):
         """

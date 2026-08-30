@@ -52,57 +52,12 @@ LIVE_SCHEDULE_PREWARM_LEAD = 0
 # - 作用：仅在正式 schedule 生效时间点附近，将报警推送到 IM；
 #   超出窗口的报警本地仍会打印，但不推送到钉钉/企业微信，降低非交易时段噪音。
 # - 对于固定频率 schedule（如 5m/1h），窗口同样基于正式 slot 计算。
-# - 生命周期消息（STARTED/STOPPED/DEAD）与显式 plan 标签消息默认不受该窗口限制。
+# - 生命周期消息（STARTED/STOPPED/DEAD）与显式 plan 标签消息默认不受此窗口限制。
 # - 若具体连接配置（BROKER_ENVIRONMENTS -> xxx -> conn -> alarm_window）提供该字段，
 #   则连接级配置优先级更高，可覆盖这里的全局默认值。
 # - 用法示例：
 #   LIVE_SCHEDULE_ALARM_WINDOW = '30m:15m'
 LIVE_SCHEDULE_ALARM_WINDOW = '0:0'
-
-
-# --- 数据源配置 ---
-# Tushare API 令牌。
-# 请到 https://tushare.pro/user/token 免费注册获取
-TUSHARE_TOKEN = 'your_token_here'
-
-# 山西证券Tushare API Token
-# 用于演示快速接入数据源
-SXSC_TUSHARE_TOKEN = 'your_token_here'
-
-# 掘金API Token 格式： TOKEN[|HOST:PORT]
-GM_TOKEN = 'your_token_here|host:port'
-
-# Tiingo API 令牌。
-TIINGO_TOKEN = 'your_token_here'
-
-
-# --- 报警与监控配置 ---
-# 报警总开关:
-# - None: 自动模式，有任一 WEBHOOK 时启用报警通道，无 WEBHOOK 时不启用
-# - True: 强制启用已配置 WEBHOOK 的报警通道
-# - False: 强制禁用报警通道，即使 WEBHOOK 已配置
-ALARMS_ENABLED = None
-
-# 钉钉机器人 Webhook
-# 格式: 'https://oapi.dingtalk.com/robot/send?access_token=xxxx'
-DINGTALK_WEBHOOK = ''
-
-# 企业微信机器人 Webhook
-# 格式: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-WECOM_WEBHOOK = ''
-
-# 报警级别过滤: INFO, WARNING, ERROR, CRITICAL
-ALARM_LEVEL = 'INFO'
-
-
-def has_alarm_webhook() -> bool:
-    return bool(DINGTALK_WEBHOOK or WECOM_WEBHOOK)
-
-
-def is_alarms_enabled() -> bool:
-    if ALARMS_ENABLED is None:
-        return has_alarm_webhook()
-    return bool(ALARMS_ENABLED)
 
 
 # --- 数据库记录配置 ---
@@ -121,55 +76,17 @@ DB_URL = 'mysql+pymysql://root:yourpassword@localhost:3306/quant'
 OPTUNA_DASHBOARD_PORT = 8090
 
 
-# --- IBKR配置 ---
-IBKR_HOST = '127.0.0.1'
-# 文件-全局配置-API-设置-启用套接字客户端&关闭只读API, 实盘与模拟端口不一样，IB Gateway默认4001
-IBKR_PORT = 7497
-IBKR_CLIENT_ID = 0
-# 可选: 指定下单账户（如子账户 U1234567）；留空则由 IB 默认路由到主账户。
-IBKR_ORDER_ACCOUNT = ''
+# --- Provider 配置：历史行情 API 凭据 ---
+from configs.providers import SXSC_TUSHARE_TOKEN, TIINGO_TOKEN, TUSHARE_TOKEN
 
+# --- 报警配置：Webhook、启用策略和报警级别 ---
+from configs.alarms import ALARM_LEVEL, ALARMS_ENABLED, DINGTALK_WEBHOOK, WECOM_WEBHOOK
 
-# --- 框架 → 实盘/仿真连接通道配置 ---
-# BROKER_ENVIRONMENTS 的 Key 必须与 adapters 下的文件名一致 (如 gm_broker.py -> "gm_broker")
-BROKER_ENVIRONMENTS = {
-    "gm_broker": {
-        'sim': {
-            'strategy_id': 'xxx',
-            'token': 'xxx',
-            'serv_addr': '127.0.0.1:7001',
-            # 支持:
-            # - 1d:14:45:00   每日固定时刻
-            # - 5m:09:30:00   以 09:30:00 为 anchor，每 5 分钟一个 slot
-            # - 1h:09:30:00   以 09:30:00 为 anchor，每 1 小时一个 slot
-            'schedule': '1d:14:45:00',
-            # 可选：覆盖 LIVE_SCHEDULE_ALARM_WINDOW
-            # 'alarm_window': '30m:15m',
-        },
-        'real': {
-            'strategy_id': 'xxx',
-            'token': 'xxx',
-            'serv_addr': '127.0.0.1:7001',
-            'schedule': '1d:14:45:00',
-            # 'alarm_window': '30m:15m',
-        }
-    },
+# --- GM 配置：SDK Token；Broker 环境位于同一子配置文件 ---
+from configs.gm import GM_TOKEN
 
-    # IB 配置
-    "ib_broker": {
-        'sim': {  # 模拟盘/Paper Trading
-            # IB 当前也支持:
-            # - 1d:15:45:00
-            # - 5m:09:30:00
-            # - 1h:09:30:00
-            'schedule': '1d:15:45:00',
-            'timezone': 'America/New_York',
-            # 'alarm_window': '30m:15m',
-        },
-        'real': {  # 实盘/Docker Gateway
-            'schedule': '1d:15:45:00',
-            'timezone': 'America/New_York',
-            # 'alarm_window': '30m:15m',
-        }
-    }
-}
+# --- IBKR 配置：TWS/Gateway 连接和下单账户；Broker 环境位于同一子配置文件 ---
+from configs.ibkr import IBKR_CLIENT_ID, IBKR_HOST, IBKR_ORDER_ACCOUNT, IBKR_PORT
+
+# --- Broker 环境与报警判断：由 Manager 合并 GM/IBKR 子配置并提供状态方法 ---
+from configs.manager import BROKER_ENVIRONMENTS, has_alarm_webhook, is_alarms_enabled

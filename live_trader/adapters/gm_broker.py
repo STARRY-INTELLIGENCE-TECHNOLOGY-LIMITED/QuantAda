@@ -27,7 +27,6 @@ from common.order_quantity import (
     positive_quantity,
     quantity_number,
 )
-from data_providers.gm_provider import GmDataProvider as UnifiedGmDataProvider
 from live_trader.engine import LiveTrader, on_order_status_callback
 from ..data_bridge.data_warm import DAILY_SCHEDULE_HEALTH_LEAD_SECONDS, SchedulePlanner
 from .base_broker import BaseLiveBroker, BaseOrderProxy
@@ -283,11 +282,6 @@ class GmOrderProxy(BaseOrderProxy):
     def is_sell(self) -> bool:
         return self._field(self.platform_order, 'side') == OrderSide_Sell
 
-class GmDataProvider(UnifiedGmDataProvider):
-    def get_history(self, symbol: str, start_date: str, end_date: str,
-                    timeframe: str = 'Days', compression: int = 1) -> pd.DataFrame:
-        # 直接透传调用父类的 get_data
-        return self.get_data(symbol, start_date, end_date, timeframe, compression)
 
 class GmBrokerAdapter(BaseLiveBroker):
     """掘金平台交易执行器（GM session 绑定单一账户）。"""

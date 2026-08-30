@@ -29,7 +29,7 @@ from common.ib_event_loop import call_async_on_owner_loop
 from common.order_quantity import positive_quantity, quantity_number
 import config
 from data_providers.csv_provider import CsvDataProvider
-from data_providers.manager import DataManager
+from data_providers.manager import DataManager, normalize_source_name
 from data_providers.ibkr_provider import IbkrDataProvider
 from ..data_bridge.data_warm import SchedulePlanner
 from .base_broker import BaseLiveBroker, BaseOrderProxy
@@ -130,21 +130,6 @@ class IBOrderProxy(BaseOrderProxy):
 
     def is_sell(self) -> bool:
         return self.trade.order.action == 'SELL'
-
-
-class IBDataProvider(IbkrDataProvider):
-    """
-    继承自 data_providers.ibkr_provider.IbkrDataProvider
-    保留在当前模块定义，以便 engine.py 能够通过反射自动发现。
-    """
-
-    def get_history(self, symbol: str, start_date: str, end_date: str,
-                    timeframe: str = 'Days', compression: int = 1) -> pd.DataFrame:
-        """
-        适配 engine.py 的接口调用
-        直接透传调用父类的 get_data
-        """
-        return self.get_data(symbol, start_date, end_date, timeframe, compression)
 
 
 class IBBrokerAdapter(BaseLiveBroker):
@@ -2082,8 +2067,14 @@ class IBBrokerAdapter(BaseLiveBroker):
         providers = list(self._price_data_manager.providers or [])
         allowed = None
         if data_source:
+            # 与 DataManager 使用同一套平台别名规范化，避免 data_source=ib
+            # 时遗漏实际名为 ibkr 的 Provider。
             raw_sources = str(data_source).strip().lower()
-            allowed = {s for s in re.split(r"[,\s]+", raw_sources) if s}
+            allowed = {
+                normalize_source_name(source)
+                for source in re.split(r"[,\s]+", raw_sources)
+                if source
+            }
 
         selected = []
         for provider in providers:
@@ -2180,10 +2171,10 @@ class IBBrokerAdapter(BaseLiveBroker):
 
     @staticmethod
     def _augment_live_data_source(data_source: str) -> str:
-        source_names = [s for s in re.split(r"[,\s]+", str(data_source or '').strip().lower()) if s]
+        source_names = DataManager._split_source_names(data_source)
         if not source_names:
             return data_source
-        if any(s in {'ib', 'ibkr'} for s in source_names):
+        if 'ibkr' in source_names:
             return ",".join(source_names)
         return ",".join(source_names + ['ibkr'])
 
@@ -2469,10 +2460,6 @@ class IBBrokerAdapter(BaseLiveBroker):
             engine_config['risk_params'] = risk_params
 
         trader = LiveTrader(engine_config)
-        # 注入 IB 实例到 data_provider (如果有)
-        if hasattr(trader.data_provider, 'ib'):
-            trader.data_provider.ib = ib
-
         trader.init(ctx)
         ctx.strategy_instance = trader
 

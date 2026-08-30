@@ -1,6 +1,18 @@
 """运行时解析配置值的回归测试。"""
 
 
+def test_config_facade_exports_the_subconfig_union():
+    import config
+
+    assert config.LOT_SIZE == 1
+    assert config.TIINGO_TOKEN == "your_token_here"
+    assert config.ALARM_LEVEL == "INFO"
+    assert config.IBKR_PORT == 7497
+    assert config.BROKER_ENVIRONMENTS["ib_broker"]["real"]["timezone"] == "America/New_York"
+    assert config.has_alarm_webhook() is False
+    assert config.is_alarms_enabled() is False
+
+
 def test_csv_provider_resolves_data_path_when_constructed(monkeypatch, tmp_path):
     import data_providers.csv_provider as csv_module
 

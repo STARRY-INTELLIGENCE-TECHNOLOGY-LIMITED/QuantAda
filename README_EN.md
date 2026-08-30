@@ -4,11 +4,9 @@
 
 [简体中文](README.md) | English
 
-An elegant, extensible, live-trading-ready quantitative trading framework for developing algorithm modules independently or collaboratively.
-`Ada` is short for `Adapter`, and also pays tribute to computing pioneer **Ada Lovelace** and the Ada programming language named after her.
+An elegant, extensible, live-trading-ready quantitative trading framework for developing algorithm modules independently or collaboratively. `Ada` is short for `Adapter`, and also pays tribute to computing pioneer **Ada Lovelace** and the Ada programming language named after her.
 
-QuantAda pushes back against the overfitting and guru culture common in quantitative trading. It brings the focus back to disciplined engineering, sound mathematical reasoning, and respect for markets.
-Its central idea is to decouple strategies, data providers, risk controls, and broker execution through adapters, keeping execution paths clear, auditable, and recoverable.
+QuantAda pushes back against the overfitting and guru culture common in quantitative trading. It brings the focus back to disciplined engineering, sound mathematical reasoning, and respect for markets. Its central idea is to decouple strategies, data providers, risk controls, and broker execution through adapters, keeping execution paths clear, auditable, and recoverable.
 
 ## Quick Start
 
@@ -25,9 +23,10 @@ pip install -r requirements.txt
 
 ### 2. Configure
 
-Configure at least one data-provider token in `config.py` (commonly `TUSHARE_TOKEN`):
+`config.py` keeps the framework core settings. Configure data-provider credentials in `configs/providers.py`; the single configuration entry point re-exports them. Set at least one data-provider token (commonly `TUSHARE_TOKEN`):
 
 ```python
+# configs/providers.py
 TUSHARE_TOKEN = "your_token_here"
 ```
 
@@ -36,6 +35,22 @@ Optionally enable database recording:
 ```python
 DB_ENABLED = True
 DB_URL = "sqlite:///quantada_logs.db"
+```
+
+Configuration is split by responsibility but flattened by `config.py` at runtime, so existing code and `--config` usage do not need to distinguish the source. `configs/manager.py` only combines broker connection environments and provides alarm-state helpers:
+
+| Configuration file | Main settings | Purpose |
+| --- | --- | --- |
+| `config.py` | `LOT_SIZE`, `DATA_PATH`, `LOG`, `PRINT_PLAN`, `KEEP_OVERNIGHT_ORDERS` | Framework, backtest, and common execution |
+| `configs/providers.py` | `TUSHARE_TOKEN`, `SXSC_TUSHARE_TOKEN`, `TIINGO_TOKEN` | Historical data providers |
+| `configs/alarms.py` | `ALARMS_ENABLED`, `DINGTALK_WEBHOOK`, `WECOM_WEBHOOK`, `ALARM_LEVEL` | Alarm channels |
+| `configs/gm.py` | `GM_TOKEN`, `GM_BROKER_ENVIRONMENTS` | GM broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['gm_broker']`) |
+| `configs/ibkr.py` | `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ORDER_ACCOUNT`, `IB_BROKER_ENVIRONMENTS` | IBKR broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['ib_broker']`) |
+
+Do not commit real tokens, passwords, or webhooks to a public repository. You can also override a merged public key at runtime, for example:
+
+```bash
+python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --data_source=tiingo --config "{'PRINT_PLAN': True}"
 ```
 
 ### 3. Basic Backtest
@@ -77,7 +92,7 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 
 ### 6. Connect to Live Trading or Simulation
 
-Configure `BROKER_ENVIRONMENTS` in `config.py`, then launch with `--connect=broker:env`:
+Configure `BROKER_ENVIRONMENTS` through the `config.py` entry point (broker defaults live in `configs/gm.py` and `configs/ibkr.py`), then launch with `--connect=broker:env`:
 
 ```bash
 python run.py sample_macd_cross_strategy --connect=gm_broker:sim
@@ -158,9 +173,7 @@ The diagram focuses on mode routing through `run.py`, the responsibility boundar
 
 ## Disclaimer
 
-This project is intended solely for technical research and engineering practice. It does not constitute investment advice.
-Live trading involves a risk of financial loss. Perform thorough backtesting and simulation before deployment.
-You are solely responsible for any losses resulting from use of this project.
+This project is intended solely for technical research and engineering practice. It does not constitute investment advice. Live trading involves a risk of financial loss. Perform thorough backtesting and simulation before deployment. You are solely responsible for any losses resulting from use of this project.
 
 ## Author
 

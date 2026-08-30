@@ -27,15 +27,7 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Implement the smallest effective fix.
 - Avoid adding new switches/knobs unless required by clear operational need.
 - Prefer local, targeted edits over broad refactors.
-- Configuration boundary: do not add module-local, broker-specific, one-off, or
-  compatibility settings to `config.py` merely to make them CLI-configurable.
-  Prefer safe defaults owned by the responsible module; if runtime override is
-  genuinely required, register it in the explicit `run.py --config` allowlist.
-  Only stable, cross-module public settings with a clear operational need belong
-  in `config.py`; new settings must update the specs, allowlist, and tests together.
-  Local exceptions are acceptable for personal or small-scope use when their
-  scope and rationale are documented; do not add abstractions for theoretical
-  uniformity without practical benefit.
+- Configuration boundary: do not add module-local, broker-specific, one-off, or compatibility settings to `config.py` merely to make them CLI-configurable. Prefer safe defaults owned by the responsible module; if runtime override is genuinely required, register it in the explicit `run.py --config` allowlist. Only stable, cross-module public settings with a clear operational need belong in `config.py`; new settings must update the specs, allowlist, and tests together. Local exceptions are acceptable for personal or small-scope use when their scope and rationale are documented; do not add abstractions for theoretical uniformity without practical benefit.
 
 4. File Responsibility / Cohesion First
 - Keep each file centered on its primary runtime responsibility.
@@ -71,9 +63,8 @@ If a proposed change conflicts with these rules, reject or redesign it.
   - `recorders/base_recorder.py`
 
 2. Live adapter module contract:
-- Each `live_trader/adapters/*_broker.py` loaded by `LiveTrader` must expose both:
-  - a `BaseLiveBroker` subclass
-  - a `BaseDataProvider` subclass discoverable in the same module
+- Each `live_trader/adapters/*_broker.py` loaded by `LiveTrader` must expose a `BaseLiveBroker` subclass.
+- `LiveTrader` selects historical data through `data_providers.DataManager`; adapter modules must not define or duplicate a `BaseDataProvider` bridge.
 - Order proxy runtime contract must satisfy not only `BaseOrderProxy` abstract methods, but also current engine expectations such as `status`, `executed`, `data`, and `is_accepted()`.
 
 3. Strategy-side execution contract:
@@ -103,10 +94,7 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Reintroducing `_deferred_orders`, `_buffered_rejected_retries`, or similar queue replay design.
 - Persisting stale intent to force next-day replay of prior-day buy decisions.
 - Expanding state machines without explicit failure evidence and tests.
-- Do not expand `config.py` for a single caller, local default, temporary
-  workaround, or compatibility alias; when a runtime override is genuinely
-  necessary, use a safe default in the responsible module and register an
-  explicit CLI override.
+- Do not expand `config.py` for a single caller, local default, temporary workaround, or compatibility alias; when a runtime override is genuinely necessary, use a safe default in the responsible module and register an explicit CLI override.
 - Adding base-class methods, config knobs, or compatibility shims for a single current caller or one-off scenario.
 - Extracting one-use local logic into named helpers or wrapper classes without a concrete second use case.
 
@@ -131,8 +119,7 @@ When user asks for rapid code generation or new module scaffolding, agents must 
 
 ## 6.5) Code Comment Rules
 - 代码注释和 Docstring 统一使用中文；第三方 API/协议名称、类名、方法名和标准错误文本可保留英文。
-- 注释和 Docstring 的每一行最多 200 个字符，按 Unicode 字符逐个计数。
-  中文一个字算一个字符，不按字节数或显示宽度换算。
+- 注释和 Docstring 的每一行最多 200 个字符，按 Unicode 字符逐个计数。中文一个字算一个字符，不按字节数或显示宽度换算。
 - 该限制只约束注释和 Docstring，不限制代码行。
 
 ## 7) Decision Ownership
