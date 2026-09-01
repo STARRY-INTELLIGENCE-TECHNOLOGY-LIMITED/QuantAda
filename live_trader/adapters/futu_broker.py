@@ -53,10 +53,31 @@ TrdEnv = getattr(_futu, 'TrdEnv', None)
 TrdMarket = getattr(_futu, 'TrdMarket', None)
 TrdSide = getattr(_futu, 'TrdSide', None)
 TradeOrderHandlerBase = getattr(_futu, 'TradeOrderHandlerBase', None)
-CurKlineHandlerBase = getattr(_futu, 'CurKlineHandlerBase', None)
-StockQuoteHandlerBase = getattr(_futu, 'StockQuoteHandlerBase', None)
-RTDataHandlerBase = getattr(_futu, 'RTDataHandlerBase', None)
-TickerHandlerBase = getattr(_futu, 'TickerHandlerBase', None)
+# 部分 futu-api 版本没有把行情 handler 基类从包根导出，但仍保留在
+# ``futu.quote.quote_response_handler``。优先使用包根导出，缺失时回退到稳定的
+# 子模块路径，避免事件模式在旧版 SDK 中被误判为不可用。
+try:
+    from futu.quote.quote_response_handler import (
+        CurKlineHandlerBase as _CurKlineHandlerBase,
+        StockQuoteHandlerBase as _StockQuoteHandlerBase,
+        RTDataHandlerBase as _RTDataHandlerBase,
+        TickerHandlerBase as _TickerHandlerBase,
+    )
+except Exception:
+    _CurKlineHandlerBase = _StockQuoteHandlerBase = None
+    _RTDataHandlerBase = _TickerHandlerBase = None
+if TradeOrderHandlerBase is None:
+    try:
+        from futu.trade.trade_response_handler import (
+            TradeOrderHandlerBase as _TradeOrderHandlerBase,
+        )
+    except Exception:
+        _TradeOrderHandlerBase = None
+    TradeOrderHandlerBase = _TradeOrderHandlerBase
+CurKlineHandlerBase = getattr(_futu, 'CurKlineHandlerBase', None) or _CurKlineHandlerBase
+StockQuoteHandlerBase = getattr(_futu, 'StockQuoteHandlerBase', None) or _StockQuoteHandlerBase
+RTDataHandlerBase = getattr(_futu, 'RTDataHandlerBase', None) or _RTDataHandlerBase
+TickerHandlerBase = getattr(_futu, 'TickerHandlerBase', None) or _TickerHandlerBase
 SubType = getattr(_futu, 'SubType', None)
 
 
