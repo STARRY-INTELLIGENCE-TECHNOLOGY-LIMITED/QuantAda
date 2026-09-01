@@ -134,6 +134,24 @@ class _ExactOneShareBuyProbeStrategy(BaseStrategy):
             self.__class__.final_size = order.executed.size
 
 
+class _ContractMultiplierBuyProbeStrategy(BaseStrategy):
+    final_size = 0
+
+    def init(self):
+        self.submitted = False
+
+    def next(self):
+        if self.submitted:
+            return
+        order = self.broker.order_target_percent(data=self.broker.datas[0], target=0.5)
+        assert order is not None
+        self.submitted = True
+
+    def notify_order(self, order):
+        if order.is_completed():
+            self.__class__.final_size = order.executed.size
+
+
 class _TinySellDoesNotFreeCashProbeStrategy(BaseStrategy):
     buy_order_submitted = None
 
@@ -405,6 +423,103 @@ def test_order_target_value_submits_exact_one_share_when_cash_allows(monkeypatch
 
     assert 'Margin' not in _ExactOneShareBuyProbeStrategy.statuses
     assert _ExactOneShareBuyProbeStrategy.final_size == 1
+
+
+def test_backtester_applies_contract_multiplier_to_option_cash_and_position_value():
+    _ContractMultiplierBuyProbeStrategy.final_size = 0
+    idx = pd.date_range('2024-01-01', periods=3, freq='D')
+    df = pd.DataFrame(
+        {
+            'open': [10.0] * 3,
+            'high': [10.0] * 3,
+            'low': [10.0] * 3,
+            'close': [10.0] * 3,
+            'volume': [1.0] * 3,
+            'option_contract_size': [100.0] * 3,
+        },
+        index=idx,
+    )
+
+    bt = Backtester(
+        datas={'US.AAPL_OPTION': df},
+        strategy_class=_ContractMultiplierBuyProbeStrategy,
+        cash=100000.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+    )
+    bt.run()
+
+    wrapper = bt.results[0]
+    data = wrapper.datas[0]
+    assert wrapper.get_contract_multiplier(data) == 100.0
+    assert _ContractMultiplierBuyProbeStrategy.final_size == 50
+    assert wrapper.getposition(data).size == 50
+    assert bt.cerebro.broker.getcash() == pytest.approx(50000.0)
+    assert bt.cerebro.broker.getvalue() == pytest.approx(100000.0)
+
+
+def test_backtester_keeps_stock_commission_info_isolated_from_option_multiplier():
+    """混合回测中股票仍按每股计价，期权才按合约乘数计价。"""
+    _TwoSymbolPercentBuyStrategy.statuses = []
+    idx = pd.date_range('2024-01-01', periods=3, freq='D')
+    stock_df = pd.DataFrame(
+        {
+            'open': [10.0] * 3,
+            'high': [10.0] * 3,
+            'low': [10.0] * 3,
+            'close': [10.0] * 3,
+            'volume': [1.0] * 3,
+        },
+        index=idx,
+    )
+    option_df = stock_df.copy()
+    option_df['option_contract_size'] = 100.0
+
+    bt = Backtester(
+        datas={'US.AAPL': stock_df, 'US.AAPL_OPTION': option_df},
+        strategy_class=_TwoSymbolPercentBuyStrategy,
+        cash=100000.0,
+        commission=0.001,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+    )
+    bt.run()
+
+    wrapper = bt.results[0]
+    stock, option = wrapper.datas
+    assert wrapper.getposition(stock).size == 6000
+    assert wrapper.getposition(option).size == 39
+    stock_comm_info = bt.cerebro.broker.getcommissioninfo(stock)
+    option_comm_info = bt.cerebro.broker.getcommissioninfo(option)
+    assert stock_comm_info is bt.cerebro.broker.comminfo[None]
+    assert stock_comm_info.p.mult == 1.0
+    assert option_comm_info is not bt.cerebro.broker.comminfo[None]
+    assert option_comm_info.p.mult == 100.0
+    assert bt.cerebro.broker.getvalue() == pytest.approx(99901.0)
+
+
+def test_backtester_option_metadata_wins_over_datafeed_generic_default_multiplier():
+    class OptionData:
+        pass
+
+    dataframe = pd.DataFrame({
+        'open': [10.0, 10.0],
+        'high': [10.0, 10.0],
+        'low': [10.0, 10.0],
+        'close': [10.0, 10.0],
+        'volume': [1.0, 1.0],
+        'option_contract_size': [100.0, 100.0],
+    }, index=pd.date_range('2024-01-01', periods=2, freq='D'))
+    data = OptionData()
+    data.contract_multiplier = 1.0
+    data.p = type('Params', (), {'dataname': dataframe})()
+
+    from backtest.backtester import _extract_contract_multiplier
+
+    assert _extract_contract_multiplier(data) == 100.0
 
 
 def test_tiny_sell_skip_does_not_free_cash_for_later_buy(monkeypatch):

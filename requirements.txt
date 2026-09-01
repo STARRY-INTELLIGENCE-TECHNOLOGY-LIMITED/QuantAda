@@ -20,6 +20,6 @@ kaleido
 pytz
 
 # --- 实盘平台 ---
-# gm  # 掘金量化
-# ib_insync
-# futu-api
+# gm  # 掘金量化；使用 GM Broker 时解除注释
+# ib_insync  # 使用 IBKR Broker 时解除注释
+# futu-api  # 使用 Futu Broker/Provider 时解除注释

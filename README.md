@@ -23,6 +23,8 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+券商 SDK 默认保持注释，避免未使用的平台污染环境。需要 GM、IBKR 或 Futu 时，先解除 `requirements.txt` 中对应行的注释，再重新执行 `python -m pip install -r requirements.txt`。
+
 ### 2) 配置
 
 `config.py` 保留框架核心配置；数据源凭据在 `configs/providers.py` 中配置，并由统一入口平铺导出。至少配置一个数据源 Token（常用 `TUSHARE_TOKEN`）：
@@ -39,12 +41,13 @@ DB_ENABLED = True
 DB_URL = "sqlite:///quantada_logs.db"
 ```
 
-配置按责任域拆分，但运行时仍由 `config.py` 平铺导出，现有代码和 `--config` 用法无需区分配置来源。`configs/manager.py` 只负责合并 Broker 连接环境并提供报警状态判断：
+配置按责任域拆分，`config.py` 固定列出各 `configs` 子模块并用一行 `import *` 平铺配置；Futu Provider/adapter 使用 `configs/futu.py` 维护的同名键。这里不做目录自动扫描，用户只需理解一个统一入口；`configs/manager.py` 只负责合并 Broker 连接环境并提供报警状态判断：
 
 | 配置文件 | 主要配置项 | 用途 |
 | --- | --- | --- |
 | `config.py` | `LOT_SIZE`、`DATA_PATH`、`LOG`、`PRINT_PLAN`、`KEEP_OVERNIGHT_ORDERS` | 框架、回测和通用执行 |
 | `configs/providers.py` | `TUSHARE_TOKEN`、`SXSC_TUSHARE_TOKEN`、`TIINGO_TOKEN` | 历史行情 Provider |
+| `configs/futu.py` | `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH`、账户/交易键、`FUTU_BROKER_ENVIRONMENTS` | 富途 OpenD 行情与官方交易连接；RSA 路径为空时使用明文协议 |
 | `configs/alarms.py` | `ALARMS_ENABLED`、`DINGTALK_WEBHOOK`、`WECOM_WEBHOOK`、`ALARM_LEVEL` | 报警通道 |
 | `configs/gm.py` | `GM_TOKEN`、`GM_BROKER_ENVIRONMENTS` | GM Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['gm_broker']`） |
 | `configs/ibkr.py` | `IBKR_HOST`、`IBKR_PORT`、`IBKR_CLIENT_ID`、`IBKR_ORDER_ACCOUNT`、`IB_BROKER_ENVIRONMENTS` | IBKR Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['ib_broker']`） |
@@ -94,12 +97,16 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 
 ### 6) 连接实盘/仿真
 
-在 `config.py` 统一入口（Broker 默认连接值位于 `configs/gm.py`、`configs/ibkr.py`）配置 `BROKER_ENVIRONMENTS`，再通过 `--connect=broker:env` 启动：
+在 `config.py` 统一入口（Broker 默认连接值位于 `configs/gm.py`、`configs/ibkr.py`、`configs/futu.py`）配置 `BROKER_ENVIRONMENTS`，再通过 `--connect=broker:env` 启动：
 
 ```bash
 python run.py sample_macd_cross_strategy --connect=gm_broker:sim
 python run.py sample_macd_cross_strategy --connect=gm_broker:real
 python run.py sample_macd_cross_strategy --connect=ib_broker:sim
+python run.py sample_auto_rebalance_strategy --connect=futu_broker:sim --data_source=futu --symbols=HK.00700
+python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_source=futu --symbols=HK.00700
+# Futu 行情订阅事件触发（使用 futu_broker:real_event；不与 schedule 同时启用）
+python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
 ```
 
 ### 7) SDK/插件化模式（策略在仓库外）

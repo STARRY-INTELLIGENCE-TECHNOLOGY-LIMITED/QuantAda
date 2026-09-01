@@ -27,7 +27,7 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Implement the smallest effective fix.
 - Avoid adding new switches/knobs unless required by clear operational need.
 - Prefer local, targeted edits over broad refactors.
-- Configuration boundary: do not add module-local, broker-specific, one-off, or compatibility settings to `config.py` merely to make them CLI-configurable. Prefer safe defaults owned by the responsible module; if runtime override is genuinely required, register it in the explicit `run.py --config` allowlist. Only stable, cross-module public settings with a clear operational need belong in `config.py`; new settings must update the specs, allowlist, and tests together. Local exceptions are acceptable for personal or small-scope use when their scope and rationale are documented; do not add abstractions for theoretical uniformity without practical benefit.
+- Configuration boundary: do not add module-local, broker-specific, one-off, or compatibility settings merely to create another configuration namespace. Keep defaults in the responsible module and list each responsibility module explicitly in `config.py`; the facade may use one-line `import *` exports to keep the user-facing surface compact. `run.py --config` should accept all uppercase keys currently flattened by that facade without a second restrictive allowlist; unknown names still warn and are ignored. New settings must update the specs and tests together. Local exceptions are acceptable for personal or small-scope use when their scope and rationale are documented; do not add abstractions for theoretical uniformity without practical benefit.
 
 4. File Responsibility / Cohesion First
 - Keep each file centered on its primary runtime responsibility.
@@ -94,7 +94,7 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Reintroducing `_deferred_orders`, `_buffered_rejected_retries`, or similar queue replay design.
 - Persisting stale intent to force next-day replay of prior-day buy decisions.
 - Expanding state machines without explicit failure evidence and tests.
-- Do not expand `config.py` for a single caller, local default, temporary workaround, or compatibility alias; when a runtime override is genuinely necessary, use a safe default in the responsible module and register an explicit CLI override.
+- Do not add a second configuration namespace for a single caller, temporary workaround, or compatibility alias. When a runtime setting belongs in a responsibility module, keep its safe default there and expose it through the existing explicit `config.py` import group; `run.py` must not add a duplicate per-key allowlist.
 - Adding base-class methods, config knobs, or compatibility shims for a single current caller or one-off scenario.
 - Extracting one-use local logic into named helpers or wrapper classes without a concrete second use case.
 

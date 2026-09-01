@@ -35,6 +35,9 @@
 5. DataManager 支持单个或多个 `data_source` 名称，多个 provider 可按逗号或空格分隔
 6. 日内 provider 必须同时按能力支持 `timeframe='Minutes'|'Seconds'` 与 `compression`；日期参数在日内模式应保留到秒，增量窗口不得擅自扩成整年高频明细。
 7. SDK/网络调用必须使用有限超时；秒级请求的单次超时应明显短于数据周期。24x7 数据源不得强制应用常规交易时段过滤。
+8. Futu Provider 直接读取 `configs/futu.py` 的 `FUTU_HOST`、`FUTU_PORT` 和可选 `FUTU_RSA_KEY_PATH` 连接 OpenD；这些同名公开键由 `config.py` 导入，因此可使用标准 `--config` 覆盖。RSA 路径为空时关闭协议加密。股票、ETF 和支持标准 K 线接口的衍生品统一通过 `request_history_kline` 标准化；Futu 事件合约期权在该接口失败时回退 `request_history_event_contract_kline`。期权链使用显式的 `get_option_chain` 查询；期权乘数由行情元数据提供给交易 adapter，元数据不可用时不得自行猜测乘数。行情与交易的代码归一化统一使用 `live_trader.adapters.futu_symbols`，不得在两个模块重复维护映射。
+9. Provider-specific SDK 缺失时必须允许其他 Provider 继续加载，并给出解除 `requirements.txt` 对应注释、重新执行 `python -m pip install -r requirements.txt` 的明确指引。
+10. 期权/期货等衍生品回测必须在 DataFrame 的 `option_contract_multiplier`、`option_contract_size`、`contract_multiplier` 或 `contract_size` 列，或 `DataFrame.attrs` 中提供正的现金名义乘数；Backtester 会将目标数量、资金、持仓估值和比例手续费统一按该乘数处理，期权专属字段优先于通用默认字段。
 
 ## 4. 报警通道
 1. 继承 `alarms.base_alarm.BaseAlarm`

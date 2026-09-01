@@ -1,20 +1,36 @@
 """Broker 环境合并和报警状态判断。
 
-普通配置由 ``config.py`` 按责任域显式导入；本模块不扫描目录，也不创建 SDK client。
+根配置由 ``config.py`` 按责任域分组导入；本模块不扫描目录，也不创建 SDK client。
 """
 
 import sys
 from copy import deepcopy
 
 from .alarms import ALARMS_ENABLED, DINGTALK_WEBHOOK, WECOM_WEBHOOK
+from .futu import FUTU_BROKER_ENVIRONMENTS
 from .gm import GM_BROKER_ENVIRONMENTS
 from .ibkr import IB_BROKER_ENVIRONMENTS
+
+
+def _configured_environment(name, default):
+    """读取根配置中可能被用户覆盖的责任域环境字典。"""
+    root = sys.modules.get('config')
+    if root is not None:
+        namespace = vars(root)
+        if name in namespace:
+            return namespace[name]
+    return default
 
 
 def _build_broker_environments() -> dict:
     """合并各 Broker 自己声明的连接环境。"""
     merged = {}
-    for environments in (GM_BROKER_ENVIRONMENTS, IB_BROKER_ENVIRONMENTS):
+    for name, default in (
+        ('GM_BROKER_ENVIRONMENTS', GM_BROKER_ENVIRONMENTS),
+        ('IB_BROKER_ENVIRONMENTS', IB_BROKER_ENVIRONMENTS),
+        ('FUTU_BROKER_ENVIRONMENTS', FUTU_BROKER_ENVIRONMENTS),
+    ):
+        environments = _configured_environment(name, default)
         if not isinstance(environments, dict):
             raise RuntimeError('BROKER_ENVIRONMENTS must be a dict')
         for broker_name, broker_config in environments.items():
@@ -25,6 +41,13 @@ def _build_broker_environments() -> dict:
 
 
 BROKER_ENVIRONMENTS = _build_broker_environments()
+
+
+def refresh_broker_environments() -> dict:
+    """按当前根配置重新合并 Broker 环境，供 CLI 覆盖后同步聚合入口。"""
+    global BROKER_ENVIRONMENTS
+    BROKER_ENVIRONMENTS = _build_broker_environments()
+    return BROKER_ENVIRONMENTS
 
 
 def _config_namespace() -> dict:

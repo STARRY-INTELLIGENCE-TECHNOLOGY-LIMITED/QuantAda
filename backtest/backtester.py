@@ -19,6 +19,83 @@ from common import log, runtime_command, runtime_notifications
 from common.order_quantity import align_quantity_down, normalize_quantity_step
 
 
+def _extract_contract_multiplier(data) -> float:
+    """从 DataFeed 或其原始 DataFrame 读取现金名义乘数。"""
+    sources = [data, getattr(data, 'p', None)]
+    dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
+    # 期权专属字段优先，避免 DataFeed 默认 contract_multiplier=1 吞掉原始表中的真实乘数。
+    name_groups = (
+        ('option_contract_multiplier', 'option_contract_size'),
+        ('contract_multiplier', 'contract_size'),
+    )
+
+    def read_values(source, names):
+        if source is None:
+            return []
+        values = []
+        if isinstance(source, dict):
+            for name in names:
+                if name in source:
+                    values.append(source[name])
+        for name in names:
+            try:
+                value = getattr(source, name)
+            except Exception:
+                continue
+            if value is not None:
+                values.append(value)
+        return values
+
+    def parse_values(values):
+        for value in values:
+            try:
+                multiplier = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(multiplier) and multiplier > 0:
+                return multiplier
+        return None
+
+    for names in name_groups:
+        for source in sources:
+            multiplier = parse_values(read_values(source, names))
+            if multiplier is not None:
+                return multiplier
+        if not isinstance(dataframe, pd.DataFrame):
+            continue
+        attrs = getattr(dataframe, 'attrs', {}) or {}
+        multiplier = parse_values(read_values(attrs, names))
+        if multiplier is not None:
+            return multiplier
+        for name in names:
+            if name not in dataframe.columns:
+                continue
+            values = pd.to_numeric(dataframe[name], errors='coerce').dropna()
+            multiplier = parse_values(reversed(values.tolist()))
+            if multiplier is not None:
+                return multiplier
+    return 1.0
+
+
+class _ContractMultiplierCommInfo(bt.CommInfoBase):
+    """将每份合约的价格、手续费和持仓估值按现金乘数放大。"""
+
+    def getoperationcost(self, size, price):
+        return super().getoperationcost(size, price) * self.p.mult
+
+    def getvaluesize(self, size, price):
+        return super().getvaluesize(size, price) * self.p.mult
+
+    def getvalue(self, position, price):
+        return super().getvalue(position, price) * self.p.mult
+
+    def _getcommission(self, size, price, pseudoexec):
+        commission = super()._getcommission(size, price, pseudoexec)
+        if self._commtype == self.COMM_PERC:
+            return commission * self.p.mult
+        return commission
+
+
 class OrderProxy:
     def __init__(self, bt_order): self._order = bt_order
 
@@ -125,6 +202,10 @@ class BacktraderStrategyWrapper(bt.Strategy):
         """统一实盘与回测的获取最新价格接口"""
         return data.close[0]
 
+    def get_contract_multiplier(self, data):
+        """返回 DataFeed 元数据声明的每份合约现金乘数。"""
+        return _extract_contract_multiplier(data)
+
     def getcommissioninfo(self, data):
         """代理调用真实 Broker 的 getcommissioninfo"""
         return self.broker.getcommissioninfo(data)
@@ -224,7 +305,11 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
         # 3. 计算目标市值和目标股数
         target_value = portfolio_value * target
-        expected_shares = target_value / price
+        unit_value = price * self.get_contract_multiplier(data)
+        if unit_value <= 0:
+            self._last_order_target_skip_reason = 'invalid_order_unit_value'
+            return None
+        expected_shares = target_value / unit_value
 
         # 4. 计算需要变化的股数
         delta_shares = expected_shares - pos_size
@@ -239,7 +324,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             # 估算包含手续费/滑点的最大购买量 (假设 commission 是比例，如 0.0003)
             commission_ratio = self.broker.getcommissioninfo(data).p.commission
             execution_cost_multiplier = (1 + self.slippage) * (1 + commission_ratio)
-            max_buy_by_cash = total_purchasing_power / (price * execution_cost_multiplier)
+            max_buy_by_cash = total_purchasing_power / (unit_value * execution_cost_multiplier)
 
             # 取 目标买入量 和 现金最大买入量 的较小值
             shares_to_buy = min(delta_shares, max_buy_by_cash)
@@ -252,7 +337,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
             if shares_to_buy > 0:
                 # 与 order_target_value 保持一致：同 Bar 内先记账，防止多标的连续买入穿透现金。
-                estimated_cost = shares_to_buy * price * execution_cost_multiplier
+                estimated_cost = shares_to_buy * unit_value * execution_cost_multiplier
                 self.virtual_spent_cash += estimated_cost
                 return self.buy(data=data, size=shares_to_buy)
 
@@ -262,7 +347,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             # 如果目标是 0，通常意味着清仓
             if target == 0.0:
                 if pos_size > 0:
-                    self.expected_freed_cash += pos_size * price
+                    self.expected_freed_cash += pos_size * unit_value
                 # 如果是清仓，直接使用 close()，它会处理所有持仓
                 # 注意：self.close() 内部逻辑可能不保证 100 整手，但在清仓时通常需要卖出所有零股
                 # 如果需要严格整手卖出，可以使用下面的逻辑，但会残留零股
@@ -275,7 +360,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 shares_to_sell = int(shares_to_sell)
 
             if shares_to_sell > 0:
-                estimated_value = shares_to_sell * price
+                estimated_value = shares_to_sell * unit_value
                 self.expected_freed_cash += estimated_value
                 return self.sell(data=data, size=shares_to_sell)
 
@@ -310,7 +395,11 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
         # 2. 计算目标股数 (核心区别：直接用 target_value / price)
         # target 参数即为目标市值 (Cash Value)
-        expected_shares = target / price
+        unit_value = price * self.get_contract_multiplier(data)
+        if unit_value <= 0:
+            self._last_order_target_skip_reason = 'invalid_order_unit_value'
+            return None
+        expected_shares = target / unit_value
 
         # 3. 计算需要变化的股数
         delta_shares = expected_shares - pos_size
@@ -332,7 +421,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             if total_purchasing_power < 0:
                 total_purchasing_power = 0
 
-            max_buy_by_cash = total_purchasing_power / (price * execution_cost_multiplier)
+            max_buy_by_cash = total_purchasing_power / (unit_value * execution_cost_multiplier)
 
             # 取 目标量 和 现金上限 的较小值
             shares_to_buy = min(delta_shares, max_buy_by_cash)
@@ -347,7 +436,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             if shares_to_buy > 0:
                 # 记账：这笔钱已经花出去了！
                 # 估算花费 = 股数 * 价格 * (1+手续费)
-                estimated_cost = shares_to_buy * price * execution_cost_multiplier
+                estimated_cost = shares_to_buy * unit_value * execution_cost_multiplier
                 self.virtual_spent_cash += estimated_cost
                 return self.buy(data=data, size=shares_to_buy)
 
@@ -362,7 +451,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             # 如果目标价值是 0 或极小，视为清仓
             if target <= 1.0:  # 容忍浮点误差，小于1块钱视同清仓
                 if pos_size > 0:
-                    self.expected_freed_cash += pos_size * price
+                    self.expected_freed_cash += pos_size * unit_value
                 return self.close(data=data)
 
             # [关键] 向下取整到 lot_size
@@ -372,7 +461,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 shares_to_sell = align_quantity_down(shares_to_sell, lot_size)
 
             if shares_to_sell > 0:
-                estimated_freed_value = shares_to_sell * price
+                estimated_freed_value = shares_to_sell * unit_value
                 self.expected_freed_cash += estimated_freed_value
                 return self.sell(data=data, size=shares_to_sell)
 
@@ -589,6 +678,20 @@ class Backtester:
     def _init_broker(self):
         self.cerebro.broker.setcash(self.cash)
         self.cerebro.broker.setcommission(commission=self.commission)
+
+        # 期权/期货等每份合约对应多个基础单位时，回测柜台也必须按同一名义乘数扣款和估值。
+        for data in self.cerebro.datas:
+            multiplier = _extract_contract_multiplier(data)
+            if multiplier == 1.0:
+                continue
+            self.cerebro.broker.addcommissioninfo(
+                _ContractMultiplierCommInfo(
+                    commission=self.commission,
+                    mult=multiplier,
+                    percabs=True,
+                ),
+                name=data._name,
+            )
 
         # 开启 "Cheat-On-Close" (收盘作弊模式)
         # 作用：让 T 日发出的市价单，以 T 日的 Close 价成交。

@@ -14,6 +14,7 @@ def test_platform_default_data_source_is_owned_by_data_providers():
 def test_data_manager_normalizes_platform_source_aliases():
     assert DataManager._split_source_names("ib tiingo") == ["ibkr", "tiingo"]
     assert DataManager._split_source_names("gmi") == ["gmi"]
+    assert DataManager._split_source_names("futu") == ["futu"]
 
 
 def test_data_manager_applies_runtime_token_only_to_selected_provider():
@@ -82,3 +83,42 @@ def test_data_manager_parses_comma_separated_sources(monkeypatch):
 
     assert calls == ["tiingo", "akshare"], "Comma-separated data_source should be tried in order."
     assert df is not None and not df.empty, "Should return data from the available provider."
+
+
+def test_data_manager_keeps_intraday_bars_for_date_only_end_boundary(monkeypatch):
+    class IntradayDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            return pd.DataFrame(
+                {
+                    "open": [10.0, 10.1],
+                    "high": [10.2, 10.3],
+                    "low": [9.8, 9.9],
+                    "close": [10.1, 10.2],
+                    "volume": [1000, 1100],
+                },
+                index=pd.to_datetime(["2024-01-02 09:30:00", "2024-01-02 15:00:00"]),
+            )
+
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [IntradayDataProvider()],
+    )
+
+    dm = DataManager()
+    df = dm.get_data(
+        "US.AAPL",
+        start_date="20240102",
+        end_date="20240102",
+        specified_sources="intraday",
+        timeframe="Minutes",
+    )
+
+    assert df is not None
+    assert list(df.index) == [
+        pd.Timestamp("2024-01-02 09:30:00"),
+        pd.Timestamp("2024-01-02 15:00:00"),
+    ]

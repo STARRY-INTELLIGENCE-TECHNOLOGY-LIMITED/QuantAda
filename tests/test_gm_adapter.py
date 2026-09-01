@@ -37,6 +37,15 @@ from live_trader.adapters.gm_broker import GmOrderProxy, GmBrokerAdapter
 from live_trader.data_bridge.data_warm import SchedulePlanner
 
 
+def test_gm_missing_sdk_error_points_to_requirements_install(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module, 'get_cash', None)
+    monkeypatch.setattr(gm_module, 'gm_get_position', None)
+    with pytest.raises(ImportError, match=r'pip install -r requirements\.txt'):
+        gm_module._require_gm_api()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_gm_order_config(monkeypatch):
     import live_trader.adapters.gm_broker as gm_module
@@ -832,6 +841,48 @@ def test_gm_live_account_snapshot_probe_rejects_invalid_cash(monkeypatch, availa
 
     assert broker.is_account_snapshot_trusted() is False
     assert broker._last_account_snapshot_fetch_failed is True
+
+
+def test_gm_a_share_lot_size_is_not_reduced_by_global_one_share_default(monkeypatch):
+    """通用 LOT_SIZE=1 时，GM 沪深股票买入仍必须使用 100 股整手。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module.config, 'LOT_SIZE', 1, raising=False)
+    broker = object.__new__(GmBrokerAdapter)
+    broker._runtime_config = {}
+
+    assert broker.get_order_lot_size(SimpleNamespace(_name='SHSE.600000')) == 100.0
+    assert broker.get_order_lot_size(SimpleNamespace(_name='SZSE.000001')) == 100.0
+    assert broker.get_order_lot_size(SimpleNamespace(_name='SHSE.510300')) == 100.0
+
+
+def test_gm_live_account_snapshot_recovers_after_short_disconnect(monkeypatch):
+    """GM 断线重连期间账户表为空时应失败关闭，账户恢复后才重新可信。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace(accounts={})
+    broker = object.__new__(GmBrokerAdapter)
+    broker.is_live = True
+    broker._last_account_snapshot_fetch_failed = False
+    broker._last_account_snapshot_fetch_error = None
+
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "get_cash",
+        lambda: SimpleNamespace(available=10000.0),
+        raising=False,
+    )
+    monkeypatch.setattr(gm_module, "gm_get_position", lambda: [], raising=False)
+
+    assert broker.is_account_snapshot_trusted() is False
+    assert broker._last_account_snapshot_fetch_failed is True
+    assert "exactly one account" in str(broker._last_account_snapshot_fetch_error)
+
+    fake_context.accounts = {"ACC-1": SimpleNamespace(id="ACC-1")}
+    assert broker.is_account_snapshot_trusted() is True
+    assert broker._last_account_snapshot_fetch_failed is False
+    assert broker._last_account_snapshot_fetch_error is None
 
 
 def test_gm_backtest_position_keeps_context_snapshot_fast_path(monkeypatch):
@@ -1889,8 +1940,11 @@ def test_gm_start_alarm_is_sent_once_across_phoenix_restarts(monkeypatch, capsys
     """
     import live_trader.adapters.gm_broker as gm_module
 
-    fake_context = SimpleNamespace()
+    fake_context = SimpleNamespace(
+        inside_accounts={"STALE": SimpleNamespace(id="STALE")}
+    )
     init_configs = []
+    account_caches_at_init = []
     poll_count = {"value": 0}
 
     class StopPhoenix(BaseException):
@@ -1926,6 +1980,10 @@ def test_gm_start_alarm_is_sent_once_across_phoenix_restarts(monkeypatch, capsys
             return 0
         raise StopPhoenix()
 
+    def _gmi_init():
+        account_caches_at_init.append(dict(fake_context.inside_accounts))
+        return 0
+
     def _sleep(seconds):
         if seconds >= 10:
             return None
@@ -1939,7 +1997,7 @@ def test_gm_start_alarm_is_sent_once_across_phoenix_restarts(monkeypatch, capsys
     monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
     monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
     monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
-    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", _gmi_init, raising=False)
     monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
     monkeypatch.setattr(gm_module, "gmi_poll", _poll_restart_then_stop, raising=False)
     monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
@@ -1958,6 +2016,7 @@ def test_gm_start_alarm_is_sent_once_across_phoenix_restarts(monkeypatch, capsys
     assert len(init_configs) == 2
     assert init_configs[0].get('_suppress_start_alarm') is False
     assert init_configs[1].get('_suppress_start_alarm') is True
+    assert account_caches_at_init == [{}, {}]
     assert "GM shutdown callback received. Restarting session" in captured.out
 
 
@@ -2022,6 +2081,7 @@ def test_gm_schedule_callback_runs_once_per_schedule_slot(monkeypatch, capsys):
     monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
     monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+    monkeypatch.setattr(gm_module, "schedule", _schedule, raising=False)
 
     fake_gm_api = SimpleNamespace(schedule=_schedule)
     monkeypatch.setitem(sys.modules, "gm.api", fake_gm_api)
@@ -2118,6 +2178,7 @@ def test_gm_live_schedule_run_is_offloaded_from_sdk_callback_thread(monkeypatch)
     monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
     monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+    monkeypatch.setattr(gm_module, "schedule", _schedule, raising=False)
 
     fake_gm_api = SimpleNamespace(schedule=_schedule)
     monkeypatch.setitem(sys.modules, "gm.api", fake_gm_api)
@@ -2211,6 +2272,7 @@ def test_gm_prewarm_callback_runs_once_per_schedule_slot(monkeypatch, capsys):
     monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
     monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
     monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+    monkeypatch.setattr(gm_module, "schedule", _schedule, raising=False)
 
     fake_gm_api = SimpleNamespace(schedule=_schedule)
     monkeypatch.setitem(sys.modules, "gm.api", fake_gm_api)

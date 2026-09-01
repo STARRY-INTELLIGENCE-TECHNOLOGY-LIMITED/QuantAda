@@ -139,7 +139,7 @@ def _run_main():
                         help="策略参数 (JSON字符串, 例如: \"{\'selectTopK\': 2, \'target_buffer\': 0.95}\")")
     parser.add_argument('--selection', type=str, default=None, help="选股器文件名 (位于selectors目录 或 自定义包路径)")
     parser.add_argument('--data_source', type=str, default=None,
-                        help="指定数据源 (例如: csv yf akshare tushare sxsc_tushare gm)")
+                        help="指定数据源 (例如: csv akshare tushare sxsc_tushare tiingo futu gm)")
     parser.add_argument('--symbols', type=str, default='SHSE.510300', help="以,分割的回测标的代码 (默认: SHSE.510300)")
     parser.add_argument('--cash', type=float, default=None, help="初始资金 (回测默认: 100000.0、实盘默认全仓)")
     parser.add_argument('--commission', type=float, default=0, help="手续费率，例如：万1.5为:0.00015 (默认：0)")
@@ -238,18 +238,30 @@ def _run_main():
             name for name in vars(config)
             if isinstance(name, str) and name.isupper()
         }
+        overridden_keys = set()
         for key, value in override_config.items():
-            # 只允许覆盖 config.py 中已声明的公开配置名称。局部 adapter、
-            # provider 或一次性参数由所属模块提供安全默认值，不通过命令行
-            # 动态扩展 config；拼写错误和过期名称必须明确告警。
+            # 只接受配置入口已平铺的名称；不做额外白名单限制，也不自动扫描目录。
+            # 拼写错误和过期名称仍明确告警，避免用户误以为覆盖已生效。
             if isinstance(key, str) and key in declared_config_keys:
                 setattr(config, key, value)
+                overridden_keys.add(key)
                 print(f"  [Config] Overriding {key} = {value}")
             else:
                 print(
                     f"  [配置警告] 未知配置覆盖项，已忽略："
                     f"{key!r} = {value!r}"
                 )
+
+        # 子模块环境字典是公开配置的一部分；覆盖后同步重建聚合入口，
+        # 否则用户看到的覆盖值不会影响 --connect 解析。
+        environment_keys = {
+            'GM_BROKER_ENVIRONMENTS',
+            'IB_BROKER_ENVIRONMENTS',
+            'FUTU_BROKER_ENVIRONMENTS',
+        }
+        if 'BROKER_ENVIRONMENTS' not in overridden_keys and overridden_keys & environment_keys:
+            from configs.manager import refresh_broker_environments
+            config.BROKER_ENVIRONMENTS = refresh_broker_environments()
 
     # 将逗号分隔的字符串转换为列表
     symbol_list = [s.strip() for s in args.symbols.split(',')]

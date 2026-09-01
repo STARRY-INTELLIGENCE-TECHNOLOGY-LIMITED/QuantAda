@@ -1,5 +1,6 @@
 # --- 交易及框架基础配置 ---
-# 数量步长（A股100，美股整数1，币市可按交易对设置为0.00000001等正数）
+# 通用数量步长；具体 Broker 可按市场覆盖（例如 Futu A 股买入强制至少 100 股）。
+# 美股通常为整数 1，币市可按交易对设置为 0.00000001 等正数。
 LOT_SIZE = 1
 
 # 实盘券商单笔订单数量上限，买卖双向生效；0 表示不限制。
@@ -76,17 +77,11 @@ DB_URL = 'mysql+pymysql://root:yourpassword@localhost:3306/quant'
 OPTUNA_DASHBOARD_PORT = 8090
 
 
-# --- Provider 配置：历史行情 API 凭据 ---
-from configs.providers import SXSC_TUSHARE_TOKEN, TIINGO_TOKEN, TUSHARE_TOKEN
-
-# --- 报警配置：Webhook、启用策略和报警级别 ---
-from configs.alarms import ALARM_LEVEL, ALARMS_ENABLED, DINGTALK_WEBHOOK, WECOM_WEBHOOK
-
-# --- GM 配置：SDK Token；Broker 环境位于同一子配置文件 ---
-from configs.gm import GM_TOKEN
-
-# --- IBKR 配置：TWS/Gateway 连接和下单账户；Broker 环境位于同一子配置文件 ---
-from configs.ibkr import IBKR_CLIENT_ID, IBKR_HOST, IBKR_ORDER_ACCOUNT, IBKR_PORT
-
-# --- Broker 环境与报警判断：由 Manager 合并 GM/IBKR 子配置并提供状态方法 ---
-from configs.manager import BROKER_ENVIRONMENTS, has_alarm_webhook, is_alarms_enabled
+# --- 责任域配置：显式列出模块，模块内部使用 import * 平铺配置键 ---
+# 这里不做目录自动扫描：配置入口保持一眼可读，新增责任域只需增加一行导入。
+from configs.providers import *
+from configs.alarms import *
+from configs.futu import *
+from configs.gm import *
+from configs.ibkr import *
+from configs.manager import *

@@ -34,6 +34,8 @@ def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
 4. 日期入参兼容 `YYYYMMDD` 与标准时间字符串。
 5. 日内场景要正确处理 `timeframe='Minutes'|'Seconds'` 和 `compression`；时间参数保留到秒，避免把秒/分钟级增量请求扩成整年明细。
 6. SDK/网络请求必须使用有限超时；秒级请求的单次超时应明显短于周期。外汇/币市等 24x7 数据不得强制使用常规交易时段过滤。
+7. Provider-specific 的连接配置放在 `configs/<name>.py`，由 Provider 直接读取；需要用户调整的配置键随 `config.py` 对应责任域的 `import *` 一起平铺，避免额外命名空间和重复 CLI 白名单。入口不使用目录扫描；若 SDK 支持可选加密，空密钥路径应表示关闭加密，不另设重复开关。
+8. Provider 使用的第三方 SDK 应采用可选导入；缺少 SDK 时不能阻断其他数据源，并应明确指引用户解除 `requirements.txt` 对应依赖行的注释后重新执行 `python -m pip install -r requirements.txt`。Futu 事件合约期权历史 K 线可在统一接口失败时回退 `request_history_event_contract_kline`，合约乘数只能来自行情元数据，不能写死。
 
 ## 输出格式
 1. 输出完整 Python 文件代码。

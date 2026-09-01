@@ -16,3 +16,14 @@ def runtime_print(message, now=None):
     else:
         ts_text = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts_text}] {message}")
+
+
+def dependency_install_hint(package_name: str, error=None) -> str:
+    """生成可选第三方依赖缺失时的统一安装提示。"""
+    message = (
+        f"缺少可选依赖 {package_name!r}。请编辑 requirements.txt，解除 {package_name} 对应行的注释，"
+        "然后执行 python -m pip install -r requirements.txt。"
+    )
+    if error is not None:
+        message += f" 原始错误: {error}"
+    return message

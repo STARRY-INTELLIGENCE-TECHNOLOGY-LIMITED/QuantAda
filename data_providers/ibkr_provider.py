@@ -3,16 +3,38 @@ import threading
 from datetime import datetime
 
 import pandas as pd
+# Provider 复用 IB Broker 的唯一实现，避免把券商逻辑扩散到 common 包。
+from live_trader.adapters.ib_broker import (
+    call_async_on_owner_loop,
+    resolve_ib_contract_spec,
+)
+from common.live_runtime import dependency_install_hint
 
 try:
-    from ib_insync import IB, Stock, Forex, Crypto, ContFuture, util
-except ImportError:
-    print("Warning: 'ib_insync' not installed. IbkrProvider will not work.")
-    IB = object  # 用于类定义的模拟对象
+    # 核心合约类单独导入，避免旧版 SDK 或测试替身缺少可选类型时把股票行情也判定为不可用。
+    from ib_insync import IB, Stock, Forex
+    _IB_IMPORT_ERROR = None
+except Exception as exc:
+    print(dependency_install_hint('ib_insync', exc))
+    _IB_IMPORT_ERROR = exc
+    IB = Stock = Forex = None
+
+try:
+    from ib_insync import Crypto
+except Exception:
+    Crypto = None
+
+try:
+    from ib_insync import ContFuture
+except Exception:
+    ContFuture = None
+
+try:
+    from ib_insync import util
+except Exception:
+    util = None
 
 import config
-from common.ib_symbol_parser import resolve_ib_contract_spec
-from common.ib_event_loop import call_async_on_owner_loop
 from data_providers.base_provider import BaseDataProvider
 
 
@@ -44,7 +66,7 @@ class IbkrDataProvider(BaseDataProvider):
         if ib_instance:
             self.ib = ib_instance
             # 否则尝试创建新实例 (用于回测或独立调用)
-        elif IB is not object:
+        elif IB is not None:
             self.ib = IB()
         else:
             self.ib = None
@@ -92,10 +114,19 @@ class IbkrDataProvider(BaseDataProvider):
         owner_thread_id = getattr(self.ib, '_quantada_event_loop_thread_id', None)
         if owner_thread_id is None:
             owner_thread_id = self._ib_event_loop_thread_id
+        current_thread_id = threading.get_ident()
+        if (
+            owner_thread_id is not None
+            and current_thread_id != owner_thread_id
+            and event_loop is None
+        ):
+            raise RuntimeError(
+                f"IB event loop is unavailable; cannot run {method_name} from worker"
+            )
         if (
             event_loop is not None
             and owner_thread_id is not None
-            and threading.get_ident() != owner_thread_id
+            and current_thread_id != owner_thread_id
         ):
             if event_loop.is_closed():
                 raise RuntimeError(f"IB event loop is closed; cannot run {method_name}")
@@ -118,11 +149,14 @@ class IbkrDataProvider(BaseDataProvider):
         """确保连接处于活动状态 (带静默降级、防幽灵占用与自愈重建)"""
         # 如果实例丢失，尝试自动重建
         if not self.ib:
+            if IB is None:
+                print(dependency_install_hint('ib_insync', _IB_IMPORT_ERROR))
+                return False
             try:
-                from ib_insync import IB
                 self.ib = IB()
                 self._attach_ib_loop_metadata(self.ib)
-            except ImportError:
+            except Exception as exc:
+                print(dependency_install_hint('ib_insync', exc))
                 return False
 
         if self.ib.isConnected():
@@ -161,7 +195,8 @@ class IbkrDataProvider(BaseDataProvider):
                     if "Event loop is closed" in err_msg or "RuntimeError" in err_msg:
                         # print(f"[IBKR] 自动修复：事件循环关闭，正在重建实例...")
                         try:
-                            from ib_insync import IB
+                            if IB is None:
+                                raise ImportError(dependency_install_hint('ib_insync', _IB_IMPORT_ERROR))
                             previous_ib = self.ib
                             self.ib = IB()
                             self._attach_ib_loop_metadata(self.ib, source=previous_ib)
@@ -182,6 +217,12 @@ class IbkrDataProvider(BaseDataProvider):
 
     def _parse_contract(self, symbol: str):
         spec = resolve_ib_contract_spec(symbol)
+
+        if spec.get('kind') == 'unsupported':
+            raise ValueError(
+                f"Unsupported IB contract format: {symbol!r}; "
+                "options/futures require an explicit provider implementation."
+            )
 
         if spec['kind'] == 'forex':
             return Forex(spec['pair'])
@@ -389,11 +430,14 @@ class IbkrDataProvider(BaseDataProvider):
 
     def __del__(self):
         """析构时断开连接，避免僵尸连接"""
-        if self.ib and self.ib.isConnected():
-            try:
-                self.ib.disconnect()
-            except:
-                pass
+        try:
+            ib = getattr(self, 'ib', None)
+            is_connected = getattr(ib, 'isConnected', None)
+            disconnect = getattr(ib, 'disconnect', None)
+            if ib is not None and callable(is_connected) and is_connected() and callable(disconnect):
+                disconnect()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

@@ -80,7 +80,11 @@
 15. 使用单线程 SDK 事件循环的 schedule 适配器（包括 GM schedule、IB `ib.sleep()` 主循环）不得在 SDK 回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将当前 slot 调度到短生命周期工作线程，让订单拒单/成交回调持续由 SDK 事件循环处理。同一适配器同时最多执行一个实盘运行，重叠 slot 记录并跳过；回测/优化保持同步快速路径。
 16. GM 适配器只交易中国市场，实盘调仓的 BUY/SELL 均应使用 `OrderType_Market`；BUY 的 `price` 至少覆盖实时最优卖价，SELL 使用实时行情作为保护价。该字段是市价保护价，不是限价委托价格；资金预检查、虚拟占资和拒单退款必须按实际保护价统一估算。不要把最新成交价微调后设置为 `OrderType_Limit` BUY/SELL，否则盘口偏离时会在柜台滞留。
 17. IBKR PAXOS `CRYPTO` 委托必须遵守柜台现金数量契约：历史数据请求使用 `AGGTRADES`；市价单设置 USD 分精度的 `cashQty` 和明确的 `IOC`，wire 层 `totalQuantity` 置零，并在 OrderProxy 上暴露基础层所需的 `submitted_size`。账户无加密交易/行情权限时应安全失败关闭，不得把延迟行情当成可成交保证。
-18. 配置边界：broker-specific 的默认值应按责任域放在 `configs` 包子模块或 adapter 内，由 `config.py` 显式导入后统一导出需要公开的稳定键；`configs/manager.py` 只处理需要组合的 Broker 环境。局部参数、一次性场景和兼容别名不得仅为了 CLI 使用而导出。
+17.1. IBKR 混合资产账户必须按目标合约的账户、合约类型、代码和币种精确匹配仓位；报价币种与账户 USD/BASE 口径不同时，目标金额、持仓市值和在途 BUY 占资必须经过可验证汇率换算。无法匹配的 OPT/FUT 或无法确认价格的在途单必须安全失败，不能归入同名股票。
+18. 配置边界：broker-specific 的默认值应按责任域放在 `configs` 包子模块或 adapter 内；`config.py` 固定列出责任域并用 `import *` 平铺，避免用户理解多套配置命名空间。入口不做目录自动扫描，`run.py --config` 对入口中已平铺的大写键保持开放，不另设重复白名单；`configs/manager.py` 只处理需要组合的 Broker 环境。
+19. Futu 官方交易：Futu 适配器使用 `OpenSecTradeContext`，连接参数、账户路由、交易环境和订单默认值分别使用 `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH`、`FUTU_ACCOUNT_ID` 等同名公开键维护在 `configs/futu.py`，并由 `config.py` 导入以支持标准 `--config` 覆盖。`FUTU_TRADE_ENV` 默认使用 `SIMULATE`，只有显式选择实盘环境时才使用 `REAL`。RSA 路径为空时关闭协议加密；构造函数没有行情上下文的异步参数，必须在线程中有界创建并设置同步查询超时。账户、持仓、订单、撤单和下单必须使用同一 `trd_env`、`acc_id`、`acc_index`；A 股卖出按 `can_sell_qty` 执行。账户摘要使用账户计价币种，FX 或账户快照不可验证时必须失败关闭，不能用旧 K 线或局部本地估值继续下单。期权 BUY/SELL 基础流程必须按 `price × option_contract_multiplier` 计算 NAV、目标仓位、买入资金和成交金额，订单数量遵循合约张数语义；不得宣称完整卖开/买平、组合或保证金策略支持。正式 schedule 槽位还必须通过 Futu market state 门控。若提供 subscription event 模式，必须使用 handler 回调并把策略运行派发到单个 worker，不得在 SDK 回调线程直接执行 `LiveTrader.run()`；事件模式不得与 schedule 同时启用。
+20. 通用 schedule：优先复用 `common.live_schedule.LiveScheduleRunner`。没有原生 schedule 回调的 Broker 调用 `run_forever()`；共享 SDK 事件循环的 Broker 在事件回调中调用 `poll_once()`。Broker 不应重复实现 slot/prewarm 去重、重叠工作线程保护和保活等待；只负责构造连接、回调上下文和 `LiveTrader.run()`。slot worker 失败必须释放对应去重键，允许后续同槽位重试；成功或重叠跳过才保留去重结果。
+21. 可选券商 SDK：`live_trader/adapters/*_broker.py` 的券商特定 SDK 必须包裹在可选导入中，不能阻断未使用券商的框架启动。实际选择缺少 SDK 的 Broker 时，必须明确指引用户解除 `requirements.txt` 对应依赖行的注释，并执行 `python -m pip install -r requirements.txt`。
 
 ---
 

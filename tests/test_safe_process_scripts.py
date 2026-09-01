@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import uuid
@@ -98,6 +99,32 @@ printf '%s\n' "$worker_key"
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().startswith("/srv/run.py strategy")
+
+
+def test_current_nohup_launch_shape_is_recognized_as_live_command(bash):
+    result = _run_bash(
+        bash,
+        """
+command=(/root/QuantAda/.venv/bin/python -u /root/QuantAda/run.py strategy
+  --selection=selector --data_source=gm
+  --config="{'GM_TOKEN':'token','BROKER_ENVIRONMENTS': {'gm_broker': {'real': {}}}}"
+  --connect=gm_broker:real --params="{'selectTopK': 1}")
+qada_is_live_command "${command[@]}"
+qada_live_command_key "${command[@]}"
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().startswith("/root/QuantAda/run.py strategy")
+
+
+def test_safe_scripts_have_executable_shebang_entrypoints():
+    """Linux 部署应能直接执行 safe_stop/safe_restart；Windows 工作区跳过权限断言。"""
+    if os.name == 'nt':
+        pytest.skip("executable-bit assertion requires POSIX")
+    for name in ('safe_stop.sh', 'safe_restart.sh'):
+        path = ROOT / 'script' / name
+        assert path.read_text(encoding='utf-8').startswith('#!/usr/bin/env bash')
+        assert os.access(path, os.X_OK)
 
 
 def test_operation_lock_rejects_concurrent_restart(bash):

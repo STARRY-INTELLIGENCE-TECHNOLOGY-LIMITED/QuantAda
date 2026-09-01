@@ -27,6 +27,7 @@ from common.order_quantity import (
     positive_quantity,
     quantity_number,
 )
+from common.live_runtime import dependency_install_hint
 from live_trader.engine import LiveTrader, on_order_status_callback
 from ..data_bridge.data_warm import DAILY_SCHEDULE_HEALTH_LEAD_SECONDS, SchedulePlanner
 from .base_broker import BaseLiveBroker, BaseOrderProxy
@@ -36,6 +37,8 @@ _GM_SDK_HEALTH_DEADLINE_SECONDS = 180.0
 _GM_AGGRESSIVE_RETRY_SECONDS = 10.0
 _GM_QUIET_PROBE_SECONDS = 10 * 60.0
 _GM_CONNECTIVITY_LOG_INTERVAL_SECONDS = 10 * 60.0
+_GM_API_IMPORT_ERROR = None
+_GM_CSDK_IMPORT_ERROR = None
 
 
 def _resolve_gm_connectivity_retry(
@@ -115,8 +118,9 @@ try:
     gm_api = sys.modules.get('gm.api')
     OrderStatus_PendingCancel = getattr(gm_api, 'OrderStatus_PendingCancel', object())
     OrderStatus_Expired = getattr(gm_api, 'OrderStatus_Expired', object())
-except ImportError:
-    print("Warning: 'gm' module not found. GmAdapter core API will not be available.")
+except Exception as exc:
+    _GM_API_IMPORT_ERROR = exc
+    print(dependency_install_hint('gm', exc))
     order_target_percent = order_target_value = get_cash = gm_get_position = subscribe = history = OrderType_Market = OrderType_Limit = None
     MODE_LIVE = MODE_BACKTEST = None
     OrderStatus_New = OrderStatus_PartiallyFilled = OrderStatus_Filled = None
@@ -126,8 +130,13 @@ except ImportError:
     PositionEffect_Open = PositionEffect_Close = None
 
 try:
+    from gm.api import schedule
+except Exception:
+    schedule = None
+
+try:
     from gm.api import set_serv_addr, set_token, ADJUST_PREV
-except ImportError:
+except Exception:
     set_serv_addr = set_token = ADJUST_PREV = None
 
 try:
@@ -136,7 +145,10 @@ try:
         py_gmi_set_backtest_config, py_gmi_run, gmi_init, gmi_poll,
         py_gmi_set_backtest_intraday
     )
-except ImportError:
+except Exception as exc:
+    _GM_CSDK_IMPORT_ERROR = exc
+    if _GM_API_IMPORT_ERROR is None:
+        print(dependency_install_hint('gm', exc))
     py_gmi_set_strategy_id = gmi_set_mode = py_gmi_set_data_callback = None
     py_gmi_set_backtest_config = py_gmi_run = gmi_init = gmi_poll = None
     py_gmi_set_backtest_intraday = None
@@ -155,6 +167,42 @@ try:
     from gm.api._errors import check_gm_status
 except ImportError:
     check_gm_status = None
+
+
+def _require_gm_api():
+    """在使用 GM Broker 前检查 API，并给出 requirements.txt 安装指引。"""
+    required = {
+        'get_cash': get_cash,
+        'get_position': gm_get_position,
+        'order_target_percent': order_target_percent,
+        'order_target_value': order_target_value,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        detail = _GM_API_IMPORT_ERROR or f"missing symbols: {', '.join(missing)}"
+        raise ImportError(dependency_install_hint('gm', detail))
+
+
+def _require_gm_runtime(mode=None):
+    """按实盘或回测模式检查 GM 原生运行时 API，并给出安装指引。"""
+    _require_gm_api()
+    required = {
+        'py_gmi_set_strategy_id': py_gmi_set_strategy_id,
+        'gmi_set_mode': gmi_set_mode,
+    }
+    if mode == MODE_BACKTEST:
+        required.update({
+            'py_gmi_set_backtest_config': py_gmi_set_backtest_config,
+            'py_gmi_run': py_gmi_run,
+        })
+    else:
+        required.update({
+            'gmi_init': gmi_init,
+        })
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        detail = _GM_CSDK_IMPORT_ERROR or f"missing symbols: {', '.join(missing)}"
+        raise ImportError(dependency_install_hint('gm', detail))
 
 
 class GmOrderProxy(BaseOrderProxy):
@@ -288,6 +336,7 @@ class GmBrokerAdapter(BaseLiveBroker):
     _DEFAULT_LIVE_SLIPPAGE = 0.0001
 
     def __init__(self, context, cash_override=None, commission_override=None, slippage_override=None):
+        _require_gm_api()
         if slippage_override is None:
             slippage_override = self._DEFAULT_LIVE_SLIPPAGE
         super().__init__(context, cash_override, commission_override, slippage_override)
@@ -299,6 +348,17 @@ class GmBrokerAdapter(BaseLiveBroker):
             return max(0, int(float(value)))
         except Exception:
             return default
+
+    def get_order_lot_size(self, data) -> float:
+        """返回 GM 标的的数量步长；沪深股票买入至少按 100 股整手。"""
+        configured = normalize_quantity_step(
+            self._runtime_setting('LOT_SIZE', getattr(config, 'LOT_SIZE', 1))
+        )
+        symbol = str(getattr(data, '_name', '') or '').strip().upper()
+        market = symbol.split('.', 1)[0]
+        if market in {'SHSE', 'SZSE', 'SH', 'SZ'}:
+            return max(configured, 100.0)
+        return configured
 
     def _find_position(self, symbol):
         if self.is_live:
@@ -410,7 +470,10 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         res = []
         try:
-            from gm.api import get_unfinished_orders, OrderSide_Buy
+            _require_gm_api()
+            get_unfinished_orders = getattr(sys.modules.get('gm.api'), 'get_unfinished_orders', None)
+            if not callable(get_unfinished_orders):
+                raise ImportError(dependency_install_hint('gm', 'gm.api.get_unfinished_orders is unavailable'))
             orders = self._query_unfinished_orders_single_account(get_unfinished_orders)
             if orders is None:
                 # 轻量 SDK/测试桩可能不暴露 native 的逐账户查询 primitive，真实 GM session 会暴露。
@@ -548,7 +611,10 @@ class GmBrokerAdapter(BaseLiveBroker):
             return False
 
         try:
-            import gm.api as gm_api
+            _require_gm_api()
+            gm_api = sys.modules.get('gm.api')
+            if gm_api is None:
+                raise ImportError(dependency_install_hint('gm', 'gm.api is unavailable'))
             pending_orders = self.get_pending_orders()
             if getattr(self, '_last_pending_orders_fetch_failed', False):
                 detail = getattr(self, '_last_pending_orders_fetch_error', None)
@@ -719,9 +785,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 self._runtime_setting('BROKER_LOT_LIMITS', 0)
             )
             if configured_limit > 0:
-                lot_size = normalize_quantity_step(
-                    self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
-                )
+                lot_size = self.get_order_lot_size(data)
                 effective_limit = align_quantity_down(configured_limit, lot_size)
                 requested_volume = positive_quantity(volume)
                 if effective_limit <= 0 or requested_volume > effective_limit:
@@ -863,9 +927,7 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             if estimated_cost > available_cash:
                 old_volume = volume
-                lot_size = normalize_quantity_step(
-                    self._runtime_setting('LOT_SIZE', getattr(config, 'LOT_SIZE', 100)) or 1
-                )
+                lot_size = self.get_order_lot_size(data)
                 volume = align_quantity_down(
                     available_cash / (freeze_price * cost_multiplier),
                     lot_size,
@@ -1068,6 +1130,9 @@ class GmBrokerAdapter(BaseLiveBroker):
                 return
         else:
             print(f"  Mode: LIVE")
+
+        # 先完成调度和模式校验，再检查对应 SDK；配置错误应优先明确反馈。
+        _require_gm_runtime(mode=mode)
 
         # 资金与费率
         initial_cash = float(kwargs.get('cash')) if kwargs.get('cash') is not None else 100000.0
@@ -1291,6 +1356,15 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             # 每次启动前重置 context 身份
             _apply_gm_connection_config()
+            # GM SDK 重连时会重新填充 inside_accounts，但不会保证移除已失效账户；
+            # 先清掉上一会话快照，避免短断线期间读取过期资金/持仓。
+            try:
+                account_cache = getattr(context, 'inside_accounts', None)
+                clear_accounts = getattr(account_cache, 'clear', None)
+                if callable(clear_accounts):
+                    clear_accounts()
+            except Exception as exc:
+                _runtime_print(f"[GmBroker Warning] Failed to clear stale account snapshot: {exc}")
             py_gmi_set_strategy_id(strategy_id)
             gmi_set_mode(mode)
             context.mode = mode
@@ -1375,7 +1449,8 @@ class GmBrokerAdapter(BaseLiveBroker):
                 # 实盘定时任务配置
                 if mode == MODE_LIVE and schedule_rule:
                     try:
-                        from gm.api import schedule
+                        if not callable(schedule):
+                            raise ImportError(dependency_install_hint('gm', 'gm.api.schedule is unavailable'))
                         if parsed_schedule:
                             try:
                                 SchedulePlanner.print_schedule_preview(
@@ -1446,6 +1521,12 @@ class GmBrokerAdapter(BaseLiveBroker):
                                         compression=strategy.config.get('compression', 1),
                                         now=getattr(schedule_ctx, 'now', None),
                                     )
+                                    if isinstance(summary, dict) and summary.get('errors'):
+                                        _runtime_print(
+                                            f"[GmBroker Warning] Prewarm returned errors for slot "
+                                            f"{prewarm_slot_key or 'unknown'}; slot remains retryable."
+                                        )
+                                        return
                                     if prewarm_slot_key:
                                         launch_state['last_prewarm_run_key'] = prewarm_slot_key
                                     _runtime_print(
@@ -1466,6 +1547,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                                 会复制触发时间，避免 GM 随事件循环推进而修改共享
                                 context 导致本轮时间漂移。
                                 """
+                                succeeded = False
                                 run_context = SimpleNamespace(
                                     now=now_snapshot,
                                     strategy_instance=trader,
@@ -1473,6 +1555,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                                 )
                                 try:
                                     trader.run(run_context)
+                                    succeeded = True
                                 except Exception as e:
                                     _runtime_print(
                                         f"[GmBroker 错误] 调度 slot {slot_key} 执行失败：{e}"
@@ -1488,6 +1571,12 @@ class GmBrokerAdapter(BaseLiveBroker):
                                         )
                                 finally:
                                     with launch_state['scheduled_run_lock']:
+                                        if (
+                                            not succeeded
+                                            and launch_state.get('last_schedule_run_key') == slot_key
+                                        ):
+                                            # 调度执行失败不能消耗槽位，否则同一槽位后续永远不会重试。
+                                            launch_state['last_schedule_run_key'] = None
                                         current_thread = launch_state.get('scheduled_run_thread')
                                         if current_thread is threading.current_thread():
                                             launch_state['scheduled_run_thread'] = None

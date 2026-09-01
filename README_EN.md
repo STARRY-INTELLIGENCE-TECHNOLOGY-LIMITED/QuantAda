@@ -21,6 +21,8 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+Broker SDKs are commented out by default to keep the base environment small. Before using GM, IBKR, or Futu, uncomment the corresponding line in `requirements.txt` and rerun `python -m pip install -r requirements.txt`.
+
 ### 2. Configure
 
 `config.py` keeps the framework core settings. Configure data-provider credentials in `configs/providers.py`; the single configuration entry point re-exports them. Set at least one data-provider token (commonly `TUSHARE_TOKEN`):
@@ -37,12 +39,13 @@ DB_ENABLED = True
 DB_URL = "sqlite:///quantada_logs.db"
 ```
 
-Configuration is split by responsibility but flattened by `config.py` at runtime, so existing code and `--config` usage do not need to distinguish the source. `configs/manager.py` only combines broker connection environments and provides alarm-state helpers:
+Configuration is split by responsibility. `config.py` lists the `configs` submodules explicitly and flattens each with one `import *` line; the Futu Provider and adapter use the same-named keys owned by `configs/futu.py`. There is no directory auto-discovery, so users only need one configuration facade. `configs/manager.py` only combines broker connection environments and provides alarm-state helpers:
 
 | Configuration file | Main settings | Purpose |
 | --- | --- | --- |
 | `config.py` | `LOT_SIZE`, `DATA_PATH`, `LOG`, `PRINT_PLAN`, `KEEP_OVERNIGHT_ORDERS` | Framework, backtest, and common execution |
 | `configs/providers.py` | `TUSHARE_TOKEN`, `SXSC_TUSHARE_TOKEN`, `TIINGO_TOKEN` | Historical data providers |
+| `configs/futu.py` | `FUTU_HOST`, `FUTU_PORT`, `FUTU_RSA_KEY_PATH`, account/trading keys, `FUTU_BROKER_ENVIRONMENTS` | Futu OpenD quote and official trading connection; an empty RSA path means plaintext protocol |
 | `configs/alarms.py` | `ALARMS_ENABLED`, `DINGTALK_WEBHOOK`, `WECOM_WEBHOOK`, `ALARM_LEVEL` | Alarm channels |
 | `configs/gm.py` | `GM_TOKEN`, `GM_BROKER_ENVIRONMENTS` | GM broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['gm_broker']`) |
 | `configs/ibkr.py` | `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ORDER_ACCOUNT`, `IB_BROKER_ENVIRONMENTS` | IBKR broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['ib_broker']`) |
@@ -92,12 +95,16 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 
 ### 6. Connect to Live Trading or Simulation
 
-Configure `BROKER_ENVIRONMENTS` through the `config.py` entry point (broker defaults live in `configs/gm.py` and `configs/ibkr.py`), then launch with `--connect=broker:env`:
+Configure `BROKER_ENVIRONMENTS` through the `config.py` entry point (broker defaults live in `configs/gm.py`, `configs/ibkr.py`, and `configs/futu.py`), then launch with `--connect=broker:env`:
 
 ```bash
 python run.py sample_macd_cross_strategy --connect=gm_broker:sim
 python run.py sample_macd_cross_strategy --connect=gm_broker:real
 python run.py sample_macd_cross_strategy --connect=ib_broker:sim
+python run.py sample_auto_rebalance_strategy --connect=futu_broker:sim --data_source=futu --symbols=HK.00700
+python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_source=futu --symbols=HK.00700
+# Futu quote-subscription event trigger (use futu_broker:real_event; do not combine with schedule)
+python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
 ```
 
 ### 7. SDK / Plugin Mode (Strategies Outside This Repository)

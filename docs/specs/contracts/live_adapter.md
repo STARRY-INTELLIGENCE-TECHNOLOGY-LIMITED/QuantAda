@@ -2,7 +2,7 @@
 
 本文件覆盖 `live_trader/adapters/*_broker.py` 的当前契约。
 
-配置边界：框架核心默认值保留在 `config.py`，Broker/Provider/Alarm 等责任域默认值存放在 `configs` 包的子模块中，由 `config.py` 显式导入并平铺导出；`configs/manager.py` 只合并 Broker 环境并提供报警状态函数。现有 `import config` 和 `run.py --config` 不变。adapter 的局部默认值仍应由所属模块安全地提供；一次性参数和兼容别名不得仅为了 CLI 使用而导出。
+配置边界：框架核心默认值保留在 `config.py`；根入口显式列出责任域模块，并用 `import *` 平铺其配置键。该入口不扫描目录，新增责任域需人工增加导入行。`configs/manager.py` 只合并 Broker 环境并提供报警状态函数。现有 `import config` 和 `run.py --config` 不变；凡已由责任域模块平铺到入口的大写键均可直接覆盖。
 
 ## 1. 模块发现契约
 1. 每个 live adapter 模块只需暴露一个 `BaseLiveBroker` 子类。
@@ -28,6 +28,7 @@
 7. 基础层拆单是第一道边界；适配器的最终 `_submit_order()` 入口也必须按本轮有效配置再次拒绝超出 `BROKER_LOT_LIMITS` 的请求，不能让超限数量抵达券商 API。有效配置应优先读取实盘运行的配置快照，避免长进程重连时模块级默认值覆盖命令行覆盖值。
 8. GM 适配器只服务中国市场，实盘调仓的 BUY/SELL 均使用 `OrderType_Market`。BUY 的 `price` 应至少覆盖实时最优卖价，SELL 使用实时行情作为保护价；该字段是市价保护价，不会把订单变回限价单。资金预检查、虚拟占资和拒单退款均按本次保护价估算。回测仍使用同步市价语义。
 9. IBKR `CRYPTO`（PAXOS）合约的历史数据使用 `AGGTRADES`；市价委托必须使用合约要求的现金数量精度（USD 分）并设置明确的有效期（当前为 `IOC`），不得同时发送非零 `totalQuantity`。订单代理应通过 `submitted_size` 保留基础层所需的币数量，不能因柜台现金数量委托的 wire 数量为零而误判未受理。
+10. Broker 专属的 SDK 导入在模块导入阶段必须保持可选。若选择的 Broker 未安装对应 SDK，适配器必须抛出异常或安全失败，并给出可执行提示：取消 `requirements.txt` 中对应行的注释，然后运行 `python -m pip install -r requirements.txt`。
 
 ## 3. 在途委托契约
 1. `get_pending_orders()` 返回项必须包含:
@@ -90,5 +91,27 @@
 3. 若某 adapter 支持 live + replay/backtest 复合模式，应在该 adapter 文档或实现中明确说明。
 4. 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
 5. schedule 只兼容 `1d|Nm|Nh:HH:MM[:SS]`；配置 `Ns` 必须明确报错并引导使用长连接事件回调与 `timeframe='Seconds'`，不得静默降级为不运行策略。分钟级 SDK 轮询和单次调用超时应随实际周期缩短，避免跨入下一周期。
-6. 若 schedule 回调与订单状态回调共享单线程 SDK 事件循环（包括 GM schedule、IB `ib.sleep()` 主循环），不能在回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将 slot 调度到单个短生命周期工作线程，并让 SDK 回调线程立即返回。重叠 slot 只记录并跳过；回测/优化不得创建该工作线程。
+6. 若 schedule 回调与订单状态回调共享单线程 SDK 事件循环（包括 GM schedule、IB `ib.sleep()` 主循环），不能在回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将 slot 调度到单个短生命周期工作线程，并让 SDK 回调线程立即返回。重叠 slot 只记录并跳过；worker 失败时必须释放该 slot 的去重键，允许后续同槽位重试；回测/优化不得创建该工作线程。
 7. 对 24x7 市场使用 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日及正常长周期 bar 间隔必须同时保留柜台订单及本地 `_active_buys`、`_pending_sells`、虚拟占资跟踪；仍以实时柜台快照和终态回调为事实来源。
+
+8. `common.live_schedule.LiveScheduleRunner` 是通用的 schedule 运行器：无原生 schedule 回调的 Broker 可调用 `run_forever()` 保活并轮询；共享 SDK 事件循环的 Broker 应在事件回调中调用 `poll_once()`。它集中处理 slot/prewarm 去重、重叠运行保护和短生命周期工作线程，Broker 只提供连接与 `LiveTrader.run()` 上下文。
+
+## 9. Futu 官方交易适配器
+
+混合资产账户中，`get_position(data)` 必须按目标标的精确查询和匹配；无关股票、期权或其他衍生品不得改变目标标的的仓位结果。`get_cash()` 与 `getvalue()` 是同一账户、同一计价币种下的账户级事实，多个标的共享现金是预期语义；目标订单的在途仓位只计入同一标的，虚拟占资则按账户级买入并发统一扣减。`order_target_*` 只调整传入标的；`execute_rebalance()` 仍是组合级接口，目标列表外的已管理标的会按既有契约清仓。
+
+1. Futu 适配器使用 `OpenSecTradeContext`，连接参数、账户路由、交易环境和订单默认值以 `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH` 等同名公开键维护在 `configs/futu.py`，并由 `config.py` 导入以支持标准 `--config` 覆盖。`FUTU_TRADE_ENV` 默认必须为 `SIMULATE`，只有显式选择实盘环境时才使用 `REAL`；RSA 路径为空时必须关闭协议加密。
+2. 交易上下文构造和同步查询必须设置有限超时，不能让 OpenD 不可用时阻塞 worker 退出；适配器只负责交易，历史行情仍由 `data_providers` 包独立选择。
+3. 账户、持仓、订单、撤单和下单必须使用同一 `trd_env`、`acc_id`、`acc_index` 范围；A 股持仓的卖出数量必须优先使用 `can_sell_qty`。
+4. 期权仅承诺框架现有 BUY/SELL 抽象可表达的基础流程；adapter 必须按 `price × contract_multiplier` 计算 NAV、目标仓位、买入资金和 `executed.value`，订单数量仍遵循券商的合约张数语义，不得把该适配器宣传为完整卖方、组合或保证金策略实现。
+5. Futu 的账户摘要和持仓查询必须使用配置的账户计价币种；跨币种估值通过可验证的 FX 报价换算，账户摘要、汇率或行情不可用时必须失败关闭，不能用旧 K 线或局部本地估值继续下单。
+6. Futu schedule 的正式槽位必须先通过 `get_market_state()` 确认所有受管标的处于可交易状态；行情上下文 CLOSED/CLOSING 或查询失败时跳过当前槽位，保留后续重试机会。
+7. Futu 事件模式使用 `CurKlineHandlerBase`/其他 SDK handler 的订阅回调；回调线程只做事件去重和单 worker 派发，策略仍通过 `LiveTrader.run()` 执行完整刷新、风控和订单流程。事件模式不得同时配置 schedule，秒级 K 线订阅必须明确拒绝。
+
+## 10. IBKR 混合资产交易
+
+1. IBKR 当前统一解析器覆盖股票（`STK`）、外汇（`CASH`）和 PAXOS 加密资产（`CRYPTO`）；期权、期货或其他未被解析器精确识别的合约不得按同名股票处理，无法匹配管理标的的非基础合约在途快照必须安全失败。
+2. `get_position(data)` 必须先按配置的 `IBKR_ORDER_ACCOUNT` 过滤账户，再按合约类型、代码、币种精确匹配；同一底层代码的股票与其他合约不得互相充当仓位。
+3. `get_cash()`、`getvalue()` 和 `get_rebalance_cash()` 使用同一账户的 USD/BASE 口径。报价币种为 HKD、CNH、EUR 等时，目标金额、持仓市值和在途 BUY 占资必须经过可验证的实时汇率换算；汇率或在途 BUY 价格无法确认时，本轮应失败关闭。
+4. 合约乘数可由 IB 合约或 DataFeed 元数据提供，并统一用于目标数量、占资、持仓估值和 `executed.value`；普通股票、外汇和未声明乘数的资产乘数为 1。
+5. `order_target_percent()` / `order_target_value()` 只调整传入标的；账户级可用现金由所有标的共同分享，但在途仓位差额只计入同一标的，混合资产不会因单一标的调仓而改写其他标的仓位。

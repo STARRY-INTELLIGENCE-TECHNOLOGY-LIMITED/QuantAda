@@ -73,6 +73,21 @@ def test_strategy_isolated_capital_prefers_rebalance_cash(monkeypatch):
     assert len(current_positions) == 1, "应识别到 1 个受管持仓。"
 
 
+def test_strategy_isolated_capital_applies_derivative_contract_multiplier():
+    class OptionBroker(DummyBroker):
+        def get_contract_multiplier(self, data):
+            return 100.0
+
+    data = DummyData("US.AAPL260918P320000")
+    broker = OptionBroker(cash=1000.0, rebalance_cash=200.0, datas=[data])
+    strategy = DummyStrategy(broker=broker, params={})
+
+    allocatable, current_positions = strategy.get_strategy_isolated_capital()
+
+    assert allocatable == pytest.approx(30200.0)
+    assert current_positions[data] == pytest.approx(30000.0)
+
+
 def test_strategy_isolated_capital_fallbacks_to_get_cash_on_rebalance_error(monkeypatch):
     """
     稳定性回归:

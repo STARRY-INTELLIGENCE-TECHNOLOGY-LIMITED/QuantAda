@@ -35,6 +35,7 @@
 - `self.broker.order_target_value(data, target_value)`
 2. Equal-weight rebalance:
 - `self.execute_rebalance(target_symbols, top_k, rebalance_threshold)`
+3. 目标仓位金额按 `price × contract_multiplier` 解释；普通股票乘数为 1，衍生品 adapter 可通过 `get_contract_multiplier(data)` 提供真实名义乘数。
 
 ## 6. 当前调仓语义
 1. `execute_rebalance()` 当前是等权接口，不是权重字典接口。

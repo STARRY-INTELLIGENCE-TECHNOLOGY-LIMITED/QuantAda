@@ -173,6 +173,40 @@ class BaseLiveBroker(ABC):
         """子类必须实现，用于获取指定标的实时价格"""
         pass
 
+    def get_order_lot_size(self, data) -> float:
+        """返回指定标的的下单数量步长；默认使用运行时 LOT_SIZE。"""
+        return self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
+
+    def get_contract_multiplier(self, data) -> float:
+        """返回一个报价单位对应的现金名义乘数；普通股票默认每股为 1。"""
+        return 1.0
+
+    def _contract_multiplier(self, data) -> float:
+        """安全读取现金名义乘数；异常或无效值均按 1 处理。"""
+        try:
+            multiplier = float(self.get_contract_multiplier(data))
+        except (TypeError, ValueError, OverflowError):
+            return 1.0
+        return multiplier if math.isfinite(multiplier) and multiplier > 0 else 1.0
+
+    def _order_unit_value(self, data, price) -> float:
+        """返回一单位数量对应的现金名义价值；默认按报价乘合约乘数。"""
+        try:
+            value = float(price) * self._contract_multiplier(data)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return value if math.isfinite(value) and value > 0 else 0.0
+
+    def get_position_market_value(self, data, size, price=None) -> float:
+        """按账户计价口径计算持仓市值；普通券商默认使用报价货币。"""
+        if price is None:
+            price = self.get_current_price(data)
+        try:
+            value = float(size) * self._order_unit_value(data, price)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return value if math.isfinite(value) else 0.0
+
     @abstractmethod
     def get_pending_orders(self) -> list:
         """
@@ -345,7 +379,11 @@ class BaseLiveBroker(ABC):
 
         # 3. 核心算法：算股数
         target_value = portfolio_value * target
-        expected_shares = target_value / price
+        unit_value = self._order_unit_value(data, price)
+        if unit_value <= 0:
+            self._last_order_target_skip_reason = 'invalid_order_unit_value'
+            return None
+        expected_shares = target_value / unit_value
 
         # 改用预期仓位计算差额
         current_size = self.get_expected_size(data)
@@ -389,7 +427,11 @@ class BaseLiveBroker(ABC):
             return None
 
         # 2. 核心算法：直接用目标金额除以价格
-        expected_shares = target / price
+        unit_value = self._order_unit_value(data, price)
+        if unit_value <= 0:
+            self._last_order_target_skip_reason = 'invalid_order_unit_value'
+            return None
+        expected_shares = target / unit_value
 
         # 改用预期仓位计算差额
         current_size = self.get_expected_size(data)
@@ -466,12 +508,16 @@ class BaseLiveBroker(ABC):
         cash = self.get_cash()
 
         cost_multiplier = self.safety_multiplier
-        estimated_cost = shares * price * cost_multiplier
+        unit_cost = self._order_unit_value(data, price)
+        if unit_cost <= 0:
+            self._last_order_target_skip_reason = 'invalid_order_unit_value'
+            return None
+        estimated_cost = shares * unit_cost * cost_multiplier
 
         cash_limited = cash < estimated_cost
         if cash_limited:
             # 无状态优先：不排队，直接按当前可用现金降级尝试
-            max_shares = cash / (price * cost_multiplier)
+            max_shares = cash / (unit_cost * cost_multiplier)
             shares = min(shares, max_shares)
             min_lot = normalize_quantity_step(lot_size)
             if decimal_quantity(shares, absolute=True) < decimal_quantity(min_lot, absolute=True):
@@ -583,12 +629,12 @@ class BaseLiveBroker(ABC):
 
     def _smart_buy(self, data, shares, price, target_pct, **kwargs):
         """智能买入 (Percent模式)：资金检查 + 自动降级"""
-        lot_size = self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
+        lot_size = self.get_order_lot_size(data)
         return self._smart_buy_core(data, shares, price, lot_size)
 
     def _smart_buy_value(self, data, shares, price, target_value, **kwargs):
         """智能买入 (Value模式)：资金检查 + 自动降级"""
-        lot_size = self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
+        lot_size = self.get_order_lot_size(data)
         return self._smart_buy_core(data, shares, price, lot_size)
 
     def _infer_submitted_shares(self, proxy, fallback_shares):
@@ -640,7 +686,9 @@ class BaseLiveBroker(ABC):
                 return reserved_cash
         except (TypeError, ValueError, OverflowError):
             pass
-        return positive_quantity(shares) * float(price) * self.safety_multiplier
+        data = getattr(proxy, 'data', None)
+        unit_value = self._order_unit_value(data, price) if data is not None else float(price)
+        return positive_quantity(shares) * unit_value * self.safety_multiplier
 
     def _reserved_cash_for_buy_info(self, buy_info):
         try:
@@ -649,9 +697,10 @@ class BaseLiveBroker(ABC):
                 return reserved_cash
         except (AttributeError, TypeError, ValueError, OverflowError):
             pass
-        return positive_quantity(buy_info.get('shares', 0)) * float(
-            buy_info.get('price', 0.0) or 0.0
-        ) * self.safety_multiplier
+        data = buy_info.get('data')
+        price = float(buy_info.get('price', 0.0) or 0.0)
+        unit_value = self._order_unit_value(data, price) if data is not None else price
+        return positive_quantity(buy_info.get('shares', 0)) * unit_value * self.safety_multiplier
 
     @staticmethod
     def _read_order_state(proxy):
@@ -783,6 +832,7 @@ class BaseLiveBroker(ABC):
                         'below_min_lot_delta',
                         'invalid_buy_price',
                         'broker_lot_limit_exceeded',
+                        'unsupported_contract',
                     }:
                         return None
                     max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
@@ -884,7 +934,7 @@ class BaseLiveBroker(ABC):
             self._runtime_log(f"[Broker Warning] SELL {data._name} skipped: live run execution budget exhausted.")
             return None
 
-        lot_size = self._runtime_setting('LOT_SIZE', config.LOT_SIZE)
+        lot_size = self.get_order_lot_size(data)
 
         # 获取当前【真实的已结算仓位】
         pos_obj = None
@@ -1304,7 +1354,7 @@ class BaseLiveBroker(ABC):
             pos = self.get_position(d)
             if pos.size:
                 p = self.get_current_price(d)
-                val += pos.size * p
+                val += self.get_position_market_value(d, pos.size, price=p)
         return val
 
     def _init_cash(self):

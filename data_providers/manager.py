@@ -17,6 +17,8 @@ _PLATFORM_DEFAULT_SOURCES = {
     'ib_broker': 'ibkr',
     'gm': 'gm',
     'gm_broker': 'gm',
+    'futu': 'futu',
+    'futu_broker': 'futu',
 }
 
 
@@ -169,11 +171,26 @@ class DataManager:
                         return dt.tz_convert(None)
                 return dt
 
+            def normalize_boundary(dt_input, is_end=False):
+                intraday_timeframes = {
+                    'minutes', 'minute', 'min', 'm',
+                    'seconds', 'second', 'sec', 's',
+                }
+                if not (is_end and str(timeframe or '').strip().lower() in intraday_timeframes):
+                    return dt_input
+                raw = str(dt_input).strip()
+                if re.search(r'[T\s]\d', raw):
+                    return dt_input
+                try:
+                    return pd.Timestamp(dt_input) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+                except Exception:
+                    return dt_input
+
             if start_date:
                 start_dt = align_date(start_date, final_df.index)
                 final_df = final_df[final_df.index >= start_dt]
             if end_date:
-                end_dt = align_date(end_date, final_df.index)
+                end_dt = align_date(normalize_boundary(end_date, is_end=True), final_df.index)
                 final_df = final_df[final_df.index <= end_dt]
 
             return final_df

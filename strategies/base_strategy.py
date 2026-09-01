@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import math
 from types import SimpleNamespace
 
 import pandas as pd
@@ -190,7 +191,20 @@ class BaseStrategy(ABC):
                 else:
                     price = pos.price
 
-                market_value = expected_size * price
+                market_value_getter = getattr(self.broker, 'get_position_market_value', None)
+                if callable(market_value_getter):
+                    market_value = market_value_getter(d, expected_size, price=price)
+                else:
+                    multiplier = 1.0
+                    multiplier_getter = getattr(self.broker, 'get_contract_multiplier', None)
+                    if callable(multiplier_getter):
+                        try:
+                            candidate = float(multiplier_getter(d))
+                            if math.isfinite(candidate) and candidate > 0:
+                                multiplier = candidate
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                    market_value = expected_size * price * multiplier
 
                 # “欺骗” Rebalancer：告诉它当前持仓是 Expected，防止它因未结算而重复发单
                 current_positions[d] = market_value

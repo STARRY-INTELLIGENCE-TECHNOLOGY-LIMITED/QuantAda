@@ -11,7 +11,7 @@
 - 标的: `[可空，可逗号分隔]`
 - 参数字典: `[可空，Python dict 字符串]`
 - 风控参数字典: `[可空，Python dict 字符串；多风控时也可为 {risk_name: {...}}]`
-- 数据源: `[可空，可为单个或逗号/空格分隔多个 provider，如 gm akshare tushare csv]`
+- 数据源: `[可空，可为单个或逗号/空格分隔多个 provider，如 gm akshare tushare tiingo futu csv]`
 - 时间范围: `[start_date/end_date，可空，格式 YYYYMMDD]`
 - 资金与成本: `[cash/commission/slippage，可空]`
 - 实盘连接: `[可空，格式 broker:env，例如 gm_broker:sim]`
@@ -38,7 +38,7 @@
    - `{'KEEP_OVERNIGHT_ORDERS': False}`: 交易日首轮前清理隔夜在途委托（默认推荐）
    - `{'KEEP_OVERNIGHT_ORDERS': True}`: 保留隔夜在途委托；24x7 币市应使用该值
    - 币市数量精度通过正小数配置，例如 `{'LOT_SIZE': 0.00000001, 'BROKER_LOT_LIMITS': 0.1, 'KEEP_OVERNIGHT_ORDERS': True}`；不得把数量参数改写为整数
-8. `--config` 接受统一 `config.py` 入口显式导出的公共大写键；用户不需要区分配置来源。局部 adapter/provider 参数使用所属模块的安全默认值，不要为了生成命令而虚构配置键或公开一次性参数。旧名称/拼写错误会明确打印警告并被忽略，生成命令时必须使用当前键名。
+8. `--config` 接受 `config.py` 入口按责任域模块 `import *` 平铺的全部大写键；入口不自动扫描目录，新增责任域由维护者显式增加一行导入。用户不需要区分配置来源，也不应被额外的运行时白名单限制。旧名称/拼写错误会明确打印警告并被忽略，生成命令时必须使用当前键名。
 9. 当 `mode=optimize` 时，框架会自动将终端滚动输出异步归档到 `.data/optimizer`；不要要求用户手动传任何内部日志路径参数。
 10. 当需要查看月度收益热力图时，使用 `--plot_scope monthly_heatmap`；也可和组合图逗号组合，例如 `--plot_scope portfolio_equity,portfolio_drawdown,monthly_heatmap`。
 

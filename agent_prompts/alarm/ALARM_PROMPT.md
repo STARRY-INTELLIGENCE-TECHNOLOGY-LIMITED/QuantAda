@@ -34,7 +34,7 @@ push_status(self, status: str, detail: str = "")
 ## 输出格式
 1. 输出完整 Python 文件代码。
 2. 给出最小集成步骤:
-- 若 webhook/token 是稳定且跨模块复用的公开配置，才在 `configs/alarms.py` 增加并通过 `config.py` 统一入口导出；否则由通道模块提供安全默认值，不为局部参数增加 CLI 配置入口
+- webhook/token 等用户需要调整的配置放在 `configs/alarms.py`，并随 `config.py` 的责任域 `import *` 统一入口导出；局部实现默认值仍可留在通道模块，不另造配置命名空间或重复 CLI 白名单。
 - 在 `alarms/manager.py` 中注册该通道
 3. 给出一个最小测试片段（直接调用 4 个 push 方法）。
 

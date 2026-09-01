@@ -1,18 +1,29 @@
 import asyncio
 import copy
+import concurrent.futures
 import datetime
+import inspect
 import math
 import re
 import threading
 import time
 from decimal import Decimal, InvalidOperation
+from typing import Dict, Optional
 
 import pandas as pd
-from ib_insync import IB, Stock, MarketOrder, Trade, Forex, Contract
+from common.live_runtime import dependency_install_hint
+
 try:
-    from ib_insync import Crypto
-except ImportError:
-    Crypto = None
+    from ib_insync import IB, Stock, MarketOrder, Trade, Forex, Contract
+    try:
+        from ib_insync import Crypto
+    except Exception:
+        Crypto = None
+    _IB_IMPORT_ERROR = None
+except Exception as exc:
+    IB = Stock = MarketOrder = Trade = Forex = Contract = Crypto = None
+    _IB_IMPORT_ERROR = exc
+    print(dependency_install_hint('ib_insync', exc))
 
 from alarms.manager import AlarmManager
 from alarms.live_alarm import LiveAlarmDeduper
@@ -23,20 +34,388 @@ from common.live_process_supervisor import (
 )
 from common.live_execution_budget import live_run_seconds_remaining
 from common.live_runtime import runtime_print
+from common.live_schedule import LiveScheduleRunner
 from common.log import coerce_dt
-from common.ib_symbol_parser import resolve_ib_contract_spec
-from common.ib_event_loop import call_async_on_owner_loop
 from common.order_quantity import positive_quantity, quantity_number
 import config
 from data_providers.csv_provider import CsvDataProvider
 from data_providers.manager import DataManager, normalize_source_name
-from data_providers.ibkr_provider import IbkrDataProvider
 from ..data_bridge.data_warm import SchedulePlanner
 from .base_broker import BaseLiveBroker, BaseOrderProxy
 
 
 _IB_SDK_HEALTH_DEADLINE_SECONDS = 180.0
 _IB_SYNC_QUERY_TIMEOUT_SECONDS = 3.0
+
+
+def _require_ib_sdk():
+    """在真正创建 IB 交易连接前给出可执行的依赖安装指引。"""
+    if IB is None or Stock is None or MarketOrder is None:
+        raise ImportError(dependency_install_hint('ib_insync', _IB_IMPORT_ERROR))
+
+
+# IB 专属的合约解析和事件循环调度实现；Provider 通过本模块复用。
+_US_PRIMARY_EXCHANGE_HINTS = {
+    'SMART', 'ISLAND', 'NASDAQ', 'ARCA', 'NYSE', 'AMEX', 'BATS', 'PINK',
+    'IEX', 'CBOE', 'MEMX', 'EDGX', 'EDGEA', 'BYX', 'BEX', 'NYSENAT',
+}
+_US_PREFIXES = {'US'}
+_CN_PREFIXES = {'SHSE', 'SZSE'}
+_HK_PREFIXES = {'SEHK', 'HK'}
+_COMMON_CURRENCIES = {
+    'USD', 'EUR', 'GBP', 'JPY', 'HKD', 'CNH', 'CNY',
+    'AUD', 'CAD', 'CHF', 'NZD', 'SGD',
+}
+_EXCHANGE_CODE_RE = re.compile(r'^[A-Z]{2,10}$')
+_IB_OPTION_CODE_RE = re.compile(
+    r'^[A-Z0-9][A-Z0-9._-]*\d{6,8}[CP]\d{3,9}$'
+)
+_IB_UNSUPPORTED_PREFIXES = {'OPT', 'FOP', 'FUT', 'BAG'}
+_CONTRACT_MULTIPLIER_GROUPS = (
+    ('option_contract_multiplier', 'option_contract_size'),
+    ('contract_multiplier', 'contract_size'),
+    ('multiplier', 'mult'),
+)
+
+
+def _is_likely_exchange_token(token: str) -> bool:
+    """判断字符串是否更可能是交易所代码，而不是货币代码。"""
+    token = str(token or '').strip().upper()
+    if not token or token in _COMMON_CURRENCIES:
+        return False
+    return token in _US_PRIMARY_EXCHANGE_HINTS or bool(_EXCHANGE_CODE_RE.fullmatch(token))
+
+
+def resolve_ib_contract_spec(symbol: str) -> Dict[str, Optional[str]]:
+    """把用户输入解析成 IB 合约规格。"""
+    raw = str(symbol or '').strip()
+    sym = raw.upper()
+    default = {
+        'kind': 'stock',
+        'symbol': sym,
+        'exchange': 'SMART',
+        'currency': 'USD',
+        'primary_exchange': None,
+    }
+
+    if not sym:
+        return default
+
+    parts = sym.split('.')
+
+    # OCC/Futu 常见的 ``UNDERLYING+到期日+C/P+行权价`` 代码当前没有
+    # 对应的 IB 合约构造参数；无论是否带市场、交易所或币种后缀，
+    # 都必须先标记为未支持，不能静默落入 STK 默认分支。
+    option_candidates = [sym]
+    candidate_parts = list(parts)
+    if candidate_parts and candidate_parts[-1] in _COMMON_CURRENCIES:
+        candidate_parts.pop()
+    if candidate_parts and candidate_parts[-1] in _US_PRIMARY_EXCHANGE_HINTS:
+        candidate_parts.pop()
+    if candidate_parts:
+        option_candidates.append('.'.join(candidate_parts))
+    if len(candidate_parts) >= 2 and (
+        candidate_parts[0] in _US_PREFIXES
+        or candidate_parts[0] in _US_PRIMARY_EXCHANGE_HINTS
+    ):
+        option_candidates.append('.'.join(candidate_parts[1:]))
+    if any(_IB_OPTION_CODE_RE.fullmatch(candidate) for candidate in option_candidates):
+        return {
+            'kind': 'unsupported',
+            'symbol': sym,
+            'reason': 'option contract format is not supported by this adapter',
+        }
+
+    if parts[0] in _IB_UNSUPPORTED_PREFIXES:
+        return {
+            'kind': 'unsupported',
+            'symbol': sym,
+            'reason': f'unsupported IB contract prefix {parts[0]}',
+        }
+    if len(parts) >= 3 and parts[0] == 'STK':
+        symbol_parts = parts[1:]
+        currency = 'USD'
+        if symbol_parts[-1] in _COMMON_CURRENCIES:
+            currency = symbol_parts.pop()
+        primary_exchange = None
+        if len(symbol_parts) > 1 and symbol_parts[-1] in _US_PRIMARY_EXCHANGE_HINTS:
+            primary_exchange = (
+                None if symbol_parts[-1] == 'SMART' else symbol_parts.pop()
+            )
+        return {
+            'kind': 'stock',
+            'symbol': '.'.join(symbol_parts),
+            'exchange': 'SMART',
+            'currency': currency,
+            'primary_exchange': primary_exchange,
+        }
+
+    if len(parts) == 3:
+        sec_type, p1, p2 = parts
+        if sec_type == 'CASH':
+            return {'kind': 'forex', 'pair': f'{p1}{p2}'}
+        if sec_type == 'CRYPTO':
+            return {'kind': 'crypto', 'symbol': p1, 'exchange': 'PAXOS', 'currency': p2}
+
+    # 支持 ``US.BRK.B`` 这类带点号股票代码，同时兼容末尾 venue 后缀。
+    if len(parts) >= 2 and parts[0] in _US_PREFIXES:
+        symbol_parts = parts[1:]
+        currency = 'USD'
+        if len(symbol_parts) > 1 and symbol_parts[-1] in _COMMON_CURRENCIES:
+            currency = symbol_parts.pop()
+        primary_exchange = None
+        if len(symbol_parts) > 1 and symbol_parts[-1] in _US_PRIMARY_EXCHANGE_HINTS:
+            primary_exchange = None if symbol_parts[-1] == 'SMART' else symbol_parts.pop()
+        if _IB_OPTION_CODE_RE.fullmatch('.'.join(symbol_parts)):
+            return {
+                'kind': 'unsupported',
+                'symbol': sym,
+                'reason': 'option contract format is not supported by this adapter',
+            }
+        return {
+            'kind': 'stock',
+            'symbol': '.'.join(symbol_parts),
+            'exchange': 'SMART',
+            'currency': currency,
+            'primary_exchange': primary_exchange,
+        }
+
+    if len(parts) == 2:
+        p1, p2 = parts
+        if p1 in _US_PREFIXES:
+            return {
+                'kind': 'stock',
+                'symbol': p2,
+                'exchange': 'SMART',
+                'currency': 'USD',
+                'primary_exchange': None,
+            }
+        if p1 in _CN_PREFIXES:
+            return {
+                'kind': 'stock',
+                'symbol': p2,
+                'exchange': 'SEHK',
+                'currency': 'CNH',
+                'primary_exchange': None,
+            }
+        if p1 in _HK_PREFIXES:
+            hk_code = str(int(p2)) if p2.isdigit() else p2
+            return {
+                'kind': 'stock',
+                'symbol': hk_code,
+                'exchange': 'SEHK',
+                'currency': 'HKD',
+                'primary_exchange': None,
+            }
+        if p1 in _US_PRIMARY_EXCHANGE_HINTS:
+            return {
+                'kind': 'stock',
+                'symbol': p2,
+                'exchange': 'SMART',
+                'currency': 'USD',
+                'primary_exchange': None if p1 == 'SMART' else p1,
+            }
+        if p1 in _COMMON_CURRENCIES and p2 in _COMMON_CURRENCIES:
+            return {'kind': 'forex', 'pair': f'{p1}{p2}'}
+        if _is_likely_exchange_token(p2):
+            return {
+                'kind': 'stock',
+                'symbol': p1,
+                'exchange': 'SMART',
+                'currency': 'USD',
+                'primary_exchange': None if p2 == 'SMART' else p2,
+            }
+
+    if sym.isdigit() or (len(sym) == 5 and sym.startswith('0')):
+        return {
+            'kind': 'stock',
+            'symbol': str(int(sym)),
+            'exchange': 'SEHK',
+            'currency': 'HKD',
+            'primary_exchange': None,
+        }
+
+    return default
+
+
+def _positive_float(value):
+    """解析正的有限浮点数；无效值返回 None。"""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _extract_contract_multiplier(value) -> float:
+    """读取 IB 合约或 DataFeed 声明的名义乘数，未知时回退为 1。"""
+    if value is None:
+        return 1.0
+
+    sources = [value]
+    contract = getattr(value, 'contract', None)
+    if contract is not None:
+        sources.append(contract)
+    params = getattr(value, 'p', None)
+    if params is not None:
+        sources.append(params)
+        dataname = getattr(params, 'dataname', None)
+        if dataname is not None:
+            sources.append(dataname)
+
+    for names in _CONTRACT_MULTIPLIER_GROUPS:
+        for source in sources:
+            if isinstance(source, pd.DataFrame):
+                attrs = getattr(source, 'attrs', {}) or {}
+                for name in names:
+                    parsed = _positive_float(attrs.get(name))
+                    if parsed is not None:
+                        return parsed
+                for name in names:
+                    if name not in source.columns:
+                        continue
+                    values = pd.to_numeric(source[name], errors='coerce').dropna()
+                    for raw_value in reversed(values.tolist()):
+                        parsed = _positive_float(raw_value)
+                        if parsed is not None:
+                            return parsed
+                continue
+
+            if isinstance(source, dict):
+                for name in names:
+                    parsed = _positive_float(source.get(name))
+                    if parsed is not None:
+                        return parsed
+                continue
+
+            for name in names:
+                try:
+                    raw_value = getattr(source, name)
+                except Exception:
+                    continue
+                parsed = _positive_float(raw_value)
+                if parsed is not None:
+                    return parsed
+    return 1.0
+
+
+def _call_on_owner_loop(
+    method,
+    method_label: str,
+    event_loop,
+    args=(),
+    kwargs=None,
+    timeout: float = 3.0,
+    await_result: bool = False,
+):
+    """在 IB 所属事件循环中调用一个同步或异步方法。"""
+    if event_loop is None:
+        raise RuntimeError(f'IB event loop is unavailable; cannot run {method_label}')
+    if event_loop.is_closed():
+        raise RuntimeError(f'IB event loop is closed; cannot run {method_label}')
+
+    try:
+        wait_timeout = max(0.01, float(timeout))
+    except (TypeError, ValueError, OverflowError):
+        wait_timeout = 3.0
+
+    result_future = concurrent.futures.Future()
+    task_holder = {}
+    call_kwargs = dict(kwargs or {})
+
+    def _finish(task):
+        if result_future.done():
+            return
+        try:
+            result_future.set_result(task.result())
+        except BaseException as exc:
+            result_future.set_exception(exc)
+
+    def _invoke():
+        if result_future.cancelled():
+            return
+        try:
+            awaitable = method(*args, **call_kwargs)
+            if not await_result or not inspect.isawaitable(awaitable):
+                if not result_future.done():
+                    result_future.set_result(awaitable)
+                return
+            task = asyncio.ensure_future(awaitable, loop=event_loop)
+            task_holder['task'] = task
+            task.add_done_callback(_finish)
+        except BaseException as exc:
+            if not result_future.done():
+                result_future.set_exception(exc)
+
+    try:
+        event_loop.call_soon_threadsafe(_invoke)
+    except BaseException:
+        result_future.cancel()
+        raise
+
+    try:
+        return result_future.result(timeout=wait_timeout)
+    except concurrent.futures.TimeoutError as exc:
+        result_future.cancel()
+
+        def _cancel_task():
+            task = task_holder.get('task')
+            if task is not None and not task.done():
+                task.cancel()
+
+        try:
+            event_loop.call_soon_threadsafe(_cancel_task)
+        except Exception:
+            pass
+        raise TimeoutError(f'{method_label} timed out after {wait_timeout:.2f}s') from exc
+
+
+def call_async_on_owner_loop(
+    ib,
+    method_name: str,
+    event_loop,
+    args=(),
+    kwargs=None,
+    timeout: float = 3.0,
+):
+    """在 IB 所属事件循环中调用异步接口，兼容协程和同步返回值。"""
+    method_label = f'IB.{method_name}Async'
+    method = getattr(ib, f'{method_name}Async', None)
+    if not callable(method):
+        raise RuntimeError(f'{method_label} is unavailable for cross-thread call')
+    return _call_on_owner_loop(
+        method,
+        method_label,
+        event_loop,
+        args=args,
+        kwargs=kwargs,
+        timeout=timeout,
+        await_result=True,
+    )
+
+
+def call_sync_on_owner_loop(
+    ib,
+    method_name: str,
+    event_loop,
+    args=(),
+    kwargs=None,
+    timeout: float = 3.0,
+):
+    """在 IB 所属事件循环中调用没有 Async 变体的同步接口。"""
+    method_label = f'IB.{method_name}'
+    method = getattr(ib, method_name, None)
+    if not callable(method):
+        raise RuntimeError(f'{method_label} is unavailable for cross-thread call')
+    return _call_on_owner_loop(
+        method,
+        method_label,
+        event_loop,
+        args=args,
+        kwargs=kwargs,
+        timeout=timeout,
+        await_result=False,
+    )
 
 
 def _disable_ib_account_summary_auto_resubscribe(ib):
@@ -62,6 +441,11 @@ class IBOrderProxy(BaseOrderProxy):
     def __init__(self, trade: Trade, data=None):
         self.trade = trade
         self.data = data
+        self.contract_multiplier = _extract_contract_multiplier(
+            getattr(trade, 'contract', None)
+        )
+        if self.contract_multiplier == 1.0 and data is not None:
+            self.contract_multiplier = _extract_contract_multiplier(data)
 
     @property
     def id(self):
@@ -73,12 +457,14 @@ class IBOrderProxy(BaseOrderProxy):
 
     @property
     def executed(self):
+        contract_multiplier = self.contract_multiplier
+
         class ExecutedStats:
             def __init__(self, trade):
                 fill = trade.orderStatus
                 self.size = fill.filled
                 self.price = fill.avgFillPrice
-                self.value = self.size * self.price
+                self.value = self.size * self.price * contract_multiplier
                 # IBKR佣金信息在 commissionReport 对象中
                 # 必须检查 commissionReport 是否存在，否则会报 AttributeError
                 self.comm = 0.0
@@ -151,6 +537,8 @@ class IBBrokerAdapter(BaseLiveBroker):
     def __init__(self, context, cash_override=None, commission_override=None, slippage_override=None):
         # 从 context 中获取由 launch 注入的 ib 实例
         self.ib: IB = getattr(context, 'ib_instance', None)
+        if self.ib is None:
+            _require_ib_sdk()
         # ``launch`` 在自身事件循环线程中驱动 ib_insync，调度 run 转移到工作线程执行；保存该事件循环以便把工作线程的阻塞快照请求投递回 SDK 线程。
         # 避免调用工作线程中不存在的 ``IB._run``。
         self._ib_event_loop = getattr(context, 'ib_event_loop', None)
@@ -164,8 +552,11 @@ class IBBrokerAdapter(BaseLiveBroker):
         if self._ib_event_loop_thread_id is None:
             # 对于单元测试 adapter 及直接构造 broker 的调用方，若 launch 未显式提供 SDK loop owner，则默认当前线程就是所属线程。
             self._ib_event_loop_thread_id = threading.get_ident()
+        # 连接恢复阶段的账户探针不属于某一次策略 run，不能继承上轮已过期的执行 deadline。
+        self._ib_connection_probe = False
         self._tickers = {}  # 缓存实时行情 snapshot
         self._fx_tickers = {}  # 缓存汇率行情
+        self._contract_multipliers = {}  # 已从 IB 合约快照确认的名义乘数
         # 最后已知有效汇率缓存 (Last Known Good Rate)
         self._last_valid_fx_rates = {}
         # 汇率历史查询失败冷却，防止单次故障导致每次 get_cash 都阻塞。
@@ -194,6 +585,76 @@ class IBBrokerAdapter(BaseLiveBroker):
     def safety_multiplier(self):
         """IB 使用精确现金估算；超额买单交由同 bar 降级重试处理。"""
         return 1.0
+
+    @staticmethod
+    def _quote_currency(data) -> str:
+        """根据统一合约规格返回报价币种。"""
+        if data is None:
+            return 'USD'
+        try:
+            spec = resolve_ib_contract_spec(getattr(data, '_name', ''))
+        except Exception:
+            return 'USD'
+        if spec.get('kind') == 'forex':
+            pair = str(spec.get('pair', '') or '').upper()
+            return pair[-3:] if len(pair) >= 6 else 'USD'
+        return str(spec.get('currency') or 'USD').upper()
+
+    def _quote_currency_to_usd(self, currency: str) -> float:
+        """将报价币种换算成 USD；无法验证汇率时返回 0。"""
+        source = str(currency or 'USD').strip().upper()
+        if source in {'USD', 'BASE'}:
+            return 1.0
+        if source == 'CNY':
+            source = 'CNH'
+
+        if source in {'EUR', 'GBP', 'AUD', 'NZD'}:
+            pairs = (
+                (f'{source}USD', False),
+                (f'USD{source}', True),
+            )
+        else:
+            pairs = (
+                (f'USD{source}', True),
+                (f'{source}USD', False),
+            )
+        for pair_symbol, inverse in pairs:
+            parsed = _positive_float(self._load_fx_rate(pair_symbol))
+            if parsed is not None:
+                return 1.0 / parsed if inverse else parsed
+        return 0.0
+
+    def get_contract_multiplier(self, data) -> float:
+        """读取 DataFeed 或 IB 合约声明的名义乘数。"""
+        multiplier = _extract_contract_multiplier(data)
+        if multiplier != 1.0:
+            return multiplier
+        symbol = str(getattr(data, '_name', '') or '').strip().upper()
+        cached = _positive_float(self._contract_multipliers.get(symbol))
+        return cached if cached is not None else 1.0
+
+    def _order_unit_value(self, data, price) -> float:
+        """按 IB 账户 USD 口径计算一单位数量的名义价值。"""
+        multiplier = self._contract_multiplier(data)
+        rate = self._quote_currency_to_usd(self._quote_currency(data))
+        try:
+            value = float(price) * multiplier * rate
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+        return value if value > 0 and math.isfinite(value) else 0.0
+
+    def get_position_market_value(self, data, size, price=None) -> float:
+        """返回按账户 USD 口径换算后的持仓市值。"""
+        value = super().get_position_market_value(data, size, price=price)
+        try:
+            positive_size = float(size) > 0
+        except (TypeError, ValueError, OverflowError):
+            positive_size = False
+        if positive_size and (not math.isfinite(value) or value <= 0):
+            raise RuntimeError(
+                f'IB position valuation unavailable for {getattr(data, "_name", "UNKNOWN")}'
+            )
+        return value
 
     @staticmethod
     def _normalize_account(account_raw) -> str:
@@ -582,6 +1043,52 @@ class IBBrokerAdapter(BaseLiveBroker):
             return False
         return True
 
+    def _invalidate_reconnect_snapshot(self):
+        """清除 IB 断线前的 wrapper 快照，等待重连后的新事实。"""
+        wrapper = getattr(self.ib, 'wrapper', None)
+        if wrapper is not None:
+            for name in (
+                'accountValues',
+                'acctSummary',
+                'accounts',
+                'positions',
+                'portfolio',
+                'trades',
+                'fills',
+                'tickers',
+            ):
+                value = getattr(wrapper, name, None)
+                clear = getattr(value, 'clear', None)
+                if callable(clear):
+                    try:
+                        clear()
+                    except Exception as exc:
+                        self._runtime_log(
+                            f"[IBBroker Warning] 清理断线前 {name} 快照失败: {exc}"
+                        )
+
+        self._tickers = {}
+        self._fx_tickers = {}
+        for cache_name in ('_last_valid_fx_rates', '_fx_rate_retry_not_before'):
+            cache = getattr(self, cache_name, None)
+            if cache is not None:
+                cache.clear()
+        self._req_all_open_orders_cache = []
+        self._req_all_open_orders_cache_valid = False
+        self._req_all_open_orders_last_ts = 0.0
+        self._last_open_trades_fetch_failed = False
+        self._last_open_trades_fetch_error = None
+        self._last_account_snapshot_fetch_failed = True
+        self._last_account_snapshot_fetch_error = 'IB reconnect snapshot pending'
+        self._last_position_snapshot_fetch_failed = True
+        self._last_position_snapshot_fetch_error = 'IB reconnect snapshot pending'
+        ledger_lock = getattr(self, '_ledger_lock', None)
+        if ledger_lock is not None:
+            with ledger_lock:
+                self._active_buys.clear()
+                self._pending_sells.clear()
+                self._virtual_spent_cash = 0.0
+
     def _push_zero_cash_account_alarm_if_needed(self, cash_value: float, has_snapshot: bool):
         account = self._configured_order_account()
         if not account:
@@ -816,7 +1323,11 @@ class IBBrokerAdapter(BaseLiveBroker):
         if not callable(method):
             raise RuntimeError(f"IB.{method_name} is unavailable")
 
-        remaining = live_run_seconds_remaining(self)
+        remaining = (
+            math.inf
+            if getattr(self, '_ib_connection_probe', False)
+            else live_run_seconds_remaining(self)
+        )
         if remaining <= 0:
             raise TimeoutError("live run execution budget exhausted")
         timeout = min(_IB_SYNC_QUERY_TIMEOUT_SECONDS, remaining)
@@ -826,10 +1337,19 @@ class IBBrokerAdapter(BaseLiveBroker):
         # 沿用当前 run 的有界预算等待结果。
         owner_thread_id = self._ib_event_loop_thread_id
         event_loop = self._ib_event_loop
+        current_thread_id = threading.get_ident()
+        if (
+            owner_thread_id is not None
+            and current_thread_id != owner_thread_id
+            and event_loop is None
+        ):
+            raise RuntimeError(
+                f"IB event loop is unavailable; cannot run {method_name} from worker"
+            )
         if (
             event_loop is not None
             and owner_thread_id is not None
-            and threading.get_ident() != owner_thread_id
+            and current_thread_id != owner_thread_id
         ):
             if event_loop.is_closed():
                 raise RuntimeError(f"IB event loop is closed; cannot run {method_name}")
@@ -856,6 +1376,46 @@ class IBBrokerAdapter(BaseLiveBroker):
                     delattr(self.ib, 'RequestTimeout')
                 except AttributeError:
                     pass
+
+    def _call_ib_sync(self, method_name: str, *args, timeout=None, **kwargs):
+        """调用 IB 同步接口；worker 线程统一把 socket 操作投递到 owner loop。"""
+        method = getattr(self.ib, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"IB.{method_name} is unavailable")
+
+        event_loop = getattr(self.ib, '_quantada_event_loop', None)
+        if event_loop is None:
+            event_loop = getattr(self, '_ib_event_loop', None)
+        owner_thread_id = getattr(self.ib, '_quantada_event_loop_thread_id', None)
+        if owner_thread_id is None:
+            owner_thread_id = getattr(self, '_ib_event_loop_thread_id', None)
+
+        if event_loop is not None and owner_thread_id is not None:
+            if threading.get_ident() == owner_thread_id:
+                return method(*args, **kwargs)
+            if timeout is None:
+                remaining = (
+                    math.inf
+                    if getattr(self, '_ib_connection_probe', False)
+                    else live_run_seconds_remaining(self)
+                )
+                timeout = min(_IB_SYNC_QUERY_TIMEOUT_SECONDS, remaining)
+            return call_sync_on_owner_loop(
+                self.ib,
+                method_name,
+                event_loop,
+                args=args,
+                kwargs=kwargs,
+                timeout=timeout,
+            )
+
+        # 没有 owner loop 元数据时，仅允许当前线程直接调用；真实 launcher
+        # 始终注入该元数据，避免 worker 把 socket 写入错误线程。
+        if owner_thread_id is not None and threading.get_ident() != owner_thread_id:
+            raise RuntimeError(
+                f"IB event loop is unavailable; cannot run {method_name} from worker"
+            )
+        return method(*args, **kwargs)
 
     @staticmethod
     def _extract_base_tag_value(source_data, tag):
@@ -965,10 +1525,12 @@ class IBBrokerAdapter(BaseLiveBroker):
                     size = po['size']
 
                     price = 0.0
+                    matched_data = None
                     # 方案 A：优先从框架维护的数据流 (datas) 中精准提取最新价
                     for d in self.datas:
                         # 兼容 'AAPL.SMART' 和 'AAPL' 的命名匹配
                         if symbol == d._name or symbol == d._name.split('.')[0]:
+                            matched_data = d
                             price = self.get_current_price(d)
                             break
 
@@ -982,11 +1544,36 @@ class IBBrokerAdapter(BaseLiveBroker):
                         if p and p > 0:
                             price = p
 
-                    # 如果成功获取价格，累加在途买单估算占资。
-                    if price > 0:
-                        virtual_frozen_cash += size * price * self.safety_multiplier
-                        if poid:
-                            covered_local_order_ids.add(poid)
+                    # 无法取得在途买单价格时不能把该笔订单静默当作零占资；
+                    # 账户现金快照不可信，本轮调仓必须失败关闭。
+                    if price <= 0:
+                        raise RuntimeError(
+                            f"IB pending BUY price unavailable: id={poid!r}, symbol={symbol!r}"
+                        )
+
+                    pending_multiplier = _positive_float(
+                        po.get('contract_multiplier', 1.0)
+                    ) or 1.0
+                    if matched_data is not None and pending_multiplier == 1.0:
+                        unit_value = self._order_unit_value(matched_data, price)
+                    else:
+                        currency = po.get(
+                            'currency',
+                            self._quote_currency(matched_data),
+                        )
+                        unit_value = (
+                            price
+                            * pending_multiplier
+                            * self._quote_currency_to_usd(currency)
+                        )
+                    if unit_value <= 0 or not math.isfinite(unit_value):
+                        raise RuntimeError(
+                            f"IB pending BUY value unavailable: id={poid!r}, symbol={symbol!r}"
+                        )
+
+                    virtual_frozen_cash += size * unit_value * self.safety_multiplier
+                    if poid:
+                        covered_local_order_ids.add(poid)
 
         except Exception as e:
             self._runtime_log(f"[IBBroker] 计算买单虚拟冻结资金时发生异常: {e}")
@@ -1001,7 +1588,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         overlap_cost = 0.0
         for oid, buy_info in getattr(self, '_active_buys', {}).items():
             try:
-                cost = buy_info['shares'] * buy_info['price'] * self.safety_multiplier
+                cost = self._reserved_cash_for_buy_info(buy_info)
             except Exception:
                 continue
             active_buys_total += cost
@@ -1096,11 +1683,10 @@ class IBBrokerAdapter(BaseLiveBroker):
             return True
         if not hasattr(self, 'ib') or not self.ib:
             return False
-        switcher = getattr(self.ib, 'reqMarketDataType', None)
-        if not callable(switcher):
+        if not callable(getattr(self.ib, 'reqMarketDataType', None)):
             return False
         try:
-            switcher(3)  # 延迟行情
+            self._call_ib_sync('reqMarketDataType', 3)  # 延迟行情
             self._delayed_market_data_enabled = True
             reason_msg = f" ({reason})" if reason else ""
             self._runtime_log(f"[IB Warning] Realtime quote unavailable, switched to delayed market data{reason_msg}.")
@@ -1115,7 +1701,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         try:
             contract = self.parse_contract(symbol)
             self._bounded_sync_query('qualifyContracts', contract)
-            ticker = self.ib.reqMktData(contract, '', False, False)
+            ticker = self._call_ib_sync('reqMktData', contract, '', False, False)
             self._tickers[symbol] = ticker
             return ticker
         except Exception:
@@ -1272,7 +1858,12 @@ class IBBrokerAdapter(BaseLiveBroker):
         if wait_s <= 0:
             return 0.0
 
-        wait_s = min(wait_s, live_run_seconds_remaining(self))
+        remaining = (
+            math.inf
+            if getattr(self, '_ib_connection_probe', False)
+            else live_run_seconds_remaining(self)
+        )
+        wait_s = min(wait_s, remaining)
         if wait_s <= 0:
             return 0.0
 
@@ -1479,6 +2070,17 @@ class IBBrokerAdapter(BaseLiveBroker):
                 # 在允许省略非终态 ``remaining=0`` 记录前先校验订单身份和方向；IB 可能发送滞后的完成回调。
                 # 数量看似完成的坏记录仍必须安全失败关闭，不能静默把潜在在途单变成空快照。
                 matched_data = self._find_data_for_contract(contract)
+                contract_sec_type = str(getattr(contract, 'secType', '') or '').strip().upper()
+                if (
+                    matched_data is None
+                    and contract_sec_type
+                    and contract_sec_type not in {'STK', 'CASH', 'CRYPTO'}
+                ):
+                    raise RuntimeError(
+                        f"IB pending trade cannot match managed data for unsupported "
+                        f"contract type: id={self._safe_pending_id(t)!r}, "
+                        f"secType={contract_sec_type!r}"
+                    )
                 symbol = (
                     str(getattr(matched_data, '_name', '') or '').strip()
                     if matched_data is not None
@@ -1538,12 +2140,27 @@ class IBBrokerAdapter(BaseLiveBroker):
                             f"IB pending trade has non-positive remaining quantity: {raw_remaining!r}"
                         )
 
-                res.append({
+                pending_item = {
                     'id': oid,
                     'symbol': symbol,
                     'direction': action,
                     'size': quantity_number(remaining),
-                })
+                }
+                contract_currency = str(
+                    getattr(contract, 'currency', '') or ''
+                ).strip().upper()
+                if contract_currency and contract_currency != 'USD':
+                    pending_item['currency'] = contract_currency
+                contract_multiplier = _extract_contract_multiplier(contract)
+                if contract_multiplier != 1.0:
+                    pending_item['contract_multiplier'] = contract_multiplier
+                    if matched_data is not None:
+                        data_name = str(
+                            getattr(matched_data, '_name', '') or ''
+                        ).strip().upper()
+                        if data_name:
+                            self._contract_multipliers[data_name] = contract_multiplier
+                res.append(pending_item)
             if open_trades_fetch_failed:
                 self._last_pending_orders_fetch_failed = True
                 self._last_pending_orders_fetch_error = getattr(
@@ -1619,7 +2236,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                             oid, perm_id, cid, reason='bind retry still has invalid orderId'
                         )
                         return False
-                self.ib.cancelOrder(order)
+                self._call_ib_sync('cancelOrder', order)
                 if self._confirm_cancel_effective(oid, max_checks=3, sleep_seconds=0.15):
                     return True
 
@@ -1660,6 +2277,12 @@ class IBBrokerAdapter(BaseLiveBroker):
         """
         spec = resolve_ib_contract_spec(symbol)
 
+        if spec.get('kind') == 'unsupported':
+            raise ValueError(
+                f"Unsupported IB contract format: {symbol!r}; "
+                "options/futures require an explicit adapter implementation."
+            )
+
         if spec['kind'] == 'forex':
             return Forex(spec['pair'])
 
@@ -1690,8 +2313,6 @@ class IBBrokerAdapter(BaseLiveBroker):
         修复了因单一币种（如USD）为负债时，忽略其他币种正资产的问题。
         """
         if not hasattr(self, 'ib') or not self.ib: return 0.0
-
-        in_loop = self._in_async_task()
 
         tags_priority = target_tags if target_tags else ['NetLiquidation', 'TotalCashValue', 'AvailableFunds']
 
@@ -1733,29 +2354,15 @@ class IBBrokerAdapter(BaseLiveBroker):
                     if val == 0 and tag != 'NetLiquidation':
                         continue
 
-                    if item.currency == 'USD':
-                        total_usd += val
+                    exchange_rate = self._quote_currency_to_usd(item.currency)
+                    if exchange_rate > 0:
+                        total_usd += val * exchange_rate
                         found_valid = True
-                    else:
-                        # --- 汇率转换逻辑 ---
-                        pair_symbol = f"USD{item.currency}"
-                        inverse_pair = False
-                        if item.currency in ['EUR', 'GBP', 'AUD', 'NZD']:
-                            pair_symbol = f"{item.currency}USD"
-                            inverse_pair = True
-
-                        exchange_rate = self._load_fx_rate(pair_symbol, in_loop=in_loop)
-
-                        if exchange_rate > 0:
-                            if inverse_pair:
-                                total_usd += val * exchange_rate
-                            else:
-                                total_usd += val / exchange_rate
-                            found_valid = True
-                        else:
-                            if val != 0:
-                                missing_fx = True
-                                self._runtime_log(f"[IB Warning] 无法获取 {item.currency} 汇率, 金额 {val} 未计入。")
+                    elif val != 0:
+                        missing_fx = True
+                        self._runtime_log(
+                            f"[IB Warning] 无法获取 {item.currency} 汇率, 金额 {val} 未计入。"
+                        )
                 except Exception:
                     continue
 
@@ -1796,7 +2403,7 @@ class IBBrokerAdapter(BaseLiveBroker):
         contract = Forex(pair_symbol)
         if not in_loop:
             self._bounded_sync_query('qualifyContracts', contract)
-        ticker = self.ib.reqMktData(contract, '', False, False)
+        ticker = self._call_ib_sync('reqMktData', contract, '', False, False)
         self._fx_tickers[pair_symbol] = ticker
         if not in_loop:
             start_wait = datetime.datetime.now()
@@ -1888,6 +2495,24 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         # 遍历柜台刷新结果；兼容 QQQ.ISLAND / QQQ.SMART 与 QQQ 的双向匹配
         raw_positions = list(positions or [])
+        if not self._configured_order_account():
+            visible_accounts = {
+                account
+                for account in (
+                    self._extract_account_from_obj(position)
+                    for position in raw_positions
+                )
+                if account
+            }
+            if len(visible_accounts) > 1:
+                error = (
+                    "IB position snapshot contains multiple accounts but "
+                    "IBKR_ORDER_ACCOUNT is not set: "
+                    f"accounts={sorted(visible_accounts)}"
+                )
+                self._last_position_snapshot_fetch_failed = True
+                self._last_position_snapshot_fetch_error = error
+                raise RuntimeError(f"IB live position query failed: {error}")
         try:
             positions = self._filter_execution_account_scoped_items(
                 raw_positions,
@@ -1901,18 +2526,34 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         expected_symbols = {symbol.upper(), symbol.split('.')[0].upper()}
         expected_sec_type = None
+        expected_currency = ''
+        expected_pair = ''
+        target_contract = None
         try:
+            parsed_spec = resolve_ib_contract_spec(symbol)
+            if parsed_spec.get('kind') == 'unsupported':
+                raise ValueError(parsed_spec.get('reason') or 'unsupported contract')
             target_contract = self.parse_contract(symbol)
             target_symbol = str(getattr(target_contract, 'symbol', '')).strip().upper()
             if target_symbol:
                 expected_symbols.add(target_symbol)
                 expected_symbols.add(target_symbol.split('.')[0])
             expected_sec_type = str(getattr(target_contract, 'secType', '')).strip().upper() or None
+            expected_currency = str(
+                getattr(target_contract, 'currency', '')
+                or parsed_spec.get('currency', '')
+            ).strip().upper()
+            if parsed_spec.get('kind') == 'forex':
+                expected_pair = str(parsed_spec.get('pair', '') or '').strip().upper()
+            elif expected_sec_type == 'CRYPTO':
+                expected_pair = f'{target_symbol}{expected_currency}'
             valid_sec_types = {'STK', 'CASH', 'CRYPTO', 'FUT', 'OPT', 'FOP', 'CFD', 'BOND', 'CMDTY', 'IND', 'WAR'}
             if expected_sec_type not in valid_sec_types:
                 expected_sec_type = None
-        except Exception:
-            pass
+        except Exception as exc:
+            self._last_position_snapshot_fetch_failed = True
+            self._last_position_snapshot_fetch_error = exc
+            raise RuntimeError(f"IB live position query failed: unsupported contract {symbol!r}: {exc}") from exc
 
         for p in positions:
             pos_contract = getattr(p, 'contract', None)
@@ -1925,6 +2566,21 @@ class IBBrokerAdapter(BaseLiveBroker):
 
             raw_symbol = str(getattr(pos_contract, 'symbol', '')).strip().upper()
             local_symbol = str(getattr(pos_contract, 'localSymbol', '')).strip().upper()
+            pos_currency = str(getattr(pos_contract, 'currency', '') or '').strip().upper()
+            if expected_currency and pos_currency and pos_currency != expected_currency:
+                continue
+
+            if expected_sec_type == 'CASH':
+                compact_local = re.sub(r'[^A-Z0-9]', '', local_symbol)
+                position_pair = f'{raw_symbol}{pos_currency}'
+                if expected_pair and expected_pair not in {position_pair, compact_local}:
+                    continue
+            elif expected_sec_type == 'CRYPTO' and expected_pair:
+                compact_local = re.sub(r'[^A-Z0-9]', '', local_symbol)
+                position_pair = f'{raw_symbol}{pos_currency}'
+                if expected_pair not in {position_pair, compact_local}:
+                    continue
+
             position_symbols = set()
             for s in (raw_symbol, local_symbol):
                 if s:
@@ -1936,6 +2592,9 @@ class IBBrokerAdapter(BaseLiveBroker):
                 o.size = p.position
                 o.price = p.avgCost
                 o.sellable = positive_quantity(p.position)
+                multiplier = _extract_contract_multiplier(pos_contract)
+                if multiplier != 1.0:
+                    self._contract_multipliers[symbol.upper()] = multiplier
                 return o
         return Pos()
 
@@ -1957,7 +2616,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                 contract = self.parse_contract(symbol)
                 self._bounded_sync_query('qualifyContracts', contract)
                 # snapshot=False 建立流式订阅
-                ticker = self.ib.reqMktData(contract, '', False, False)
+                ticker = self._call_ib_sync('reqMktData', contract, '', False, False)
                 self._tickers[symbol] = ticker
 
                 import time
@@ -2182,7 +2841,20 @@ class IBBrokerAdapter(BaseLiveBroker):
     def _submit_order(self, data, volume, side, price):
         if not self.ib: return None
 
-        contract = self.parse_contract(data._name)
+        try:
+            contract = self.parse_contract(data._name)
+        except Exception as exc:
+            self._last_order_target_skip_reason = 'unsupported_contract'
+            self._runtime_log(
+                f"[IB Warning] Unsupported contract {getattr(data, '_name', '')!r}; "
+                f"order skipped: {exc}"
+            )
+            return None
+        contract_multiplier = _extract_contract_multiplier(contract)
+        if contract_multiplier != 1.0:
+            self._contract_multipliers[
+                str(getattr(data, '_name', '') or '').strip().upper()
+            ] = contract_multiplier
         action = 'BUY' if side == 'BUY' else 'SELL'
 
         raw_volume = positive_quantity(volume)
@@ -2256,7 +2928,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             # 透传 IB 订单 account 字段；留空时由 IB 默认使用主账户路由。
             order.account = configured_account
 
-        trade = self.ib.placeOrder(contract, order)
+        trade = self._call_ib_sync('placeOrder', contract, order)
         proxy = IBOrderProxy(trade, data=data)
         if contract_type == 'CRYPTO':
             # wire order 有意将 totalQuantity 设为 0，但 base layer 仍需要 requested asset quantity。
@@ -2311,12 +2983,33 @@ class IBBrokerAdapter(BaseLiveBroker):
         import time
         import asyncio
         import pytz
-        from ib_insync import IB
+        _require_ib_sdk()
         _runtime_print = runtime_print
 
-        host = config.IBKR_HOST
-        port = config.IBKR_PORT
-        client_id = config.IBKR_CLIENT_ID
+        host = conn_cfg.get('host', getattr(config, 'IBKR_HOST', '127.0.0.1'))
+        try:
+            port = int(conn_cfg.get('port', getattr(config, 'IBKR_PORT', 7497)))
+        except (TypeError, ValueError, OverflowError):
+            port = int(getattr(config, 'IBKR_PORT', 7497))
+        try:
+            client_id = int(
+                conn_cfg.get('client_id', getattr(config, 'IBKR_CLIENT_ID', 0))
+            )
+        except (TypeError, ValueError, OverflowError):
+            client_id = int(getattr(config, 'IBKR_CLIENT_ID', 0))
+        order_account = str(
+            conn_cfg.get(
+                'order_account',
+                conn_cfg.get('account', getattr(config, 'IBKR_ORDER_ACCOUNT', '')),
+            )
+            or ''
+        ).strip()
+        # Provider 的独立重连路径读取模块级 IBKR_* 默认值；启动环境生效后
+        # 同步写回，避免共享会话断线重建时退回旧 Gateway 路由。
+        config.IBKR_HOST = host
+        config.IBKR_PORT = port
+        config.IBKR_CLIENT_ID = client_id
+        config.IBKR_ORDER_ACCOUNT = order_account
 
         # 默认为空，表示使用服务器本地时间
         timezone_str = conn_cfg.get('timezone')
@@ -2432,6 +3125,14 @@ class IBBrokerAdapter(BaseLiveBroker):
         # 初始化 Engine (只做一次)
         from live_trader.engine import LiveTrader, on_order_status_callback
         engine_config = config.__dict__.copy()
+        # 将连接环境的 IB 路由写入本轮配置快照，保证 Broker 后续对账与下单
+        # 使用和启动连接相同的 Gateway、clientId 与目标账户。
+        engine_config.update({
+            'IBKR_HOST': host,
+            'IBKR_PORT': port,
+            'IBKR_CLIENT_ID': client_id,
+            'IBKR_ORDER_ACCOUNT': order_account,
+        })
         engine_config['strategy_name'] = strategy_path
         engine_config['params'] = params
         engine_config['platform'] = 'ib'
@@ -2477,47 +3178,90 @@ class IBBrokerAdapter(BaseLiveBroker):
 
         ib.orderStatusEvent += on_trade_update
 
-        # --- 调度器状态变量 ---
-        last_schedule_run_key = None
-        last_prewarm_run_key = None
         is_first_connect = True
-        scheduled_run_lock = threading.Lock()
-        scheduled_run_thread = None
 
-        def _run_scheduled_worker(now_snapshot, slot_key):
+        def _run_scheduled_slot(now_snapshot, slot_key):
             """在 IB 事件循环之外执行调仓，避免阻塞订单回调。"""
-            nonlocal scheduled_run_thread
+            _runtime_print(
+                f">>> ⏰ Schedule Triggered: {schedule_rule or 'unknown'} "
+                f"(slot={slot_key or 'unknown'}) <<<"
+            )
             run_context = copy.copy(ctx)
             run_context.now = now_snapshot
             run_context.strategy_instance = trader
             run_context.use_schedule = True
+            trader.run(run_context)
+            next_run = SchedulePlanner.resolve_next_schedule_slot(
+                now_snapshot + datetime.timedelta(seconds=1),
+                parsed_schedule,
+            ) if parsed_schedule else None
+            next_run_text = (
+                next_run.strftime('%Y-%m-%d %H:%M:%S')
+                if next_run is not None else '无后续调度槽位'
+            )
+            _runtime_print(f">>> Run Finished. Next run: {next_run_text}")
+
+        def _run_schedule_prewarm(now_snapshot, slot_key):
+            """执行单个 IB schedule 槽位的数据预热。"""
+            timeframe = trader.config.get('timeframe', 'Days')
+            compression = trader.config.get('compression', 1)
+            _runtime_print(
+                f">>> 🔥 Prewarm Triggered: {schedule_rule or 'unknown'} "
+                f"(slot={slot_key or 'unknown'}) <<<"
+            )
+            summary = trader.broker.run_schedule_prewarm(
+                schedule_rule=schedule_rule,
+                data_provider=trader.data_provider,
+                symbols=target_symbols,
+                timeframe=timeframe,
+                compression=compression,
+                now=now_snapshot,
+            )
+            _runtime_print(
+                ">>> Prewarm Finished. "
+                f"source={summary.get('source')}, "
+                f"symbol={summary.get('symbol')}, "
+                f"extras={summary.get('extras')}, "
+                f"errors={summary.get('errors')}"
+            )
+            return summary
+
+        def _on_schedule_error(error, slot_key):
+            _runtime_print(
+                f"[Schedule Error] 调度 slot {slot_key or '未知'} 执行失败: {error}"
+            )
             try:
-                trader.run(run_context)
-                next_run = SchedulePlanner.resolve_next_schedule_slot(
-                    now_snapshot + datetime.timedelta(seconds=1),
-                    parsed_schedule,
-                )
-                next_run_text = (
-                    next_run.strftime('%Y-%m-%d %H:%M:%S')
-                    if next_run is not None else '无后续调度槽位'
-                )
-                _runtime_print(f">>> Run Finished. Next run: {next_run_text}")
-            except Exception as e:
-                _runtime_print(f"[Schedule Error] 调度 slot {slot_key or '未知'} 执行失败: {e}")
-                try:
-                    AlarmManager().push_exception("IBBroker 调度运行", e)
-                except Exception as alarm_error:
-                    _runtime_print(f"[IBBroker Warning] 调度运行告警发送失败: {alarm_error}")
-            finally:
-                with scheduled_run_lock:
-                    if scheduled_run_thread is threading.current_thread():
-                        scheduled_run_thread = None
+                AlarmManager().push_exception("IBBroker 调度运行", error)
+            except Exception as alarm_error:
+                _runtime_print(f"[IBBroker Warning] 调度运行告警发送失败: {alarm_error}")
+
+        def _on_prewarm_error(error, slot_key):
+            _runtime_print(
+                f"[Prewarm Error] slot {slot_key or '未知'} 检查失败: {error}"
+            )
+
+        # 公共运行器集中负责 slot/prewarm 去重、重叠保护和失败后释放槽位；
+        # IB 这里只提供事件循环之外的策略回调和券商专属告警。
+        schedule_runner = LiveScheduleRunner(
+            parsed_schedule=parsed_schedule,
+            on_slot=_run_scheduled_slot,
+            on_prewarm=_run_schedule_prewarm,
+            on_slot_error=_on_schedule_error,
+            on_prewarm_error=_on_prewarm_error,
+            prewarm_lead_seconds=prewarm_lead_seconds,
+            runtime_log=_runtime_print,
+        )
 
         # --- 3. 进入“不死鸟”主循环 ---
         while True:
             try:
                 # --- A. 连接阶段 ---
                 if not ib.isConnected():
+                    invalidate_snapshot = getattr(
+                        trader.broker, '_invalidate_reconnect_snapshot', None
+                    )
+                    if callable(invalidate_snapshot):
+                        invalidate_snapshot()
                     _runtime_print(f"[System] Connecting to IB Gateway ({host}:{port}) with clientId={client_id}...")
                     try:
                         report_live_worker_state(
@@ -2528,7 +3272,6 @@ class IBBrokerAdapter(BaseLiveBroker):
                         )
                         # 多账户 Gateway 会话必须在连接时传入配置账户，否则 ib_insync 可能只初始化默认/第一个账户订阅。
                         # 对不支持 ``account`` 关键字的旧 SDK 或测试桩保留 TypeError 回退。
-                        order_account = str(getattr(config, 'IBKR_ORDER_ACCOUNT', '') or '').strip()
                         try:
                             if order_account:
                                 ib.connect(host, port, clientId=client_id, account=order_account)
@@ -2568,7 +3311,14 @@ class IBBrokerAdapter(BaseLiveBroker):
                                 hasattr(trader.broker, 'is_account_snapshot_trusted')
                                 and not IBBrokerAdapter._in_async_task()
                             ):
-                                trusted = trader.broker.is_account_snapshot_trusted()
+                                previous_probe_state = getattr(
+                                    trader.broker, '_ib_connection_probe', False
+                                )
+                                trader.broker._ib_connection_probe = True
+                                try:
+                                    trusted = trader.broker.is_account_snapshot_trusted()
+                                finally:
+                                    trader.broker._ib_connection_probe = previous_probe_state
                                 if not trusted:
                                     detail = getattr(
                                         trader.broker,
@@ -2649,75 +3399,13 @@ class IBBrokerAdapter(BaseLiveBroker):
                     # 2. 执行策略
                     ctx.now = pd.Timestamp(now)
 
-                    if parsed_schedule and prewarm_lead_seconds > 0:
-                        try:
-                            should_prewarm, seconds_to_schedule, schedule_slot_key = (
-                                SchedulePlanner.should_trigger_schedule_prewarm_for_rule(
-                                    now=now,
-                                    parsed_schedule=parsed_schedule,
-                                    lead_seconds=prewarm_lead_seconds,
-                                    last_prewarm_run_key=last_prewarm_run_key,
-                                    last_schedule_run_key=last_schedule_run_key,
-                                )
-                            )
-                            if should_prewarm:
-                                timeframe = trader.config.get('timeframe', 'Days')
-                                compression = trader.config.get('compression', 1)
-                                _runtime_print(
-                                    f">>> 🔥 Prewarm Triggered: {schedule_rule} "
-                                    f"(T-{seconds_to_schedule:.2f}s) <<<"
-                                )
-                                summary = trader.broker.run_schedule_prewarm(
-                                    schedule_rule=schedule_rule,
-                                    data_provider=trader.data_provider,
-                                    symbols=target_symbols,
-                                    timeframe=timeframe,
-                                    compression=compression,
-                                    now=ctx.now,
-                                )
-                                last_prewarm_run_key = schedule_slot_key
-                                _runtime_print(
-                                    ">>> Prewarm Finished. "
-                                    f"source={summary.get('source')}, "
-                                    f"symbol={summary.get('symbol')}, "
-                                    f"extras={summary.get('extras')}, "
-                                    f"errors={summary.get('errors')}"
-                                )
-                        except Exception as e:
-                            _runtime_print(f"[Prewarm Error] Check failed: {e}")
-
-                    # (B) 调度检查逻辑
+                    # 公共运行器负责 prewarm/slot 去重与单 worker 派发；
+                    # 此处仍在 IB 所属事件循环中轮询，但完整策略运行不会阻塞该循环。
                     if parsed_schedule:
-                        try:
-                            should_run, delta, schedule_slot_key = SchedulePlanner.should_trigger_schedule(
-                                now=now,
-                                parsed_schedule=parsed_schedule,
-                                last_schedule_run_key=last_schedule_run_key,
-                            )
-                            if should_run:
-                                _runtime_print(
-                                    f">>> ⏰ Schedule Triggered: {schedule_rule} (Delta: {delta:.2f}s) <<<"
-                                )
-                                last_schedule_run_key = schedule_slot_key
-                                with scheduled_run_lock:
-                                    previous_thread = scheduled_run_thread
-                                    if previous_thread is not None and previous_thread.is_alive():
-                                        _runtime_print(
-                                            "[IBBroker Warning] 上一个调度运行仍在执行，"
-                                            f"已跳过 slot {schedule_slot_key or '未知'}。"
-                                        )
-                                        continue
-                                    worker = threading.Thread(
-                                        target=_run_scheduled_worker,
-                                        args=(pd.Timestamp(ctx.now), schedule_slot_key),
-                                        name=f"quantada-ib-run-{schedule_slot_key or 'unknown'}",
-                                        daemon=True,
-                                    )
-                                    scheduled_run_thread = worker
-                                worker.start()
-
-                        except Exception as e:
-                            _runtime_print(f"[Schedule Error] Check failed: {e}")
+                        schedule_runner.poll_once(now)
+                        # 让刚启动的工作线程先获得一次执行机会；不等待其完成，
+                        # 保持 IB 事件循环可继续处理订单回调。
+                        time.sleep(0.01)
 
                 if not ib.isConnected():
                     _runtime_print("[System] IB connection ended. Re-entering recovery mode.")

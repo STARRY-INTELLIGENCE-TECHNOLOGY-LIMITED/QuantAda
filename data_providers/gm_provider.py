@@ -1,12 +1,13 @@
 from datetime import datetime
 
 import pandas as pd
+from common.live_runtime import dependency_install_hint
 
 try:
     from gm.api import history, set_token, current, set_serv_addr
-except ImportError as e:
-    print("Warning: 'gm' module not found. GmDataProvider will not be available. Error: {}".format(e))
-    history = set_token = current = None
+except Exception as e:
+    print(dependency_install_hint('gm', e))
+    history = set_token = current = set_serv_addr = None
 
 from .base_provider import BaseDataProvider
 import config
