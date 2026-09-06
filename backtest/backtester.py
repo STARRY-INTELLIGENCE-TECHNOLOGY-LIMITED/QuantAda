@@ -168,6 +168,10 @@ class BacktraderStrategyWrapper(bt.Strategy):
         self.expected_freed_cash = 0.0
         # 本轮循环已花费的虚拟现金
         self.virtual_spent_cash = 0.0
+            # 已提交但尚未在持仓快照中体现的 CSP 指派义务。
+        # 回测撮合通常同步完成，但 Backtrader 的通知与策略回调仍可能跨一个
+        # bar，必须按订单生命周期保留该短期账本，防止同一 bar 重复卖开。
+        self._csp_order_reservations = {}
         self.dataclose = self.datas[0].close
         self.strategy = strategy_class(broker=self, params=params)
         self.risk_controls = []
@@ -192,6 +196,10 @@ class BacktraderStrategyWrapper(bt.Strategy):
         """统一实盘与回测的获取现金接口"""
         return self.broker.getcash()
 
+    def get_rebalance_cash(self):
+        """返回回测调仓口径的现金，并扣除 Short Put 指派义务。"""
+        return self.get_csp_uncommitted_cash()
+
     def getvalue(self):
         """代理调用真实 Broker 的 getvalue，并启用全局缓存拦截"""
         if hasattr(self, 'current_portfolio_value'):
@@ -205,6 +213,143 @@ class BacktraderStrategyWrapper(bt.Strategy):
     def get_contract_multiplier(self, data):
         """返回 DataFeed 元数据声明的每份合约现金乘数。"""
         return _extract_contract_multiplier(data)
+
+    def get_csp_uncommitted_cash(self):
+        """回测路径按已成交短 Put 义务计算严格 CSP 可用现金。"""
+        from common.options.cash import uncommitted_cash
+
+        short_puts = []
+        for data in self.datas:
+            position = self.getposition(data)
+            if position.size >= 0:
+                continue
+            dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
+            row = None
+            if isinstance(dataframe, pd.DataFrame) and not dataframe.empty:
+                current_dt = None
+                try:
+                    current_dt = pd.Timestamp(data.datetime.datetime(0))
+                except Exception:
+                    pass
+                if current_dt is not None:
+                    index = pd.to_datetime(dataframe.index, errors='coerce')
+                    if getattr(index, 'tz', None) is not None and current_dt.tzinfo is None:
+                        index = index.tz_localize(None)
+                    visible = dataframe.loc[index <= current_dt]
+                    row = visible.iloc[-1] if not visible.empty else None
+            if row is None:
+                continue
+            option_type = str(row.get('option_type', '')).upper()
+            strike = row.get('strike', row.get('strike_price'))
+            if option_type not in {'PUT', 'P'} or strike is None:
+                try:
+                    from common.options.analytics import parse_option_symbol
+                    parsed = parse_option_symbol(getattr(data, '_name', ''))
+                except Exception:
+                    parsed = {}
+                option_type = option_type if option_type in {'PUT', 'P'} else parsed.get('option_type', '')
+                strike = strike if strike is not None else parsed.get('strike')
+            if option_type not in {'PUT', 'P'} or strike is None:
+                continue
+            short_puts.append({
+                'strike': strike,
+                'contracts': abs(position.size),
+                'contract_multiplier': self.get_contract_multiplier(data),
+            })
+        pending_short_puts = []
+        for reservation in self._csp_order_reservations.values():
+            remaining = float(reservation.get('remaining', 0.0))
+            if remaining <= 0:
+                continue
+            pending_short_puts.append({
+                'strike': reservation['strike'],
+                'remaining': remaining,
+                'contract_multiplier': reservation['contract_multiplier'],
+            })
+        return float(uncommitted_cash(
+            self.getcash(),
+            short_puts=short_puts,
+            pending_short_puts=pending_short_puts,
+        ))
+
+    def submit_option_order(self, data, volume, order_effect, price=None, **kwargs):
+        """回测中提供显式期权效果入口；生命周期事件仍需单独建模。"""
+        from common.options.contracts import (
+            InvalidOptionOrderEffect,
+            normalize_option_order_effect,
+            validate_option_order_effect,
+        )
+
+        try:
+            effect = normalize_option_order_effect(order_effect)
+            quantity = float(volume)
+            if not math.isfinite(quantity) or quantity <= 0:
+                raise InvalidOptionOrderEffect('quantity must be positive')
+            current_size = float(self.getposition(data).size)
+            if effect == 'SELL_TO_OPEN' and current_size > 0:
+                raise InvalidOptionOrderEffect(
+                    'SELL_TO_OPEN cannot be submitted against a confirmed long position'
+                )
+            validate_option_order_effect(
+                effect,
+                current_size,
+                quantity,
+                allow_sell_to_open=effect == 'SELL_TO_OPEN',
+            )
+        except (InvalidOptionOrderEffect, TypeError, ValueError, OverflowError):
+            self._last_order_target_skip_reason = 'unsupported_option_order_effect'
+            return None
+
+        if effect == 'SELL_TO_OPEN':
+            risk_leg = kwargs.get('risk_leg')
+            if risk_leg is None:
+                self._last_order_target_skip_reason = 'csp_risk_leg_missing'
+                return None
+            from common.options.cash import assignment_cash
+
+            available = self.get_csp_uncommitted_cash()
+            try:
+                option_type = str(getattr(risk_leg, 'option_type', '')).upper()
+                signed_quantity = float(getattr(risk_leg, 'signed_quantity'))
+                strike = float(getattr(risk_leg, 'strike'))
+                multiplier = float(getattr(risk_leg, 'contract_multiplier'))
+                if option_type not in {'PUT', 'P'} or signed_quantity >= 0:
+                    raise ValueError('SELL_TO_OPEN backtest only supports signed short Put')
+                required = float(assignment_cash(strike, quantity, multiplier))
+            except (TypeError, ValueError, OverflowError):
+                self._last_order_target_skip_reason = 'invalid_csp_risk_leg'
+                return None
+            if available < required:
+                self._last_order_target_skip_reason = 'csp_assignment_cash_insufficient'
+                return None
+            order = self.sell(data=data, size=quantity, price=price)
+            if order is None:
+                return None
+            try:
+                order.addinfo(
+                    option_order_effect=effect,
+                    csp_assignment_cash=required,
+                    csp_strike=strike,
+                    csp_contract_multiplier=multiplier,
+                    csp_requested_quantity=quantity,
+                )
+            except Exception:
+                pass
+            self._csp_order_reservations[str(order.ref)] = {
+                'strike': strike,
+                'contract_multiplier': multiplier,
+                'remaining': quantity,
+                'initial': quantity,
+                'data': data,
+            }
+            return order
+        if effect == 'BUY_TO_CLOSE':
+            return self.buy(data=data, size=quantity, price=price)
+        if effect == 'BUY_TO_OPEN':
+            return self.buy(data=data, size=quantity, price=price)
+        if effect == 'SELL_TO_CLOSE':
+            return self.sell(data=data, size=quantity, price=price)
+        return None
 
     def getcommissioninfo(self, data):
         """代理调用真实 Broker 的 getcommissioninfo"""
@@ -267,6 +412,22 @@ class BacktraderStrategyWrapper(bt.Strategy):
         return order
 
     def notify_order(self, order):
+        reservation = self._csp_order_reservations.get(str(getattr(order, 'ref', '')))
+        if reservation is not None:
+            status = getattr(order, 'status', None)
+            terminal = status in {
+                getattr(order, 'Completed', object()),
+                getattr(order, 'Canceled', object()),
+                getattr(order, 'Expired', object()),
+                getattr(order, 'Margin', object()),
+                getattr(order, 'Rejected', object()),
+            }
+            if terminal:
+                self._csp_order_reservations.pop(str(order.ref), None)
+            else:
+                executed = abs(float(getattr(order.executed, 'size', 0.0) or 0.0))
+                requested = float(reservation.get('initial', reservation.get('remaining', 0.0)))
+                reservation['remaining'] = max(0.0, requested - executed)
         self.trade_tracker.notify_order(order)
 
         for rc in self.risk_controls:

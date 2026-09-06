@@ -19,6 +19,13 @@ import pandas as pd
 
 import config
 from common import runtime_notifications
+from common.options.cash import (
+    CSPCashError,
+    aggregate_assignment_cash,
+    assignment_cash,
+    assert_csp_capacity,
+    uncommitted_cash,
+)
 from common.log import coerce_dt
 from common.live_schedule import LiveScheduleRunner
 from common.order_quantity import positive_quantity, quantity_number
@@ -26,6 +33,16 @@ from common.live_runtime import dependency_install_hint, runtime_print
 from live_trader.data_bridge.data_warm import SchedulePlanner
 
 from .base_broker import BaseLiveBroker, BaseOrderProxy
+from common.options.contracts import (
+    InvalidOptionOrderEffect,
+    apply_signed_position,
+    normalize_option_order_effect,
+    order_effect_side,
+    signed_position_delta,
+    validate_option_order_effect,
+)
+from common.options.greeks import OptionGreeks, aggregate_option_greeks
+from common.options.risk import OptionRiskLeg, compute_option_margin
 from .futu_symbols import (
     OPTION_CODE_RE as _OPTION_CODE_RE,
     normalize_futu_symbol,
@@ -155,6 +172,10 @@ _FUTU_EVENT_SUBTYPE_BASES = {
 }
 _FUTU_EVENT_TIME_FIELDS = (
     'time_key', 'datetime', 'update_time', 'data_time', 'time', 'created_at',
+)
+_OPTION_CONTRACT_DETAIL_RE = re.compile(
+    r"(?P<expiry>\d{6,8})(?P<right>[CP])(?P<strike>\d{5,9})$",
+    re.IGNORECASE,
 )
 
 def _field(value, names, default=None):
@@ -417,6 +438,25 @@ def _symbol_from_order(order):
     return _normalise_symbol(_raw_order_symbol(order), market_hint=market_hint)
 
 
+def _parse_option_contract(symbol):
+    """解析富途期权代码中的到期日、方向和执行价。"""
+    normalized = _normalise_symbol(symbol)
+    if not normalized or not _OPTION_CODE_RE.match(normalized):
+        return {}
+    match = _OPTION_CONTRACT_DETAIL_RE.search(normalized.split('.', 1)[-1])
+    if not match:
+        return {}
+    try:
+        strike = float(match.group('strike')) / 1000.0
+    except (TypeError, ValueError, OverflowError):
+        return {}
+    return {
+        'expiry': match.group('expiry'),
+        'option_type': 'CALL' if match.group('right').upper() == 'C' else 'PUT',
+        'strike': strike,
+    }
+
+
 class FutuOrderProxy(BaseOrderProxy):
     """富途订单状态代理，向基础执行器暴露统一的订单语义。"""
 
@@ -433,11 +473,27 @@ class FutuOrderProxy(BaseOrderProxy):
         'SUBMIT_FAILED', 'FAILED', 'REJECTED', 'DISABLED', 'DELETED', 'TIMEOUT', 'UNSUBMITTED',
     }
 
-    def __init__(self, raw_order, is_live=True, data=None, contract_multiplier=None):
+    def __init__(
+        self,
+        raw_order,
+        is_live=True,
+        data=None,
+        contract_multiplier=None,
+        order_effect=None,
+    ):
         self.raw_order = raw_order
         self.platform_order = raw_order
         self.is_live = bool(is_live)
         self.data = data
+        raw_effect = _field(raw_order, ('order_effect', 'position_effect'), None)
+        if order_effect is None and raw_effect:
+            order_effect = raw_effect
+        if order_effect:
+            try:
+                order_effect = normalize_option_order_effect(order_effect)
+            except InvalidOptionOrderEffect:
+                order_effect = None
+        self.order_effect = order_effect
         requested = _field(raw_order, ('qty', 'volume', 'total_quantity', 'totalQuantity'))
         self.submitted_size = requested
         self.requested_size = requested
@@ -513,9 +569,27 @@ class FutuOrderProxy(BaseOrderProxy):
     def is_sell(self) -> bool:
         return _enum_name(_field(self.raw_order, ('trd_side', 'side', 'action'), '')) == 'SELL'
 
+    def signed_position_delta(self, filled_size=None):
+        """返回已成交部分对应的 signed position 增量。"""
+        if not self.order_effect:
+            return 0
+        size = self.executed.size if filled_size is None else filled_size
+        return signed_position_delta(self.order_effect, size)
+
+    def apply_signed_position(self, current_position, filled_size=None):
+        """按订单效果计算成交后的 signed position。"""
+        if not self.order_effect:
+            return current_position
+        size = self.executed.size if filled_size is None else filled_size
+        return apply_signed_position(current_position, self.order_effect, size)
+
 
 class FutuBrokerAdapter(BaseLiveBroker):
-    """富途 OpenD 证券交易适配器，支持股票、ETF 和基础期权买卖。"""
+    """富途 OpenD 账户级适配器，支持股票、ETF 和受限的期权订单效果。
+
+    期权卖开需要保证金与组合风控，目前只在显式入口中安全拒绝；买开、卖平
+    和已有负仓的买平不复制账户状态，仍以富途持仓和订单快照为事实来源。
+    """
 
     _PENDING_STATUSES = FutuOrderProxy._PENDING_STATUSES
     _TERMINAL_STATUSES = (
@@ -602,6 +676,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
         # 期权报价通常按标的每股计价，而 Futu 下单数量按合约张数计。
         # 首次快照时读取 option_contract_multiplier，后续目标仓位使用同一口径。
         self._contract_multipliers = {}
+        # 仅保存当前 run 内尚未出现在远端快照中的 CSP 受理量；跨 K 不作为事实来源。
+        self._option_run_reservations = {}
         self._fx_rate_cache = {}
         self._quote_context_retry_at = 0.0
 
@@ -611,6 +687,12 @@ class FutuBrokerAdapter(BaseLiveBroker):
         self._set_query_timeout(self._trade_ctx)
 
         super().__init__(context, cash_override, commission_override, slippage_override)
+
+    def set_datetime(self, dt):
+        """跨 bar 清理短期 CSP 受理标记，下一轮重新以券商快照重建。"""
+        if self._datetime is not None and dt != self._datetime:
+            self._option_run_reservations.clear()
+        return super().set_datetime(dt)
 
     @staticmethod
     def _safe_int(value, default=0):
@@ -1381,6 +1463,182 @@ class FutuBrokerAdapter(BaseLiveBroker):
             self._last_position_snapshot_fetch_error = exc
             raise
 
+    def _query_all_position_rows(self):
+        """查询同一账户全部仓位，供账户级期权义务盘点使用。"""
+        context = self._get_trade_context()
+        if context is None:
+            raise RuntimeError('Futu trade context is unavailable')
+        query_kwargs = {
+            'trd_env': self._trade_env_value(),
+            'acc_id': self._account_id_value(),
+            'acc_index': self._account_index_value(),
+            'refresh_cache': True,
+            'currency': self._account_currency_value(),
+        }
+        try:
+            with self._context_lock:
+                try:
+                    response = context.position_list_query(code='', **query_kwargs)
+                except TypeError:
+                    response = context.position_list_query(**query_kwargs)
+            if not isinstance(response, tuple) or len(response) < 2:
+                raise RuntimeError('Futu position_list_query returned an invalid response')
+            if response[0] != RET_OK:
+                raise RuntimeError(f'Futu position_list_query failed: {response[1]}')
+            return _rows(response[1])
+        except Exception as exc:
+            self._last_position_snapshot_fetch_failed = True
+            self._last_position_snapshot_fetch_error = exc
+            raise
+
+    def _option_multiplier_for_symbol(self, symbol, row=None):
+        """从仓位、缓存或已加载 data 读取真实期权乘数；缺失即失败关闭。"""
+        normalized = _normalise_symbol(symbol)
+        if row is not None:
+            parsed = _decimal(_field(row, (
+                'option_contract_multiplier', 'option_contract_size',
+                'contract_multiplier', 'contract_size', 'lot_size',
+            ), None), None)
+            if parsed is not None and parsed > 0:
+                return float(parsed)
+        cached = _decimal(self._contract_multipliers.get(normalized), None)
+        if cached is not None and cached > 0:
+            return float(cached)
+        for data in self.datas:
+            if _normalise_symbol(getattr(data, '_name', '')) != normalized:
+                continue
+            value = self.get_contract_multiplier(data)
+            parsed = _decimal(value, None)
+            if parsed is not None and parsed > 0:
+                return float(parsed)
+        raise RuntimeError(f'Futu option contract multiplier unavailable: {normalized}')
+
+    @staticmethod
+    def _pending_remaining_quantity(row):
+        """读取 pending 订单剩余数量，并严格拒绝不可验证的数量。"""
+        requested = _decimal(_field(row, ('qty', 'volume', 'total_quantity'), None), None)
+        dealt = _decimal(_field(row, ('dealt_qty', 'filled_qty', 'filled_volume'), 0), Decimal('0'))
+        reported = _decimal(_field(row, ('remaining', 'remaining_qty'), None), None)
+        remaining = reported if reported is not None else (
+            requested - dealt if requested is not None else None
+        )
+        if remaining is None or remaining < 0:
+            raise RuntimeError('Futu pending order has invalid remaining quantity')
+        if remaining == 0:
+            if requested is not None and dealt is not None and requested > 0 and dealt >= requested:
+                return Decimal('0')
+            raise RuntimeError('Futu pending order has no verifiable remaining quantity')
+        return remaining
+
+    def get_option_assignment_obligations(self):
+        """从真实短 Put、pending 卖开 Put 和当前 run 受理量重建指派义务。"""
+        rows = self._query_all_position_rows()
+        parsed_positions = {}
+        short_puts = []
+        for row in rows:
+            record = self._position_record(row)
+            parsed_positions[record['symbol']] = record
+            if (
+                record['signed_qty'] < 0
+                and record['option_type'] == 'PUT'
+            ):
+                multiplier = record['contract_multiplier']
+                if multiplier is None:
+                    multiplier = self._option_multiplier_for_symbol(record['symbol'], row=row)
+                item = {
+                    'symbol': record['symbol'],
+                    'strike': record['strike'],
+                    'contracts': abs(record['signed_qty']),
+                    'contract_multiplier': multiplier,
+                }
+                if item['strike'] is None:
+                    raise RuntimeError(f"Futu short Put strike unavailable: {record['symbol']}")
+                short_puts.append(item)
+
+        pending_short_puts = []
+        pending_ids = set()
+        pending_rows = self._query_order_rows()
+        available_long = {
+            symbol: max(Decimal('0'), record['signed_qty'])
+            for symbol, record in parsed_positions.items()
+        }
+        for row in pending_rows:
+            order_id = _text(_field(row, ('order_id', 'orderId', 'id'), ''))
+            symbol = _symbol_from_order(row)
+            side = _enum_name(_field(row, ('trd_side', 'side', 'action'), ''))
+            status = _enum_name(_field(row, ('order_status', 'status'), ''))
+            if not order_id or side != 'SELL' or status in self._TERMINAL_STATUSES:
+                continue
+            detail = _parse_option_contract(symbol)
+            if detail.get('option_type') != 'PUT':
+                continue
+            remaining = self._pending_remaining_quantity(row)
+            if remaining <= 0:
+                continue
+            raw_effect = _field(row, ('order_effect', 'position_effect', 'effect'), None)
+            effect = None
+            if raw_effect not in (None, ''):
+                try:
+                    effect = normalize_option_order_effect(raw_effect)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        f'Futu pending option order has unknown effect: id={order_id!r}'
+                    )
+            # 本次运行刚提交的卖开订单，其效果记录保存在短期映射中；
+            # 其他缺少效果字段的柜台记录无法安全区分卖平/卖开，必须失败关闭。
+            reservation = self._option_run_reservations.get(order_id)
+            if effect is None and reservation is not None:
+                effect = 'SELL_TO_OPEN'
+            if effect not in {'SELL_TO_OPEN', 'SELL_TO_CLOSE'}:
+                raise RuntimeError(
+                    f'Futu pending option order effect unavailable: id={order_id!r}'
+                )
+            if effect == 'SELL_TO_CLOSE':
+                available = available_long.get(symbol, Decimal('0'))
+                if remaining > available:
+                    raise RuntimeError(
+                        f'Futu pending SELL_TO_CLOSE exceeds long position: id={order_id!r}'
+                    )
+                available_long[symbol] = available - remaining
+                opening_quantity = Decimal('0')
+            else:
+                opening_quantity = remaining
+            if opening_quantity <= 0:
+                continue
+            multiplier = self._option_multiplier_for_symbol(symbol, row=row)
+            pending_short_puts.append({
+                'order_id': order_id,
+                'symbol': symbol,
+                'strike': detail['strike'],
+                'remaining': opening_quantity,
+                'contract_multiplier': multiplier,
+            })
+            pending_ids.add(order_id)
+
+        for order_id, item in self._option_run_reservations.items():
+            if order_id not in pending_ids:
+                pending_short_puts.append(dict(item, order_id=order_id))
+
+        total = aggregate_assignment_cash(short_puts, pending_short_puts)
+        return {
+            'short_positions': tuple(short_puts),
+            'pending_orders': tuple(pending_short_puts),
+            'assignment_cash': total,
+        }
+
+    def get_csp_uncommitted_cash(self):
+        """返回账户级可用于新增 CSP 的未承诺现金。"""
+        obligations = self.get_option_assignment_obligations()
+        return uncommitted_cash(
+            self.get_cash(),
+            short_puts=obligations['short_positions'],
+            pending_short_puts=obligations['pending_orders'],
+        )
+
+    def get_rebalance_cash(self):
+        """将 Short Put 指派义务纳入策略调仓现金口径。"""
+        return float(self.get_csp_uncommitted_cash())
+
     @staticmethod
     def _position_record(row):
         raw_code = _field(row, ('code', 'symbol', 'stock_code'), '')
@@ -1432,10 +1690,31 @@ class FutuBrokerAdapter(BaseLiveBroker):
         symbol = _normalise_symbol(raw_code, market_hint)
         if not symbol:
             raise RuntimeError('Futu position is missing code')
+        option_detail = _parse_option_contract(symbol)
+        raw_multiplier = None
+        for name in (
+            'option_contract_multiplier',
+            'option_contract_size',
+            'contract_multiplier',
+            'contract_size',
+            'lot_size',
+        ):
+            candidate = _decimal(_field(row, name, None), None)
+            if candidate is not None and candidate > 0:
+                # lot_size 对普通股票不是现金乘数；期权才允许作为最后回退。
+                if name == 'lot_size' and not option_detail:
+                    continue
+                raw_multiplier = candidate
+                break
         position_side = _enum_name(_field(row, 'position_side', ''))
-        if position_side not in {'', 'N/A', 'NONE', 'LONG'}:
+        is_short = position_side in {'SHORT', 'SHORT_SELL', 'SHORTSELL'}
+        if is_short and not FutuBrokerAdapter._is_option_symbol(symbol):
             raise RuntimeError(
                 f'Futu short position is unsupported for {symbol}: side={position_side}'
+            )
+        if position_side not in {'', 'N/A', 'NONE', 'LONG'} and not is_short:
+            raise RuntimeError(
+                f'Futu position side is unsupported for {symbol}: side={position_side}'
             )
         position_type = _enum_name(_field(row, 'position_type', ''))
         raw_combo_id = _field(row, 'combo_id', '')
@@ -1455,10 +1734,15 @@ class FutuBrokerAdapter(BaseLiveBroker):
         return {
             'symbol': symbol,
             'qty': qty,
+            'signed_qty': -qty if is_short else qty,
             'sellable': sellable,
             'price': price,
             'position_side': position_side,
             'position_type': position_type,
+            'option_type': option_detail.get('option_type', ''),
+            'strike': option_detail.get('strike'),
+            'expiry': option_detail.get('expiry', ''),
+            'contract_multiplier': raw_multiplier,
             'market_value': (
                 parsed_market_value
                 if (parsed_market_value := _decimal(
@@ -1501,13 +1785,21 @@ class FutuBrokerAdapter(BaseLiveBroker):
         if not matched:
             return SimpleNamespace(size=0, price=0.0, sellable=0, position_id='')
 
-        total_qty = sum((item['qty'] for item in matched), Decimal('0'))
-        weighted_value = sum((item['qty'] * item['price'] for item in matched), Decimal('0'))
-        cost = weighted_value / total_qty if total_qty > 0 else Decimal('0')
-        sellable_values = [item['sellable'] for item in matched if item['sellable'] is not None]
+        total_qty = sum((item['signed_qty'] for item in matched), Decimal('0'))
+        weighted_value = sum(
+            (abs(item['signed_qty']) * item['price'] for item in matched),
+            Decimal('0'),
+        )
+        gross_qty = sum((abs(item['signed_qty']) for item in matched), Decimal('0'))
+        cost = weighted_value / gross_qty if gross_qty > 0 else Decimal('0')
+        sellable_values = [
+            item['sellable']
+            for item in matched
+            if item['sellable'] is not None and item['signed_qty'] > 0
+        ]
         if sellable_values:
             sellable = sum(sellable_values, Decimal('0'))
-        elif target.split('.', 1)[0] in {'SH', 'SZ'}:
+        elif total_qty > 0 and target.split('.', 1)[0] in {'SH', 'SZ'}:
             # A 股没有明确 can_sell_qty 时宁可禁止卖出，也不把 T+1 仓位误作可卖。
             sellable = Decimal('0')
         else:
@@ -1515,7 +1807,9 @@ class FutuBrokerAdapter(BaseLiveBroker):
         return SimpleNamespace(
             size=quantity_number(total_qty),
             price=float(cost),
-            sellable=quantity_number(max(Decimal('0'), sellable)),
+            sellable=quantity_number(
+                max(Decimal('0'), sellable if total_qty > 0 else Decimal('0'))
+            ),
             position_id=next((item['position_id'] for item in matched if item['position_id']), ''),
         )
 
@@ -1800,6 +2094,42 @@ class FutuBrokerAdapter(BaseLiveBroker):
             self._last_order_target_skip_reason = 'invalid_order_quantity'
             return None
 
+        option_order_effect = None
+        if (
+            self._is_option_symbol(symbol)
+            and side_name == 'SELL'
+            and not getattr(self, '_allow_option_sell_open_once', False)
+        ):
+            # 期权普通 SELL 只能是已确认正仓的卖平；不允许把它当成卖开。
+            try:
+                position = self.get_position(data)
+                signed_size = _decimal(getattr(position, 'size', 0), None)
+                sellable = _decimal(self.get_sellable_position(data), None)
+            except Exception as exc:
+                self._last_order_target_skip_reason = 'unsupported_option_order_effect'
+                self._runtime_log(
+                    f'[FutuBroker] option SELL {symbol} skipped: position snapshot unavailable ({exc})'
+                )
+                return None
+            if signed_size is None or signed_size <= 0 or sellable is None or quantity > sellable:
+                self._last_order_target_skip_reason = 'unsupported_option_order_effect'
+                self._runtime_log(
+                    f'[FutuBroker] option SELL {symbol} is only valid as SELL_TO_CLOSE; '
+                    f'position={signed_size}, sellable={sellable}, quantity={quantity}'
+                )
+                return None
+            option_order_effect = 'SELL_TO_CLOSE'
+        elif self._is_option_symbol(symbol) and side_name == 'BUY':
+            # 买入在已有负仓时属于买平，否则属于买开；查询失败不改动原有
+            # BUY 失败关闭边界，显式效果入口仍会先完成严格校验。
+            try:
+                position = self.get_position(data)
+                signed_size = _decimal(getattr(position, 'size', 0), None)
+                if signed_size is not None:
+                    option_order_effect = 'BUY_TO_CLOSE' if signed_size < 0 else 'BUY_TO_OPEN'
+            except Exception:
+                option_order_effect = None
+
         lot_limit = _decimal(self._current_setting('BROKER_LOT_LIMITS', 0), Decimal('0'))
         if lot_limit is not None and lot_limit > 0 and quantity > lot_limit:
             self._last_order_target_skip_reason = 'broker_lot_limit_exceeded'
@@ -1876,11 +2206,14 @@ class FutuBrokerAdapter(BaseLiveBroker):
             enriched.setdefault('qty', quantity_number(quantity))
             enriched.setdefault('price', float(order_price))
             enriched.setdefault('order_status', 'SUBMITTED')
+            if option_order_effect:
+                enriched.setdefault('order_effect', option_order_effect)
             proxy = FutuOrderProxy(
                 enriched,
                 is_live=self.is_live,
                 data=data,
                 contract_multiplier=self._contract_multiplier(data),
+                order_effect=option_order_effect,
             )
             if not proxy.id:
                 message = f'Futu place_order returned no order_id for {symbol} {side_name}'
@@ -1899,6 +2232,157 @@ class FutuBrokerAdapter(BaseLiveBroker):
             self._runtime_log(message)
             runtime_notifications.push_text(message, level='ERROR')
             return None
+
+    def submit_option_order(self, data, volume, order_effect, price=None,
+                            *, allow_sell_to_open=False, risk_leg=None,
+                            underlying_positions=None):
+        """按显式期权订单效果提交当前已实现的安全子集。
+
+        Futu 当前适配器只允许买开、卖平和已有负仓的买平。若调用方明确
+        提供风险腿并开启 ``allow_sell_to_open``，仅在现金担保 Put 或
+        Covered Call 通过实时账户快照后允许卖开；普通 SELL 仍不会伪装成卖开。
+        """
+        symbol = _normalise_symbol(getattr(data, '_name', ''))
+        if not self._is_option_symbol(symbol):
+            self._last_order_target_skip_reason = 'option_effect_requires_option_symbol'
+            return None
+        try:
+            effect = normalize_option_order_effect(order_effect)
+            position = self.get_position(data)
+            current_size = getattr(position, 'size', 0) or 0
+            if effect == 'SELL_TO_OPEN':
+                if not allow_sell_to_open or not isinstance(risk_leg, OptionRiskLeg):
+                    raise InvalidOptionOrderEffect(
+                        'SELL_TO_OPEN requires an explicit secured risk leg'
+                    )
+                if _normalise_symbol(risk_leg.symbol) != symbol:
+                    raise InvalidOptionOrderEffect(
+                        'risk leg symbol does not match option order symbol'
+                    )
+                option_match = re.search(r'\d{6,8}([CP])\d+$', symbol, re.IGNORECASE)
+                if option_match:
+                    expected_type = (
+                        'CALL' if option_match.group(1).upper() == 'C' else 'PUT'
+                    )
+                    if str(risk_leg.option_type).upper() not in {expected_type, expected_type[0]}:
+                        raise InvalidOptionOrderEffect(
+                            'risk leg option type does not match option symbol'
+                        )
+                if abs(float(risk_leg.signed_quantity)) + 1e-12 < float(volume):
+                    raise InvalidOptionOrderEffect(
+                        'risk leg quantity is smaller than requested order quantity'
+                    )
+                if float(risk_leg.signed_quantity) >= 0:
+                    raise InvalidOptionOrderEffect(
+                        'SELL_TO_OPEN risk leg must describe a short position'
+                    )
+                if str(risk_leg.option_type).upper() == 'PUT':
+                    obligations = self.get_option_assignment_obligations()
+                    assert_csp_capacity(
+                        self.get_cash(),
+                        obligations['short_positions'],
+                        obligations['pending_orders'],
+                        risk_leg.strike,
+                        volume,
+                        risk_leg.contract_multiplier,
+                    )
+                margin_snapshot = self.get_option_margin_snapshot(
+                    [risk_leg],
+                    underlying_positions=underlying_positions,
+                )
+                if margin_snapshot.available_margin < 0:
+                    raise InvalidOptionOrderEffect(
+                        'option margin is insufficient'
+                    )
+            else:
+                validate_option_order_effect(
+                    effect,
+                    current_size,
+                    volume,
+                    allow_sell_to_open=False,
+                )
+            side = order_effect_side(effect)
+        except (InvalidOptionOrderEffect, RuntimeError, ValueError, TypeError) as exc:
+            self._last_order_target_skip_reason = 'unsupported_option_order_effect'
+            message = (
+                f'[FutuBroker] option order rejected locally: symbol={symbol}, '
+                f'effect={order_effect!r}, reason={exc}'
+            )
+            self._runtime_log(message)
+            runtime_notifications.push_text(message, level='ERROR')
+            return None
+
+        if price is None:
+            price = self.get_current_price(data)
+        if effect == 'SELL_TO_OPEN':
+            self._allow_option_sell_open_once = True
+        try:
+            proxy = self._submit_order(data, volume, side, price)
+        finally:
+            self.__dict__.pop('_allow_option_sell_open_once', None)
+        if proxy is None:
+            return None
+        # 订单效果是本地审计元数据；Futu API 的买卖方向仍由 side 表达。
+        proxy.order_effect = effect
+        if isinstance(getattr(proxy, 'raw_order', None), dict):
+            proxy.raw_order['order_effect'] = effect
+        if effect == 'SELL_TO_OPEN' and str(risk_leg.option_type).upper() == 'PUT':
+            self._option_run_reservations[str(proxy.id)] = {
+                'symbol': symbol,
+                'strike': float(risk_leg.strike),
+                'remaining': float(volume),
+                'contract_multiplier': float(risk_leg.contract_multiplier),
+            }
+            proxy.assignment_cash_reserved = float(
+                assignment_cash(
+                    risk_leg.strike,
+                    volume,
+                    risk_leg.contract_multiplier,
+                )
+            )
+        return proxy
+
+    def get_option_margin_snapshot(self, legs, *, stress_down=0.20,
+                                   stress_up=0.20, underlying_positions=None):
+        """以当前账户现金和真实持仓计算受限期权保证金快照。
+
+        未提供 underlying_positions 时按 legs 的 underlying 从已加载 data 逐一
+        查询；查询失败即抛出，调用方不得把失败当作零仓或可用保证金。
+        """
+        if underlying_positions is None:
+            underlying_positions = {}
+            data_by_symbol = {
+                _normalise_symbol(getattr(data, '_name', '')): data
+                for data in self.datas
+            }
+            for leg in legs or []:
+                underlying = _normalise_symbol(getattr(leg, 'underlying', ''))
+                data = data_by_symbol.get(underlying)
+                if data is None:
+                    raise RuntimeError(
+                        f'Futu underlying position is not managed: {underlying}'
+                    )
+                position = self.get_position(data)
+                underlying_positions[underlying] = getattr(position, 'size', 0) or 0
+        return compute_option_margin(
+            legs,
+            cash=self.get_cash(),
+            underlying_positions=underlying_positions,
+            stress_down=stress_down,
+            stress_up=stress_up,
+        )
+
+    @staticmethod
+    def aggregate_option_greeks(legs) -> OptionGreeks:
+        """聚合已计算的期权 Greeks，不读取或缓存账户状态。"""
+        return aggregate_option_greeks(legs)
+
+    def on_order_status(self, proxy):
+        """终态回调清理当前 run 短期 CSP 标记，下一轮仍以柜台事实为准。"""
+        result = super().on_order_status(proxy)
+        if not proxy.is_pending() and not proxy.is_accepted():
+            self._option_run_reservations.pop(str(getattr(proxy, 'id', '') or ''), None)
+        return result
 
     def convert_order_proxy(self, raw_order) -> 'BaseOrderProxy':
         """将 Futu 订单回调转换为代理，并按规范精确匹配 data。"""
@@ -1921,6 +2405,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
             is_live=self.is_live,
             data=matched_data,
             contract_multiplier=multiplier,
+            order_effect=_field(raw_order, ('order_effect', 'position_effect'), None),
         )
 
     @staticmethod

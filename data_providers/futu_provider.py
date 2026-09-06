@@ -18,6 +18,7 @@ from live_trader.adapters.futu_symbols import (
     VENUE_ALIASES as _VENUE_ALIASES,
     normalize_futu_symbol,
 )
+from common.options.chain import normalize_option_chain
 from .base_provider import BaseDataProvider
 from common.live_runtime import dependency_install_hint
 
@@ -62,6 +63,32 @@ def _positive_float(value):
     except (TypeError, ValueError, OverflowError):
         return None
     return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _field_value(row, names):
+    """从元数据行按别名读取第一个非空字段。"""
+    if row is None:
+        return None
+    for name in names:
+        if name in row.index:
+            value = row.get(name)
+            if value is not None and not pd.isna(value) and not (
+                isinstance(value, str) and not value.strip()
+            ):
+                return value
+    return None
+
+
+def _row_first_value(row, names):
+    """从字典或 Series 行读取第一个非空字段。"""
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        for name in names:
+            if name in row and row[name] is not None and not pd.isna(row[name]):
+                return row[name]
+        return None
+    return _field_value(row, names)
 
 
 class FutuDataProvider(BaseDataProvider):
@@ -534,8 +561,10 @@ class FutuDataProvider(BaseDataProvider):
 
     def get_option_chain(self, underlying: str, start=None, end=None,
                          option_type='ALL', option_cond_type='ALL',
-                         index_option_type='NORMAL', data_filter=None) -> pd.DataFrame:
-        """按标的查询期权链，并记录返回的合约代码供后续历史请求使用。"""
+                         index_option_type='NORMAL', data_filter=None,
+                         normalized=False, timestamp=None, as_of=None,
+                         contract_multiplier=None) -> pd.DataFrame:
+        """查询期权链；``normalized=True`` 时返回统一字段模型。"""
         code = self._normalize_symbol(underlying)
         if not code:
             return None
@@ -568,7 +597,154 @@ class FutuDataProvider(BaseDataProvider):
                 self._normalize_symbol(value) for value in data['code'].dropna().tolist()
             }
             self._known_option_symbols.update(code for code in known_symbols if code)
-        return data.copy()
+        result = data.copy()
+        if not normalized:
+            return result
+        result = self._enrich_option_chain_metadata(result, code)
+        # OpenD 链接口有时只返回合约字段，实时调用可用本次请求完成时间作为
+        # 快照边界；历史调用必须由源数据提供真实 timestamp，runtime 会拒绝
+        # 将调用方时间戳伪装成历史可见时间。
+        effective_timestamp = timestamp if timestamp is not None else pd.Timestamp.now(tz='UTC')
+        normalized_result = normalize_option_chain(
+            result,
+            code,
+            timestamp=effective_timestamp,
+            as_of=as_of,
+            contract_multiplier=contract_multiplier,
+            symbol_normalizer=self._normalize_symbol,
+            require_quotes=True,
+        )
+        if normalized_result is None:
+            print(f'[Futu] Option-chain normalization failed for {code}; snapshot rejected.')
+        return normalized_result
+
+    def _enrich_option_chain_metadata(self, chain: pd.DataFrame, underlying: str) -> pd.DataFrame:
+        """仅从富途元数据和实时快照补全链字段，不猜测合约乘数。"""
+        result = chain.copy()
+        codes = []
+        if 'code' in result.columns:
+            codes = [
+                self._normalize_symbol(value)
+                for value in result['code'].dropna().tolist()
+                if self._normalize_symbol(value)
+            ]
+        multiplier_columns = [
+            name for name in (
+                'contract_multiplier', 'contract_size',
+                'option_contract_multiplier', 'option_contract_size',
+            ) if name in result.columns
+        ]
+        has_multiplier = any(
+            pd.to_numeric(result[name], errors='coerce').gt(0).any()
+            for name in multiplier_columns
+        )
+        if codes and not has_multiplier:
+            basic = self.get_stock_basicinfo(
+                market=codes[0].split('.', 1)[0],
+                stock_type='OPTION',
+                code_list=codes,
+            )
+            if isinstance(basic, pd.DataFrame) and not basic.empty:
+                basic_codes = {
+                    self._normalize_symbol(value): row
+                    for _, row in basic.iterrows()
+                    for value in [_field_value(row, ('code', 'symbol'))]
+                    if value
+                }
+                multiplier_values = []
+                for code_value in result['code']:
+                    row = basic_codes.get(self._normalize_symbol(code_value))
+                    multiplier_values.append(
+                        _row_first_value(
+                            row,
+                            ('option_contract_multiplier', 'option_contract_size',
+                             'contract_multiplier', 'contract_size'),
+                        )
+                    )
+                result['contract_multiplier'] = multiplier_values
+
+        # 期权链接口只描述合约，盘口和乘数从同一 OpenD 行情快照补全。
+        if codes:
+            quote = self.get_market_snapshot(codes)
+            if isinstance(quote, pd.DataFrame) and not quote.empty and 'code' in quote.columns:
+                quote_rows = {
+                    self._normalize_symbol(value): row
+                    for _, row in quote.iterrows()
+                    for value in [_field_value(row, ('code', 'symbol'))]
+                    if value
+                }
+                for output_name, aliases in (
+                    ('contract_multiplier', ('option_contract_multiplier', 'option_contract_size', 'contract_multiplier', 'contract_size')),
+                    ('bid', ('bid_price', 'bid')),
+                    ('ask', ('ask_price', 'ask')),
+                    ('last', ('last_price', 'last', 'price', 'close')),
+                    ('volume', ('volume', 'vol')),
+                    ('open_interest', ('option_open_interest', 'open_interest', 'oi')),
+                    ('iv', ('option_implied_volatility', 'implied_volatility', 'iv')),
+                    ('delta', ('option_delta', 'delta')),
+                    ('gamma', ('option_gamma', 'gamma')),
+                    ('theta', ('option_theta', 'theta')),
+                    ('vega', ('option_vega', 'vega')),
+                    ('rho', ('option_rho', 'rho')),
+                    ('timestamp', ('update_time', 'timestamp', 'datetime')),
+                ):
+                    if output_name in result.columns:
+                        current_values = result[output_name].tolist()
+                    else:
+                        current_values = [None] * len(result)
+                    result[output_name] = [
+                        current if current is not None and not pd.isna(current)
+                        else _row_first_value(
+                            quote_rows.get(self._normalize_symbol(code_value)), aliases
+                        )
+                        for current, code_value in zip(current_values, result['code'])
+                    ]
+
+        if not any(name in result.columns for name in ('spot', 'spot_price', 'stock_price')):
+            snapshot = self.get_market_snapshot([underlying])
+            if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
+                spot = _row_first_value(
+                    snapshot.iloc[0],
+                    ('last_price', 'last', 'price', 'close'),
+                )
+                if spot is not None:
+                    result['spot'] = spot
+        # 部分 OpenD 期权快照不返回币种；这是 Provider 已知的市场元数据，
+        # 可以安全补全，不能把它留作交易链中的未知风险字段。
+        if 'currency' not in result.columns or result['currency'].isna().all():
+            market_currency = {
+                'US': 'USD',
+                'HK': 'HKD',
+                'SH': 'CNH',
+                'SZ': 'CNH',
+                'SG': 'SGD',
+                'JP': 'JPY',
+                'AU': 'AUD',
+                'CA': 'CAD',
+            }.get(underlying.split('.', 1)[0].upper())
+            if market_currency:
+                result['currency'] = market_currency
+        return result
+
+    def get_option_chain_normalized(self, underlying: str, start=None, end=None,
+                                    option_type='ALL', option_cond_type='ALL',
+                                    index_option_type='NORMAL', data_filter=None,
+                                    timestamp=None, as_of=None,
+                                    contract_multiplier=None) -> pd.DataFrame:
+        """返回严格的 QuantAda 统一期权链字段。"""
+        return self.get_option_chain(
+            underlying,
+            start=start,
+            end=end,
+            option_type=option_type,
+            option_cond_type=option_cond_type,
+            index_option_type=index_option_type,
+            data_filter=data_filter,
+            normalized=True,
+            timestamp=timestamp,
+            as_of=as_of,
+            contract_multiplier=contract_multiplier,
+        )
 
     def get_stock_basicinfo(self, market=None, stock_type='STOCK', code_list=None) -> pd.DataFrame:
         """查询股票、ETF、期权等基础合约信息。"""

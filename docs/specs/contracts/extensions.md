@@ -35,9 +35,13 @@
 5. DataManager 支持单个或多个 `data_source` 名称，多个 provider 可按逗号或空格分隔
 6. 日内 provider 必须同时按能力支持 `timeframe='Minutes'|'Seconds'` 与 `compression`；日期参数在日内模式应保留到秒，增量窗口不得擅自扩成整年高频明细。
 7. SDK/网络调用必须使用有限超时；秒级请求的单次超时应明显短于数据周期。24x7 数据源不得强制应用常规交易时段过滤。
-8. Futu Provider 直接读取 `configs/futu.py` 的 `FUTU_HOST`、`FUTU_PORT` 和可选 `FUTU_RSA_KEY_PATH` 连接 OpenD；这些同名公开键由 `config.py` 导入，因此可使用标准 `--config` 覆盖。RSA 路径为空时关闭协议加密。股票、ETF 和支持标准 K 线接口的衍生品统一通过 `request_history_kline` 标准化；Futu 事件合约期权在该接口失败时回退 `request_history_event_contract_kline`。期权链使用显式的 `get_option_chain` 查询；期权乘数由行情元数据提供给交易 adapter，元数据不可用时不得自行猜测乘数。行情与交易的代码归一化统一使用 `live_trader.adapters.futu_symbols`，不得在两个模块重复维护映射。
+8. Futu Provider 直接读取 `configs/futu.py` 的 `FUTU_HOST`、`FUTU_PORT` 和可选 `FUTU_RSA_KEY_PATH` 连接 OpenD；这些同名公开键由 `config.py` 导入，因此可使用标准 `--config` 覆盖。RSA 路径为空时关闭协议加密。股票、ETF 和支持标准 K 线接口的衍生品统一通过 `request_history_kline` 标准化；Futu 事件合约期权在该接口失败时回退 `request_history_event_contract_kline`。期权链使用显式的 `get_option_chain` 查询；期权乘数由行情元数据提供给交易 adapter，元数据不可用时不得自行猜测乘数。行情与交易的代码归一化统一使用 `live_trader.adapters.futu_symbols`，不得在两个模块重复维护映射。需要统一模型时使用 `get_option_chain_normalized()`，字段固定为 `timestamp`、`underlying`、`spot`、`option_symbol`、`option_type`、`strike`、`expiry`、`bid`、`ask`、`last`、`volume`、`open_interest`、`iv`、`delta`、`gamma`、`theta`、`vega`、`rho`、`contract_multiplier`、`currency`；重复、过期、缺少关键字段或乘数的链必须失败关闭。
 9. Provider-specific SDK 缺失时必须允许其他 Provider 继续加载，并给出解除 `requirements.txt` 对应注释、重新执行 `python -m pip install -r requirements.txt` 的明确指引。
 10. 期权/期货等衍生品回测必须在 DataFrame 的 `option_contract_multiplier`、`option_contract_size`、`contract_multiplier` 或 `contract_size` 列，或 `DataFrame.attrs` 中提供正的现金名义乘数；Backtester 会将目标数量、资金、持仓估值和比例手续费统一按该乘数处理，期权专属字段优先于通用默认字段。
+11. 期权生命周期、保证金与 Greeks 工具必须保持纯计算和确定性：支持 OTM 到期归零、ITM Put 指派、ITM Call 行权、现金/实物结算及最小换月；现金担保 Put、Covered Call 之外的裸卖和多腿组合必须失败关闭。Greeks 缺失 IV 时才可回退 HV，非有限值按安全边界处理。动态链刷新必须有界，过期/缺失链不得交易；盘中对冲必须受最大数量、最大换手和盘口状态约束。
+12. 通用期权解析、估值、链模型、订单效果、现金义务、Greeks 和生命周期工具统一放在 `common/options/`，不得使用券商前缀或直接导入具体 adapter/Provider/SDK；策略私有目录不得复制同一套通用期权实现。
+13. 通用期权到期损益分析统一使用 `common/options/payoff.py`；策略通过 `BaseStrategy.publish_option_payoff()` 推送 Plan。实盘即时推送，回测按计划 key 延迟推送；分析不得直接导入具体 IM 或券商模块。
+14. 通用期权损益腿必须显式提供正的合约乘数；Greeks 的波动率、利率和股息率默认使用小数形式，百分数输入必须显式声明单位。到期前换月必须使用旧合约实际平仓价，不得伪装成到期指派；股息只有在调用方提供已按除息日筛选的事件时才可入账。
 
 ## 4. 报警通道
 1. 继承 `alarms.base_alarm.BaseAlarm`

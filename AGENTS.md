@@ -51,6 +51,12 @@ If a proposed change conflicts with these rules, reject or redesign it.
 - Prefer deleting obsolete compatibility layers over keeping two ways to do the same thing.
 - When touching a bloated base class, prefer shrinking or localizing logic instead of adding one more abstraction on top.
 
+7. 通用包与券商边界
+- `common/` 及其子包只能放置与具体券商、SDK、账户路由和市场协议无关的通用框架能力。
+- 禁止在 `common/` 下新增 `futu_*`、`ib_*`、`gm_*` 等券商绑定模块，也禁止通用工具直接导入券商 adapter、Provider 或 SDK。
+- 期权链、Greeks、现金义务、生命周期和订单效果等跨券商纯计算工具统一放在 `common/options/`，通过参数、协议或可注入函数适配数据源；Futu/IBKR 特有代码留在对应 `data_providers/` 或 `live_trader/adapters/`。
+- 若某个工具只服务一个券商，必须放在该券商责任模块或其聚焦子包，不得借 `common/` 建立隐藏的第二配置或状态边界。
+
 ## 2) Architecture Contracts (Must Follow)
 1. Respect base interfaces and contracts:
 - `live_trader/adapters/base_broker.py`

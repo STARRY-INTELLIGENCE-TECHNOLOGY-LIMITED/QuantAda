@@ -129,6 +129,43 @@ class BaseStrategy(ABC):
             return runtime_notifications.push_plan(content, level=level)
         return runtime_notifications.defer_plan(content, level=level, key=key)
 
+    def publish_option_payoff(
+        self,
+        option_legs=(),
+        underlying_legs=(),
+        *,
+        fixed_cash=0.0,
+        spot=None,
+        title="option_payoff",
+        key="option_payoff",
+        currency="",
+        level="INFO",
+    ):
+        """生成期权损益分析并沿用统一 Plan 通知边界。
+
+        实盘即时推送，回测/优化按 key 延迟到结束；分析本身是纯计算，不读取
+        账户状态，也不保存交易意图。券商和 IM 的具体实现均不进入期权工具。
+        """
+        from common.options.payoff import analyze_payoff, format_payoff_plan
+
+        analysis = analyze_payoff(
+            option_legs=option_legs,
+            underlying_legs=underlying_legs,
+            fixed_cash=fixed_cash,
+            spot=spot,
+            currency=currency,
+        )
+        if self._print_plan_enabled():
+            content = format_payoff_plan(title, analysis, [
+                *(option_legs or ()),
+                *(underlying_legs or ()),
+            ])
+            if getattr(self.broker, 'is_live', False):
+                runtime_notifications.push_plan(content, level=level)
+            else:
+                runtime_notifications.defer_plan(content, level=level, key=key)
+        return analysis
+
     def _print_plan_enabled(self):
         """优先从当前券商运行快照读取 PRINT_PLAN。"""
         runtime_setting = getattr(self.broker, '_runtime_setting', None)
@@ -143,6 +180,9 @@ class BaseStrategy(ABC):
         """
         current_positions = {}
         managed_market_value = 0.0
+        csp_cash_semantics = callable(
+            getattr(self.broker, 'get_csp_uncommitted_cash', None)
+        )
 
         # 1. 抓取券商真实在途订单 (降维成大写的字典，方便极速查表)
         pending_map = {}
@@ -182,8 +222,41 @@ class BaseStrategy(ABC):
             # 【防爆仓核心】计算预期仓位 (Expected Size)
             expected_size = settled_size + get_pending(d._name, 'BUY') - get_pending(d._name, 'SELL')
 
-            # 只要预期仓位 > 0，就纳入市值计算 (交给 Rebalancer 识别)
-            if expected_size > 0:
+            # 普通股票仍只盘点多仓；期权负仓也必须纳入账户风险盘点，
+            # 否则 Rebalancer 会把 Short Put 当作不存在，策略资金将被高估。
+            option_type = ''
+            dataframe = getattr(getattr(d, 'p', None), 'dataname', None)
+            row = None
+            if isinstance(dataframe, pd.DataFrame) and not dataframe.empty:
+                try:
+                    current_dt = self._normalize_bar_dt(d.datetime.datetime(0))
+                except Exception:
+                    current_dt = None
+                if current_dt is not None:
+                    index = pd.to_datetime(dataframe.index, errors='coerce')
+                    if getattr(index, 'tz', None) is not None and current_dt.tzinfo is None:
+                        index = index.tz_localize(None)
+                    visible = dataframe.loc[index <= current_dt]
+                    if not visible.empty:
+                        row = visible.iloc[-1]
+                if row is None:
+                    row = dataframe.iloc[0]
+                for name in ('option_type', 'right', 'cp', 'put_call'):
+                    if name in row.index:
+                        option_type = str(row.get(name) or '').strip().upper()
+                        break
+            if option_type in {'P', 'PUT'}:
+                option_type = 'PUT'
+            elif option_type in {'C', 'CALL'}:
+                option_type = 'CALL'
+            else:
+                try:
+                    from common.options.analytics import parse_option_symbol
+                    option_type = parse_option_symbol(getattr(d, '_name', '')).get('option_type', '')
+                except Exception:
+                    option_type = ''
+
+            if expected_size > 0 or (expected_size < 0 and option_type in {'PUT', 'CALL'}):
                 if hasattr(self.broker, 'get_current_price'):
                     price = self.broker.get_current_price(d)
                 elif len(d) > 0:
@@ -206,9 +279,13 @@ class BaseStrategy(ABC):
                             pass
                     market_value = expected_size * price * multiplier
 
-                # “欺骗” Rebalancer：告诉它当前持仓是 Expected，防止它因未结算而重复发单
+                # “欺骗” Rebalancer：告诉它当前持仓是 Expected，防止它因未结算而重复发单。
+                # Short option 的 market_value 保留负号，作为风险暴露而不是可投资多仓。
                 current_positions[d] = market_value
-                managed_market_value += market_value
+                # 提供 CSP 专用现金口径时，assignment collateral 已在现金侧扣除，
+                # 不能再次把短期权负市值从总资金扣除；通用 Broker 则保留负风险暴露。
+                if market_value > 0 or not csp_cash_semantics:
+                    managed_market_value += market_value
 
         # 3. 资金盘点
         # - get_cash: 当前可立即下单资金口径（可能包含券商杠杆语义）
@@ -216,7 +293,14 @@ class BaseStrategy(ABC):
         # 策略层统一使用 get_rebalance_cash，避免计划口径与下单口径发生语义撕裂。
         available_cash = self.broker.get_cash()
         rebalance_cash = available_cash
-        if hasattr(self.broker, 'get_rebalance_cash'):
+        csp_cash_getter = getattr(self.broker, 'get_csp_uncommitted_cash', None)
+        if callable(csp_cash_getter):
+            try:
+                rebalance_cash = float(csp_cash_getter())
+            except Exception as e:
+                # CSP 现金快照不可验证时不能把全部现金重新解释为可担保资金。
+                raise RuntimeError(f"获取 CSP 担保资金口径失败，本轮调仓中止: {e}") from e
+        elif hasattr(self.broker, 'get_rebalance_cash'):
             try:
                 rebalance_cash = float(self.broker.get_rebalance_cash())
             except Exception as e:

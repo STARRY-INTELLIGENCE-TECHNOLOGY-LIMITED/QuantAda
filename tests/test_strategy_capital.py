@@ -88,6 +88,54 @@ def test_strategy_isolated_capital_applies_derivative_contract_multiplier():
     assert current_positions[data] == pytest.approx(30000.0)
 
 
+def test_strategy_isolated_capital_includes_signed_short_option_risk():
+    """Short Put 不得从策略隔离资金盘点中消失。"""
+    option = DummyData("US.AAPL260918P320000")
+    option.p.dataname["option_type"] = "PUT"
+
+    class ShortOptionBroker(DummyBroker):
+        def getposition(self, data):
+            return SimpleNamespace(size=-2.0, price=5.0)
+
+        def get_contract_multiplier(self, data):
+            return 100.0
+
+    broker = ShortOptionBroker(
+        cash=10000.0,
+        rebalance_cash=10000.0,
+        datas=[option],
+    )
+    strategy = DummyStrategy(broker=broker, params={})
+
+    allocatable, current_positions = strategy.get_strategy_isolated_capital()
+
+    assert current_positions[option] == pytest.approx(-20000.0)
+    assert allocatable == pytest.approx(-10000.0)
+
+
+def test_strategy_isolated_capital_does_not_double_count_csp_collateral():
+    option = DummyData("US.AAPL260918P320000")
+    option.p.dataname["option_type"] = "PUT"
+
+    class CspBroker(DummyBroker):
+        def getposition(self, data):
+            return SimpleNamespace(size=-1.0, price=5.0)
+
+        def get_contract_multiplier(self, data):
+            return 100.0
+
+        def get_csp_uncommitted_cash(self):
+            return 1000.0
+
+    broker = CspBroker(cash=10000.0, rebalance_cash=10000.0, datas=[option])
+    strategy = DummyStrategy(broker=broker, params={})
+
+    allocatable, current_positions = strategy.get_strategy_isolated_capital()
+
+    assert current_positions[option] == pytest.approx(-10000.0)
+    assert allocatable == pytest.approx(1000.0)
+
+
 def test_strategy_isolated_capital_fallbacks_to_get_cash_on_rebalance_error(monkeypatch):
     """
     稳定性回归:

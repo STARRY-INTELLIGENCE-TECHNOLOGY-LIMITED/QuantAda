@@ -107,6 +107,8 @@
 5. Futu 的账户摘要和持仓查询必须使用配置的账户计价币种；跨币种估值通过可验证的 FX 报价换算，账户摘要、汇率或行情不可用时必须失败关闭，不能用旧 K 线或局部本地估值继续下单。
 6. Futu schedule 的正式槽位必须先通过 `get_market_state()` 确认所有受管标的处于可交易状态；行情上下文 CLOSED/CLOSING 或查询失败时跳过当前槽位，保留后续重试机会。
 7. Futu 事件模式使用 `CurKlineHandlerBase`/其他 SDK handler 的订阅回调；回调线程只做事件去重和单 worker 派发，策略仍通过 `LiveTrader.run()` 执行完整刷新、风控和订单流程。事件模式不得同时配置 schedule，秒级 K 线订阅必须明确拒绝。
+8. 期权订单效果必须显式区分 `BUY_TO_OPEN`、`SELL_TO_CLOSE`、`SELL_TO_OPEN`、`BUY_TO_CLOSE`。当前 Futu 只允许买开、卖平及已有负仓的买平；未实现保证金前，卖开必须 fail-closed，普通 `SELL` 不得伪装成卖开。成交后的 signed position 变化必须按订单效果计算，不能依赖本地长期虚拟仓位。
+9. Futu 实时期权链、组合保证金和对冲只允许使用有界、当前可信的快照；动态链缺失或过期时禁止换月/对冲。首版风险范围仅为 Cash-Secured Put 与 Covered Call，裸卖和多腿组合必须拒绝；盘中对冲必须重新读取真实持仓、现金、保证金与 Greeks，并遵守最大对冲量和最大换手。
 
 ## 10. IBKR 混合资产交易
 
