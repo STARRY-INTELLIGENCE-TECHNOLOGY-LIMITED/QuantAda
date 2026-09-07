@@ -40,3 +40,13 @@ def test_multi_leg_and_insufficient_put_collateral_fail_closed():
         compute_option_margin([put, call], cash=100000)
     with pytest.raises(OptionMarginError, match='collateral'):
         compute_option_margin([put], cash=100)
+
+
+def test_multi_leg_long_options_are_supported_without_short_margin():
+    call = OptionRiskLeg('C', 'US.AAPL', 'CALL', 1, 320, 5, 300, 100)
+    put = OptionRiskLeg('P', 'US.AAPL', 'PUT', 1, 280, 4, 300, 100)
+
+    snapshot = compute_option_margin([call, put], cash=1_000)
+
+    assert snapshot.margin_used == 0
+    assert snapshot.max_loss_estimate == 900

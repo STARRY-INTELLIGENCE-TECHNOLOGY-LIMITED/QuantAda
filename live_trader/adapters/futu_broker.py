@@ -132,6 +132,17 @@ _CURRENCY_CASH_FIELDS = {
     'MYR': ('myr_net_cash_power', 'my_cash'),
     'NZD': ('nzd_net_cash_power', 'nz_cash'),
 }
+_CURRENCY_SETTLED_CASH_FIELDS = {
+    'HKD': ('hk_cash',),
+    'USD': ('us_cash',),
+    'CNH': ('cn_cash',),
+    'JPY': ('jp_cash',),
+    'SGD': ('sg_cash',),
+    'AUD': ('au_cash',),
+    'CAD': ('ca_cash',),
+    'MYR': ('my_cash',),
+    'NZD': ('nz_cash',),
+}
 _TRADABLE_MARKET_STATES = {
     'AUCTION',
     'MORNING',
@@ -498,6 +509,8 @@ class FutuOrderProxy(BaseOrderProxy):
         self.submitted_size = requested
         self.requested_size = requested
         self.reserved_cash = 0.0
+        symbol = _normalise_symbol(_field(raw_order, ('code', 'symbol', 'stock_code'), ''))
+        is_option = bool(_parse_option_contract(symbol).get('option_type'))
         multiplier = contract_multiplier
         multiplier_value = _decimal(multiplier, None)
         if multiplier_value is None or multiplier_value <= 0:
@@ -512,7 +525,11 @@ class FutuOrderProxy(BaseOrderProxy):
                 if candidate is not None and candidate > 0:
                     multiplier_value = candidate
                     break
-        self.contract_multiplier = float(multiplier_value) if multiplier_value is not None else 1.0
+        self.contract_multiplier = (
+            float(multiplier_value)
+            if multiplier_value is not None
+            else (0.0 if is_option else 1.0)
+        )
 
     @property
     def id(self):
@@ -587,9 +604,12 @@ class FutuOrderProxy(BaseOrderProxy):
 class FutuBrokerAdapter(BaseLiveBroker):
     """富途 OpenD 账户级适配器，支持股票、ETF 和受限的期权订单效果。
 
-    期权卖开需要保证金与组合风控，目前只在显式入口中安全拒绝；买开、卖平
-    和已有负仓的买平不复制账户状态，仍以富途持仓和订单快照为事实来源。
+    期权卖开需要显式风险腿与组合风控；买开、卖平和已有负仓的买平不复制
+    账户状态，仍以富途持仓和订单快照为事实来源。
     """
+
+    # 调仓现金口径已扣除可验证的期权现金义务。
+    rebalance_cash_includes_option_obligations = True
 
     _PENDING_STATUSES = FutuOrderProxy._PENDING_STATUSES
     _TERMINAL_STATUSES = (
@@ -751,6 +771,26 @@ class FutuBrokerAdapter(BaseLiveBroker):
         specific = _CURRENCY_CASH_FIELDS.get(currency, ())
         # power 是含保证金假设的最大购买力，不等同于可用现金，不能作为现金回退。
         return tuple(specific) + ('available_funds', 'net_cash_power', 'cash')
+
+    def _settled_cash_field_names(self):
+        """返回不含购买力/保证金字段的现金字段。"""
+        currency = self._account_currency_name()
+        # ``available_funds`` 是现金字段；明确排除 ``*_net_cash_power`` 和
+        # ``net_cash_power``，后者可能包含券商保证金购买力。
+        return tuple(_CURRENCY_SETTLED_CASH_FIELDS.get(currency, ())) + (
+            'cash', 'available_funds'
+        )
+
+    def _fetch_settled_cash(self) -> float:
+        """读取现金担保专用的已结算现金；缺失时失败关闭。"""
+        rows = self._query_account_info()
+        value = self._first_numeric(rows, self._settled_cash_field_names(), positive=True)
+        if value is None:
+            error = RuntimeError('Futu account snapshot has no settled cash field for CSP')
+            self._last_account_snapshot_fetch_failed = True
+            self._last_account_snapshot_fetch_error = error
+            raise error
+        return float(value)
 
     def _get_fx_rate(self, source_currency, target_currency):
         """读取报价币种到账户币种的实时汇率；不可用时返回 None。"""
@@ -1626,18 +1666,40 @@ class FutuBrokerAdapter(BaseLiveBroker):
             'assignment_cash': total,
         }
 
-    def get_csp_uncommitted_cash(self):
-        """返回账户级可用于新增 CSP 的未承诺现金。"""
+    def get_option_uncommitted_cash(self):
+        """返回账户级可用于新增仓位的未承诺现金。"""
         obligations = self.get_option_assignment_obligations()
         return uncommitted_cash(
-            self.get_cash(),
+            self._fetch_settled_cash(),
             short_puts=obligations['short_positions'],
             pending_short_puts=obligations['pending_orders'],
         )
 
+    def get_csp_uncommitted_cash(self):
+        """兼容旧 CSP 策略的现金入口。"""
+        return self.get_option_uncommitted_cash()
+
     def get_rebalance_cash(self):
-        """将 Short Put 指派义务纳入策略调仓现金口径。"""
-        return float(self.get_csp_uncommitted_cash())
+        """将已知期权现金义务纳入策略调仓现金口径。"""
+        obligations = self.get_option_assignment_obligations()
+        if obligations['assignment_cash'] == 0:
+            # 没有期权现金义务时保持股票/ETF 策略既有现金语义；只有
+            # CSP/其它现金担保短腿存在时才切换到 settled-cash 口径。
+            return float(self.get_cash())
+        return float(uncommitted_cash(
+            self._fetch_settled_cash(),
+            short_puts=obligations['short_positions'],
+            pending_short_puts=obligations['pending_orders'],
+        ))
+
+    def get_rebalance_position_value(self, data, signed_size, price, market_value):
+        """按账户现金义务口径调整调仓持仓价值。"""
+        if float(signed_size) < 0:
+            detail = _parse_option_contract(getattr(data, '_name', ''))
+            if detail.get('option_type') == 'PUT':
+                # Short Put 的指派现金已由 get_option_uncommitted_cash 扣除。
+                return 0.0
+        return float(market_value)
 
     @staticmethod
     def _position_record(row):
@@ -2279,7 +2341,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 if str(risk_leg.option_type).upper() == 'PUT':
                     obligations = self.get_option_assignment_obligations()
                     assert_csp_capacity(
-                        self.get_cash(),
+                        self._fetch_settled_cash(),
                         obligations['short_positions'],
                         obligations['pending_orders'],
                         risk_leg.strike,
@@ -2364,9 +2426,15 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     )
                 position = self.get_position(data)
                 underlying_positions[underlying] = getattr(position, 'size', 0) or 0
+        requires_settled_cash = any(
+            float(getattr(leg, 'signed_quantity', 0.0)) < 0
+            and str(getattr(leg, 'option_type', '')).upper() in {'PUT', 'P'}
+            for leg in (legs or ())
+        )
+        cash_value = self._fetch_settled_cash() if requires_settled_cash else self.get_cash()
         return compute_option_margin(
             legs,
-            cash=self.get_cash(),
+            cash=cash_value,
             underlying_positions=underlying_positions,
             stress_down=stress_down,
             stress_up=stress_up,

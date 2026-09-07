@@ -18,7 +18,8 @@ ANNUAL_FACTOR = 252
 # 数据缓存路径
 DATA_PATH = '.data'
 
-# 缓存数据，常用于离线或数据源不稳定等情况。使用后请使用--refresh或手动删除缓存目录下文件
+# 缓存数据；启用后单一显式在线 data_source 会优先复用完整 CSV 缓存。
+# 使用 --refresh 可绕过缓存重新拉取并合并，显式 data_source=csv 仍可离线读取。
 CACHE_DATA = False
 
 # 是否打印详细交易日志

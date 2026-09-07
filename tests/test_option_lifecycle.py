@@ -42,6 +42,24 @@ def test_itm_put_physical_assignment_changes_cash_and_underlying_by_multiplier()
     assert result.underlying_delta == -100
 
 
+def test_assignment_properly_converts_cash_to_equity_shares():
+    contract = OptionContract("US.SPY260918P00450000", "PUT", 450, "2026-09-18", 100)
+
+    result = settle_option_expiry(
+        contract,
+        -1,
+        400,
+        cash=50_000,
+        underlying_position=0,
+        at="2026-09-18",
+    )
+
+    assert result.event == "ASSIGNED_PUT"
+    assert result.cash_after == 5_000
+    assert result.underlying_after == 100
+    assert result.option_position_after == 0
+
+
 def test_itm_call_cash_settlement_and_short_put_assignment_are_signed():
     call = OptionContract('US.AAPL260918C320000', 'CALL', 320, '2026-09-18', 100, 'cash')
     result = settle_option_expiry(call, 2, 350, cash=1000, at='2026-09-18')

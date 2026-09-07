@@ -83,6 +83,12 @@ python run.py sample_auto_rebalance_strategy --symbols=SZSE.159915 --params "{'s
 # 使用 CSV 缓存 / 强制刷新
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --data_source csv
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --refresh
+
+# 在线数据源拉取后启用本地缓存；同一 data_source 的后续回测/优化自动命中完整缓存
+python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta --config "{'CACHE_DATA': True}"
+
+# 强制绕过缓存重新拉取并合并
+python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta --refresh --config "{'CACHE_DATA': True}"
 ```
 
 ### 5) 参数优化（Optuna）

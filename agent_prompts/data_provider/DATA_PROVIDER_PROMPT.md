@@ -36,8 +36,9 @@ def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
 6. SDK/网络请求必须使用有限超时；秒级请求的单次超时应明显短于周期。外汇/币市等 24x7 数据不得强制使用常规交易时段过滤。
 7. Provider-specific 的连接配置放在 `configs/<name>.py`，由 Provider 直接读取；需要用户调整的配置键随 `config.py` 对应责任域的 `import *` 一起平铺，避免额外命名空间和重复 CLI 白名单。入口不使用目录扫描；若 SDK 支持可选加密，空密钥路径应表示关闭加密，不另设重复开关。
 8. Provider 使用的第三方 SDK 应采用可选导入；缺少 SDK 时不能阻断其他数据源，并应明确指引用户解除 `requirements.txt` 对应依赖行的注释后重新执行 `python -m pip install -r requirements.txt`。Futu 事件合约期权历史 K 线可在统一接口失败时回退 `request_history_event_contract_kline`，合约乘数只能来自行情元数据，不能写死。
-
 9. Futu 期权链如提供统一查询入口，必须保留 `timestamp`，并输出 `timestamp`、`underlying`、`spot`、`option_symbol`、`option_type`、`strike`、`expiry`、`bid`、`ask`、`last`、`volume`、`open_interest`、`iv`、`delta`、`gamma`、`theta`、`vega`、`rho`、`contract_multiplier`、`currency`。重复、过期、缺少关键字段或合约乘数时必须失败关闭，不能静默补成普通股票或乘数 1。
+10. ThetaData Provider 使用可选 `thetadata` SDK，令牌优先从 `THETADATA_API_KEY` 环境变量或 `configs/providers.py` 的 `THETADATA_TOKEN` 读取，也可运行时安全注入；应调用 `stock_history_*` 与 `option_history_*` 历史接口，不得用快照伪造历史。OCC 期权代码须解析为根代码、到期日、方向和行权价；日期/epoch 与 `date + ms_of_day` 必须正确转换，SDK 调用必须有界超时，返回字段缺失时安全降级。标准订阅调用期权链时应回退一阶 Greeks 并合并 OHLC/OI，明确标记缺失字段。
+11. `CACHE_DATA=True` 时，DataManager 对单一显式在线 `data_source` 优先复用覆盖完整请求窗口的 CSV；缺口或 `refresh=True` 才访问在线 Provider 并合并写回。多 Provider 链和未指定数据源的默认责任链不得因缓存改变顺序。
 
 ## 输出格式
 1. 输出完整 Python 文件代码。

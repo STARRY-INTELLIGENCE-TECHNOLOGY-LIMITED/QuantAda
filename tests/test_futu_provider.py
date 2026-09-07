@@ -108,7 +108,7 @@ def test_futu_get_data_standardizes_history_and_preserves_metadata():
     assert kwargs['start'] == '2024-01-01'
     assert kwargs['end'] == '2024-01-03'
     assert kwargs['autype'] == getattr(futu_module.AuType, 'QFQ', 'qfq')
-    assert kwargs['max_count'] is None
+    assert kwargs['max_count'] == 1000
 
 
 def test_futu_intraday_request_preserves_seconds_and_uses_native_period():
@@ -244,7 +244,134 @@ def test_futu_option_history_uses_unadjusted_prices():
     assert context.history_calls[0][1]['autype'] == getattr(futu_module.AuType, 'NONE', 'None')
 
 
-def test_futu_option_history_falls_back_to_event_contract_api_and_keeps_multiplier():
+def test_futu_option_history_rejects_unsupported_native_periods():
+    context = FakeQuoteContext(history=_history_frame())
+    provider = FutuDataProvider(quote_ctx=context)
+
+    assert provider.get_data(
+        'US.AAPL210115C185000',
+        timeframe='Minutes',
+        compression=3,
+    ) is None
+    assert context.history_calls == []
+
+
+def test_futu_history_kline_uses_official_page_key_for_option_history():
+    first = pd.DataFrame({
+        'time_key': ['2024-01-01'],
+        'open': [1.0], 'high': [1.1], 'low': [0.9], 'close': [1.0], 'volume': [10],
+    })
+    second = pd.DataFrame({
+        'time_key': ['2024-01-02'],
+        'open': [1.0], 'high': [1.2], 'low': [0.8], 'close': [1.1], 'volume': [12],
+    })
+
+    class PagedOptionContext(FakeQuoteContext):
+        def __init__(self):
+            super().__init__(history=None, snapshot=pd.DataFrame([{
+                'code': 'US.AAPL210115C185000',
+                'option_contract_multiplier': 100.0,
+            }]))
+
+        def request_history_kline(self, code, **kwargs):
+            self.history_calls.append((code, kwargs))
+            if kwargs.get('page_req_key') is None:
+                return 0, first, b'NEXT'
+            return 0, second, None
+
+    context = PagedOptionContext()
+    provider = FutuDataProvider(quote_ctx=context)
+    result = provider.get_data('US.AAPL210115C185000')
+
+    assert result is not None
+    assert len(result) == 2
+    assert len(context.history_calls) == 2
+    assert context.history_calls[0][1]['max_count'] == 1000
+    assert context.history_calls[1][1]['page_req_key'] == b'NEXT'
+
+
+def test_futu_history_pagination_has_safety_bound():
+    class EndlessContext(FakeQuoteContext):
+        def request_history_kline(self, code, **kwargs):
+            self.history_calls.append((code, kwargs))
+            return 0, pd.DataFrame({
+                'time_key': ['2024-01-01'], 'open': [1.0], 'high': [1.1],
+                'low': [0.9], 'close': [1.0], 'volume': [1],
+            }), f"NEXT-{len(self.history_calls)}"
+
+    context = EndlessContext()
+    provider = FutuDataProvider(quote_ctx=context)
+
+    assert provider.get_data('SHSE.600519', '20240101', '20240102') is None
+    assert len(context.history_calls) == futu_module._MAX_HISTORY_PAGES
+
+
+def test_futu_get_data_merges_history_with_current_option_snapshot_when_end_is_future():
+    history = pd.DataFrame({
+        'time_key': ['2026-09-05'],
+        'open': [1.0], 'high': [1.1], 'low': [0.9], 'close': [1.0], 'volume': [10],
+    })
+    option = 'US.AAPL260909P205000'
+    context = FakeQuoteContext(
+        history=history,
+        snapshot=pd.DataFrame([{
+            'code': option,
+            'update_time': '2026-09-06 10:00:00',
+            'open_price': 1.1,
+            'high_price': 1.2,
+            'low_price': 1.0,
+            'last_price': 1.15,
+            'volume': 20,
+            'option_contract_multiplier': 100,
+        }]),
+    )
+    provider = FutuDataProvider(quote_ctx=context)
+
+    result = provider.get_data(
+        option,
+        start_date='2026-09-01',
+        end_date='2099-01-01',
+    )
+
+    assert result is not None
+    assert len(result) == 2
+    assert result.attrs['future_data_unavailable'] is True
+    assert result.iloc[-1]['close'] == 1.15
+
+
+def test_futu_get_data_merges_stock_snapshot_with_explicit_adjustment_marker():
+    context = FakeQuoteContext(
+        history=pd.DataFrame({
+            'time_key': ['2026-09-05'],
+            'open': [100.0], 'high': [101.0], 'low': [99.0],
+            'close': [100.5], 'volume': [1000],
+        }),
+        snapshot=pd.DataFrame([{
+            'code': 'US.AAPL',
+            'update_time': '2026-09-06 10:00:00',
+            'open_price': 101.0,
+            'high_price': 102.0,
+            'low_price': 100.0,
+            'last_price': 101.5,
+            'volume': 1200,
+        }]),
+    )
+    provider = FutuDataProvider(quote_ctx=context)
+
+    result = provider.get_data(
+        'US.AAPL',
+        start_date='2026-09-01',
+        end_date='2099-01-01',
+    )
+
+    assert result is not None
+    assert len(result) == 2
+    assert result.attrs['future_data_unavailable'] is True
+    assert result.attrs['current_snapshot_unadjusted'] is True
+    assert result.iloc[-1]['close'] == 101.5
+
+
+def test_futu_option_history_does_not_use_event_contract_api_fallback():
     class EventContractContext(FakeQuoteContext):
         def __init__(self):
             super().__init__(history=None, snapshot=pd.DataFrame([
@@ -275,12 +402,9 @@ def test_futu_option_history_falls_back_to_event_contract_api_and_keeps_multipli
 
     result = provider.get_data('US.AAPL210115C185000')
 
-    assert result is not None
+    assert result is None
     assert len(context.history_calls) == 1
-    assert len(context.event_history_calls) == 1
-    assert context.event_history_calls[0][0] == 'US.AAPL210115C185000'
-    assert result.attrs['contract_multiplier'] == 100.0
-    assert result['contract_multiplier'].iloc[-1] == 100.0
+    assert len(context.event_history_calls) == 0
 
 
 def test_futu_option_history_without_multiplier_is_excluded():
@@ -371,6 +495,100 @@ def test_futu_option_chain_records_contracts_for_future_history_calls():
     assert context.option_chain_calls[0][1]['start'] == '2024-01-01'
     assert context.option_chain_calls[0][1]['end'] == '2024-01-03'
     assert context.history_calls[0][1]['autype'] == getattr(futu_module.AuType, 'NONE', 'None')
+
+
+def test_futu_normalized_option_chain_batches_snapshot_requests_over_400_codes():
+    codes = [f'US.AAPL260918P{index:06d}' for index in range(401)]
+    chain = pd.DataFrame({
+        'code': codes,
+        'option_type': ['PUT'] * len(codes),
+        'strike_time': ['2026-09-18'] * len(codes),
+        'strike_price': [300.0] * len(codes),
+    })
+
+    class BatchContext(FakeQuoteContext):
+        def __init__(self):
+            super().__init__(option_chain=chain)
+            self.snapshot_batch_sizes = []
+
+        def get_market_snapshot(self, codes):
+            self.snapshot_batch_sizes.append(len(codes))
+            return 0, pd.DataFrame([
+                {
+                    'code': code,
+                    'last_price': 1.0,
+                    'bid_price': 0.9,
+                    'ask_price': 1.1,
+                    'volume': 1,
+                    'option_open_interest': 1,
+                    'option_implied_volatility': 0.2,
+                    'option_delta': -0.1,
+                    'option_gamma': 0.01,
+                    'option_theta': -0.01,
+                    'option_vega': 0.01,
+                    'option_rho': -0.01,
+                    'option_contract_multiplier': 100,
+                    'update_time': '2026-09-06 10:00:00',
+                }
+                for code in codes
+            ])
+
+    context = BatchContext()
+    provider = FutuDataProvider(quote_ctx=context)
+    result = provider.get_option_chain_normalized(
+        'US.AAPL',
+        timestamp='2026-09-06T10:00:00Z',
+    )
+
+    assert result is not None
+    assert max(context.snapshot_batch_sizes) <= 400
+    assert len(context.snapshot_batch_sizes) >= 2
+
+
+def test_futu_normalized_historical_option_chain_requires_as_of():
+    chain = pd.DataFrame({
+        'code': ['US.AAPL260918P320000'],
+        'option_type': ['PUT'],
+        'strike_time': ['2026-09-18'],
+        'strike_price': [320.0],
+    })
+    context = FakeQuoteContext(
+        option_chain=chain,
+        snapshot=pd.DataFrame([{
+            'code': 'US.AAPL260918P320000', 'last_price': 3.2,
+            'bid_price': 3.1, 'ask_price': 3.3, 'volume': 1,
+            'option_open_interest': 1, 'option_implied_volatility': 0.2,
+            'option_delta': -0.2, 'option_gamma': 0.01,
+            'option_theta': -0.01, 'option_vega': 0.01, 'option_rho': -0.01,
+            'option_contract_multiplier': 100, 'update_time': '2026-09-01 10:00:00',
+        }]),
+    )
+    provider = FutuDataProvider(quote_ctx=context)
+
+    assert provider.get_option_chain_normalized(
+        'US.AAPL', start='2026-09-01', end='2026-09-02'
+    ) is None
+
+
+def test_futu_option_chain_rejects_incomplete_snapshot_batch():
+    chain = pd.DataFrame({
+        'code': [f'US.AAPL260918P{index:06d}' for index in range(401)],
+        'option_type': ['PUT'] * 401,
+        'strike_time': ['2026-09-18'] * 401,
+        'strike_price': [300.0] * 401,
+    })
+
+    class PartialBatchContext(FakeQuoteContext):
+        def get_market_snapshot(self, codes):
+            if len(self.snapshot_calls) == 1:
+                self.snapshot_calls.append(codes)
+                return 1, None
+            return super().get_market_snapshot(codes)
+
+    context = PartialBatchContext(option_chain=chain)
+    provider = FutuDataProvider(quote_ctx=context)
+
+    assert provider.get_option_chain_normalized('US.AAPL') is None
 
 
 def test_futu_snapshot_and_basicinfo_normalize_codes():

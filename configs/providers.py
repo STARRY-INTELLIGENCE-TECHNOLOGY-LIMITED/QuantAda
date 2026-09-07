@@ -9,3 +9,6 @@ SXSC_TUSHARE_TOKEN = 'your_token_here'
 
 # Tiingo API 令牌；未配置时 Provider 会安全跳过。
 TIINGO_TOKEN = 'your_token_here'
+
+# Thetadata API 令牌；未配置时 Provider 会安全跳过。
+THETADATA_TOKEN = 'your_token_here'

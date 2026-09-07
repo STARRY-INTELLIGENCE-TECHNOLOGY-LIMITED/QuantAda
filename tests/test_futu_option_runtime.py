@@ -51,6 +51,19 @@ def test_put_delta_filter_uses_signed_delta_and_target_distance():
     assert row['option_symbol'] == 'US.AAPL261016P300000'
 
 
+def test_option_selector_respects_configured_dte_bounds():
+    chain = _chain()
+
+    row = select_option_contract(
+        chain,
+        option_type='PUT',
+        min_dte=30,
+        max_dte=45,
+        now='2026-09-01T00:00:00Z',
+    )
+    assert row['option_symbol'] == 'US.AAPL261016P310000'
+
+
 def test_chain_refresh_rejects_stale_or_caller_only_historical_timestamp():
     class Provider:
         def get_option_chain_normalized(self, *_args, **_kwargs):

@@ -52,7 +52,7 @@
 5. 多账户 adapter 必须让现金、持仓、pending 与下单使用同一明确账户范围。GM adapter 当前只支持券商会话绑定的单一账户，使用 SDK 默认单账户语义，不增加账户选择配置；IB 等多账户 adapter 仍须按其连接配置明确筛选目标账户。已明确筛选目标账户后，其他账户有仓而目标账户为空是合法的零仓，不得误报为快照故障。
 6. 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；adapter 不应自行实现固定 sleep、轮询补买或卖后现金等待状态机。
 7. 为支持通用卖后现金等待，adapter 只需保证:
-- `get_rebalance_cash()` 或 `get_cash()` 返回当前真实可用于调仓的现金口径
+- `get_rebalance_cash()` 或 `get_cash()` 返回当前真实可用于调仓的现金口径；如期权担保/保证金会改变持仓市值盘点，可提供 `get_rebalance_position_value(data, signed_size, price, market_value)`，由 Broker 自己解释其风险口径。
 - `get_current_price(data)` 能返回当前估算价格
 - 卖单返回的 OrderProxy 可被执行器推断单笔委托数量，优先暴露 `submitted_size` / `requested_size`，或让原始对象保留在 `platform_order.volume` / `raw_order.volume` / `trade.order.totalQuantity`
 - `submitted_size` / `requested_size` 只能表示该代理对应的单笔委托数量；基础层拆单批次总量使用 `batch_submitted_size`

@@ -124,8 +124,11 @@ def test_strategy_isolated_capital_does_not_double_count_csp_collateral():
         def get_contract_multiplier(self, data):
             return 100.0
 
-        def get_csp_uncommitted_cash(self):
+        def get_rebalance_cash(self):
             return 1000.0
+
+        def get_rebalance_position_value(self, data, signed_size, price, market_value):
+            return 0.0
 
     broker = CspBroker(cash=10000.0, rebalance_cash=10000.0, datas=[option])
     strategy = DummyStrategy(broker=broker, params={})
@@ -142,12 +145,21 @@ def test_strategy_isolated_capital_fallbacks_to_get_cash_on_rebalance_error(monk
     get_rebalance_cash 异常时，策略层应回退 get_cash，不能中断调仓流程。
     """
     broker = DummyBroker(cash=1000.0, rebalance_cash=None)
+    broker.is_live = False
     strategy = DummyStrategy(broker=broker, params={})
 
     allocatable, _ = strategy.get_strategy_isolated_capital()
 
     # fallback：get_cash + 受管市值 managed_market_value = 1000 + 300。
     assert allocatable == pytest.approx(1300.0), "rebalance 口径异常时应回退到 get_cash 口径。"
+
+
+def test_strategy_isolated_capital_fails_closed_on_live_rebalance_cash_error():
+    broker = DummyBroker(cash=1000.0, rebalance_cash=None)
+    strategy = DummyStrategy(broker=broker, params={})
+
+    with pytest.raises(RuntimeError, match="获取调仓资金口径失败"):
+        strategy.get_strategy_isolated_capital()
 
 
 def test_strategy_isolated_capital_backtest_ignores_pending_orders(monkeypatch):

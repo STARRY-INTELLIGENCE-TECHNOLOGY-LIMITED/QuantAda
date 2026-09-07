@@ -19,6 +19,8 @@ _PLATFORM_DEFAULT_SOURCES = {
     'gm_broker': 'gm',
     'futu': 'futu',
     'futu_broker': 'futu',
+    'theta': 'theta',
+    'thetadata': 'theta',
 }
 
 
@@ -145,7 +147,23 @@ class DataManager:
             if not providers_to_use:
                 print(f"Error: None of the specified sources '{specified_sources}' are valid.")
                 return None
-            final_df = self._fetch_from_providers(symbol, start_date, end_date, providers_to_use, timeframe, compression)
+            # 单一在线 Provider 显式指定时，优先复用完整本地缓存；多 Provider
+            # 仍严格保持调用方给出的责任链顺序，避免缓存改变 fallback 语义。
+            if len(source_names) == 1 and source_names[0] != 'csv':
+                final_df = self._load_complete_cache(
+                    symbol,
+                    start_date,
+                    end_date,
+                    timeframe,
+                    compression,
+                    refresh,
+                )
+            else:
+                final_df = None
+            if final_df is not None and not final_df.empty:
+                print(f"Using complete cached data for {symbol}.")
+            else:
+                final_df = self._fetch_from_providers(symbol, start_date, end_date, providers_to_use, timeframe, compression)
 
         # 路径二: 执行默认的责任链逻辑
         else:
@@ -198,6 +216,81 @@ class DataManager:
         print(f"Error: All data providers failed for symbol {symbol}.")
         return None
 
+    def _load_complete_cache(self, symbol, start_date, end_date, timeframe, compression, refresh):
+        """读取覆盖请求窗口的缓存；缺口或刷新请求均返回 None。"""
+        if not getattr(config, 'CACHE_DATA', False) or refresh:
+            return None
+        try:
+            cached = CsvDataProvider(self.data_path).get_data(
+                symbol,
+                timeframe=timeframe,
+                compression=compression,
+            )
+        except Exception as exc:
+            print(f"Failed to read cache for {symbol}: {exc}")
+            return None
+        if cached is None or cached.empty:
+            return None
+        index = pd.to_datetime(cached.index, errors='coerce')
+        index = index[~index.isna()]
+        if len(index) == 0:
+            return None
+
+        def boundary(value, is_end=False):
+            if value is None or str(value).strip() == '':
+                return None
+            result = pd.Timestamp(value)
+            is_intraday = str(timeframe or '').strip().lower() in {
+                'minutes', 'minute', 'min', 'm', 'seconds', 'second', 'sec', 's',
+            }
+            if is_end and is_intraday and not re.search(r'[T\s]\d', str(value).strip()):
+                result = result + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+            return result
+
+        try:
+            start_bound = boundary(start_date)
+            end_bound = boundary(end_date, is_end=True)
+            index_tz = getattr(index, 'tz', None)
+            is_intraday = str(timeframe or '').strip().lower() in {
+                'minutes', 'minute', 'min', 'm', 'seconds', 'second', 'sec', 's',
+            }
+            start_date_only = bool(
+                start_date is not None
+                and not re.search(r'[T\s]\d', str(start_date).strip())
+            )
+            end_date_only = bool(
+                end_date is not None
+                and not re.search(r'[T\s]\d', str(end_date).strip())
+            )
+
+            def align(value):
+                if value is None:
+                    return None
+                if index_tz is not None:
+                    return value.tz_localize(index_tz) if value.tzinfo is None else value.tz_convert(index_tz)
+                return value.tz_convert(None) if value.tzinfo is not None else value
+
+            cache_min = index.min()
+            cache_max = index.max()
+            start_compare = align(start_bound)
+            end_compare = align(end_bound)
+            if is_intraday and start_date_only and start_compare is not None:
+                start_compare = start_compare.normalize()
+                cache_min = cache_min.normalize()
+            if is_intraday and end_date_only and end_compare is not None:
+                end_compare = end_compare.normalize()
+                cache_max = cache_max.normalize()
+            if start_compare is not None and cache_min > start_compare:
+                print(f"Cache incomplete for {symbol}: starts at {cache_min}, requested {start_bound}.")
+                return None
+            if end_compare is not None and cache_max < end_compare:
+                print(f"Cache incomplete for {symbol}: ends at {cache_max}, requested {end_bound}.")
+                return None
+        except Exception as exc:
+            print(f"Invalid cache boundary for {symbol}: {exc}")
+            return None
+        return cached
+
     def _get_data_smart(self, symbol, start_date, end_date, timeframe: str, compression: int, refresh: bool):
         """
         默认链路不再使用 CSV 缓存，除非显式指定 data_source=csv。
@@ -237,14 +330,39 @@ class DataManager:
         return None
 
     def _cache_data(self, df: pd.DataFrame, symbol: str, timeframe: str = 'Days', compression: int = 1):
-        """将DataFrame完整写入CSV文件（覆盖）"""
+        """将数据按时间索引与既有缓存合并后写入，避免分段下载覆盖历史。"""
         if not getattr(config, 'CACHE_DATA', False):
             return
         if not os.path.exists(self.data_path):
             os.makedirs(self.data_path)
         csv_filepath = CsvDataProvider.get_cache_filepath(self.data_path, symbol, timeframe, compression)
+        temp_filepath = None
         try:
-            df.to_csv(csv_filepath, mode='w')
+            incoming = df.copy()
+            incoming.index = pd.to_datetime(incoming.index, errors='coerce', utc=True).tz_localize(None)
+            incoming = incoming[~incoming.index.isna()]
+            if os.path.isfile(csv_filepath):
+                try:
+                    existing = pd.read_csv(csv_filepath, index_col='datetime', parse_dates=True)
+                    existing.index = pd.to_datetime(existing.index, errors='coerce', utc=True).tz_localize(None)
+                    merged = pd.concat([existing, incoming], axis=0, sort=False)
+                except Exception as cache_error:
+                    print(f"缓存文件损坏，将以本次有效数据重建 {csv_filepath}: {cache_error}")
+                    merged = incoming
+            else:
+                merged = incoming
+            merged.index = pd.to_datetime(merged.index, errors='coerce', utc=True).tz_localize(None)
+            merged = merged[~merged.index.isna()]
+            merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+            merged.index.name = 'datetime'
+            temp_filepath = f"{csv_filepath}.tmp"
+            merged.to_csv(temp_filepath, mode='w')
+            os.replace(temp_filepath, csv_filepath)
             print(f"Data for {symbol} cached to {csv_filepath}")
         except Exception as e:
+            if temp_filepath and os.path.isfile(temp_filepath):
+                try:
+                    os.remove(temp_filepath)
+                except OSError:
+                    pass
             print(f"Failed to cache data for {symbol}: {e}")

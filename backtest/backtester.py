@@ -21,6 +21,12 @@ from common.order_quantity import align_quantity_down, normalize_quantity_step
 
 def _extract_contract_multiplier(data) -> float:
     """从 DataFeed 或其原始 DataFrame 读取现金名义乘数。"""
+    try:
+        from common.options.analytics import parse_option_symbol
+
+        is_option = bool(parse_option_symbol(getattr(data, '_name', '')).get('option_type'))
+    except Exception:
+        is_option = False
     sources = [data, getattr(data, 'p', None)]
     dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
     # 期权专属字段优先，避免 DataFeed 默认 contract_multiplier=1 吞掉原始表中的真实乘数。
@@ -60,12 +66,16 @@ def _extract_contract_multiplier(data) -> float:
         for source in sources:
             multiplier = parse_values(read_values(source, names))
             if multiplier is not None:
+                if is_option and names == ('contract_multiplier', 'contract_size') and multiplier <= 1:
+                    continue
                 return multiplier
         if not isinstance(dataframe, pd.DataFrame):
             continue
         attrs = getattr(dataframe, 'attrs', {}) or {}
         multiplier = parse_values(read_values(attrs, names))
         if multiplier is not None:
+            if is_option and names == ('contract_multiplier', 'contract_size') and multiplier <= 1:
+                continue
             return multiplier
         for name in names:
             if name not in dataframe.columns:
@@ -73,7 +83,13 @@ def _extract_contract_multiplier(data) -> float:
             values = pd.to_numeric(dataframe[name], errors='coerce').dropna()
             multiplier = parse_values(reversed(values.tolist()))
             if multiplier is not None:
+                if is_option and names == ('contract_multiplier', 'contract_size') and multiplier <= 1:
+                    continue
                 return multiplier
+    # 期权缺少现金名义乘数时必须失败关闭，不能把普通股票的 1 倍
+    # 默认值带入担保金额、手续费或持仓估值。
+    if is_option:
+        return 0.0
     return 1.0
 
 
@@ -168,10 +184,10 @@ class BacktraderStrategyWrapper(bt.Strategy):
         self.expected_freed_cash = 0.0
         # 本轮循环已花费的虚拟现金
         self.virtual_spent_cash = 0.0
-            # 已提交但尚未在持仓快照中体现的 CSP 指派义务。
+        # 已提交但尚未在持仓快照中体现的期权现金义务。
         # 回测撮合通常同步完成，但 Backtrader 的通知与策略回调仍可能跨一个
         # bar，必须按订单生命周期保留该短期账本，防止同一 bar 重复卖开。
-        self._csp_order_reservations = {}
+        self._option_cash_reservations = {}
         self.dataclose = self.datas[0].close
         self.strategy = strategy_class(broker=self, params=params)
         self.risk_controls = []
@@ -197,8 +213,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
         return self.broker.getcash()
 
     def get_rebalance_cash(self):
-        """返回回测调仓口径的现金，并扣除 Short Put 指派义务。"""
-        return self.get_csp_uncommitted_cash()
+        """返回回测调仓口径的现金，并扣除已知期权现金义务。"""
+        return self.get_option_uncommitted_cash()
 
     def getvalue(self):
         """代理调用真实 Broker 的 getvalue，并启用全局缓存拦截"""
@@ -214,8 +230,22 @@ class BacktraderStrategyWrapper(bt.Strategy):
         """返回 DataFeed 元数据声明的每份合约现金乘数。"""
         return _extract_contract_multiplier(data)
 
-    def get_csp_uncommitted_cash(self):
-        """回测路径按已成交短 Put 义务计算严格 CSP 可用现金。"""
+    def get_rebalance_position_value(self, data, signed_size, price, market_value):
+        """返回调仓资金盘点使用的持仓价值，按 Broker 担保口径调整。"""
+        if float(signed_size) < 0:
+            try:
+                from common.options.analytics import parse_option_symbol
+
+                option_type = parse_option_symbol(getattr(data, '_name', '')).get('option_type')
+                if option_type == 'PUT':
+                    # Short Put 的指派现金已由 get_option_uncommitted_cash 扣除。
+                    return 0.0
+            except Exception:
+                pass
+        return float(market_value)
+
+    def get_option_uncommitted_cash(self):
+        """按已确认期权现金义务计算可用于新增仓位的现金。"""
         from common.options.cash import uncommitted_cash
 
         short_puts = []
@@ -251,13 +281,16 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 strike = strike if strike is not None else parsed.get('strike')
             if option_type not in {'PUT', 'P'} or strike is None:
                 continue
-            short_puts.append({
-                'strike': strike,
-                'contracts': abs(position.size),
-                'contract_multiplier': self.get_contract_multiplier(data),
-            })
+            # 只有 Short Put 产生现金担保义务；Covered Call 的担保事实
+            # 是标的股数，不应被误扣成 Strike×Multiplier 现金。
+            if option_type in {'PUT', 'P'}:
+                short_puts.append({
+                    'strike': strike,
+                    'contracts': abs(position.size),
+                    'contract_multiplier': self.get_contract_multiplier(data),
+                })
         pending_short_puts = []
-        for reservation in self._csp_order_reservations.values():
+        for reservation in self._option_cash_reservations.values():
             remaining = float(reservation.get('remaining', 0.0))
             if remaining <= 0:
                 continue
@@ -272,6 +305,10 @@ class BacktraderStrategyWrapper(bt.Strategy):
             pending_short_puts=pending_short_puts,
         ))
 
+    def get_csp_uncommitted_cash(self):
+        """兼容旧 CSP 策略的现金入口。"""
+        return self.get_option_uncommitted_cash()
+
     def submit_option_order(self, data, volume, order_effect, price=None, **kwargs):
         """回测中提供显式期权效果入口；生命周期事件仍需单独建模。"""
         from common.options.contracts import (
@@ -279,6 +316,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             normalize_option_order_effect,
             validate_option_order_effect,
         )
+        from common.options.risk import compute_option_margin
 
         try:
             effect = normalize_option_order_effect(order_effect)
@@ -300,27 +338,66 @@ class BacktraderStrategyWrapper(bt.Strategy):
             self._last_order_target_skip_reason = 'unsupported_option_order_effect'
             return None
 
+        if effect == 'BUY_TO_OPEN':
+            try:
+                execution_price = float(price if price is not None else data.close[0])
+                multiplier = float(self.get_contract_multiplier(data))
+                commission_ratio = float(self.broker.getcommissioninfo(data).p.commission)
+                required = (
+                    quantity
+                    * execution_price
+                    * multiplier
+                    * (1.0 + self.slippage)
+                    * (1.0 + commission_ratio)
+                )
+                if (
+                    not math.isfinite(required)
+                    or required < 0
+                    or not math.isfinite(multiplier)
+                    or multiplier <= 0
+                    or self.get_option_uncommitted_cash() < required
+                ):
+                    self._last_order_target_skip_reason = 'option_cash_insufficient'
+                    return None
+            except (TypeError, ValueError, OverflowError):
+                self._last_order_target_skip_reason = 'invalid_option_cash_requirement'
+                return None
+
         if effect == 'SELL_TO_OPEN':
             risk_leg = kwargs.get('risk_leg')
             if risk_leg is None:
-                self._last_order_target_skip_reason = 'csp_risk_leg_missing'
+                self._last_order_target_skip_reason = 'option_risk_leg_missing'
                 return None
-            from common.options.cash import assignment_cash
-
-            available = self.get_csp_uncommitted_cash()
             try:
                 option_type = str(getattr(risk_leg, 'option_type', '')).upper()
                 signed_quantity = float(getattr(risk_leg, 'signed_quantity'))
                 strike = float(getattr(risk_leg, 'strike'))
                 multiplier = float(getattr(risk_leg, 'contract_multiplier'))
-                if option_type not in {'PUT', 'P'} or signed_quantity >= 0:
-                    raise ValueError('SELL_TO_OPEN backtest only supports signed short Put')
-                required = float(assignment_cash(strike, quantity, multiplier))
+                if signed_quantity >= 0 or abs(signed_quantity) < quantity:
+                    raise ValueError('SELL_TO_OPEN risk leg must cover the requested short quantity')
+                if option_type in {'PUT', 'P'}:
+                    from common.options.cash import assignment_cash
+
+                    available = self.get_option_uncommitted_cash()
+                    required = float(assignment_cash(strike, quantity, multiplier))
+                    if available < required:
+                        # 保留旧 CSP skip reason，便于现有 recorder/策略诊断兼容。
+                        self._last_order_target_skip_reason = 'csp_assignment_cash_insufficient'
+                        return None
+                elif option_type in {'CALL', 'C'}:
+                    compute_option_margin(
+                        [risk_leg],
+                        cash=max(0.0, float(self.getcash())),
+                        underlying_positions=kwargs.get('underlying_positions') or {},
+                    )
+                    required = 0.0
+                else:
+                    raise ValueError('unsupported short option type')
             except (TypeError, ValueError, OverflowError):
-                self._last_order_target_skip_reason = 'invalid_csp_risk_leg'
+                self._last_order_target_skip_reason = 'invalid_option_risk_leg'
                 return None
-            if available < required:
-                self._last_order_target_skip_reason = 'csp_assignment_cash_insufficient'
+            except Exception:
+                self._last_order_target_skip_reason = 'option_collateral_insufficient'
                 return None
             order = self.sell(data=data, size=quantity, price=price)
             if order is None:
@@ -328,20 +405,21 @@ class BacktraderStrategyWrapper(bt.Strategy):
             try:
                 order.addinfo(
                     option_order_effect=effect,
-                    csp_assignment_cash=required,
-                    csp_strike=strike,
-                    csp_contract_multiplier=multiplier,
-                    csp_requested_quantity=quantity,
+                    option_assignment_cash=required,
+                    option_strike=strike,
+                    option_contract_multiplier=multiplier,
+                    option_requested_quantity=quantity,
                 )
             except Exception:
                 pass
-            self._csp_order_reservations[str(order.ref)] = {
-                'strike': strike,
-                'contract_multiplier': multiplier,
-                'remaining': quantity,
-                'initial': quantity,
-                'data': data,
-            }
+            if option_type in {'PUT', 'P'}:
+                self._option_cash_reservations[str(order.ref)] = {
+                    'strike': strike,
+                    'contract_multiplier': multiplier,
+                    'remaining': quantity,
+                    'initial': quantity,
+                    'data': data,
+                }
             return order
         if effect == 'BUY_TO_CLOSE':
             return self.buy(data=data, size=quantity, price=price)
@@ -412,7 +490,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         return order
 
     def notify_order(self, order):
-        reservation = self._csp_order_reservations.get(str(getattr(order, 'ref', '')))
+        reservation = self._option_cash_reservations.get(str(getattr(order, 'ref', '')))
         if reservation is not None:
             status = getattr(order, 'status', None)
             terminal = status in {
@@ -423,7 +501,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 getattr(order, 'Rejected', object()),
             }
             if terminal:
-                self._csp_order_reservations.pop(str(order.ref), None)
+                self._option_cash_reservations.pop(str(order.ref), None)
             else:
                 executed = abs(float(getattr(order.executed, 'size', 0.0) or 0.0))
                 requested = float(reservation.get('initial', reservation.get('remaining', 0.0)))
@@ -479,7 +557,11 @@ class BacktraderStrategyWrapper(bt.Strategy):
         if delta_shares > 0:  # 买入
             # 获取可用现金
             # 可用现金 = 账户当前现金 + 本次循环中卖单预计回笼的资金
-            current_cash = self.broker.getcash()
+            # Short Put 指派义务是不可动用的现金；普通买单也不能穿透该隔离。
+            current_cash = min(
+                self.broker.getcash(),
+                self.get_option_uncommitted_cash(),
+            )
             total_purchasing_power = current_cash + self.expected_freed_cash - self.virtual_spent_cash
 
             # 估算包含手续费/滑点的最大购买量 (假设 commission 是比例，如 0.0003)
@@ -568,7 +650,11 @@ class BacktraderStrategyWrapper(bt.Strategy):
         # 4. 执行下单逻辑 (逻辑复用 order_target_percent)
         if delta_shares > 0:  # 买入
             # 获取可用现金 (含本次循环预计释放的资金)
-            current_cash = self.broker.getcash()
+            # Short Put 指派义务是不可动用的现金；普通买单也不能穿透该隔离。
+            current_cash = min(
+                self.broker.getcash(),
+                self.get_option_uncommitted_cash(),
+            )
 
             # 2. 计算动态购买力
             # 公式: 静态现金 + 卖出回笼 - [新增]本轮已花掉的钱

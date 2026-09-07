@@ -204,3 +204,38 @@ def test_futu_csp_cash_is_rebuilt_from_short_positions_and_pending_orders():
     )
     assert rejected is None
     assert broker._last_order_target_skip_reason == 'unsupported_option_order_effect'
+
+
+def test_futu_csp_cash_ignores_margin_buying_power_and_uses_cash_field():
+    class PowerOnly(_Trade):
+        def accinfo_query(self, **_kwargs):
+            return 0, pd.DataFrame([{
+                'usd_net_cash_power': 100_000,
+                'available_funds': 'N/A',
+                'cash': 5_000,
+                'total_assets': 100_000,
+            }])
+
+    broker, _ = _broker()
+    broker._trade_ctx = PowerOnly()
+    broker.trade_ctx = broker._trade_ctx
+    broker.trd_ctx = broker._trade_ctx
+
+    assert broker.get_csp_uncommitted_cash() == 5_000
+
+
+def test_futu_non_option_rebalance_keeps_normal_cash_semantics():
+    class PowerOnly(_Trade):
+        def accinfo_query(self, **_kwargs):
+            return 0, pd.DataFrame([{
+                'usd_net_cash_power': 100_000,
+                'available_funds': 'N/A',
+                'total_assets': 100_000,
+            }])
+
+    broker, _ = _broker()
+    broker._trade_ctx = PowerOnly()
+    broker.trade_ctx = broker._trade_ctx
+    broker.trd_ctx = broker._trade_ctx
+
+    assert broker.get_rebalance_cash() == 100_000

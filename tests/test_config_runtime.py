@@ -6,6 +6,7 @@ def test_config_facade_exports_public_subconfig_groups():
 
     assert config.LOT_SIZE == 1
     assert config.TIINGO_TOKEN == "your_token_here"
+    assert config.THETADATA_TOKEN == "your_token_here"
     assert config.ALARM_LEVEL == "INFO"
     assert config.IBKR_PORT == 7497
     assert config.GM_BROKER_ENVIRONMENTS["gm_broker"]["sim"]["schedule"] == "1d:14:45:00"
@@ -15,6 +16,7 @@ def test_config_facade_exports_public_subconfig_groups():
     assert config.FUTU_RSA_KEY_PATH == ''
     assert config.FUTU_TRADE_ENV == 'SIMULATE'
     assert config.FUTU_ACCOUNT_ID == 0
+    assert not hasattr(config, 'THETADATA_API_KEY')
     assert config.FUTU_BROKER_ENVIRONMENTS['futu_broker']['sim']['trd_env'] == 'SIMULATE'
     assert config.BROKER_ENVIRONMENTS["ib_broker"]["real"]["timezone"] == "America/New_York"
     assert config.has_alarm_webhook() is False

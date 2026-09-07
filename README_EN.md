@@ -81,6 +81,12 @@ python run.py sample_auto_rebalance_strategy --symbols=SZSE.159915 --params "{'s
 # Use the CSV cache or force a refresh
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --data_source csv
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --refresh
+
+# Cache an explicit online source locally for repeated backtests/optimization
+python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta --config "{'CACHE_DATA': True}"
+
+# Force an online refresh and merge it into the cache
+python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta --refresh --config "{'CACHE_DATA': True}"
 ```
 
 ### 5. Parameter Optimization (Optuna)

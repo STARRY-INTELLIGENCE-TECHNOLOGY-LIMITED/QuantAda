@@ -2,7 +2,8 @@
 
 该模块只负责行情读取和结果标准化，不负责交易下单。富途 OpenD 的
 股票、ETF 及普通衍生品使用统一历史 K 线接口；事件合约期权在标准接口
-不支持时回退专用历史接口。期权链提供额外的显式查询方法，方便策略先发现合约再调用 ``get_data`` 回测。
+失败时保持失败关闭，不把预测/事件合约专用接口误用于普通期权。期权链提供
+额外的显式查询方法，方便策略先发现合约再调用 ``get_data`` 回测。
 """
 
 import math
@@ -47,6 +48,8 @@ except Exception as exc:
 
 
 _DEFAULT_QUERY_TIMEOUT_SECONDS = 5.0
+_HISTORY_PAGE_SIZE = 1000
+_MAX_HISTORY_PAGES = 100
 _CONTEXT_INIT_TIMEOUT_SECONDS = 5.0
 _QUOTE_CONTEXT_RETRY_BACKOFF_SECONDS = 5.0
 _REQUIRED_COLUMNS = ('open', 'high', 'low', 'close', 'volume')
@@ -322,7 +325,7 @@ class FutuDataProvider(BaseDataProvider):
         return not observed_status
 
     def _request_history(self, code: str, start_date, end_date, ktype, autype):
-        """调用历史 K 线接口并统一处理返回协议。"""
+        """按官方分页协议读取历史 K 线；期权优先使用普通历史接口。"""
         context = self._get_quote_context()
         if context is None:
             return None
@@ -339,44 +342,65 @@ class FutuDataProvider(BaseDataProvider):
             'end': end_date,
             'ktype': ktype,
             'autype': autype,
-            'max_count': None,
+            'max_count': _HISTORY_PAGE_SIZE,
         }
         if fields is not None:
             kwargs['fields'] = fields
         try:
             with self._context_lock:
                 request_method = getattr(context, 'request_history_kline', None)
-                event_method = getattr(context, 'request_history_event_contract_kline', None)
-                is_option = self._is_option_symbol(code)
                 response = None
                 standard_failed = False
                 if callable(request_method):
                     try:
-                        response = request_method(code, **kwargs)
-                        standard_failed = (
-                            not isinstance(response, tuple)
-                            or len(response) < 2
-                            or response[0] != RET_OK
-                            or response[1] is None
-                            or (
-                                isinstance(response[1], pd.DataFrame)
-                                and response[1].empty
+                        pages = []
+                        page_req_key = None
+                        seen_page_keys = set()
+                        page_count = 0
+                        while True:
+                            page_count += 1
+                            if page_count > _MAX_HISTORY_PAGES:
+                                raise RuntimeError('Futu history pagination exceeded safety limit')
+                            page_kwargs = dict(kwargs)
+                            if page_req_key is not None:
+                                page_kwargs['page_req_key'] = page_req_key
+                            response = request_method(code, **page_kwargs)
+                            if (
+                                not isinstance(response, tuple)
+                                or len(response) < 2
+                                or response[0] != RET_OK
+                                or response[1] is None
+                            ):
+                                standard_failed = True
+                                break
+                            page_data = response[1]
+                            if isinstance(page_data, pd.DataFrame) and not page_data.empty:
+                                pages.append(page_data)
+                            next_key = response[2] if len(response) >= 3 else None
+                            if next_key in (None, b'', ''):
+                                break
+                            key_marker = bytes(next_key) if isinstance(next_key, bytearray) else next_key
+                            if key_marker in seen_page_keys:
+                                raise RuntimeError('Futu history pagination key repeated')
+                            seen_page_keys.add(key_marker)
+                            page_req_key = next_key
+                        if not standard_failed:
+                            response = (
+                                RET_OK,
+                                pd.concat(pages, ignore_index=True) if pages else pd.DataFrame(),
+                                None,
                             )
-                        )
+                            standard_failed = response[1].empty
                     except Exception:
                         standard_failed = True
+                        # 分页中途失败时不得把最后一页当作完整历史返回。
+                        response = None
                 else:
                     standard_failed = True
 
-                # Futu 美股期权历史行情需要事件合约专用接口；普通证券仍走标准接口。
-                if is_option and standard_failed and callable(event_method):
-                    response = event_method(
-                        code,
-                        start=start_date,
-                        end=end_date,
-                        ktype=ktype,
-                        max_count=None,
-                    )
+                # request_history_event_contract_kline 专属于预测/事件合约，
+                # 不是普通美股期权的历史 K 线回退接口。普通期权标准接口失败
+                # 时直接失败关闭，避免把权限错误误导成事件合约权限问题。
                 if response is None:
                     raise RuntimeError('Futu history K-line interface is unavailable')
         except Exception as exc:
@@ -426,6 +450,40 @@ class FutuDataProvider(BaseDataProvider):
         extras = [column for column in df.columns if column not in ordered and column != time_column]
         return df[ordered + extras]
 
+    def _current_snapshot_kline(self, symbol):
+        """把当前可验证快照转换为单根 K 线；缺字段时返回 None。"""
+        snapshot = self.get_market_snapshot([symbol])
+        if snapshot is None or snapshot.empty:
+            return None
+        row = snapshot.iloc[0]
+        timestamp = _field_value(row, ('update_time', 'time_key', 'datetime', 'time'))
+        open_price = _positive_float(_field_value(row, ('open_price', 'open')))
+        high_price = _positive_float(_field_value(row, ('high_price', 'high')))
+        low_price = _positive_float(_field_value(row, ('low_price', 'low')))
+        last_price = _positive_float(_field_value(row, ('last_price', 'last', 'price', 'close')))
+        raw_volume = _field_value(row, ('volume', 'vol'))
+        if raw_volume is None or (isinstance(raw_volume, str) and not raw_volume.strip()):
+            return None
+        try:
+            volume = float(raw_volume)
+        except (TypeError, ValueError, OverflowError):
+            volume = 0.0
+        if timestamp is None or None in (open_price, high_price, low_price, last_price):
+            return None
+        if not math.isfinite(volume) or volume < 0:
+            return None
+        if not (high_price >= max(open_price, low_price, last_price) and low_price <= min(open_price, high_price, last_price)):
+            return None
+        return pd.DataFrame([{
+            'code': symbol,
+            'time_key': timestamp,
+            'open': open_price,
+            'high': high_price,
+            'low': low_price,
+            'close': last_price,
+            'volume': volume,
+        }])
+
     @staticmethod
     def _aggregate_rows(df: pd.DataFrame, compression: int) -> pd.DataFrame:
         """对 Futu 不提供的多日周期做确定性的行级 OHLCV 聚合。"""
@@ -453,9 +511,52 @@ class FutuDataProvider(BaseDataProvider):
         if not futu_symbol:
             return None
         normalized_timeframe = str(timeframe or '').strip().lower()
+        if self._is_option_symbol(futu_symbol):
+            try:
+                option_period = int(compression or 1)
+            except (TypeError, ValueError, OverflowError):
+                print(f'[Futu] Invalid option compression: {compression!r}.')
+                return None
+            option_supported = (
+                normalized_timeframe in {'days', 'day', 'd'}
+                or (
+                    normalized_timeframe in {'minutes', 'minute', 'min', 'm'}
+                    and option_period in {1, 5, 15, 60}
+                )
+            )
+            if not option_supported:
+                print(
+                    f'[Futu] Option history supports only Days or 1/5/15/60 Minutes; '
+                    f'requested {timeframe}/{compression}.'
+                )
+                return None
         intraday = normalized_timeframe in {'minutes', 'minute', 'min', 'm'}
+        now_utc = pd.Timestamp.now(tz='UTC')
+
+        def input_bound(value, is_end=False):
+            if value is None or str(value).strip() == '':
+                return None
+            parsed = pd.Timestamp(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.tz_localize('UTC')
+            else:
+                parsed = parsed.tz_convert('UTC')
+            raw = str(value).strip()
+            if is_end and not intraday and ' ' not in raw and 'T' not in raw:
+                parsed = parsed.normalize() + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+            return parsed
+
+        requested_start = input_bound(start_date)
+        requested_end = input_bound(end_date, is_end=True)
+        crosses_current = requested_end is not None and requested_end > now_utc
+        if requested_start is not None and requested_start > now_utc:
+            # Futu 历史接口没有未来 K 线；不能用当前值伪造未来数据。
+            return None
+        history_end = end_date
+        if crosses_current:
+            history_end = now_utc.strftime('%Y-%m-%d %H:%M:%S') if intraday else now_utc.strftime('%Y-%m-%d')
         start = self._normalize_date(start_date, intraday=intraday)
-        end = self._normalize_date(end_date, intraday=intraday, end=True)
+        end = self._normalize_date(history_end, intraday=intraday, end=True)
         market_name = futu_symbol.split('.', 1)[0]
         non_adjusted = market_name in {'FX', 'HK_FUTURE', 'EC'}
         autype_name = (
@@ -468,6 +569,24 @@ class FutuDataProvider(BaseDataProvider):
         result = self._normalize_dataframe(raw_df)
         if result is None:
             return None
+        if crosses_current and not intraday:
+            # 过去到当前/未来的请求统一合并一根当前完整快照；普通股票默认
+            # 历史数据可能是 QFQ，而快照无法复权，因此显式留下口径标记。
+            current_row = self._current_snapshot_kline(futu_symbol)
+            if current_row is not None:
+                current_normalized = self._normalize_dataframe(current_row)
+                if current_normalized is not None:
+                    result = pd.concat([result, current_normalized])
+                    result = result[~result.index.duplicated(keep='last')].sort_index()
+            result.attrs['requested_end'] = requested_end
+            result.attrs['history_end'] = now_utc
+            result.attrs['future_data_unavailable'] = True
+            result.attrs['current_snapshot_unadjusted'] = autype_name != 'NONE'
+        elif crosses_current and intraday:
+            # 当前快照无法还原完整分钟/小时 OHLC，保留历史段并标记未来段未提供。
+            result.attrs['requested_end'] = requested_end
+            result.attrs['history_end'] = now_utc
+            result.attrs['future_data_unavailable'] = True
         if self._is_option_symbol(futu_symbol):
             # 历史 K 线接口不返回期权合约乘数；把同一 OpenD 快照中的合约元数据
             # 写入结果，供回测柜台按合约张数正确估值和扣款。
@@ -568,6 +687,9 @@ class FutuDataProvider(BaseDataProvider):
         code = self._normalize_symbol(underlying)
         if not code:
             return None
+        if normalized and (start is not None or end is not None) and as_of is None:
+            print(f'[Futu] Historical normalized option chains require as_of for visibility.')
+            return None
         context = self._get_quote_context()
         if context is None:
             return None
@@ -604,7 +726,12 @@ class FutuDataProvider(BaseDataProvider):
         # OpenD 链接口有时只返回合约字段，实时调用可用本次请求完成时间作为
         # 快照边界；历史调用必须由源数据提供真实 timestamp，runtime 会拒绝
         # 将调用方时间戳伪装成历史可见时间。
-        effective_timestamp = timestamp if timestamp is not None else pd.Timestamp.now(tz='UTC')
+        historical_chain = start is not None or end is not None or as_of is not None
+        effective_timestamp = (
+            None
+            if historical_chain
+            else timestamp if timestamp is not None else pd.Timestamp.now(tz='UTC')
+        )
         normalized_result = normalize_option_chain(
             result,
             code,
@@ -665,7 +792,20 @@ class FutuDataProvider(BaseDataProvider):
 
         # 期权链接口只描述合约，盘口和乘数从同一 OpenD 行情快照补全。
         if codes:
-            quote = self.get_market_snapshot(codes)
+            # Futu 单次市场快照最多接受 400 个代码；期权链常超过该上限，
+            # 必须分批查询并合并，不能把整条链一次性提交后静默失败。
+            quote_parts = []
+            quote_failed = False
+            for offset in range(0, len(codes), 400):
+                quote_part = self.get_market_snapshot(codes[offset:offset + 400])
+                if isinstance(quote_part, pd.DataFrame) and not quote_part.empty:
+                    quote_parts.append(quote_part)
+                else:
+                    quote_failed = True
+            if quote_failed:
+                print(f'[Futu] Option-chain snapshot incomplete for {underlying}; chain rejected.')
+                return result
+            quote = pd.concat(quote_parts, ignore_index=True) if quote_parts else None
             if isinstance(quote, pd.DataFrame) and not quote.empty and 'code' in quote.columns:
                 quote_rows = {
                     self._normalize_symbol(value): row

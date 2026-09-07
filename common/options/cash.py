@@ -1,4 +1,4 @@
-"""Cash-Secured Put 的无状态资金义务计算工具。"""
+"""期权现金担保义务的无状态计算工具；当前现金担保模型以 Short Put 为主。"""
 
 from __future__ import annotations
 

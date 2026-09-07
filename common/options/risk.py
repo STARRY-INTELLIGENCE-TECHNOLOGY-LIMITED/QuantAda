@@ -1,4 +1,4 @@
-"""Cash-Secured Put 与 Covered Call 的账户级风险计算。"""
+"""期权现金义务、担保条件与压力风险的纯计算工具。"""
 
 from __future__ import annotations
 
@@ -85,9 +85,10 @@ def compute_option_margin(
     stress_down=0.20,
     stress_up=0.20,
 ) -> OptionMarginSnapshot:
-    """计算当前仅允许的现金担保 Put 与 Covered Call 风险。
+    """计算现金担保 Put、Covered Call 与纯多头期权腿风险。
 
-    不支持裸卖和多腿组合；任何担保不足直接抛出，调用方必须 fail-closed。
+    含空头的多腿组合仍需专用组合保证金/原子执行模型，当前 fail-closed；
+    多个纯多头腿只承担已支付权利金，可用于 Long Strangle/Straddle 等研究。
     """
     cash_value = _finite(cash, "cash")
     if cash_value < 0:
@@ -95,7 +96,13 @@ def compute_option_margin(
     if not isinstance(legs, (list, tuple)):
         raise OptionMarginError("legs must be a list or tuple")
     if len(legs) > 1:
-        raise OptionMarginError("multi-leg option combinations are unsupported")
+        try:
+            if any(_finite(leg.signed_quantity, "signed_quantity") < 0 for leg in legs):
+                raise OptionMarginError(
+                    "multi-leg combinations with short legs require a defined-risk model"
+                )
+        except AttributeError:
+            raise OptionMarginError("legs must contain OptionRiskLeg values") from None
     positions = dict(underlying_positions or {})
     margin_used = 0.0
     max_loss = 0.0

@@ -60,6 +60,8 @@
 ## 8. 独立资金语义
 1. 策略调仓使用真实持仓 + 在途订单做 bottom-up 盘点。
 2. 若 broker 提供 `get_rebalance_cash()`，策略计划口径优先使用该值。
+3. 若 broker 提供 `get_rebalance_position_value(data, signed_size, price, market_value)`，
+   策略使用其结果参与资金盘点；该入口用于适配期权担保/保证金口径，BaseStrategy 不识别具体策略名称或券商规则。
 
 ## 9. 策略排名通知
 1. 横截面排名/轮动策略需要推送分数排名时，使用 `self.publish_rankings(ranked_candidates, title="ranked_symbols", dt=current_dt)`。

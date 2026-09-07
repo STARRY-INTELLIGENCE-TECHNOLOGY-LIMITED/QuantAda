@@ -180,9 +180,7 @@ class BaseStrategy(ABC):
         """
         current_positions = {}
         managed_market_value = 0.0
-        csp_cash_semantics = callable(
-            getattr(self.broker, 'get_csp_uncommitted_cash', None)
-        )
+        rebalance_cash_getter = getattr(self.broker, 'get_rebalance_cash', None)
 
         # 1. 抓取券商真实在途订单 (降维成大写的字典，方便极速查表)
         pending_map = {}
@@ -223,7 +221,7 @@ class BaseStrategy(ABC):
             expected_size = settled_size + get_pending(d._name, 'BUY') - get_pending(d._name, 'SELL')
 
             # 普通股票仍只盘点多仓；期权负仓也必须纳入账户风险盘点，
-            # 否则 Rebalancer 会把 Short Put 当作不存在，策略资金将被高估。
+            # 否则 Rebalancer 会把短期权风险当作不存在，策略资金将被高估。
             option_type = ''
             dataframe = getattr(getattr(d, 'p', None), 'dataname', None)
             row = None
@@ -282,10 +280,24 @@ class BaseStrategy(ABC):
                 # “欺骗” Rebalancer：告诉它当前持仓是 Expected，防止它因未结算而重复发单。
                 # Short option 的 market_value 保留负号，作为风险暴露而不是可投资多仓。
                 current_positions[d] = market_value
-                # 提供 CSP 专用现金口径时，assignment collateral 已在现金侧扣除，
-                # 不能再次把短期权负市值从总资金扣除；通用 Broker 则保留负风险暴露。
-                if market_value > 0 or not csp_cash_semantics:
-                    managed_market_value += market_value
+                # 期权担保/保证金的具体口径由 Broker 自己调整；基础策略不
+                # 识别具体期权策略名称或订单效果。
+                value_adjuster = getattr(
+                    self.broker, 'get_rebalance_position_value', None
+                )
+                if callable(value_adjuster):
+                    try:
+                        adjusted_value = float(value_adjuster(
+                            d, expected_size, price, market_value
+                        ))
+                        if not math.isfinite(adjusted_value):
+                            raise ValueError("non-finite adjusted position value")
+                        market_value = adjusted_value
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"获取 {d._name} 调仓持仓价值失败: {exc}"
+                        ) from exc
+                managed_market_value += market_value
 
         # 3. 资金盘点
         # - get_cash: 当前可立即下单资金口径（可能包含券商杠杆语义）
@@ -293,17 +305,13 @@ class BaseStrategy(ABC):
         # 策略层统一使用 get_rebalance_cash，避免计划口径与下单口径发生语义撕裂。
         available_cash = self.broker.get_cash()
         rebalance_cash = available_cash
-        csp_cash_getter = getattr(self.broker, 'get_csp_uncommitted_cash', None)
-        if callable(csp_cash_getter):
+        if callable(rebalance_cash_getter):
             try:
-                rebalance_cash = float(csp_cash_getter())
+                rebalance_cash = float(rebalance_cash_getter())
             except Exception as e:
-                # CSP 现金快照不可验证时不能把全部现金重新解释为可担保资金。
-                raise RuntimeError(f"获取 CSP 担保资金口径失败，本轮调仓中止: {e}") from e
-        elif hasattr(self.broker, 'get_rebalance_cash'):
-            try:
-                rebalance_cash = float(self.broker.get_rebalance_cash())
-            except Exception as e:
+                # 调仓现金快照不可验证时不能把全部现金重新解释为可用资金。
+                if getattr(self.broker, 'is_live', False):
+                    raise RuntimeError(f"获取调仓资金口径失败，本轮调仓中止: {e}") from e
                 self.log(f"获取调仓资金口径异常，回退 get_cash: {e}")
                 rebalance_cash = available_cash
 
