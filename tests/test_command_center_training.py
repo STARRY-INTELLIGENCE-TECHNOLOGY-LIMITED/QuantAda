@@ -51,6 +51,18 @@ def test_extract_strategy_params_accepts_static_dict_call(tmp_path: Path) -> Non
     assert extract_strategy_params(source) == {"lookback": 15, "threshold": 0.1}
 
 
+def test_extract_strategy_params_ignores_method_local_params(tmp_path: Path) -> None:
+    source = tmp_path / "local_params_strategy.py"
+    source.write_text(
+        "class DemoStrategy:\n"
+        "    params = {'lookback': 15}\n"
+        "    def next(self):\n"
+        "        params = {'not_strategy_param': 99}\n",
+        encoding="utf-8",
+    )
+    assert extract_strategy_params(source) == {"lookback": 15}
+
+
 def test_recommend_ranges_accepts_annotated_params_assignment(tmp_path: Path) -> None:
     source = tmp_path / "annotated_strategy.py"
     source.write_text(
@@ -254,3 +266,6 @@ def test_selection_store_keeps_selected_result_snapshot(tmp_path: Path) -> None:
     assert store.load() == {result.result_id}
     assert store.load_results()[result.result_id]["params"] == {"lookback": 20}
     assert store.load_results()[result.result_id]["main_eval"] == {}
+    store.unselect(result.result_id)
+    assert store.load() == set()
+    assert result.result_id in store.load_results()

@@ -67,24 +67,45 @@ def _param_items(node: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
     return []
 
 
+def _find_params_node(tree: ast.AST) -> ast.AST | None:
+    """优先寻找类级 params，避免误读方法内部的局部变量。"""
+
+    def assignment_value(node: ast.AST) -> ast.AST | None:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            is_params = any(isinstance(target, ast.Name) and target.id == "params" for target in targets)
+            return node.value if is_params else None
+        if isinstance(node, ast.AnnAssign):
+            return node.value if isinstance(node.target, ast.Name) and node.target.id == "params" else None
+        return None
+
+    class_candidates: list[ast.AST] = []
+    for class_node in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
+        for statement in class_node.body:
+            value = assignment_value(statement)
+            if value is not None and _param_items(value):
+                class_candidates.append(value)
+    if class_candidates:
+        return class_candidates[-1]
+    candidates: list[ast.AST] = []
+    for node in ast.walk(tree):
+        value = assignment_value(node)
+        if value is not None and _param_items(value):
+            candidates.append(value)
+    return candidates[-1] if candidates else None
+
+
 def extract_strategy_params(source_path: Path | str) -> dict[str, Any]:
     """从策略类的 params = {...} 中提取可静态解析的默认值。"""
 
     path = Path(source_path)
     source = path.read_text(encoding="utf-8-sig")
     tree = ast.parse(source, filename=str(path))
-    candidates: list[ast.AST] = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(target, ast.Name) and target.id == "params" for target in targets):
-                value = node.value
-                if _param_items(value):
-                    candidates.append(value)
-    if not candidates:
+    params_node = _find_params_node(tree)
+    if params_node is None:
         return {}
     result: dict[str, Any] = {}
-    for key_node, value_node in _param_items(candidates[-1]):
+    for key_node, value_node in _param_items(params_node):
         key = _literal(key_node)
         value = _literal(value_node)
         if isinstance(key, str) and value is not _UNPARSED:
@@ -121,14 +142,7 @@ def recommend_ranges(source_path: Path | str) -> list[ParameterSuggestion]:
     path = Path(source_path)
     source_lines = path.read_text(encoding="utf-8-sig").splitlines()
     tree = ast.parse("\n".join(source_lines), filename=str(path))
-    params_node: ast.AST | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if any(isinstance(target, ast.Name) and target.id == "params" for target in targets):
-                value = node.value
-                if value is not None and _param_items(value):
-                    params_node = value
+    params_node = _find_params_node(tree)
     if params_node is None:
         return []
     suggestions: list[ParameterSuggestion] = []
@@ -253,12 +267,6 @@ def _read_log_results(path: Path) -> list[TrainingResult]:
                 params = _parse_params_block(lines, params_index, next_score)
                 if params:
                     break
-        if not params:
-            for params_index in range(max(0, index - 40), index):
-                if _PARAMS_RE.match(lines[params_index]):
-                    params = _parse_params_block(lines, params_index, index)
-                    if params:
-                        break
         for summary_index in range(index + 1, next_score):
             if _SUMMARY_RE.match(lines[summary_index]):
                 main_eval, test_set = _parse_summary_metrics(lines, summary_index, next_score)
@@ -351,6 +359,17 @@ class TrainingSelectionStore:
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }
         )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def unselect(self, result_id: str) -> None:
+        """取消结果的版本标记，但保留结果快照。"""
+
+        payload = self._read()
+        selected = set(payload.get("selected", []))
+        selected.discard(result_id)
+        payload["selected"] = sorted(selected)
+        payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
