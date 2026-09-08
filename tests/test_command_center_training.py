@@ -8,6 +8,7 @@ from pathlib import Path
 
 from command_center.training import (
     TrainingSelectionStore,
+    TrainingResult,
     extract_strategy_params,
     recommend_ranges,
     result_to_params,
@@ -38,6 +39,15 @@ class DemoStrategy:
         "enabled": True,
         "mode": "fast",
     }
+
+
+def test_extract_strategy_params_accepts_static_dict_call(tmp_path: Path) -> None:
+    source = tmp_path / "dict_strategy.py"
+    source.write_text(
+        "class DemoStrategy:\n    params = dict(lookback=15, threshold=0.1)\n",
+        encoding="utf-8",
+    )
+    assert extract_strategy_params(source) == {"lookback": 15, "threshold": 0.1}
 
 
 def test_recommend_ranges_are_type_aware_and_include_source_metadata(tmp_path: Path) -> None:
@@ -118,6 +128,27 @@ def test_result_index_scans_logs_and_recovers_params(tmp_path: Path) -> None:
     assert result_to_params(results[0]) == {"lookback": 20, "threshold": 0.3}
 
 
+def test_result_index_recovers_wrapped_params_before_next_metric(tmp_path: Path) -> None:
+    optimizer = tmp_path / ".data" / "optimizer"
+    optimizer.mkdir(parents=True)
+    log = optimizer / "optimizer_terminal_wrapped.log"
+    log.write_text(
+        "Best Training Score (sharpe): 1.25\n"
+        "SUMMARY OF BEST CONFIGURATION\n"
+        " Params:   {'lookback': 20, 'threshold':\n"
+        " 0.3, 'mode': 'fast'}\n"
+        "Best Training Score (calmar): 2.50\n"
+        " Params:   {'lookback': 30}\n",
+        encoding="utf-8",
+    )
+
+    results = scan_training_results(tmp_path)
+
+    by_metric = {item.metric: item for item in results}
+    assert by_metric["calmar"].params == {"lookback": 30}
+    assert by_metric["sharpe"].params == {"lookback": 20, "threshold": 0.3, "mode": "fast"}
+
+
 def test_result_index_ignores_malformed_params_without_aborting_scan(tmp_path: Path) -> None:
     optimizer = tmp_path / ".data" / "optimizer"
     optimizer.mkdir(parents=True)
@@ -131,8 +162,26 @@ def test_result_index_ignores_malformed_params_without_aborting_scan(tmp_path: P
     results = scan_training_results(tmp_path)
 
     assert len(results) == 2
-    assert results[0].params == {}
-    assert results[1].params == {"lookback": 8}
+    by_metric = {item.metric: item for item in results}
+    assert by_metric["sharpe"].params == {}
+    assert by_metric["return"].params == {"lookback": 8}
+
+
+def test_result_index_reassembles_wrapped_params_dict(tmp_path: Path) -> None:
+    optimizer = tmp_path / ".data" / "optimizer"
+    optimizer.mkdir(parents=True)
+    log = optimizer / "optimizer_terminal_wrapped.log"
+    log.write_text(
+        "Best Training Score (sharpe): 1.5\n"
+        " Params: {'lookback': 20,\n"
+        "  'nested': {'window': 5}}\n",
+        encoding="utf-8",
+    )
+
+    results = scan_training_results(tmp_path)
+
+    assert len(results) == 1
+    assert results[0].params == {"lookback": 20, "nested": {"window": 5}}
 
 
 def test_selection_store_persists_unique_selected_result_ids(tmp_path: Path) -> None:
@@ -143,3 +192,18 @@ def test_selection_store_persists_unique_selected_result_ids(tmp_path: Path) -> 
 
     assert store.load() == {"new:2", "old:1"}
     assert store.path.is_file()
+
+
+def test_selection_store_keeps_selected_result_snapshot(tmp_path: Path) -> None:
+    store = TrainingSelectionStore(tmp_path)
+    result = TrainingResult(
+        "run.log:10:sharpe",
+        "run.log",
+        "sharpe",
+        "1.2",
+        {"lookback": 20},
+        "2026-01-01T00:00:00",
+    )
+    store.save_result(result)
+    assert store.load() == {result.result_id}
+    assert store.load_results()[result.result_id]["params"] == {"lookback": 20}
