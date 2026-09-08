@@ -339,10 +339,10 @@ class TrainingSelectionStore:
             "path": result.path,
             "metric": result.metric,
             "score": result.score,
-                        "params": result.params,
-                        "modified_at": result.modified_at,
-                        "main_eval": result.main_eval or {},
-                        "test_set": result.test_set or {},
+            "params": result.params,
+            "modified_at": result.modified_at,
+            "main_eval": result.main_eval or {},
+            "test_set": result.test_set or {},
         }
         payload.update(
             {
