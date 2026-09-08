@@ -94,7 +94,9 @@ def test_result_index_scans_logs_and_recovers_params(tmp_path: Path) -> None:
     first = optimizer / "optimizer_terminal_old.log"
     second = optimizer / "optimizer_terminal_new.log"
     first.write_text(
-        "Best Training Score (sharpe): 1.25\nParams: {'lookback': 10}\n",
+        "Best Training Score (sharpe): 1.25\n"
+        + "report line\n" * 60
+        + " Params: {'lookback': 10}\n",
         encoding="utf-8",
     )
     second.write_text(
@@ -114,6 +116,23 @@ def test_result_index_scans_logs_and_recovers_params(tmp_path: Path) -> None:
     assert results[0].path.endswith("optimizer_terminal_new.log")
     assert results[0].result_id.startswith("optimizer_terminal_new.log:2:total_return")
     assert result_to_params(results[0]) == {"lookback": 20, "threshold": 0.3}
+
+
+def test_result_index_ignores_malformed_params_without_aborting_scan(tmp_path: Path) -> None:
+    optimizer = tmp_path / ".data" / "optimizer"
+    optimizer.mkdir(parents=True)
+    log = optimizer / "optimizer_terminal_broken.log"
+    log.write_text(
+        "Best Training Score (sharpe): 1.0\n Params: {'broken': }\n"
+        "Best Training Score (return): 2.0\n Params: {'lookback': 8}\n",
+        encoding="utf-8",
+    )
+
+    results = scan_training_results(tmp_path)
+
+    assert len(results) == 2
+    assert results[0].params == {}
+    assert results[1].params == {"lookback": 8}
 
 
 def test_selection_store_persists_unique_selected_result_ids(tmp_path: Path) -> None:
