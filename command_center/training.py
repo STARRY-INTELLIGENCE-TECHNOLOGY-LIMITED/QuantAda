@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+_UNPARSED = object()
+
+
 @dataclass(frozen=True)
 class ParameterSuggestion:
     """单个策略参数及推荐的 Optuna 搜索定义。"""
@@ -34,13 +37,15 @@ class TrainingResult:
     params: dict[str, Any]
     modified_at: str
     selected: bool = False
+    main_eval: dict[str, str] | None = None
+    test_set: dict[str, str] | None = None
 
 
-def _literal(node: ast.AST) -> Any:
+def _literal(node: ast.AST | None) -> Any:
     try:
         return ast.literal_eval(node)
     except (ValueError, TypeError, SyntaxError):
-        return None
+        return _UNPARSED
 
 
 def _comment_for_line(source_lines: list[str], line: int) -> str:
@@ -55,7 +60,7 @@ def _param_items(node: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
         return list(zip(node.keys, node.values))
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "dict":
         return [
-            (ast.Constant(keyword.arg), keyword.value)
+            (ast.copy_location(ast.Constant(keyword.arg), keyword), keyword.value)
             for keyword in node.keywords
             if keyword.arg is not None
         ]
@@ -82,7 +87,7 @@ def extract_strategy_params(source_path: Path | str) -> dict[str, Any]:
     for key_node, value_node in _param_items(candidates[-1]):
         key = _literal(key_node)
         value = _literal(value_node)
-        if isinstance(key, str) and value is not None:
+        if isinstance(key, str) and value is not _UNPARSED:
             result[key] = value
     return result
 
@@ -130,7 +135,7 @@ def recommend_ranges(source_path: Path | str) -> list[ParameterSuggestion]:
     for key_node, value_node in _param_items(params_node):
         name = _literal(key_node)
         value = _literal(value_node)
-        if not isinstance(name, str) or value is None:
+        if not isinstance(name, str) or value is _UNPARSED:
             continue
         value_type, recommendation = _suggestion(name, value)
         suggestions.append(
@@ -171,6 +176,10 @@ def recommendation_notes(suggestions: Iterable[ParameterSuggestion]) -> list[str
 
 _METRIC_RE = re.compile(r"Best Training Score \(([^)]+)\):\s*([^\s]+)")
 _PARAMS_RE = re.compile(r"^\s*Params:\s*(\{.*)")
+_SUMMARY_RE = re.compile(r"^\s*SUMMARY OF BEST CONFIGURATION\s*$")
+_SUMMARY_FIELD_RE = re.compile(
+    r"^\s*(MainEval|TestSet|Annual|Drawdown|Calmar|Sharpe|Trades|WinRate|PF):\s*(.*)$"
+)
 
 
 def _parse_params_block(lines: list[str], start: int, limit: int) -> dict[str, Any]:
@@ -195,6 +204,30 @@ def _parse_params_block(lines: list[str], start: int, limit: int) -> dict[str, A
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _parse_summary_metrics(lines: list[str], start: int, limit: int) -> tuple[dict[str, str], dict[str, str]]:
+    """从最佳配置摘要中提取 MainEval 和 TestSet 指标。"""
+
+    main_eval: dict[str, str] = {}
+    test_set: dict[str, str] = {}
+    section: dict[str, str] | None = None
+    for index in range(start, limit):
+        if _SUMMARY_RE.match(lines[index]):
+            continue
+        match = _SUMMARY_FIELD_RE.match(lines[index])
+        if not match:
+            continue
+        field, value = match.groups()
+        if field == "MainEval":
+            section = main_eval
+            section["window"] = value.strip()
+        elif field == "TestSet":
+            section = test_set
+            section["window"] = value.strip()
+        elif section is not None:
+            section[field.lower()] = value.strip()
+    return main_eval, test_set
+
+
 def _read_log_results(path: Path) -> list[TrainingResult]:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -210,6 +243,8 @@ def _read_log_results(path: Path) -> list[TrainingResult]:
             continue
         metric, score = match.groups()
         params: dict[str, Any] = {}
+        main_eval: dict[str, str] = {}
+        test_set: dict[str, str] = {}
         # 训练摘要中间可能包含整段测试集报告，不能用过短的固定窗口；
         # 只在下一个指标开始前查找，避免把后一个结果的参数错配过来。
         next_score = score_indexes[score_position + 1] if score_position + 1 < len(score_indexes) else len(lines)
@@ -224,9 +259,25 @@ def _read_log_results(path: Path) -> list[TrainingResult]:
                     params = _parse_params_block(lines, params_index, index)
                     if params:
                         break
+        for summary_index in range(index + 1, next_score):
+            if _SUMMARY_RE.match(lines[summary_index]):
+                main_eval, test_set = _parse_summary_metrics(lines, summary_index, next_score)
+                break
         result_id = f"{path.name}:{index + 1}:{metric}"
         modified = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
-        results.append(TrainingResult(result_id, str(path), metric, score, params, modified))
+        results.append(
+            TrainingResult(
+                result_id,
+                str(path),
+                metric,
+                score,
+                params,
+                modified,
+                False,
+                main_eval,
+                test_set,
+            )
+        )
     return results
 
 
@@ -288,8 +339,10 @@ class TrainingSelectionStore:
             "path": result.path,
             "metric": result.metric,
             "score": result.score,
-            "params": result.params,
-            "modified_at": result.modified_at,
+                        "params": result.params,
+                        "modified_at": result.modified_at,
+                        "main_eval": result.main_eval or {},
+                        "test_set": result.test_set or {},
         }
         payload.update(
             {

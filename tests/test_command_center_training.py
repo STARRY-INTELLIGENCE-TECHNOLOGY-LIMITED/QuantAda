@@ -65,6 +65,20 @@ def test_recommend_ranges_accepts_annotated_params_assignment(tmp_path: Path) ->
     assert suggestions[0].name == "lookback"
 
 
+def test_recommend_ranges_preserves_dict_call_source_line(tmp_path: Path) -> None:
+    source = tmp_path / "dict_recommend_strategy.py"
+    source.write_text(
+        "class DemoStrategy:\n"
+        "    params = dict(lookback=15, threshold=0.1)  # 静态参数\n",
+        encoding="utf-8",
+    )
+
+    suggestions = recommend_ranges(source)
+
+    assert {item.name for item in suggestions} == {"lookback", "threshold"}
+    assert all(item.source_line == 2 for item in suggestions)
+
+
 def test_recommend_ranges_are_type_aware_and_include_source_metadata(tmp_path: Path) -> None:
     source = tmp_path / "demo_strategy.py"
     source.write_text(
@@ -128,7 +142,13 @@ def test_result_index_scans_logs_and_recovers_params(tmp_path: Path) -> None:
     )
     second.write_text(
         "noise\nBest Training Score (total_return): 2.5\n"
-        "Params: {'lookback': 20, 'threshold': 0.3}\n",
+        "Params: {'lookback': 20, 'threshold': 0.3}\n"
+        "SUMMARY OF BEST CONFIGURATION\n"
+        "MainEval: 20230101 -> 20251231\n"
+        "Annual: 20.00%\n"
+        "Calmar: 2.5\n"
+        "TestSet: 20260101 -> 20260630\n"
+        "Annual: 10.00%\n",
         encoding="utf-8",
     )
     now = time.time()
@@ -143,6 +163,15 @@ def test_result_index_scans_logs_and_recovers_params(tmp_path: Path) -> None:
     assert results[0].path.endswith("optimizer_terminal_new.log")
     assert results[0].result_id.startswith("optimizer_terminal_new.log:2:total_return")
     assert result_to_params(results[0]) == {"lookback": 20, "threshold": 0.3}
+    assert results[0].main_eval == {
+        "window": "20230101 -> 20251231",
+        "annual": "20.00%",
+        "calmar": "2.5",
+    }
+    assert results[0].test_set == {
+        "window": "20260101 -> 20260630",
+        "annual": "10.00%",
+    }
 
 
 def test_result_index_recovers_wrapped_params_before_next_metric(tmp_path: Path) -> None:
@@ -224,3 +253,4 @@ def test_selection_store_keeps_selected_result_snapshot(tmp_path: Path) -> None:
     store.save_result(result)
     assert store.load() == {result.result_id}
     assert store.load_results()[result.result_id]["params"] == {"lookback": 20}
+    assert store.load_results()[result.result_id]["main_eval"] == {}
