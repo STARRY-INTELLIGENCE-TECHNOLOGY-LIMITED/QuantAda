@@ -51,6 +51,20 @@ def test_extract_strategy_params_accepts_static_dict_call(tmp_path: Path) -> Non
     assert extract_strategy_params(source) == {"lookback": 15, "threshold": 0.1}
 
 
+def test_recommend_ranges_accepts_annotated_params_assignment(tmp_path: Path) -> None:
+    source = tmp_path / "annotated_strategy.py"
+    source.write_text(
+        "class DemoStrategy:\n"
+        "    params: dict = {'lookback': 10}\n",
+        encoding="utf-8",
+    )
+
+    suggestions = recommend_ranges(source)
+
+    assert len(suggestions) == 1
+    assert suggestions[0].name == "lookback"
+
+
 def test_recommend_ranges_are_type_aware_and_include_source_metadata(tmp_path: Path) -> None:
     source = tmp_path / "demo_strategy.py"
     source.write_text(

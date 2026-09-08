@@ -118,10 +118,12 @@ def recommend_ranges(source_path: Path | str) -> list[ParameterSuggestion]:
     tree = ast.parse("\n".join(source_lines), filename=str(path))
     params_node: ast.AST | None = None
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "params" for target in node.targets
-        ) and _param_items(node.value):
-            params_node = node.value
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == "params" for target in targets):
+                value = node.value
+                if value is not None and _param_items(value):
+                    params_node = value
     if params_node is None:
         return []
     suggestions: list[ParameterSuggestion] = []
