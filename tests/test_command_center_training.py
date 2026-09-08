@@ -11,6 +11,7 @@ from command_center.training import (
     TrainingResult,
     extract_strategy_params,
     recommend_ranges,
+    recommendation_notes,
     result_to_params,
     scan_training_results,
     suggestions_to_dict,
@@ -96,6 +97,8 @@ def test_recommend_ranges_are_type_aware_and_include_source_metadata(tmp_path: P
         "high": 30,
         "step": 2,
     }
+    notes = recommendation_notes(suggestions)
+    assert any("mode" in note and "固定类别" in note for note in notes)
 
 
 def test_result_index_scans_logs_and_recovers_params(tmp_path: Path) -> None:
