@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+import live_trader.adapters.futu_broker as futu_module
 from live_trader.adapters.futu_broker import FutuBrokerAdapter
 from common.options.contracts import (
     InvalidOptionOrderEffect,
@@ -41,6 +42,18 @@ class _Trade:
             'qty': kwargs['qty'],
             'price': kwargs['price'],
         }])
+
+
+class _ComboLegStub:
+    """不依赖可选 futu-api 包的组合腿测试替身。"""
+
+    pass
+
+
+def _enable_combo_api(monkeypatch):
+    """让组合订单测试只验证 adapter 逻辑，不把 SDK 安装作为测试前提。"""
+
+    monkeypatch.setattr(futu_module, 'ComboLeg', _ComboLegStub)
 
 
 def _broker(positions=None):
@@ -217,7 +230,8 @@ def test_futu_spread_fails_closed_when_combo_api_is_unavailable():
     assert trade.place_calls == []
 
 
-def test_futu_spread_uses_combo_api_as_one_broker_order():
+def test_futu_spread_uses_combo_api_as_one_broker_order(monkeypatch):
+    _enable_combo_api(monkeypatch)
     short_symbol = 'US.AAPL260918P320000'
     long_symbol = 'US.AAPL260918P300000'
 
@@ -284,7 +298,8 @@ def test_futu_spread_uses_combo_api_as_one_broker_order():
     assert broker._option_run_reservations["COMBO-1"]["remaining"] == 1
 
 
-def test_futu_close_spread_rejects_mismatched_contract_multiplier():
+def test_futu_close_spread_rejects_mismatched_contract_multiplier(monkeypatch):
+    _enable_combo_api(monkeypatch)
     short_symbol = 'US.AAPL260918P320000'
     hedge_symbol = 'US.AAPL260918P300000'
 
@@ -332,7 +347,8 @@ def test_futu_close_spread_rejects_mismatched_contract_multiplier():
     assert trade.combo_place_calls == []
 
 
-def test_futu_spread_respects_option_entry_kill_switch():
+def test_futu_spread_respects_option_entry_kill_switch(monkeypatch):
+    _enable_combo_api(monkeypatch)
     short_symbol = 'US.AAPL260918P320000'
     long_symbol = 'US.AAPL260918P300000'
 

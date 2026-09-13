@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -382,7 +383,7 @@ def test_web_service_reads_strategy_params_by_module_path(tmp_path):
     source.write_text("class Demo:\n    params = {'period': 20, 'enabled': True}\n", encoding="utf-8")
     service = CommandCenterService(tmp_path)
     result = service.strategy_params({"strategy": "strategies.demo"})
-    assert result["source_path"].endswith("strategies\\demo.py")
+    assert Path(result["source_path"]) == source.resolve()
     assert result["params"] == {"period": 20, "enabled": True}
 
 
