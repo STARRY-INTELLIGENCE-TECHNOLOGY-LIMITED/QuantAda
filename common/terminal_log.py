@@ -16,6 +16,9 @@ import config
 
 
 OPTIMIZER_TERMINAL_LOG_ENV = "QUANTADA_OPTIMIZER_TERMINAL_LOG"
+# 优化器最终摘要的 AI 分析边界；报告输出与工作台读取必须共用同一文案。
+OPTIMIZER_AI_ANALYSIS_START_MARKER = "=== 请忽略上文日志输出，请将下文提供给AI辅助分析 ==="
+OPTIMIZER_AI_ANALYSIS_END_MARKER = "=== 请将上文提供给AI辅助分析 ==="
 _TERMINAL_LOG_TEE = None
 
 

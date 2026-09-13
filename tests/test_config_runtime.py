@@ -14,6 +14,13 @@ def test_config_facade_exports_public_subconfig_groups():
     assert config.FUTU_HOST == '127.0.0.1'
     assert config.FUTU_PORT == 11111
     assert config.FUTU_RSA_KEY_PATH == ''
+    assert config.FUTU_TRADE_PASSWORD_ENV == ''
+    assert config.FUTU_TRADE_PASSWORD_MD5_ENV == ''
+    assert config.FUTU_TRADE_PASSWORD == ''
+    assert config.FUTU_TRADE_PASSWORD_MD5 == ''
+    assert config.FUTU_ACCOUNT_ID == 0
+    assert config.FUTU_ACCOUNT_INDEX == 0
+    assert config.FUTU_ACCOUNT_CURRENCY == 'HKD'
     assert config.FUTU_TRADE_ENV == 'SIMULATE'
     assert config.FUTU_ACCOUNT_ID == 0
     assert not hasattr(config, 'THETADATA_API_KEY')
@@ -55,6 +62,34 @@ def test_run_main_overrides_futu_public_keys_like_other_config(monkeypatch, caps
     assert "[Config] Overriding FUTU_HOST = 192.0.2.10" in output
     assert "[Config] Overriding FUTU_PORT = 22222" in output
     assert "[Config] Overriding FUTU_RSA_KEY_PATH = key.pem" in output
+
+
+def test_run_main_prints_private_futu_unlock_value_in_internal_mode(monkeypatch, capsys):
+    import sys
+    import config
+    import run
+
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        [
+            'run.py',
+            'dummy_strategy',
+            '--start_date',
+            '20230101',
+            '--config',
+            "{'FUTU_TRADE_PASSWORD': 'fixture'}",
+        ],
+    )
+    monkeypatch.setattr(config, 'DB_ENABLED', False, raising=False)
+    monkeypatch.setattr(config, 'HTTP_LOG_URL', None, raising=False)
+    monkeypatch.setattr(config, 'FUTU_TRADE_PASSWORD', '', raising=False)
+    monkeypatch.setattr(run, 'run_backtest', lambda **kwargs: None)
+
+    run._run_main()
+
+    output = capsys.readouterr().out
+    assert 'fixture' in output
 
 
 def test_run_main_allows_explicitly_imported_broker_environment_dicts(monkeypatch, capsys):

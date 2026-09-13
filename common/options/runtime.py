@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 import time
 from dataclasses import dataclass
 
@@ -89,43 +90,69 @@ def refresh_option_chain(provider, underlying, *, start=None, end=None,
     started = monotonic()
     try:
         fetcher = getattr(provider, "get_option_chain_normalized", None)
-        if fetcher is not None:
-            chain = fetcher(
-                underlying,
-                start=start,
-                end=end,
-                timestamp=now,
-                as_of=as_of,
-            )
+        if callable(fetcher):
+            kwargs = {
+                "start": start,
+                "end": end,
+                "timestamp": now,
+                "as_of": as_of,
+            }
+            try:
+                parameters = inspect.signature(fetcher).parameters
+            except (TypeError, ValueError):
+                parameters = None
+            if parameters is not None and not any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                kwargs = {
+                    name: value
+                    for name, value in kwargs.items()
+                    if name in parameters
+                }
+            chain = fetcher(underlying, **kwargs)
         else:
             fetcher = getattr(provider, "get_option_chain", None)
-            if fetcher is None:
+            if not callable(fetcher):
                 return None
-            chain = fetcher(
-                underlying,
-                start=start,
-                end=end,
-                timestamp=now,
-                as_of=as_of,
-                normalized=True,
-            )
+            kwargs = {
+                "start": start,
+                "end": end,
+                "timestamp": now,
+                "as_of": as_of,
+                "normalized": True,
+            }
+            try:
+                parameters = inspect.signature(fetcher).parameters
+            except (TypeError, ValueError):
+                parameters = None
+            if parameters is not None and not any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                kwargs = {
+                    name: value
+                    for name, value in kwargs.items()
+                    if name in parameters
+                }
+            chain = fetcher(underlying, **kwargs)
     except Exception:
         return None
     elapsed = monotonic() - started
     if elapsed > age_limit or chain is None or getattr(chain, "empty", True):
         return None
-    timestamp = _as_utc(now, "now") if now is not None else pd.Timestamp.now(tz="UTC")
+    fetched_at = _as_utc(now, "now") if now is not None else pd.Timestamp.now(tz="UTC")
+    visibility_time = _as_utc(as_of, "as_of") if as_of is not None else fetched_at
     observed = _chain_observation_time(chain)
     if observed is not None:
         # 快照时间晚于决策时刻说明发生 lookahead；过旧快照不能用于换月或对冲。
-        age = (timestamp - observed).total_seconds()
+        age = (visibility_time - observed).total_seconds()
         if age < 0 or age > age_limit:
             return None
     elif as_of is not None or getattr(chain, "attrs", {}).get("timestamp_source") == "caller":
         # 历史边界下没有源时间戳无法证明链的可见性。
         return None
-    snapshot_as_of = _as_utc(as_of, "as_of") if as_of is not None else timestamp
-    return ChainSnapshot(data=chain, fetched_at=timestamp, as_of=snapshot_as_of)
+    return ChainSnapshot(data=chain, fetched_at=fetched_at, as_of=visibility_time)
 
 
 def select_option_contract(chain, *, option_type=None, min_dte=None, max_dte=None,
@@ -140,9 +167,14 @@ def select_option_contract(chain, *, option_type=None, min_dte=None, max_dte=Non
     if not required.issubset(set(getattr(chain, "columns", ()) )):
         return None
     frame = chain.copy()
+    decision_time = as_of if as_of is not None else now
+    current = _as_utc(decision_time, "as_of" if as_of is not None else "now") \
+        if decision_time is not None else pd.Timestamp.now(tz="UTC")
     if option_type:
-        frame = frame[frame["option_type"].str.upper() == str(option_type).upper()]
-    current = _as_utc(now, "now") if now is not None else pd.Timestamp.now(tz="UTC")
+        frame = frame[
+            frame["option_type"].astype("string").str.upper()
+            == str(option_type).upper()
+        ]
     observation = _chain_observation_time(frame)
     if observation is not None and observation > current:
         return None
@@ -152,14 +184,32 @@ def select_option_contract(chain, *, option_type=None, min_dte=None, max_dte=Non
                 return None
         except OptionRuntimeError:
             return None
-    if getattr(chain, "attrs", {}).get("timestamp_source") == "caller":
-        # 调用方时间戳不是源观测时间，不能单独证明历史可见性。
+    if (
+        getattr(chain, "attrs", {}).get("timestamp_source") == "caller"
+        and as_of is not None
+    ):
+        # 调用方时间戳不是源观测时间，不能单独证明历史可见性；
+        # 实时链没有 as_of 时，抓取时刻本身就是允许的快照边界。
         return None
+    if as_of is not None:
+        if "timestamp" in frame.columns:
+            timestamps = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)
+            frame = frame[timestamps.notna() & (timestamps <= current)]
+        elif getattr(chain, "attrs", {}).get("as_of") is None:
+            # 历史边界下没有逐行源时间戳，不能证明链对当前决策时点可见。
+            return None
+        if frame.empty:
+            return None
     frame["expiry"] = pd.to_datetime(frame["expiry"], errors="coerce", utc=True)
     for column in ("strike", "delta", "bid", "ask", "last"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=["expiry", "strike", "delta", "bid", "ask", "last"])
-    frame = frame[(frame["strike"] > 0) & (frame["bid"] >= 0) & (frame["ask"] >= frame["bid"])]
+    frame = frame[
+        (frame["strike"] > 0)
+        & (frame["bid"] >= 0)
+        & (frame["ask"] >= frame["bid"])
+        & (frame["last"] > 0)
+    ]
     dte = (frame["expiry"] - current).dt.total_seconds() / 86400.0
     # 过期合约无论调用方是否传入 min_dte 都不得被选中。
     frame = frame[dte >= 0]
@@ -172,8 +222,8 @@ def select_option_contract(chain, *, option_type=None, min_dte=None, max_dte=Non
     # 只有纯正数区间才采用绝对值兼容旧的无方向调用。
     lower = _finite(min_delta, "min_delta") if min_delta is not None else None
     upper = _finite(max_delta, "max_delta") if max_delta is not None else None
-    signed = option_type is not None and str(option_type).upper() in {"PUT", "CALL"}
-    signed = signed or (lower is not None and lower < 0) or (upper is not None and upper < 0)
+    signed = (lower is not None and lower < 0) or (upper is not None and upper < 0)
+    signed = signed or (target_delta is not None and _finite(target_delta, "target_delta") < 0)
     delta_values = frame["delta"] if signed else frame["delta"].abs()
     if lower is not None:
         frame = frame[delta_values >= lower]

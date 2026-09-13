@@ -209,10 +209,11 @@ def parse_option_symbol(symbol: str, strike_scale: float = 1000.0) -> dict:
     scale = safe_number(strike_scale, 1000.0)
     if scale <= 0:
         scale = 1000.0
-    if len(strike_digits) <= 4:
-        scale = 1.0
-    elif len(strike_digits) == 5:
-        scale = 100.0
+    # OCC 使用固定八位执行价；Futu 的代码会省略前导零，但仍以千分之一
+    # 美元编码（例如 P9000 表示 9.000）。短于八位时统一按 Futu 口径解析，
+    # 避免同一合约在行情、策略和交易模块得到不同执行价。
+    if len(strike_digits) < 8:
+        scale = 1000.0
 
     return {
         "underlying": match.group("underlying"),

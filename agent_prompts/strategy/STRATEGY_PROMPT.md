@@ -151,3 +151,7 @@ class YourCustomStrategy(BaseStrategy):
 * 代码必须包含清晰的注释。
 * 不要直接操作 `data.close[0]` 这种行式索引进行复杂指标计算，优先提取 Pandas Series 后再做向量化处理。
 * 不要生成 `self.execute_rebalance(target_percents)` 这类旧接口调用；若使用自动调仓，请按当前 `target_symbols + top_k` 契约输出。
+
+## 期权卖方补充契约
+
+期权卖方策略不得把本地现金、持仓或订单意图当作事实。`SELL_TO_OPEN_PUT` 若要求灾难保护，必须同时构造包含两个 `OptionRiskLeg` 的定义风险 Put Credit Spread，并调用券商原子组合入口；入口不存在或券商不支持时直接阻断，不得顺序提交裸 Put。实盘风险 Watchdog 和清算对账只接受券商快照，未知快照必须停止新开仓；回测仍使用同步内存路径。

@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import config
 import pandas as pd
@@ -19,7 +20,9 @@ from live_trader.adapters.futu_symbols import (
     VENUE_ALIASES as _VENUE_ALIASES,
     normalize_futu_symbol,
 )
+from common.options.analytics import parse_expiry, parse_option_symbol
 from common.options.chain import normalize_option_chain
+from common.options.data_safety import sanitize_market_dataframe
 from .base_provider import BaseDataProvider
 from common.live_runtime import dependency_install_hint
 
@@ -53,6 +56,19 @@ _MAX_HISTORY_PAGES = 100
 _CONTEXT_INIT_TIMEOUT_SECONDS = 5.0
 _QUOTE_CONTEXT_RETRY_BACKOFF_SECONDS = 5.0
 _REQUIRED_COLUMNS = ('open', 'high', 'low', 'close', 'volume')
+_MARKET_TIMEZONES = {
+    'US': 'America/New_York',
+    'HK': 'Asia/Hong_Kong',
+    'SH': 'Asia/Shanghai',
+    'SZ': 'Asia/Shanghai',
+    'SG': 'Asia/Singapore',
+    'JP': 'Asia/Tokyo',
+    'AU': 'Australia/Sydney',
+    'CA': 'America/Toronto',
+    'HK_FUTURE': 'Asia/Hong_Kong',
+    'FX': 'UTC',
+    'CRYPTO': 'UTC',
+}
 
 def _enum_value(enum_type, name: str, fallback: str):
     """读取 SDK 枚举值；测试替身或旧 SDK 缺失时回退为协议字符串。"""
@@ -112,6 +128,7 @@ class FutuDataProvider(BaseDataProvider):
         self._quote_context_init_thread = None
         self._quote_context_init_failed = False
         self._quote_context_retry_at = 0.0
+        self.live_mode = False
 
         if OpenQuoteContext is None and quote_ctx is None and _FUTU_IMPORT_ERROR is None:
             print(dependency_install_hint('futu-api'))
@@ -178,6 +195,37 @@ class FutuDataProvider(BaseDataProvider):
     @staticmethod
     def _is_option_symbol(symbol: str) -> bool:
         return bool(_OPTION_CODE_RE.match(FutuDataProvider._normalize_symbol(symbol)))
+
+    def set_live_mode(self, enabled: bool) -> None:
+        """设置当前是否处于实盘路径；实盘快照必须通过时间新鲜度校验。"""
+        self.live_mode = bool(enabled)
+
+    @staticmethod
+    def _quote_is_fresh(row, symbol: str) -> bool:
+        """校验实时快照时间戳，避免将陈旧报价拼入实盘数据。"""
+        raw_timestamp = _row_first_value(row, ('update_time', 'timestamp', 'time_key', 'datetime'))
+        parsed = pd.to_datetime(raw_timestamp, errors='coerce')
+        if pd.isna(parsed):
+            return False
+        stamp = pd.Timestamp(parsed)
+        if stamp.tzinfo is None:
+            market = FutuDataProvider._normalize_symbol(symbol).split('.', 1)[0]
+            timezone = _MARKET_TIMEZONES.get(market)
+            if not timezone:
+                return False
+            try:
+                stamp = stamp.tz_localize(ZoneInfo(timezone))
+            except Exception:
+                return False
+        try:
+            max_age = float(getattr(config, 'OPTION_RISK_MAX_QUOTE_AGE_SECONDS', 300.0))
+        except (TypeError, ValueError, OverflowError):
+            max_age = 300.0
+        if not math.isfinite(max_age) or max_age < 0:
+            max_age = 300.0
+        now = pd.Timestamp.now(tz=stamp.tz)
+        age = (now - stamp).total_seconds()
+        return math.isfinite(age) and age >= -5.0 and age <= max_age
 
     def _configure_protocol(self):
         """根据 RSA 路径配置全局协议；空路径明确关闭加密。"""
@@ -448,33 +496,50 @@ class FutuDataProvider(BaseDataProvider):
         df = df[~df.index.duplicated(keep='last')].sort_index()
         ordered = list(_REQUIRED_COLUMNS)
         extras = [column for column in df.columns if column not in ordered and column != time_column]
-        return df[ordered + extras]
+        return sanitize_market_dataframe(df[ordered + extras], require_ohlcv=True)
 
     def _current_snapshot_kline(self, symbol):
         """把当前可验证快照转换为单根 K 线；缺字段时返回 None。"""
         snapshot = self.get_market_snapshot([symbol])
         if snapshot is None or snapshot.empty:
             return None
-        row = snapshot.iloc[0]
+        requested_symbol = self._normalize_symbol(symbol)
+        matching_rows = []
+        for _, candidate in snapshot.iterrows():
+            candidate_symbol = self._normalize_symbol(
+                _row_first_value(candidate, ('code', 'symbol'))
+            )
+            # 单一快照也必须带可验证代码；否则无法排除错行。
+            if not candidate_symbol or candidate_symbol != requested_symbol:
+                continue
+            matching_rows.append(candidate)
+        if len(matching_rows) != 1:
+            return None
+        row = matching_rows[0]
+        if self.live_mode and not self._quote_is_fresh(row, requested_symbol):
+            return None
         timestamp = _field_value(row, ('update_time', 'time_key', 'datetime', 'time'))
         open_price = _positive_float(_field_value(row, ('open_price', 'open')))
         high_price = _positive_float(_field_value(row, ('high_price', 'high')))
         low_price = _positive_float(_field_value(row, ('low_price', 'low')))
         last_price = _positive_float(_field_value(row, ('last_price', 'last', 'price', 'close')))
         raw_volume = _field_value(row, ('volume', 'vol'))
+        # 实时快照可能不提供成交量；当前行仍可由四个价格事实组成，
+        # 用 0 表示“本次未提供”而不是丢弃可靠价格。
         if raw_volume is None or (isinstance(raw_volume, str) and not raw_volume.strip()):
-            return None
-        try:
-            volume = float(raw_volume)
-        except (TypeError, ValueError, OverflowError):
             volume = 0.0
+        else:
+            try:
+                volume = float(raw_volume)
+            except (TypeError, ValueError, OverflowError):
+                volume = 0.0
         if timestamp is None or None in (open_price, high_price, low_price, last_price):
             return None
         if not math.isfinite(volume) or volume < 0:
             return None
         if not (high_price >= max(open_price, low_price, last_price) and low_price <= min(open_price, high_price, last_price)):
             return None
-        return pd.DataFrame([{
+        result = pd.DataFrame([{
             'code': symbol,
             'time_key': timestamp,
             'open': open_price,
@@ -483,12 +548,64 @@ class FutuDataProvider(BaseDataProvider):
             'close': last_price,
             'volume': volume,
         }])
+        if self._is_option_symbol(symbol):
+            # 期权日线历史接口只有 OHLCV；将同一时刻快照中的可验证盘口、
+            # Greeks 和合约元数据带到当前行，供实盘策略做有限的流动性检查。
+            option_fields = (
+                ('option_type', ('option_type',)),
+                ('strike', ('option_strike_price', 'strike_price')),
+                ('expiry', ('strike_time', 'option_expiry_date')),
+                ('bid', ('bid_price', 'bid')),
+                ('ask', ('ask_price', 'ask')),
+                ('last', ('last_price', 'last', 'price', 'close')),
+                ('open_interest', ('option_open_interest', 'open_interest', 'oi')),
+                ('iv', ('option_implied_volatility', 'implied_volatility', 'iv')),
+                ('delta', ('option_delta', 'delta')),
+                ('gamma', ('option_gamma', 'gamma')),
+                ('theta', ('option_theta', 'theta')),
+                ('vega', ('option_vega', 'vega')),
+                ('rho', ('option_rho', 'rho')),
+                ('contract_multiplier', (
+                    'option_contract_multiplier', 'option_contract_size',
+                    'contract_multiplier', 'contract_size',
+                )),
+                ('currency', ('currency', 'quote_currency', 'currency_code')),
+            )
+            for output_name, aliases in option_fields:
+                value = _field_value(row, aliases)
+                if value is not None:
+                    result[output_name] = value
+            # 快照请求虽只带一个代码，仍校验柜台回传的合约元数据，避免
+            # 错行/权限降级响应把另一执行价或到期日写入当前期权序列。
+            parsed = parse_option_symbol(symbol)
+            if parsed.get('option_type'):
+                snapshot_row = result.iloc[0]
+                raw_type = snapshot_row.get('option_type')
+                if raw_type is not None and not pd.isna(raw_type):
+                    raw_type = str(raw_type).strip().upper()
+                    expected_type = str(parsed['option_type']).upper()
+                    if raw_type not in {expected_type, expected_type[:1]}:
+                        return None
+                if snapshot_row.get('strike') is not None and not pd.isna(snapshot_row.get('strike')):
+                    try:
+                        raw_strike = float(snapshot_row.get('strike'))
+                        expected_strike = float(parsed['strike'])
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                    if abs(raw_strike - expected_strike) > max(1e-9, abs(expected_strike) * 1e-9):
+                        return None
+                if snapshot_row.get('expiry') is not None and not pd.isna(snapshot_row.get('expiry')):
+                    expiry = parse_expiry(snapshot_row.get('expiry'))
+                    if pd.isna(expiry) or pd.Timestamp(expiry).normalize() != pd.Timestamp(parsed['expiry']).normalize():
+                        return None
+        return result
 
     @staticmethod
     def _aggregate_rows(df: pd.DataFrame, compression: int) -> pd.DataFrame:
         """对 Futu 不提供的多日周期做确定性的行级 OHLCV 聚合。"""
         if compression <= 1 or df is None or df.empty:
             return df
+        attrs = dict(getattr(df, 'attrs', {}) or {})
         group_id = pd.Series(range(len(df)), index=df.index) // compression
         grouped = df.groupby(group_id, sort=True)
         result = pd.DataFrame({
@@ -498,7 +615,13 @@ class FutuDataProvider(BaseDataProvider):
             'close': grouped['close'].last(),
             'volume': grouped['volume'].sum(min_count=1),
         })
+        # 期权盘口、Greeks 和合约元数据不是 OHLCV，采用聚合区间最后一条
+        # 可见事实保留到压缩结果，避免 Days/5 等周期丢失交易所需字段。
+        for column in df.columns:
+            if column not in {'open', 'high', 'low', 'close', 'volume'}:
+                result[column] = grouped[column].last()
         result.index = pd.DatetimeIndex([group.index[-1] for _, group in grouped], name='datetime')
+        result.attrs.update(attrs)
         return result
 
     def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
@@ -581,6 +704,10 @@ class FutuDataProvider(BaseDataProvider):
             result.attrs['requested_end'] = requested_end
             result.attrs['history_end'] = now_utc
             result.attrs['future_data_unavailable'] = True
+            if self.live_mode and current_row is None:
+                # 实盘日线末端需要当前可验证快照；不能把旧历史行当成
+                # 当前价格输入继续交给策略。
+                return None
             result.attrs['current_snapshot_unadjusted'] = autype_name != 'NONE'
         elif crosses_current and intraday:
             # 当前快照无法还原完整分钟/小时 OHLC，保留历史段并标记未来段未提供。
@@ -619,7 +746,17 @@ class FutuDataProvider(BaseDataProvider):
                 if multiplier is None:
                     snapshot = self.get_market_snapshot([futu_symbol])
                     if snapshot is not None and not snapshot.empty:
-                        row = snapshot.iloc[0]
+                        requested_symbol = self._normalize_symbol(futu_symbol)
+                        matching_rows = [
+                            row for _, row in snapshot.iterrows()
+                            if self._normalize_symbol(
+                                _row_first_value(row, ('code', 'symbol'))
+                            ) == requested_symbol
+                        ]
+                        row = matching_rows[0] if len(matching_rows) == 1 else None
+                    else:
+                        row = None
+                    if row is not None:
                         for name in (
                             'option_contract_multiplier',
                             'option_contract_size',
@@ -723,6 +860,8 @@ class FutuDataProvider(BaseDataProvider):
         if not normalized:
             return result
         result = self._enrich_option_chain_metadata(result, code)
+        if result is None or result.empty:
+            return None
         # OpenD 链接口有时只返回合约字段，实时调用可用本次请求完成时间作为
         # 快照边界；历史调用必须由源数据提供真实 timestamp，runtime 会拒绝
         # 将调用方时间戳伪装成历史可见时间。
@@ -761,8 +900,13 @@ class FutuDataProvider(BaseDataProvider):
                 'option_contract_multiplier', 'option_contract_size',
             ) if name in result.columns
         ]
+        option_codes = {
+            code for code in codes if _OPTION_CODE_RE.match(code)
+        }
         has_multiplier = any(
-            pd.to_numeric(result[name], errors='coerce').gt(0).any()
+            pd.to_numeric(result[name], errors='coerce').gt(
+                1.0 if name in {'contract_multiplier', 'contract_size'} and option_codes else 0.0
+            ).any()
             for name in multiplier_columns
         )
         if codes and not has_multiplier:
@@ -804,15 +948,23 @@ class FutuDataProvider(BaseDataProvider):
                     quote_failed = True
             if quote_failed:
                 print(f'[Futu] Option-chain snapshot incomplete for {underlying}; chain rejected.')
-                return result
+                return None
             quote = pd.concat(quote_parts, ignore_index=True) if quote_parts else None
             if isinstance(quote, pd.DataFrame) and not quote.empty and 'code' in quote.columns:
-                quote_rows = {
-                    self._normalize_symbol(value): row
-                    for _, row in quote.iterrows()
-                    for value in [_field_value(row, ('code', 'symbol'))]
-                    if value
-                }
+                quote_rows = {}
+                for _, row in quote.iterrows():
+                    quote_symbol = self._normalize_symbol(
+                        _field_value(row, ('code', 'symbol'))
+                    )
+                    if not quote_symbol:
+                        continue
+                    if quote_symbol in quote_rows:
+                        print(
+                            f'[Futu] Duplicate option-chain quote for {quote_symbol}; '
+                            'chain rejected.'
+                        )
+                        return None
+                    quote_rows[quote_symbol] = row
                 for output_name, aliases in (
                     ('contract_multiplier', ('option_contract_multiplier', 'option_contract_size', 'contract_multiplier', 'contract_size')),
                     ('bid', ('bid_price', 'bid')),
@@ -840,15 +992,55 @@ class FutuDataProvider(BaseDataProvider):
                         for current, code_value in zip(current_values, result['code'])
                     ]
 
-        if not any(name in result.columns for name in ('spot', 'spot_price', 'stock_price')):
+        # Backtrader/普通股票字段常带默认 contract_multiplier=1；期权链必须
+        # 保留真实期权乘数，不能让这个默认值绕过基础信息查询和统一校验。
+        if 'contract_multiplier' in result.columns and 'code' in result.columns:
+            values = pd.to_numeric(result['contract_multiplier'], errors='coerce')
+            cleaned = []
+            for value, code_value in zip(values, result['code']):
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    parsed = float('nan')
+                threshold = 1.0 if _OPTION_CODE_RE.match(
+                    self._normalize_symbol(code_value)
+                ) else 0.0
+                cleaned.append(parsed if math.isfinite(parsed) and parsed > threshold else None)
+            result['contract_multiplier'] = cleaned
+
+        spot_columns = [
+            name for name in ('spot', 'spot_price', 'stock_price')
+            if name in result.columns
+        ]
+        has_valid_spot = any(
+            pd.to_numeric(result[name], errors='coerce').map(
+                lambda value: math.isfinite(float(value)) and float(value) > 0
+            ).any()
+            for name in spot_columns
+        )
+        if not has_valid_spot:
             snapshot = self.get_market_snapshot([underlying])
-            if isinstance(snapshot, pd.DataFrame) and not snapshot.empty:
-                spot = _row_first_value(
-                    snapshot.iloc[0],
+            if not isinstance(snapshot, pd.DataFrame) or snapshot.empty:
+                return None
+            requested_underlying = self._normalize_symbol(underlying)
+            matching = []
+            for _, row in snapshot.iterrows():
+                row_symbol = self._normalize_symbol(
+                    _row_first_value(row, ('code', 'symbol'))
+                )
+                if row_symbol and row_symbol == requested_underlying:
+                    matching.append(row)
+            if len(matching) != 1:
+                return None
+            spot = _positive_float(
+                _row_first_value(
+                    matching[0],
                     ('last_price', 'last', 'price', 'close'),
                 )
-                if spot is not None:
-                    result['spot'] = spot
+            )
+            if spot is None:
+                return None
+            result['spot'] = spot
         # 部分 OpenD 期权快照不返回币种；这是 Provider 已知的市场元数据，
         # 可以安全补全，不能把它留作交易链中的未知风险字段。
         if 'currency' not in result.columns or result['currency'].isna().all():

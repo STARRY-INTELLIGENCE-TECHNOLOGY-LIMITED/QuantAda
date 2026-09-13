@@ -8,7 +8,9 @@ import pandas as pd
 
 import config
 from .base_provider import BaseDataProvider
+from .compositions import build_provider_composition
 from .csv_provider import CsvDataProvider
+from common.options.data_safety import sanitize_market_dataframe
 
 
 _PLATFORM_DEFAULT_SOURCES = {
@@ -33,6 +35,10 @@ def resolve_platform_default_source(platform: str) -> str:
 def normalize_source_name(source: str) -> str:
     """将平台或 Provider 别名规范化为 DataManager 使用的名称。"""
     normalized = str(source or '').strip().lower()
+    if normalized in {'hybrid', 'option_hybrid', 'theta+futu', 'futu+theta', 'theta_futu', 'futu_theta'}:
+        return 'hybrid'
+    if normalized == 'sxsc_tushare':
+        return 'sxsctushare'
     return _PLATFORM_DEFAULT_SOURCES.get(normalized, normalized)
 
 
@@ -45,6 +51,83 @@ class DataManager:
             (p.__class__.__name__.replace('DataProvider', '').lower(), p)
             for p in self.providers
         )
+        self._composed_providers = {}
+        self._live_mode = False
+        self._bound_broker = None
+
+    def _provider_for_source(self, name):
+        """返回普通 Provider 或按配置惰性构造的组合 Provider。"""
+
+        raw_name = str(name or '').strip().lower()
+        normalized = normalize_source_name(raw_name)
+        provider = self.provider_map.get(normalized)
+        if provider is not None:
+            return provider
+        compositions = getattr(config, 'DATA_PROVIDER_COMPOSITIONS', {})
+        spec = None
+        composition_name = normalized
+        if isinstance(compositions, dict):
+            if raw_name in compositions:
+                composition_name = raw_name
+                spec = compositions[raw_name]
+            else:
+                spec = compositions.get(normalized)
+        if spec is None:
+            return None
+        composed = getattr(self, '_composed_providers', None)
+        if not isinstance(composed, dict):
+            composed = {}
+            self._composed_providers = composed
+        if composition_name not in composed:
+            composed[composition_name] = build_provider_composition(
+                composition_name, spec, self.provider_map
+            )
+            setter = getattr(composed[composition_name], 'set_live_mode', None)
+            if callable(setter):
+                setter(getattr(self, '_live_mode', False))
+            if getattr(self, '_bound_broker', None) is not None:
+                binder = getattr(composed[composition_name], 'bind_broker', None)
+                if callable(binder):
+                    binder(self._bound_broker)
+        return composed[composition_name]
+
+    def _all_provider_instances(self):
+        """返回普通和已构造组合 Provider，供运行时注入/关闭使用。"""
+
+        yield from self.providers
+        composed = getattr(self, '_composed_providers', None)
+        if isinstance(composed, dict):
+            yield from composed.values()
+
+    @staticmethod
+    def _explicit_provider_method(provider, name):
+        """仅返回实例显式属性或类层声明的方法，避免触发动态 API。"""
+
+        instance_values = getattr(provider, '__dict__', None)
+        if isinstance(instance_values, dict):
+            candidate = instance_values.get(name)
+            if callable(candidate):
+                return candidate
+        for base in type(provider).__mro__:
+            candidate = base.__dict__.get(name)
+            if callable(candidate):
+                return getattr(provider, name)
+        return None
+
+    @staticmethod
+    def _explicit_provider_value(provider, name, default=None):
+        """读取显式 Provider 字段，不触发动态 ``__getattr__``。"""
+
+        instance_values = getattr(provider, '__dict__', None)
+        if isinstance(instance_values, dict) and name in instance_values:
+            return instance_values[name]
+        for base in type(provider).__mro__:
+            if name in base.__dict__:
+                try:
+                    return getattr(provider, name)
+                except Exception:
+                    return default
+        return default
 
     @staticmethod
     def _split_source_names(specified_sources: str) -> list:
@@ -57,7 +140,18 @@ class DataManager:
         raw = str(specified_sources).strip().lower()
         if not raw:
             return []
-        return [normalize_source_name(s) for s in re.split(r"[,\s]+", raw) if s]
+        # ``theta+futu`` 表示字段合并 Provider；逗号/空格仍表示普通回退链。
+        compact = re.sub(r'\s*\+\s*', '+', raw)
+        compositions = getattr(config, 'DATA_PROVIDER_COMPOSITIONS', {})
+        if not isinstance(compositions, dict):
+            compositions = {}
+        if (
+            compact in compositions
+        ):
+            return [compact]
+        if normalize_source_name(compact) == 'hybrid':
+            return ['hybrid']
+        return [normalize_source_name(s) for s in re.split(r"[,\s]+", compact) if s]
 
     def apply_runtime_token(self, token: str, specified_sources: str = None) -> bool:
         """将外部运行时令牌注入选中的托管数据源。"""
@@ -66,22 +160,84 @@ class DataManager:
             return False
 
         allowed_sources = set(self._split_source_names(specified_sources))
+        allowed_sources.update(normalize_source_name(name) for name in allowed_sources)
         applied = False
-        for provider in self.providers:
-            provider_name = provider.__class__.__name__.replace('DataProvider', '').lower()
-            if allowed_sources and provider_name not in allowed_sources:
-                continue
-            is_external = bool(getattr(provider, 'is_external_mode', False))
-            is_placeholder = getattr(provider, 'token', None) == 'EXTERNAL_MODE'
-            if not (is_external or is_placeholder):
-                continue
-            try:
-                provider.token = raw_token
-                provider.is_external_mode = False
-                applied = True
-            except Exception:
-                continue
+        for provider in self._all_provider_instances():
+            outer_name = provider.__class__.__name__.replace('DataProvider', '').lower()
+            candidates = [provider]
+            for child_name in (
+                'historical_provider', 'realtime_provider',
+                'theta_provider', 'futu_provider',
+            ):
+                child = (
+                    getattr(provider, '__dict__', {}).get(child_name)
+                    if isinstance(getattr(provider, '__dict__', None), dict)
+                    else None
+                )
+                if child is not None:
+                    candidates.append(child)
+            for candidate in candidates:
+                provider_name = candidate.__class__.__name__.replace('DataProvider', '').lower()
+                if allowed_sources and provider_name not in allowed_sources and outer_name not in allowed_sources:
+                    continue
+                is_external = bool(self._explicit_provider_value(candidate, 'is_external_mode', False))
+                is_placeholder = self._explicit_provider_value(candidate, 'token', None) == 'EXTERNAL_MODE'
+                if not (is_external or is_placeholder):
+                    continue
+                try:
+                    candidate.token = raw_token
+                    candidate.is_external_mode = False
+                    applied = True
+                except Exception:
+                    continue
         return applied
+
+    def set_live_mode(self, enabled: bool) -> None:
+        """向支持混合实时行情的 Provider 传递当前运行模式。"""
+
+        live_mode = bool(enabled)
+        self._live_mode = live_mode
+        for provider in self._all_provider_instances():
+            setter = self._explicit_provider_method(provider, 'set_live_mode')
+            if callable(setter):
+                try:
+                    setter(live_mode)
+                except Exception:
+                    continue
+
+    def bind_broker(self, broker) -> None:
+        """将券商持有的共享行情会话注入支持混合数据的 Provider。"""
+
+        self._bound_broker = broker
+        for provider in self._all_provider_instances():
+            binder = self._explicit_provider_method(provider, 'bind_broker')
+            if callable(binder):
+                try:
+                    binder(broker)
+                except Exception:
+                    continue
+
+    def close(self) -> None:
+        """关闭普通和惰性构造的 Provider，避免组合层连接泄漏。"""
+        seen = set()
+        for provider in self._all_provider_instances():
+            if provider is None or id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            # 某些 Provider 通过 __getattr__ 暴露动态 API；直接 getattr(provider,
+            # 'close') 可能变成一次远程 ``close`` 查询。只调用类层实际声明的关闭方法。
+            close_declared = any(
+                callable(base.__dict__.get('close'))
+                for base in type(provider).__mro__
+            )
+            if not close_declared:
+                continue
+            closer = self._explicit_provider_method(provider, 'close')
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    continue
 
     def auto_discover_and_sort_providers(self, provider_dir=None):
         """
@@ -110,7 +266,12 @@ class DataManager:
                 try:
                     module = importlib.import_module(module_path)
                     for name, obj in inspect.getmembers(module, inspect.isclass):
-                        if issubclass(obj, BaseDataProvider) and obj is not BaseDataProvider:
+                        if (
+                            issubclass(obj, BaseDataProvider)
+                            and obj is not BaseDataProvider
+                            and obj.__module__ == module.__name__
+                            and not bool(getattr(obj, 'HYBRID_ONLY', False))
+                        ):
                             discovered_providers.append(obj())
                             print(f"  Discovered provider: {name} (Priority: {obj.PRIORITY})")
                             break
@@ -143,13 +304,30 @@ class DataManager:
                 print(f"--- Using specified data sources: {', '.join(source_names)} ---")
             else:
                 print(f"--- Using specified data sources: {specified_sources} ---")
-            providers_to_use = [self.provider_map[name] for name in source_names if name in self.provider_map]
+            providers_to_use = []
+            for name in source_names:
+                try:
+                    provider = self._provider_for_source(name)
+                except Exception as exc:
+                    # 单个组合源构造失败时保留后续 Provider 回退链；显式源的
+                    # 错误已经在本地日志中说明，不应把整轮数据请求直接抛出。
+                    print(f"Error: Failed to construct data source {name!r}: {exc}")
+                    continue
+                if provider is not None:
+                    providers_to_use.append(provider)
             if not providers_to_use:
                 print(f"Error: None of the specified sources '{specified_sources}' are valid.")
                 return None
             # 单一在线 Provider 显式指定时，优先复用完整本地缓存；多 Provider
             # 仍严格保持调用方给出的责任链顺序，避免缓存改变 fallback 语义。
-            if len(source_names) == 1 and source_names[0] != 'csv':
+            # 混合层必须每次读取 Futu 当前快照，不能被完整历史缓存短路。
+            # 实盘必须重新读取在线事实；即使本地 CSV 覆盖完整窗口，也不能
+            # 用历史缓存短路当前行情。回测/优化仍保留显式在线源的缓存加速。
+            if (
+                len(source_names) == 1
+                and source_names[0] not in {'csv', 'hybrid'}
+                and not bool(getattr(self, '_live_mode', False))
+            ):
                 final_df = self._load_complete_cache(
                     symbol,
                     start_date,
@@ -163,7 +341,10 @@ class DataManager:
             if final_df is not None and not final_df.empty:
                 print(f"Using complete cached data for {symbol}.")
             else:
-                final_df = self._fetch_from_providers(symbol, start_date, end_date, providers_to_use, timeframe, compression)
+                final_df = self._fetch_from_providers(
+                    symbol, start_date, end_date, providers_to_use,
+                    timeframe, compression, refresh=refresh,
+                )
 
         # 路径二: 执行默认的责任链逻辑
         else:
@@ -230,6 +411,10 @@ class DataManager:
             print(f"Failed to read cache for {symbol}: {exc}")
             return None
         if cached is None or cached.empty:
+            return None
+        cached = sanitize_market_dataframe(cached)
+        if cached is None or cached.empty:
+            print(f"Cached data for {symbol} contains no finite OHLCV rows.")
             return None
         index = pd.to_datetime(cached.index, errors='coerce')
         index = index[~index.isna()]
@@ -299,15 +484,20 @@ class DataManager:
         online_providers = [
             p for p in self.providers
             if p.__class__.__name__.replace('DataProvider', '').lower() != 'csv'
+            and not bool(self._explicit_provider_value(p, 'HYBRID_ONLY', False))
         ]
 
         if refresh:
             print(f"Force refresh requested. Bypassing cache for {symbol}...")
 
-        return self._fetch_from_providers(symbol, start_date, end_date, online_providers, timeframe, compression)
+        return self._fetch_from_providers(
+            symbol, start_date, end_date, online_providers,
+            timeframe, compression, refresh=refresh,
+        )
 
     def _fetch_from_providers(self, symbol, start_date, end_date, providers,
-                              timeframe: str = 'Days', compression: int = 1):
+                              timeframe: str = 'Days', compression: int = 1,
+                              refresh: bool = False):
         """
         遍历给定的提供者列表获取数据。
         如果成功且来源不是CSV，则执行缓存。
@@ -316,11 +506,29 @@ class DataManager:
             provider_name = provider.__class__.__name__
             print(f"Attempting to fetch data for {symbol} using {provider_name}...")
             try:
-                df = provider.get_data(symbol, start_date, end_date, timeframe, compression)
+                if bool(self._explicit_provider_value(provider, 'HYBRID_ONLY', False)):
+                    try:
+                        df = provider.get_data(
+                            symbol, start_date, end_date, timeframe, compression,
+                            refresh=refresh,
+                        )
+                    except TypeError as exc:
+                        if 'refresh' not in str(exc):
+                            raise
+                        df = provider.get_data(symbol, start_date, end_date, timeframe, compression)
+                else:
+                    df = provider.get_data(symbol, start_date, end_date, timeframe, compression)
                 if df is not None and not df.empty:
+                    df = sanitize_market_dataframe(df)
+                    if df is None or df.empty:
+                        print(f"{provider_name} returned no finite OHLCV rows for {symbol}.")
+                        continue
                     print(f"Successfully fetched data using {provider_name}.")
 
-                    if not isinstance(provider, CsvDataProvider):
+                    if (
+                        not isinstance(provider, CsvDataProvider)
+                        and not bool(self._explicit_provider_value(provider, 'HYBRID_ONLY', False))
+                    ):
                         self._cache_data(df, symbol, timeframe, compression)
 
                     return df
@@ -338,19 +546,29 @@ class DataManager:
         csv_filepath = CsvDataProvider.get_cache_filepath(self.data_path, symbol, timeframe, compression)
         temp_filepath = None
         try:
-            incoming = df.copy()
+            incoming = sanitize_market_dataframe(df)
+            if incoming is None or incoming.empty:
+                return
             incoming.index = pd.to_datetime(incoming.index, errors='coerce', utc=True).tz_localize(None)
             incoming = incoming[~incoming.index.isna()]
             if os.path.isfile(csv_filepath):
                 try:
                     existing = pd.read_csv(csv_filepath, index_col='datetime', parse_dates=True)
                     existing.index = pd.to_datetime(existing.index, errors='coerce', utc=True).tz_localize(None)
-                    merged = pd.concat([existing, incoming], axis=0, sort=False)
+                    existing = sanitize_market_dataframe(existing)
+                    merged = (
+                        pd.concat([existing, incoming], axis=0, sort=False)
+                        if existing is not None and not existing.empty
+                        else incoming
+                    )
                 except Exception as cache_error:
                     print(f"缓存文件损坏，将以本次有效数据重建 {csv_filepath}: {cache_error}")
                     merged = incoming
             else:
                 merged = incoming
+            merged = sanitize_market_dataframe(merged)
+            if merged is None or merged.empty:
+                return
             merged.index = pd.to_datetime(merged.index, errors='coerce', utc=True).tz_localize(None)
             merged = merged[~merged.index.isna()]
             merged = merged[~merged.index.duplicated(keep='last')].sort_index()

@@ -115,6 +115,19 @@ def test_option_history_parses_occ_and_enriches_greeks():
     assert fake.calls[0][1]["right"] == "P"
 
 
+def test_adjusted_option_history_is_rejected_without_verified_multiplier():
+    class Adjusted(_FakeTheta):
+        def option_history_eod(self, **kwargs):
+            frame = super().option_history_eod(**kwargs)
+            frame["is_adjusted"] = True
+            return frame
+
+    result = ThetaDataProvider(client=Adjusted()).get_data(
+        "US.AAPL240119P00150000", "20240101", "20240105"
+    )
+    assert result is None
+
+
 def test_daily_history_uses_date_boundary_for_cross_feed_alignment():
     result = ThetaDataProvider(client=_FakeTheta()).get_data(
         "US.AAPL", "20240101", "20240105"

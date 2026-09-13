@@ -77,6 +77,77 @@ def _column(df, aliases):
     return None
 
 
+def _is_adjusted_option_response(raw) -> bool:
+    """识别 ThetaData 响应中明确标记的调整后期权合约。"""
+    frame = _to_pandas(raw)
+    values = []
+    if isinstance(frame, pd.DataFrame):
+        for name in (
+            'is_adjusted', 'adjusted', 'adjustment', 'contract_adjusted',
+            'deliverable', 'contract_type',
+        ):
+            column = _column(frame, (name,))
+            if column is not None:
+                for value in frame[column].tolist():
+                    if name == 'deliverable':
+                        try:
+                            if math.isfinite(float(value)) and float(value) != 100.0:
+                                return True
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                    values.append(value)
+        attrs = getattr(frame, 'attrs', {}) or {}
+        for key, value in attrs.items():
+            if str(key).strip().lower() in {
+                'is_adjusted', 'adjusted', 'adjustment', 'contract_adjusted',
+                'deliverable', 'contract_type',
+            }:
+                items = value if isinstance(value, (list, tuple)) else [value]
+                if str(key).strip().lower() == 'deliverable':
+                    for item in items:
+                        try:
+                            if math.isfinite(float(item)) and float(item) != 100.0:
+                                return True
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                values.extend(items)
+    elif isinstance(raw, dict):
+        for key, value in raw.items():
+            if str(key).strip().lower() in {
+                'is_adjusted', 'adjusted', 'adjustment', 'contract_adjusted',
+                'deliverable', 'contract_type',
+            }:
+                values.extend(value if isinstance(value, (list, tuple)) else [value])
+    for value in values:
+        if isinstance(value, bool) and value:
+            return True
+        text = str(value or '').strip().lower()
+        if text in {'true', 'yes', 'y', 'adjusted', 'adjust'} or 'adjusted' in text:
+            return True
+    return False
+
+
+def _response_option_multiplier(raw):
+    """读取响应中明确提供的期权现金乘数。"""
+    frame = _to_pandas(raw)
+    if not isinstance(frame, pd.DataFrame):
+        return None
+    column = _column(frame, (
+        'option_contract_multiplier', 'option_contract_size',
+        'contract_multiplier', 'contract_size',
+    ))
+    if column is None:
+        return None
+    for value in reversed(frame[column].tolist()):
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(parsed) and parsed > 0:
+            return parsed
+    return None
+
+
 class ThetaDataProvider(BaseDataProvider):
     """通过 ThetaData 获取美国股票和期权历史数据。"""
 
@@ -430,6 +501,12 @@ class ThetaDataProvider(BaseDataProvider):
             else:
                 print("[ThetaData] stock history supports Days or 1/5/15/60 Minutes only")
                 return None
+        response_multiplier = _response_option_multiplier(raw) if parsed else None
+        if parsed and _is_adjusted_option_response(raw) and response_multiplier is None:
+            # ThetaData 当前不提供调整后合约的可靠现金乘数；不能静默套用
+            # 标准美股期权的 100 倍假设。
+            print('[ThetaData] adjusted option contract lacks a verified multiplier; history rejected')
+            return None
         result = self._normalise_ohlcv(raw)
         if result is None:
             return None
@@ -438,13 +515,15 @@ class ThetaDataProvider(BaseDataProvider):
             result.attrs["history_end"] = pd.Timestamp(today, tz="UTC")
             result.attrs["future_data_unavailable"] = True
         if parsed:
-            multiplier = self._option_multiplier()
+            multiplier = response_multiplier or self._option_multiplier()
             if multiplier is None:
                 print("[ThetaData] option contract multiplier is invalid; history rejected")
                 return None
             result.attrs["option_symbol"] = normalized
             result.attrs["contract_multiplier"] = multiplier
-            result.attrs["contract_multiplier_source"] = "standard_market_assumption"
+            result.attrs["contract_multiplier_source"] = (
+                "source" if response_multiplier is not None else "standard_market_assumption"
+            )
             result["contract_multiplier"] = multiplier
             # Greeks 是独立接口；失败时价格仍然可用于静态回测。
             if _ENRICH_OPTIONS:
@@ -500,7 +579,9 @@ class ThetaDataProvider(BaseDataProvider):
                 result.attrs.update(result_attrs)
                 result.attrs["option_symbol"] = normalized
                 result.attrs["contract_multiplier"] = multiplier
-                result.attrs["contract_multiplier_source"] = "standard_market_assumption"
+                result.attrs["contract_multiplier_source"] = (
+                    "source" if response_multiplier is not None else "standard_market_assumption"
+                )
                 result["contract_multiplier"] = multiplier
                 # ThetaData Greeks 提供 IV 但不直接提供 IVP；按历史前缀
                 # 计算可复现的百分位，供 CSP 等策略使用，避免引入未来数据。

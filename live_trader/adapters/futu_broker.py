@@ -14,13 +14,13 @@ import threading
 import time
 from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 import config
 from common import runtime_notifications
 from common.options.cash import (
-    CSPCashError,
     aggregate_assignment_cash,
     assignment_cash,
     assert_csp_capacity,
@@ -43,6 +43,7 @@ from common.options.contracts import (
 )
 from common.options.greeks import OptionGreeks, aggregate_option_greeks
 from common.options.risk import OptionRiskLeg, compute_option_margin
+from common.options.analytics import parse_expiry, parse_option_symbol, underlying_key
 from .futu_symbols import (
     OPTION_CODE_RE as _OPTION_CODE_RE,
     normalize_futu_symbol,
@@ -69,6 +70,7 @@ TimeInForce = getattr(_futu, 'TimeInForce', None)
 TrdEnv = getattr(_futu, 'TrdEnv', None)
 TrdMarket = getattr(_futu, 'TrdMarket', None)
 TrdSide = getattr(_futu, 'TrdSide', None)
+ComboLeg = getattr(_futu, 'ComboLeg', None)
 TradeOrderHandlerBase = getattr(_futu, 'TradeOrderHandlerBase', None)
 # 部分 futu-api 版本没有把行情 handler 基类从包根导出，但仍保留在
 # ``futu.quote.quote_response_handler``。优先使用包根导出，缺失时回退到稳定的
@@ -185,9 +187,30 @@ _FUTU_EVENT_TIME_FIELDS = (
     'time_key', 'datetime', 'update_time', 'data_time', 'time', 'created_at',
 )
 _OPTION_CONTRACT_DETAIL_RE = re.compile(
-    r"(?P<expiry>\d{6,8})(?P<right>[CP])(?P<strike>\d{5,9})$",
+    # Futu 会省略执行价前导零：例如 P9000 表示 9.000 美元，
+    # 因此低价期权的 strike 部分可能只有 3~4 位。
+    r"(?P<expiry>\d{6,8})(?P<right>[CP])(?P<strike>\d{3,9})$",
     re.IGNORECASE,
 )
+
+_OPTION_MULTIPLIER_FIELDS = (
+    'option_contract_multiplier', 'option_contract_size',
+)
+_GENERIC_MULTIPLIER_FIELDS = ('contract_multiplier', 'contract_size')
+
+_FUTU_MARKET_TIMEZONES = {
+    'US': 'America/New_York',
+    'HK': 'Asia/Hong_Kong',
+    'SH': 'Asia/Shanghai',
+    'SZ': 'Asia/Shanghai',
+    'SG': 'Asia/Singapore',
+    'JP': 'Asia/Tokyo',
+    'AU': 'Australia/Sydney',
+    'CA': 'America/Toronto',
+    'HK_FUTURE': 'Asia/Hong_Kong',
+    'FX': 'UTC',
+    'CRYPTO': 'UTC',
+}
 
 def _field(value, names, default=None):
     """兼容 DataFrame 行、字典和 SDK 属性对象。"""
@@ -468,6 +491,68 @@ def _parse_option_contract(symbol):
     }
 
 
+def _option_multiplier_from_row(row):
+    """从期权专属元数据读取现金乘数；拒绝 lot_size 和通用默认值 1。"""
+    for name in _OPTION_MULTIPLIER_FIELDS:
+        value = _decimal(_field(row, name, None), None)
+        if value is not None and value > 0:
+            return value
+    for name in _GENERIC_MULTIPLIER_FIELDS:
+        value = _decimal(_field(row, name, None), None)
+        # Futu 的普通 DataFeed 默认 contract_multiplier=1；期权不能把它
+        # 当作真实现金乘数，否则会把 100 倍合约低估为 1 倍。
+        if value is not None and value > 1:
+            return value
+    return None
+
+
+def _expiry_key(value):
+    """将到期日转换为稳定键；无法确认的日期返回空字符串。"""
+    parsed = parse_expiry(value)
+    if pd.isna(parsed):
+        return ''
+    return pd.Timestamp(parsed).strftime('%Y%m%d')
+
+
+def _risk_leg_matches_contract(risk_leg, symbol, actual_multiplier):
+    """校验单腿风险描述与券商合约元数据一致。"""
+    if not isinstance(risk_leg, OptionRiskLeg):
+        raise InvalidOptionOrderEffect('explicit option risk leg is required')
+    detail = _parse_option_contract(symbol)
+    if not detail:
+        raise InvalidOptionOrderEffect('option contract metadata is unavailable')
+    try:
+        risk_strike = float(risk_leg.strike)
+        risk_multiplier = float(risk_leg.contract_multiplier)
+    except (TypeError, ValueError, OverflowError):
+        raise InvalidOptionOrderEffect('risk leg strike or multiplier is invalid') from None
+    if not math.isfinite(risk_strike) or risk_strike <= 0:
+        raise InvalidOptionOrderEffect('risk leg strike is invalid')
+    if not math.isfinite(risk_multiplier) or risk_multiplier <= 0:
+        raise InvalidOptionOrderEffect('risk leg multiplier is invalid')
+    if abs(risk_strike - float(detail['strike'])) > max(1e-9, abs(float(detail['strike'])) * 1e-9):
+        raise InvalidOptionOrderEffect('risk leg strike does not match option symbol')
+    if abs(risk_multiplier - float(actual_multiplier)) > max(1e-9, abs(float(actual_multiplier)) * 1e-9):
+        raise InvalidOptionOrderEffect('risk leg multiplier does not match option contract')
+    expected_type = detail['option_type']
+    if str(risk_leg.option_type or '').strip().upper() not in {expected_type, expected_type[0]}:
+        raise InvalidOptionOrderEffect('risk leg option type does not match option symbol')
+    symbol_parsed = parse_option_symbol(symbol)
+    expected_underlying = str(symbol_parsed.get('underlying') or '').strip().upper()
+    provided_underlying_raw = str(risk_leg.underlying or '').strip().upper()
+    expected_market = symbol.split('.', 1)[0]
+    expected_underlying_symbol = _normalise_symbol(
+        f'{expected_market}.{expected_underlying}'
+    ) if expected_underlying else ''
+    provided_underlying_symbol = _normalise_symbol(provided_underlying_raw)
+    if expected_underlying and provided_underlying_symbol != expected_underlying_symbol:
+        raise InvalidOptionOrderEffect('risk leg underlying does not match option symbol')
+    risk_expiry = _expiry_key(getattr(risk_leg, 'expiry', None))
+    # 单腿现金担保校验不要求调用方重复提供到期日；若提供则必须一致。
+    if risk_expiry and risk_expiry != _expiry_key(detail['expiry']):
+        raise InvalidOptionOrderEffect('risk leg expiry does not match option symbol')
+
+
 class FutuOrderProxy(BaseOrderProxy):
     """富途订单状态代理，向基础执行器暴露统一的订单语义。"""
 
@@ -510,21 +595,26 @@ class FutuOrderProxy(BaseOrderProxy):
         self.requested_size = requested
         self.reserved_cash = 0.0
         symbol = _normalise_symbol(_field(raw_order, ('code', 'symbol', 'stock_code'), ''))
-        is_option = bool(_parse_option_contract(symbol).get('option_type'))
+        is_option = bool(_parse_option_contract(symbol).get('option_type')) or any(
+            _field(raw_order, name, None) is not None
+            for name in _OPTION_MULTIPLIER_FIELDS
+        )
         multiplier = contract_multiplier
         multiplier_value = _decimal(multiplier, None)
-        if multiplier_value is None or multiplier_value <= 0:
+        if is_option and multiplier_value is not None and multiplier_value <= 1:
             multiplier_value = None
-            for name in (
-                'option_contract_multiplier',
-                'option_contract_size',
-                'contract_multiplier',
-                'contract_size',
-            ):
-                candidate = _decimal(_field(raw_order, name, None), None)
-                if candidate is not None and candidate > 0:
-                    multiplier_value = candidate
-                    break
+        if multiplier_value is None or multiplier_value <= 0:
+            multiplier_value = (
+                _option_multiplier_from_row(raw_order)
+                if is_option
+                else None
+            )
+            if multiplier_value is None and not is_option:
+                for name in _GENERIC_MULTIPLIER_FIELDS:
+                    candidate = _decimal(_field(raw_order, name, None), None)
+                    if candidate is not None and candidate > 0:
+                        multiplier_value = candidate
+                        break
         self.contract_multiplier = (
             float(multiplier_value)
             if multiplier_value is not None
@@ -601,6 +691,103 @@ class FutuOrderProxy(BaseOrderProxy):
         return apply_signed_position(current_position, self.order_effect, size)
 
 
+class FutuComboOrderProxy(FutuOrderProxy):
+    """富途原子组合订单代理。
+
+    一个组合订单同时包含多条腿，不能被基础层误判为单一 BUY/SELL；
+    ``combo_legs`` 保留本地 data/effect 映射，最终仓位仍以券商快照为准。
+    """
+
+    def __init__(self, raw_order, *, legs, is_live=True, contract_multiplier=None):
+        first_data = legs[0].get('data') if legs else None
+        combo_multiplier = None
+        for item in legs or ():
+            risk_leg = item.get('risk_leg') if isinstance(item, dict) else None
+            candidate = _decimal(
+                getattr(risk_leg, 'contract_multiplier', None), None
+            )
+            if candidate is not None and candidate > 1:
+                combo_multiplier = float(candidate)
+                break
+        explicit_multiplier = _decimal(contract_multiplier, None)
+        if explicit_multiplier is not None and explicit_multiplier > 0:
+            combo_multiplier = float(explicit_multiplier)
+        super().__init__(
+            raw_order,
+            is_live=is_live,
+            data=first_data,
+            contract_multiplier=combo_multiplier or 1.0,
+            order_effect=None,
+        )
+        self.combo_legs = tuple(dict(item) for item in legs)
+        self.combo_effects = tuple(item.get('effect') for item in legs)
+        self.is_combo = True
+        # 组合订单不是单一方向，不能伪装成 OPTION_SPREAD 传给单腿仓位变换函数。
+        self.order_effect = None
+
+    def is_buy(self) -> bool:
+        return False
+
+    def is_sell(self) -> bool:
+        return False
+
+    @property
+    def executed(self):
+        """聚合柜台未提供的逐腿成交数量，满足统一成交流程契约。"""
+        aggregate = super().executed
+        has_leg_fills = any(
+            _field(leg, ('dealt_qty', 'filled_qty', 'filled_volume'), None) is not None
+            for leg in self.combo_legs
+        )
+        has_leg_prices = any(
+            _field(leg, ('dealt_avg_price', 'avg_fill_price', 'filled_vwap'), None) is not None
+            for leg in self.combo_legs
+        )
+        if aggregate.size > 0 and (not has_leg_fills or not has_leg_prices):
+            return aggregate
+        leg_sizes = []
+        weighted_price = Decimal('0')
+        weighted_quantity = Decimal('0')
+        total_value = Decimal('0')
+        total_commission = Decimal('0')
+        latest_dt = aggregate.dt
+        for leg in self.combo_legs:
+            size = _decimal(_field(leg, ('dealt_qty', 'filled_qty', 'filled_volume'), 0), Decimal('0'))
+            if size is None or size < 0:
+                size = Decimal('0')
+            price = _decimal(_field(leg, ('dealt_avg_price', 'avg_fill_price', 'filled_vwap', 'price'), 0), Decimal('0'))
+            value = _decimal(_field(leg, ('dealt_amount', 'dealt_val', 'filled_amount', 'filled_value'), None), None)
+            commission = _decimal(_field(leg, ('commission', 'dealt_commission', 'fee'), 0), Decimal('0'))
+            leg_sizes.append(size)
+            weighted_price += size * (price or Decimal('0'))
+            weighted_quantity += size
+            total_value += (
+                value
+                if value is not None
+                else size * (price or Decimal('0')) * Decimal(str(self.contract_multiplier))
+            )
+            total_commission += commission or Decimal('0')
+            leg_dt = coerce_dt(_field(leg, ('updated_time', 'update_time', 'dealt_time', 'create_time'), None))
+            if leg_dt is not None and (latest_dt is None or leg_dt > latest_dt):
+                latest_dt = leg_dt
+        if not leg_sizes or self.contract_multiplier <= 0:
+            return aggregate
+        # 原子组合的订单数量是每条腿的共同合约数；部分成交不一致时按
+        # 已完成的最小腿数量汇总，避免把两条腿相加成两倍成交量。
+        total_size = min(leg_sizes)
+        return SimpleNamespace(
+            size=quantity_number(total_size),
+            price=quantity_number(weighted_price / weighted_quantity) if weighted_quantity > 0 else 0,
+            value=quantity_number(total_value),
+            comm=quantity_number(total_commission),
+            dt=latest_dt,
+        )
+
+    def signed_position_delta(self, filled_size=None):
+        """组合订单没有单腿 signed delta；成交后必须重新读取券商持仓。"""
+        raise InvalidOptionOrderEffect('combo order has multiple leg position deltas')
+
+
 class FutuBrokerAdapter(BaseLiveBroker):
     """富途 OpenD 账户级适配器，支持股票、ETF 和受限的期权订单效果。
 
@@ -656,6 +843,9 @@ class FutuBrokerAdapter(BaseLiveBroker):
         self._owns_quote_ctx = False
         self._trade_context_init_failed = False
         self._trade_context_retry_at = 0.0
+        self._trade_unlock_context = None
+        self._trade_unlock_failed_context = None
+        self._last_trade_unlock_error = None
         self.trade_ctx = self._trade_ctx
         self.trd_ctx = self._trade_ctx
         self.quote_ctx = self._quote_ctx
@@ -698,6 +888,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
         self._contract_multipliers = {}
         # 仅保存当前 run 内尚未出现在远端快照中的 CSP 受理量；跨 K 不作为事实来源。
         self._option_run_reservations = {}
+        # 组合回调可能不携带腿明细，按订单 ID 保留本次提交的腿映射。
+        self._combo_order_legs = {}
         self._fx_rate_cache = {}
         self._quote_context_retry_at = 0.0
 
@@ -765,6 +957,34 @@ class FutuBrokerAdapter(BaseLiveBroker):
         """返回账户估值/可用资金所使用的币种名称。"""
         return _enum_name(self._account_currency_value())
 
+    def _quote_is_fresh(self, row, symbol):
+        """校验 Futu 实时报价时间戳；无法验证时拒绝期权成交价。"""
+        raw_timestamp = _field(row, ('update_time', 'timestamp', 'time_key', 'datetime'), None)
+        parsed = pd.to_datetime(raw_timestamp, errors='coerce')
+        if pd.isna(parsed):
+            return False
+        stamp = pd.Timestamp(parsed)
+        if stamp.tzinfo is None:
+            market = _normalise_symbol(symbol).split('.', 1)[0]
+            timezone = _FUTU_MARKET_TIMEZONES.get(market)
+            if not timezone:
+                return False
+            try:
+                stamp = stamp.tz_localize(ZoneInfo(timezone))
+            except Exception:
+                return False
+        try:
+            max_age = float(self._current_setting(
+                'OPTION_RISK_MAX_QUOTE_AGE_SECONDS', 300.0
+            ))
+        except (TypeError, ValueError, OverflowError):
+            max_age = 300.0
+        if not math.isfinite(max_age) or max_age < 0:
+            max_age = 300.0
+        now = pd.Timestamp.now(tz=stamp.tz)
+        age = (now - stamp).total_seconds()
+        return math.isfinite(age) and age >= -5.0 and age <= max_age
+
     def _cash_field_names(self):
         """返回账户计价币种对应的实时购买力字段，并保留旧版字段回退。"""
         currency = self._account_currency_name()
@@ -820,7 +1040,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 return None
             for row in _rows(response[1]):
                 row_code = _normalise_symbol(_field(row, ('code', 'symbol'), ''))
-                if row_code and row_code != _normalise_symbol(code):
+                if not row_code or row_code != _normalise_symbol(code):
                     continue
                 value = self._positive_decimal(
                     _field(row, ('last_price', 'last', 'price', 'close'), None)
@@ -880,10 +1100,10 @@ class FutuBrokerAdapter(BaseLiveBroker):
         """返回按账户币种换算后的持仓市值。"""
         value = super().get_position_market_value(data, size, price=price)
         try:
-            positive_size = float(size) > 0
+            nonzero_size = float(size) != 0
         except (TypeError, ValueError, OverflowError):
-            positive_size = False
-        if positive_size and (not math.isfinite(value) or value <= 0):
+            nonzero_size = True
+        if nonzero_size and (not math.isfinite(value) or value == 0):
             raise RuntimeError(
                 f'Futu position valuation unavailable for {getattr(data, "_name", "UNKNOWN")}'
             )
@@ -923,6 +1143,86 @@ class FutuBrokerAdapter(BaseLiveBroker):
             SysConfig.set_init_rsa_file(file=rsa_path)
         else:
             SysConfig.enable_proto_encrypt(False)
+
+    def _maybe_unlock_trade(self, context):
+        """按外部环境变量自动解锁实盘交易；不保存或输出凭据。"""
+        if context is None:
+            return False
+        password_env = _text(self._futu_setting('FUTU_TRADE_PASSWORD_ENV', ''))
+        password_md5_env = _text(self._futu_setting('FUTU_TRADE_PASSWORD_MD5_ENV', ''))
+        direct_password = _text(self._futu_setting('FUTU_TRADE_PASSWORD', ''))
+        direct_password_md5 = _text(self._futu_setting('FUTU_TRADE_PASSWORD_MD5', ''))
+        configured_count = sum(
+            bool(value)
+            for value in (password_env, password_md5_env, direct_password, direct_password_md5)
+        )
+        if not configured_count:
+            return True
+        if self._trade_unlock_context is context:
+            return True
+        if self._trade_unlock_failed_context is context:
+            return False
+        if configured_count > 1 or (password_env and password_md5_env):
+            error = RuntimeError(
+                'Futu trade unlock requires only one of FUTU_TRADE_PASSWORD_ENV '
+                'or FUTU_TRADE_PASSWORD_MD5_ENV'
+            )
+            self._last_trade_unlock_error = error
+            self._trade_unlock_failed_context = context
+            self._runtime_log('[FutuBroker] trade unlock configuration is ambiguous.')
+            return False
+        if _enum_name(self._trade_env_value()) != 'REAL':
+            # 仿真环境不需要交易密码；保留配置也不能改变仿真交易语义。
+            return True
+        unlock_trade = getattr(context, 'unlock_trade', None)
+        if not callable(unlock_trade):
+            error = RuntimeError('Futu trade context does not provide unlock_trade')
+            self._last_trade_unlock_error = error
+            self._trade_unlock_failed_context = context
+            self._runtime_log('[FutuBroker] trade unlock API is unavailable.')
+            return False
+
+        env_name = password_env or password_md5_env
+        credential = (
+            direct_password
+            or direct_password_md5
+            or os.environ.get(env_name, '')
+        )
+        if not credential:
+            error = RuntimeError(f'Futu trade unlock environment variable is empty: {env_name}')
+            self._last_trade_unlock_error = error
+            self._trade_unlock_failed_context = context
+            self._runtime_log(
+                f'[FutuBroker] trade unlock skipped: environment variable {env_name} is empty.'
+            )
+            return False
+        try:
+            kwargs = {'is_unlock': True}
+            if direct_password or password_env:
+                kwargs['password'] = credential
+            else:
+                kwargs['password_md5'] = credential
+            response = unlock_trade(**kwargs)
+            ret_code = response[0] if isinstance(response, tuple) and response else response
+            if ret_code != RET_OK:
+                error = RuntimeError(f'Futu trade unlock rejected (ret_code={ret_code!r})')
+                self._last_trade_unlock_error = error
+                self._trade_unlock_failed_context = context
+                self._runtime_log(
+                    f'[FutuBroker] trade unlock rejected (ret_code={ret_code!r}).'
+                )
+                return False
+            self._trade_unlock_context = context
+            self._last_trade_unlock_error = None
+            return True
+        except Exception:
+            error = RuntimeError('Futu trade unlock failed')
+            self._last_trade_unlock_error = error
+            self._trade_unlock_failed_context = context
+            self._runtime_log('[FutuBroker] trade unlock failed.')
+            return False
+        finally:
+            credential = None
 
     def _get_quote_context(self):
         """按需创建行情上下文，使独立启动的 Futu adapter 也能读取期权乘数。"""
@@ -1073,6 +1373,30 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 except Exception:
                     status = ''
                 if status not in {'CLOSED', 'CLOSING'}:
+                    if not self._maybe_unlock_trade(self._trade_ctx):
+                        failed_context = self._trade_ctx
+                        owns_failed_context = self._owns_trade_ctx
+                        # 解锁失败的 context 可能已被永久标记为失败；解绑后
+                        # 下一次重试才能创建新连接并重新读取凭据。外部注入的
+                        # context 不由本适配器关闭，但也不能继续作为可用事实源。
+                        self._trade_ctx = None
+                        self.trade_ctx = None
+                        self.trd_ctx = None
+                        self._owns_trade_ctx = False
+                        self._trade_unlock_context = None
+                        self._trade_unlock_failed_context = None
+                        if owns_failed_context:
+                            try:
+                                failed_context.close()
+                            except Exception as exc:
+                                self._runtime_log(
+                                    f'[FutuBroker] Failed to close unlock-failed trade context: {exc}'
+                                )
+                        self._trade_context_init_failed = True
+                        self._trade_context_retry_at = (
+                            time.monotonic() + _QUOTE_CONTEXT_RETRY_BACKOFF_SECONDS
+                        )
+                        return None
                     return self._trade_ctx
 
                 stale_context = self._trade_ctx
@@ -1081,6 +1405,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 self.trade_ctx = None
                 self.trd_ctx = None
                 self._owns_trade_ctx = False
+                self._trade_unlock_context = None
+                self._trade_unlock_failed_context = None
                 if owns_stale_context:
                     try:
                         stale_context.close()
@@ -1193,6 +1519,17 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     time.monotonic() + _QUOTE_CONTEXT_RETRY_BACKOFF_SECONDS
                 )
                 return None
+            if not self._maybe_unlock_trade(self._trade_ctx):
+                try:
+                    self._trade_ctx.close()
+                except Exception:
+                    pass
+                self._trade_ctx = None
+                self._trade_context_init_failed = True
+                self._trade_context_retry_at = (
+                    time.monotonic() + _QUOTE_CONTEXT_RETRY_BACKOFF_SECONDS
+                )
+                return None
             self._owns_trade_ctx = True
             self.trade_ctx = self._trade_ctx
             self.trd_ctx = self._trade_ctx
@@ -1211,6 +1548,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 self.trade_ctx = None
                 self.trd_ctx = None
                 self._owns_trade_ctx = False
+                self._trade_unlock_context = None
+                self._trade_unlock_failed_context = None
             if quote_context is not None:
                 self._quote_ctx = None
                 self.quote_ctx = None
@@ -1352,23 +1691,16 @@ class FutuBrokerAdapter(BaseLiveBroker):
     def _cache_contract_multiplier(self, symbol, row):
         """从行情快照缓存期权乘数，不把股票的空字段误当成有效值。"""
         is_option = self._is_option_symbol(symbol)
-        multiplier = None
-        for name in (
-            'option_contract_multiplier',
-            'option_contract_size',
-            'contract_multiplier',
-            'contract_size',
-        ):
-            multiplier = self._positive_decimal(_field(row, name, None))
-            if (
-                is_option
-                and name in {'contract_multiplier', 'contract_size'}
-                and multiplier is not None
-                and multiplier <= 1
-            ):
-                multiplier = None
-            if multiplier is not None:
-                break
+        multiplier = (
+            _option_multiplier_from_row(row)
+            if is_option
+            else None
+        )
+        if not is_option:
+            for name in _GENERIC_MULTIPLIER_FIELDS:
+                multiplier = self._positive_decimal(_field(row, name, None))
+                if multiplier is not None:
+                    break
         if multiplier is None or not symbol:
             return
         self._contract_multipliers[symbol] = float(multiplier)
@@ -1525,6 +1857,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 raise RuntimeError('Futu position_list_query returned an invalid response')
             if response[0] != RET_OK:
                 raise RuntimeError(f'Futu position_list_query failed: {response[1]}')
+            self._last_position_snapshot_fetch_failed = False
+            self._last_position_snapshot_fetch_error = None
             return _rows(response[1])
         except Exception as exc:
             self._last_position_snapshot_fetch_failed = True
@@ -1535,10 +1869,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
         """从仓位、缓存或已加载 data 读取真实期权乘数；缺失即失败关闭。"""
         normalized = _normalise_symbol(symbol)
         if row is not None:
-            parsed = _decimal(_field(row, (
-                'option_contract_multiplier', 'option_contract_size',
-                'contract_multiplier', 'contract_size', 'lot_size',
-            ), None), None)
+            parsed = _option_multiplier_from_row(row)
             if parsed is not None and parsed > 0:
                 return float(parsed)
         cached = _decimal(self._contract_multipliers.get(normalized), None)
@@ -1557,11 +1888,18 @@ class FutuBrokerAdapter(BaseLiveBroker):
     def _pending_remaining_quantity(row):
         """读取 pending 订单剩余数量，并严格拒绝不可验证的数量。"""
         requested = _decimal(_field(row, ('qty', 'volume', 'total_quantity'), None), None)
-        dealt = _decimal(_field(row, ('dealt_qty', 'filled_qty', 'filled_volume'), 0), Decimal('0'))
+        dealt = _decimal(_field(row, ('dealt_qty', 'filled_qty', 'filled_volume'), None), None)
         reported = _decimal(_field(row, ('remaining', 'remaining_qty'), None), None)
-        remaining = reported if reported is not None else (
-            requested - dealt if requested is not None else None
-        )
+        if (requested is not None and requested < 0) or (dealt is not None and dealt < 0):
+            raise RuntimeError('Futu pending order has invalid quantity')
+        if reported is not None and reported == 0 and requested is not None and dealt is not None:
+            # 柜台偶发将未完成订单的 remaining 短暂报告为 0；只要总量和
+            # 已成交量可验证，就按未成交部分保守计算，避免误把快照判坏。
+            remaining = requested - dealt
+        else:
+            remaining = reported if reported is not None else (
+                requested - dealt if requested is not None else None
+            )
         if remaining is None or remaining < 0:
             raise RuntimeError('Futu pending order has invalid remaining quantity')
         if remaining == 0:
@@ -1624,6 +1962,30 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     raise RuntimeError(
                         f'Futu pending option order has unknown effect: id={order_id!r}'
                     )
+            # 组合订单的聚合行通常没有 order_effect；优先从当前 run 保留的
+            # 逐腿映射恢复本行对应效果，避免跨 K 后把已知平仓组合误判为未知卖开。
+            combo_map = getattr(self, '_combo_order_legs', None)
+            combo_legs = combo_map.get(order_id, ()) if isinstance(combo_map, dict) else ()
+            if effect is None and combo_legs:
+                matching_legs = [
+                    item for item in combo_legs
+                    if _normalise_symbol(item.get('symbol', '')) == symbol
+                ]
+                if matching_legs:
+                    effects = {
+                        normalize_option_order_effect(item.get('effect'))
+                        for item in matching_legs
+                        if item.get('effect') not in (None, '')
+                    }
+                    if len(effects) == 1:
+                        effect = next(iter(effects))
+                elif all(
+                    item.get('effect') in {'BUY_TO_CLOSE', 'SELL_TO_CLOSE'}
+                    for item in combo_legs
+                ):
+                    # 聚合代码无法对应单腿时，纯平仓组合不产生新的 Short Put
+                    # 义务；安全地忽略本行，而不是伪造卖开效果。
+                    continue
             # 本次运行刚提交的卖开订单，其效果记录保存在短期映射中；
             # 其他缺少效果字段的柜台记录无法安全区分卖平/卖开，必须失败关闭。
             reservation = self._option_run_reservations.get(order_id)
@@ -1675,10 +2037,6 @@ class FutuBrokerAdapter(BaseLiveBroker):
             pending_short_puts=obligations['pending_orders'],
         )
 
-    def get_csp_uncommitted_cash(self):
-        """兼容旧 CSP 策略的现金入口。"""
-        return self.get_option_uncommitted_cash()
-
     def get_rebalance_cash(self):
         """将已知期权现金义务纳入策略调仓现金口径。"""
         obligations = self.get_option_assignment_obligations()
@@ -1716,6 +2074,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 break
         if qty is None:
             raise RuntimeError(f'Futu position has invalid quantity: {raw_qty!r}')
+        if qty < 0:
+            raise RuntimeError(f'Futu position has negative quantity: {raw_qty!r}')
         raw_sellable = None
         sellable = None
         invalid_sellable = None
@@ -1754,22 +2114,26 @@ class FutuBrokerAdapter(BaseLiveBroker):
             raise RuntimeError('Futu position is missing code')
         option_detail = _parse_option_contract(symbol)
         raw_multiplier = None
-        for name in (
-            'option_contract_multiplier',
-            'option_contract_size',
-            'contract_multiplier',
-            'contract_size',
-            'lot_size',
-        ):
-            candidate = _decimal(_field(row, name, None), None)
-            if candidate is not None and candidate > 0:
-                # lot_size 对普通股票不是现金乘数；期权才允许作为最后回退。
-                if name == 'lot_size' and not option_detail:
-                    continue
-                raw_multiplier = candidate
-                break
+        if option_detail:
+            raw_multiplier = _option_multiplier_from_row(row)
+        else:
+            for name in _GENERIC_MULTIPLIER_FIELDS + ('lot_size',):
+                candidate = _decimal(_field(row, name, None), None)
+                if candidate is not None and candidate > 0:
+                    raw_multiplier = candidate
+                    break
         position_side = _enum_name(_field(row, 'position_side', ''))
         is_short = position_side in {'SHORT', 'SHORT_SELL', 'SHORTSELL'}
+        if (
+            option_detail
+            and position_side not in {'LONG', 'SHORT', 'SHORT_SELL', 'SHORTSELL'}
+            and (sellable is None or sellable <= 0)
+        ):
+            # 缺少方向时仅接受带有正的可卖数量的明确多仓事实；
+            # 没有可卖量的期权行无法排除 Short Put，必须失败关闭。
+            raise RuntimeError(
+                f'Futu option position has unknown position side: {position_side or "UNKNOWN"}'
+            )
         if is_short and not FutuBrokerAdapter._is_option_symbol(symbol):
             raise RuntimeError(
                 f'Futu short position is unsupported for {symbol}: side={position_side}'
@@ -1786,11 +2150,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
             combo_id.upper() in {'', '0', 'N/A', 'NONE'}
             or (combo_number is not None and combo_number == 0)
         )
-        if position_type == 'COMBINED' or not combo_is_empty:
-            raise RuntimeError(
-                f'Futu combination position is unsupported for {symbol}: '
-                f'position_type={position_type or "UNKNOWN"}, combo_id={combo_id or "UNKNOWN"}'
-            )
+        # COMBINED/带 combo_id 的记录仍按代码解析；get_position() 会对同一标的
+        # 的腿记录做精确聚合，不再把组合持仓误判为不可用快照。
         if sellable is not None and sellable < 0:
             raise RuntimeError(f'Futu position has negative sellable quantity: {raw_sellable!r}')
         return {
@@ -1814,6 +2175,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
             ),
             'currency': _text(_field(row, 'currency', '')),
             'position_id': _text(_field(row, ('position_id', 'id'), '')),
+            'combo_id': combo_id if not combo_is_empty else '',
             'market': _text(market_hint).upper(),
         }
 
@@ -1873,6 +2235,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 max(Decimal('0'), sellable if total_qty > 0 else Decimal('0'))
             ),
             position_id=next((item['position_id'] for item in matched if item['position_id']), ''),
+            combo_id=next((item['combo_id'] for item in matched if item.get('combo_id')), ''),
+            combo_ids=tuple(dict.fromkeys(item['combo_id'] for item in matched if item.get('combo_id'))),
         )
 
     def get_sellable_position(self, data):
@@ -1896,7 +2260,9 @@ class FutuBrokerAdapter(BaseLiveBroker):
                         _field(row, ('code', 'symbol'), ''),
                         _field(row, 'market', ''),
                     )
-                    if row_symbol and row_symbol != symbol:
+                    if not row_symbol or row_symbol != symbol:
+                        continue
+                    if not self._quote_is_fresh(row, symbol):
                         continue
                     self._cache_contract_multiplier(row_symbol or symbol, row)
                     price = _decimal(
@@ -2031,12 +2397,18 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     )
 
                 requested = _decimal(_field(row, ('qty', 'volume', 'total_quantity'), None), None)
-                dealt = _decimal(_field(row, ('dealt_qty', 'filled_qty', 'filled_volume'), 0), Decimal('0'))
+                dealt = _decimal(_field(row, ('dealt_qty', 'filled_qty', 'filled_volume'), None), None)
                 reported_remaining = _decimal(
                     _field(row, ('remaining', 'remaining_qty'), None),
                     None,
                 )
-                if reported_remaining is not None:
+                if (requested is not None and requested < 0) or (dealt is not None and dealt < 0):
+                    raise RuntimeError(f'Futu pending order has invalid quantity: id={order_id!r}')
+                if reported_remaining is not None and reported_remaining == 0 and requested is not None and dealt is not None:
+                    # 与 _pending_remaining_quantity 保持一致：非终态的 0
+                    # 只在 qty/filled 可验证时按差额计入在途。
+                    remaining = requested - dealt
+                elif reported_remaining is not None:
                     if reported_remaining < 0:
                         raise RuntimeError(
                             f'Futu pending order has negative remaining quantity: id={order_id!r}'
@@ -2054,6 +2426,58 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     raise RuntimeError(
                         f'Futu pending order has no verifiable remaining quantity: id={order_id!r}'
                     )
+                combo_map = getattr(self, '_combo_order_legs', None)
+                combo_legs = combo_map.get(order_id, ()) if isinstance(combo_map, dict) else ()
+                raw_combo_legs = _field(row, ('combo_legs', 'comboLegs', 'legs'), None)
+                if isinstance(raw_combo_legs, pd.DataFrame):
+                    raw_combo_legs = _rows(raw_combo_legs)
+                if not combo_legs and isinstance(raw_combo_legs, (list, tuple)) and len(raw_combo_legs) > 1:
+                    combo_legs = [
+                        {
+                            'symbol': _normalise_symbol(_field(item, ('code', 'symbol'), '')),
+                            'effect': None,
+                            'direction': _enum_name(_field(item, ('trd_side', 'side'), '')),
+                        }
+                        for item in raw_combo_legs
+                    ]
+                combo_type = _enum_name(_field(row, ('order_type', 'combo_type', 'order_kind'), ''))
+                combo_ref = _text(_field(row, ('combo_id', 'combo_order_id'), ''))
+                combo_marked = (
+                    combo_ref.upper() not in {'', '0', 'NONE', 'N/A'}
+                    or any(marker in combo_type for marker in ('COMBO', 'COMBINATION', 'SPREAD'))
+                )
+                if combo_marked and not (isinstance(combo_legs, (list, tuple)) and len(combo_legs) > 1):
+                    # 组合聚合行缺少逐腿方向时，不能把首腿的 SELL/BUY
+                    # 当成完整组合事实；返回不可信快照，等待下一轮带腿明细的重试。
+                    raise RuntimeError(
+                        f'Futu combo pending order lacks verifiable leg details: id={order_id!r}'
+                    )
+                if isinstance(combo_legs, (list, tuple)) and len(combo_legs) > 1:
+                    # 组合订单必须按腿展开，否则基础层只能把聚合 SELL
+                    # 作用到首腿，第二条腿无法进入预期仓位计算。
+                    for leg in combo_legs:
+                        leg_symbol = _normalise_symbol(leg.get('symbol', ''))
+                        if not leg_symbol:
+                            raise RuntimeError(
+                                f'Futu combo pending leg is missing code: id={order_id!r}'
+                            )
+                        effect = leg.get('effect')
+                        if effect not in (None, ''):
+                            effect = normalize_option_order_effect(effect)
+                            leg_direction = order_effect_side(effect)
+                        else:
+                            leg_direction = _enum_name(leg.get('direction', ''))
+                        if leg_direction not in {'BUY', 'SELL'}:
+                            raise RuntimeError(
+                                f'Futu combo pending leg has unknown direction: id={order_id!r}'
+                            )
+                        result.append({
+                            'id': order_id,
+                            'symbol': self._framework_symbol(leg_symbol),
+                            'direction': leg_direction,
+                            'size': quantity_number(remaining),
+                        })
+                    continue
                 result.append({
                     'id': order_id,
                     'symbol': self._framework_symbol(symbol),
@@ -2182,15 +2606,21 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 return None
             option_order_effect = 'SELL_TO_CLOSE'
         elif self._is_option_symbol(symbol) and side_name == 'BUY':
-            # 买入在已有负仓时属于买平，否则属于买开；查询失败不改动原有
-            # BUY 失败关闭边界，显式效果入口仍会先完成严格校验。
+            # 买入在已有负仓时属于买平，否则属于买开；无法确认仓位时必须
+            # 失败关闭，不能把未知状态交给券商自行解释。
             try:
                 position = self.get_position(data)
                 signed_size = _decimal(getattr(position, 'size', 0), None)
-                if signed_size is not None:
-                    option_order_effect = 'BUY_TO_CLOSE' if signed_size < 0 else 'BUY_TO_OPEN'
-            except Exception:
-                option_order_effect = None
+                if signed_size is None or not signed_size.is_finite():
+                    raise RuntimeError('option position snapshot is unavailable')
+                option_order_effect = 'BUY_TO_CLOSE' if signed_size < 0 else 'BUY_TO_OPEN'
+            except Exception as exc:
+                self._last_order_target_skip_reason = 'unsupported_option_order_effect'
+                self._runtime_log(
+                    f'[FutuBroker] option BUY {symbol} skipped: '
+                    f'position snapshot unavailable ({exc})'
+                )
+                return None
 
         lot_limit = _decimal(self._current_setting('BROKER_LOT_LIMITS', 0), Decimal('0'))
         if lot_limit is not None and lot_limit > 0 and quantity > lot_limit:
@@ -2222,10 +2652,17 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 return None
 
         unit_value = self._order_unit_value(data, order_price)
-        if side_name == 'BUY' and unit_value <= 0:
+        # 期权乘数缺失时，卖开同样必须失败关闭；否则可用 risk_leg 的乘数
+        # 通过现金检查，却以 0 名义价值进入柜台和本地估值。
+        if self._is_option_symbol(symbol) and (
+            unit_value <= 0 or self._contract_multiplier(data) <= 0
+        ):
             self._last_order_target_skip_reason = 'invalid_order_unit_value'
+            self._runtime_log(
+                f'[FutuBroker] option {side_name} {symbol} skipped: '
+                'contract multiplier or FX valuation is unavailable.'
+            )
             return None
-
         context = self._get_trade_context()
         if context is None:
             self._runtime_log(f'[FutuBroker] {side_name} {symbol} skipped: trade context unavailable')
@@ -2304,12 +2741,19 @@ class FutuBrokerAdapter(BaseLiveBroker):
         提供风险腿并开启 ``allow_sell_to_open``，仅在现金担保 Put 或
         Covered Call 通过实时账户快照后允许卖开；普通 SELL 仍不会伪装成卖开。
         """
+        self._last_order_target_skip_reason = None
         symbol = _normalise_symbol(getattr(data, '_name', ''))
         if not self._is_option_symbol(symbol):
             self._last_order_target_skip_reason = 'option_effect_requires_option_symbol'
             return None
         try:
             effect = normalize_option_order_effect(order_effect)
+            if self.option_entry_blocked() and effect in {'SELL_TO_OPEN', 'BUY_TO_OPEN'}:
+                self._last_order_target_skip_reason = 'option_entry_kill_switch'
+                self._runtime_log(
+                    f'[FutuBroker] option entry blocked by risk watchdog: {symbol}'
+                )
+                return None
             position = self.get_position(data)
             current_size = getattr(position, 'size', 0) or 0
             if effect == 'SELL_TO_OPEN':
@@ -2321,15 +2765,14 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     raise InvalidOptionOrderEffect(
                         'risk leg symbol does not match option order symbol'
                     )
-                option_match = re.search(r'\d{6,8}([CP])\d+$', symbol, re.IGNORECASE)
-                if option_match:
-                    expected_type = (
-                        'CALL' if option_match.group(1).upper() == 'C' else 'PUT'
+                contract_detail = _parse_option_contract(symbol)
+                expected_type = contract_detail.get('option_type')
+                if expected_type and str(risk_leg.option_type or '').strip().upper() not in {
+                    expected_type, expected_type[0]
+                }:
+                    raise InvalidOptionOrderEffect(
+                        'risk leg option type does not match option symbol'
                     )
-                    if str(risk_leg.option_type).upper() not in {expected_type, expected_type[0]}:
-                        raise InvalidOptionOrderEffect(
-                            'risk leg option type does not match option symbol'
-                        )
                 if abs(float(risk_leg.signed_quantity)) + 1e-12 < float(volume):
                     raise InvalidOptionOrderEffect(
                         'risk leg quantity is smaller than requested order quantity'
@@ -2338,7 +2781,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     raise InvalidOptionOrderEffect(
                         'SELL_TO_OPEN risk leg must describe a short position'
                     )
-                if str(risk_leg.option_type).upper() == 'PUT':
+                if str(risk_leg.option_type).upper() in {'PUT', 'P'}:
                     obligations = self.get_option_assignment_obligations()
                     assert_csp_capacity(
                         self._fetch_settled_cash(),
@@ -2348,6 +2791,13 @@ class FutuBrokerAdapter(BaseLiveBroker):
                         volume,
                         risk_leg.contract_multiplier,
                     )
+                actual_multiplier = self._contract_multiplier(data)
+                if actual_multiplier <= 0:
+                    self._last_order_target_skip_reason = 'invalid_order_unit_value'
+                    raise InvalidOptionOrderEffect(
+                        'option contract multiplier is unavailable'
+                    )
+                _risk_leg_matches_contract(risk_leg, symbol, actual_multiplier)
                 margin_snapshot = self.get_option_margin_snapshot(
                     [risk_leg],
                     underlying_positions=underlying_positions,
@@ -2365,7 +2815,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 )
             side = order_effect_side(effect)
         except (InvalidOptionOrderEffect, RuntimeError, ValueError, TypeError) as exc:
-            self._last_order_target_skip_reason = 'unsupported_option_order_effect'
+            if self._last_order_target_skip_reason != 'invalid_order_unit_value':
+                self._last_order_target_skip_reason = 'unsupported_option_order_effect'
             message = (
                 f'[FutuBroker] option order rejected locally: symbol={symbol}, '
                 f'effect={order_effect!r}, reason={exc}'
@@ -2388,7 +2839,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
         proxy.order_effect = effect
         if isinstance(getattr(proxy, 'raw_order', None), dict):
             proxy.raw_order['order_effect'] = effect
-        if effect == 'SELL_TO_OPEN' and str(risk_leg.option_type).upper() == 'PUT':
+        if effect == 'SELL_TO_OPEN' and str(risk_leg.option_type).upper() in {'PUT', 'P'}:
             self._option_run_reservations[str(proxy.id)] = {
                 'symbol': symbol,
                 'strike': float(risk_leg.strike),
@@ -2404,8 +2855,272 @@ class FutuBrokerAdapter(BaseLiveBroker):
             )
         return proxy
 
+    def submit_option_spread(self, legs, volume=1, **kwargs):
+        """使用 Futu ``place_combo_order`` 原子提交两腿期权组合。
+
+        提交前会重新读取每条腿的券商仓位并调用
+        ``comboorder_tradinginfo_query``。接口缺失、仿真环境不支持、腿信息不
+        完整或柜台拒绝时均不回退为单腿订单，确保不会意外暴露裸期权风险。
+        """
+        context = self._get_trade_context()
+        if ComboLeg is None or context is None or not callable(getattr(context, 'place_combo_order', None)):
+            self._last_order_target_skip_reason = 'atomic_option_spread_unsupported'
+            self._runtime_log('[FutuBroker] combo order API is unavailable; no option leg submitted.')
+            return None
+        if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+            self._last_order_target_skip_reason = 'invalid_option_spread'
+            return None
+        try:
+            opening_effects = {
+                normalize_option_order_effect(item.get('effect'))
+                for item in legs
+                if isinstance(item, dict)
+            }
+        except Exception:
+            opening_effects = set()
+        if self.option_entry_blocked() and opening_effects & {'SELL_TO_OPEN', 'BUY_TO_OPEN'}:
+            self._last_order_target_skip_reason = 'option_entry_kill_switch'
+            self._runtime_log('[FutuBroker] option spread entry blocked by risk gate.')
+            return None
+        try:
+            quantity = _decimal(volume, None)
+            if quantity is None or quantity <= 0:
+                raise ValueError('spread quantity must be positive and finite')
+            normalized = []
+            for item in legs:
+                if not isinstance(item, dict):
+                    raise ValueError('spread leg must be a mapping')
+                data = item.get('data')
+                effect = normalize_option_order_effect(item.get('effect'))
+                symbol = _normalise_symbol(getattr(data, '_name', ''))
+                risk_leg = item.get('risk_leg')
+                leg_quantity = _decimal(item.get('volume', quantity), None)
+                price = _decimal(item.get('price'), None)
+                if not symbol or leg_quantity is None or leg_quantity != quantity or price is None or price <= 0:
+                    raise ValueError('spread leg has invalid symbol, quantity or price')
+                position = self.get_position(data)
+                current_size = _decimal(getattr(position, 'size', 0), None)
+                if current_size is None:
+                    raise ValueError('spread position snapshot unavailable')
+                validate_option_order_effect(
+                    effect,
+                    current_size,
+                    quantity,
+                    allow_sell_to_open=effect == 'SELL_TO_OPEN',
+                )
+                if effect in {'SELL_TO_OPEN', 'BUY_TO_OPEN'}:
+                    if not isinstance(risk_leg, OptionRiskLeg):
+                        raise ValueError('spread opening leg risk metadata is required')
+                    if _normalise_symbol(risk_leg.symbol) != symbol:
+                        raise ValueError('spread risk leg symbol mismatch')
+                    actual_multiplier = self._contract_multiplier(data)
+                    if actual_multiplier <= 0:
+                        raise ValueError('spread option contract multiplier is unavailable')
+                    _risk_leg_matches_contract(risk_leg, symbol, actual_multiplier)
+                    option_type = str(risk_leg.option_type or '').upper()
+                    expected_signed = -float(quantity) if effect == 'SELL_TO_OPEN' else float(quantity)
+                    if option_type not in {'PUT', 'P'} or abs(float(risk_leg.signed_quantity) - expected_signed) > 1e-12:
+                        raise ValueError('only matched Put spread legs are supported')
+                normalized.append({
+                    'data': data,
+                    'symbol': symbol,
+                    'effect': effect,
+                    'price': float(price),
+                    'risk_leg': risk_leg,
+                    'position_id': _text(getattr(position, 'position_id', '')),
+                })
+
+            short = next((item for item in normalized if item['effect'] == 'SELL_TO_OPEN'), None)
+            long = next((item for item in normalized if item['effect'] == 'BUY_TO_OPEN'), None)
+            closing = short is None and {
+                item['effect'] for item in normalized
+            } == {'BUY_TO_CLOSE', 'SELL_TO_CLOSE'}
+            if short is not None and long is not None:
+                if self.option_entry_blocked():
+                    self._last_order_target_skip_reason = 'option_entry_kill_switch'
+                    self._runtime_log('[FutuBroker] option spread entry blocked by risk gate.')
+                    return None
+                if underlying_key(short['risk_leg'].underlying) != underlying_key(long['risk_leg'].underlying):
+                    raise ValueError('spread legs must share underlying')
+                short_contract = _parse_option_contract(short['symbol'])
+                long_contract = _parse_option_contract(long['symbol'])
+                if not short_contract or not long_contract or short_contract.get('expiry') != long_contract.get('expiry'):
+                    raise ValueError('spread symbols must share a recognized expiry')
+                if short_contract.get('option_type') != 'PUT' or long_contract.get('option_type') != 'PUT':
+                    raise ValueError('spread symbols must both be Put contracts')
+                if abs(float(short_contract['strike']) - float(short['risk_leg'].strike)) > 1e-12:
+                    raise ValueError('short risk leg strike does not match option symbol')
+                if abs(float(long_contract['strike']) - float(long['risk_leg'].strike)) > 1e-12:
+                    raise ValueError('long risk leg strike does not match option symbol')
+                if short['risk_leg'].strike <= long['risk_leg'].strike:
+                    raise ValueError('Put credit spread requires short strike above long strike')
+                short_expiry = _expiry_key(short['risk_leg'].expiry)
+                long_expiry = _expiry_key(long['risk_leg'].expiry)
+                if not short_expiry or not long_expiry or short_expiry != long_expiry:
+                    raise ValueError('spread legs must share expiry')
+                if abs(float(short['risk_leg'].contract_multiplier) - float(long['risk_leg'].contract_multiplier)) > 1e-12:
+                    raise ValueError('spread legs must share contract multiplier')
+            elif not closing:
+                raise ValueError('unsupported option spread effects')
+            if closing:
+                parsed_close = [_parse_option_contract(item['symbol']) for item in normalized]
+                if any(not item for item in parsed_close):
+                    raise ValueError('closing spread symbols are not recognized option contracts')
+                close_expiries = {_expiry_key(item.get('expiry')) for item in parsed_close}
+                if not close_expiries or '' in close_expiries or len(close_expiries) != 1:
+                    raise ValueError('closing spread legs must share expiry')
+                if parsed_close[0].get('option_type') != 'PUT' or parsed_close[1].get('option_type') != 'PUT':
+                    raise ValueError('only Put spreads are supported')
+                close_buy = next(item for item in normalized if item['effect'] == 'BUY_TO_CLOSE')
+                close_sell = next(item for item in normalized if item['effect'] == 'SELL_TO_CLOSE')
+                if close_buy['symbol'] == close_sell['symbol']:
+                    raise ValueError('closing spread legs must be distinct contracts')
+                buy_contract = _parse_option_contract(close_buy['symbol'])
+                sell_contract = _parse_option_contract(close_sell['symbol'])
+                if buy_contract.get('strike', 0) <= sell_contract.get('strike', 0):
+                    raise ValueError('closing Put spread strikes are invalid')
+                buy_parsed = parse_option_symbol(close_buy['symbol'])
+                sell_parsed = parse_option_symbol(close_sell['symbol'])
+                buy_underlying = underlying_key(buy_parsed.get('underlying', ''))
+                sell_underlying = underlying_key(sell_parsed.get('underlying', ''))
+                if not buy_underlying or buy_underlying != sell_underlying:
+                    raise ValueError('closing spread legs must share underlying')
+                buy_multiplier = self._contract_multiplier(close_buy['data'])
+                sell_multiplier = self._contract_multiplier(close_sell['data'])
+                if (
+                    buy_multiplier <= 0 or sell_multiplier <= 0
+                    or abs(buy_multiplier - sell_multiplier) > max(
+                        1e-9, abs(buy_multiplier) * 1e-9
+                    )
+                ):
+                    raise ValueError('closing spread legs must share contract multiplier')
+
+            net_price = sum(
+                item['price'] if item['effect'] in {'SELL_TO_OPEN', 'SELL_TO_CLOSE'} else -item['price']
+                for item in normalized
+            )
+            if short is not None and net_price <= 0:
+                raise ValueError('credit spread net price must be positive')
+            if closing:
+                net_price = abs(net_price)
+            combo_legs = []
+            for item in normalized:
+                combo_leg = ComboLeg()
+                combo_leg.code = item['symbol']
+                combo_leg.trd_side = _enum_value(TrdSide, 'SELL' if item['effect'] in {'SELL_TO_OPEN', 'SELL_TO_CLOSE'} else 'BUY', 'SELL')
+                combo_leg.qty_ratio = 1.0
+                if closing and item['position_id']:
+                    combo_leg.position_id = item['position_id']
+                combo_legs.append(combo_leg)
+            trading_info = getattr(context, 'comboorder_tradinginfo_query', None)
+            if not callable(trading_info):
+                raise RuntimeError('Futu combo trading-info query is unavailable')
+            with self._context_lock:
+                info = trading_info(
+                    combo_legs,
+                    price=float(net_price),
+                    qty=float(quantity),
+                    order_type=self._order_type_value(),
+                    trd_env=self._trade_env_value(),
+                    acc_id=self._account_id_value(),
+                    acc_index=self._account_index_value(),
+                )
+            if not isinstance(info, tuple) or len(info) < 2 or info[0] != RET_OK:
+                detail = info[1] if isinstance(info, tuple) and len(info) > 1 else info
+                raise RuntimeError(f'Futu combo trading-info rejected: {detail}')
+            info_rows = _rows(info[1])
+            if not info_rows:
+                raise RuntimeError('Futu combo trading-info returned no risk fields')
+            margin_values = []
+            for row in info_rows:
+                raw_margin = _field(
+                    row,
+                    ('initial_margin_change', 'maintenance_margin_change'),
+                    None,
+                )
+                if raw_margin is None:
+                    continue
+                parsed_margin = _decimal(raw_margin, None)
+                if parsed_margin is None:
+                    raise RuntimeError('Futu combo trading-info margin is invalid')
+                margin_values.append(parsed_margin)
+            if not margin_values:
+                raise RuntimeError('Futu combo trading-info margin is unavailable')
+            if short is not None and any(value < 0 for value in margin_values):
+                raise RuntimeError('Futu combo trading-info opening margin is negative')
+            if short is not None:
+                # 柜台只返回增量保证金，不代表账户一定有能力承担它；
+                # 还要以当前账户已结算且未被其它 Short Put 占用的现金复核。
+                required_margin = max(margin_values)
+                available_cash = self.get_option_uncommitted_cash()
+                if required_margin > Decimal(str(available_cash)) + Decimal('1e-12'):
+                    raise RuntimeError(
+                        f'Futu combo opening margin exceeds available settled cash: '
+                        f'required={required_margin}, available={available_cash}'
+                    )
+            with self._context_lock:
+                # Watchdog/清算闸门可能在查询期间刚刚触发；下单前再次检查，
+                # 平仓组合不受该开仓闸门影响。
+                if (
+                    short is not None
+                    and self.option_entry_blocked()
+                ):
+                    self._last_order_target_skip_reason = 'option_entry_kill_switch'
+                    return None
+                response = context.place_combo_order(
+                    combo_legs,
+                    price=float(net_price),
+                    qty=float(quantity),
+                    order_type=self._order_type_value(),
+                    trd_env=self._trade_env_value(),
+                    acc_id=self._account_id_value(),
+                    acc_index=self._account_index_value(),
+                    time_in_force=self._time_in_force_value(),
+                    remark='QuantAda option spread',
+                )
+            if not isinstance(response, tuple) or len(response) < 2 or response[0] != RET_OK:
+                detail = response[1] if isinstance(response, tuple) and len(response) > 1 else response
+                raise RuntimeError(f'Futu combo order rejected: {detail}')
+            records = _rows(response[1])
+            raw_order = _order_dict(records[0]) if records else {}
+            raw_order.setdefault('order_id', _field(response[1], ('order_id',), ''))
+            raw_order.setdefault('code', normalized[0]['symbol'])
+            raw_order.setdefault('qty', quantity_number(quantity))
+            raw_order.setdefault('price', float(net_price))
+            raw_order.setdefault('order_status', 'SUBMITTED')
+            proxy = FutuComboOrderProxy(raw_order, legs=normalized, is_live=self.is_live)
+            if not proxy.id:
+                raise RuntimeError('Futu combo order returned no order id')
+            self._combo_order_legs[str(proxy.id)] = tuple(dict(item) for item in normalized)
+            proxy.submitted_size = quantity_number(quantity)
+            proxy.requested_size = quantity_number(quantity)
+            if short is not None:
+                short_leg = short['risk_leg']
+                self._option_run_reservations[str(proxy.id)] = {
+                    'symbol': short['symbol'],
+                    'strike': float(short_leg.strike),
+                    'remaining': float(quantity),
+                    'contract_multiplier': float(short_leg.contract_multiplier),
+                }
+                proxy.assignment_cash_reserved = float(
+                    assignment_cash(short_leg.strike, quantity, short_leg.contract_multiplier)
+                )
+            return proxy
+        except Exception as exc:
+            self._last_order_target_skip_reason = (
+                'atomic_option_spread_unsupported'
+                if 'not support' in str(exc).lower() or '不支持' in str(exc)
+                else 'option_spread_rejected'
+            )
+            message = f'[FutuBroker] atomic option spread rejected: {exc}'
+            self._runtime_log(message)
+            runtime_notifications.push_text(message, level='ERROR')
+            return None
+
     def get_option_margin_snapshot(self, legs, *, stress_down=0.20,
-                                   stress_up=0.20, underlying_positions=None):
+                                   stress_up=0.20, underlying_positions=None,
+                                   portfolio_margin=False, volatility_shock=0.0,
+                                   price_shock=None):
         """以当前账户现金和真实持仓计算受限期权保证金快照。
 
         未提供 underlying_positions 时按 legs 的 underlying 从已加载 data 逐一
@@ -2438,7 +3153,316 @@ class FutuBrokerAdapter(BaseLiveBroker):
             underlying_positions=underlying_positions,
             stress_down=stress_down,
             stress_up=stress_up,
+            portfolio_margin=portfolio_margin,
+            volatility_shock=volatility_shock,
+            price_shock=price_shock,
         )
+
+    def get_option_risk_snapshot(self):
+        """从 Futu 实时行情、账户和持仓接口构造期权风险快照。
+
+        该方法不读取策略历史 DataFrame，也不使用本地模拟保证金作为券商事实。
+        缺少实时 Greeks、盘口、乘数、账户保证金或底层现货时返回不可信状态，
+        由引擎/Watchdog 阻断新的期权风险敞口。
+        """
+        try:
+            position_rows = self._query_all_position_rows()
+        except Exception as exc:
+            return {'trusted': False, 'supported': True, 'has_options': False,
+                    'error': f'position snapshot unavailable: {exc}'}
+
+        # 同一合约可能因组合编号/成本批次在持仓接口中返回多行；风险快照应按
+        # 代码聚合数量后再请求一次行情，不能把重复行情误判为不可信快照。
+        option_rows_by_symbol = {}
+        underlying_codes = set()
+        from common.options.analytics import parse_option_symbol
+
+        for raw_row in position_rows:
+            try:
+                record = self._position_record(raw_row)
+            except Exception as exc:
+                return {'trusted': False, 'supported': True, 'has_options': False,
+                        'error': f'position row invalid: {exc}'}
+            if record.get('option_type') not in {'PUT', 'CALL'}:
+                continue
+            quantity = _decimal(record.get('signed_qty'), None)
+            if quantity is None or quantity == 0:
+                continue
+            symbol = _normalise_symbol(record.get('symbol', ''))
+            parsed = parse_option_symbol(symbol)
+            underlying = _text(parsed.get('underlying', ''))
+            market = symbol.split('.', 1)[0] if '.' in symbol else ''
+            if not underlying:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': f'option underlying unavailable: {symbol}'}
+            underlying_codes.add(_normalise_symbol(f'{market}.{underlying}'))
+            existing = option_rows_by_symbol.get(symbol)
+            if existing is None:
+                option_rows_by_symbol[symbol] = [raw_row, record, symbol, parsed, quantity]
+            else:
+                existing_record = existing[1]
+                existing_multiplier = existing_record.get('contract_multiplier')
+                current_multiplier = record.get('contract_multiplier')
+                if (
+                    existing_multiplier is not None
+                    and current_multiplier is not None
+                    and abs(float(existing_multiplier) - float(current_multiplier))
+                    > max(1e-9, abs(float(existing_multiplier)) * 1e-9)
+                ):
+                    return {
+                        'trusted': False,
+                        'supported': True,
+                        'has_options': True,
+                        'error': f'option position multiplier mismatch: {symbol}',
+                    }
+                existing[4] += quantity
+
+        option_rows = tuple(
+            item for item in option_rows_by_symbol.values()
+            if item[4] != 0
+        )
+
+        if not option_rows:
+            # 即使当前没有期权仓位，也要确认账户快照可读且净资产为
+            # 有限正数；否则首次期权开仓不能把未知账户状态当作健康。
+            try:
+                account_rows = self._query_account_info()
+                account = account_rows[0] if account_rows else {}
+                total_assets = _decimal(_field(account, ('total_assets',), None), None)
+                if total_assets is None or total_assets <= 0:
+                    raise RuntimeError('Futu account total_assets unavailable')
+            except Exception as exc:
+                return {
+                    'trusted': False,
+                    'supported': True,
+                    'has_options': False,
+                    'error': f'account snapshot unavailable: {exc}',
+                }
+            return {
+                'trusted': True,
+                'supported': True,
+                'has_options': False,
+                'portfolio_gamma': 0.0,
+                'margin_used': 0.0,
+                'margin_utilization': 0.0,
+                'max_spread_pct': 0.0,
+                'as_of': None,
+            }
+
+        quote_context = self._get_quote_context()
+        if quote_context is None:
+            return {'trusted': False, 'supported': True, 'has_options': True,
+                    'error': 'quote context unavailable'}
+        symbols = [item[2] for item in option_rows] + sorted(underlying_codes)
+        try:
+            with self._context_lock:
+                response = quote_context.get_market_snapshot(symbols)
+            if not isinstance(response, tuple) or len(response) < 2 or response[0] != RET_OK:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': f'option quote snapshot rejected: {response}'}
+            quote_rows = {}
+            for row in _rows(response[1]):
+                quote_symbol = _normalise_symbol(
+                    _field(row, ('code', 'symbol'), ''),
+                    _field(row, 'market', ''),
+                )
+                if not quote_symbol:
+                    continue
+                if quote_symbol in quote_rows:
+                    return {'trusted': False, 'supported': True, 'has_options': True,
+                            'error': f'duplicate option quote: {quote_symbol}'}
+                quote_rows[quote_symbol] = row
+        except Exception as exc:
+            return {'trusted': False, 'supported': True, 'has_options': True,
+                    'error': f'option quote snapshot failed: {exc}'}
+
+        # 期权风险不能脱离底层现货报价；请求成功但缺少底层报价仍是不可信快照。
+        for underlying in underlying_codes:
+            underlying_quote = quote_rows.get(underlying)
+            spot = _decimal(
+                _field(underlying_quote, ('last_price', 'last', 'price', 'close'), None)
+                if underlying_quote is not None else None,
+                None,
+            )
+            if spot is None or spot <= 0:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': f'underlying quote missing: {underlying}'}
+
+        max_age_raw = self._runtime_setting('OPTION_RISK_MAX_QUOTE_AGE_SECONDS', 300.0)
+        try:
+            max_age = float(max_age_raw)
+        except (TypeError, ValueError, OverflowError):
+            max_age = 300.0
+        if not math.isfinite(max_age) or max_age < 0:
+            max_age = 300.0
+
+        def quote_time(quote, symbol):
+            raw_timestamp = _field(quote, ('update_time', 'timestamp', 'time_key'), None)
+            parsed = coerce_dt(raw_timestamp)
+            if parsed is None:
+                raise RuntimeError(f'option quote timestamp missing: {symbol}')
+            stamp = pd.Timestamp(parsed)
+            if stamp.tzinfo is None:
+                market = _normalise_symbol(symbol).split('.', 1)[0]
+                timezone = _FUTU_MARKET_TIMEZONES.get(market)
+                if timezone:
+                    try:
+                        stamp = stamp.tz_localize(ZoneInfo(timezone))
+                    except Exception:
+                        raise RuntimeError(
+                            f'option quote timestamp timezone invalid: {symbol}'
+                        ) from None
+            now = pd.Timestamp.now(tz=stamp.tz) if stamp.tzinfo is not None else pd.Timestamp.now()
+            age = (now - stamp).total_seconds()
+            if not math.isfinite(age) or age < -5 or age > max_age:
+                raise RuntimeError(f'option quote timestamp stale: {symbol} age={age:.1f}s')
+            return stamp
+
+        freshness_error = None
+        # 底层现货报价同样必须有可验证的新鲜时间戳。
+        for underlying in underlying_codes:
+            try:
+                quote_time(quote_rows.get(underlying), underlying)
+            except Exception as exc:
+                freshness_error = freshness_error or str(exc)
+
+        total_gamma = 0.0
+        max_spread = 0.0
+        latest_timestamp = None
+        for raw_row, record, symbol, parsed, quantity in option_rows:
+            quote = quote_rows.get(symbol)
+            if quote is None:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': f'option quote missing: {symbol}'}
+
+            def finite_field(names, *, positive=False, nonnegative=False):
+                value = _decimal(_field(quote, names, None), None)
+                if value is None or (positive and value <= 0) or (nonnegative and value < 0):
+                    return None
+                return float(value)
+
+            bid = finite_field(('bid_price', 'bid'), nonnegative=True)
+            ask = finite_field(('ask_price', 'ask'), nonnegative=True)
+            last = finite_field(('last_price', 'last', 'price', 'close'), positive=True)
+            gamma = finite_field(('option_gamma', 'gamma'))
+            if (
+                bid is None
+                or ask is None
+                or last is None
+                or gamma is None
+                or gamma < 0
+                or bid <= 0
+                or ask <= 0
+                or ask < bid
+            ):
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': f'option quote fields incomplete: {symbol}'}
+            multiplier = _option_multiplier_from_row(quote)
+            if multiplier is None or multiplier <= 0:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': f'option multiplier unavailable: {symbol}'}
+            spread = (ask - bid) / last
+            if not math.isfinite(spread) or spread < 0:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': f'option spread invalid: {symbol}'}
+            max_spread = max(max_spread, spread)
+            total_gamma += float(quantity) * gamma * float(multiplier)
+            try:
+                parsed_timestamp = quote_time(quote, symbol)
+            except Exception as exc:
+                freshness_error = freshness_error or str(exc)
+                parsed_timestamp = None
+            if parsed_timestamp is not None and (latest_timestamp is None or parsed_timestamp > latest_timestamp):
+                latest_timestamp = parsed_timestamp
+
+        try:
+            account_rows = self._query_account_info()
+            account = account_rows[0] if account_rows else {}
+            margin_used = None
+            for field_name in ('initial_margin', 'maintenance_margin'):
+                candidate_margin = _decimal(_field(account, field_name, None), None)
+                if candidate_margin is not None:
+                    margin_used = candidate_margin
+                    break
+            total_assets = _decimal(_field(account, ('total_assets',), None), None)
+            if margin_used is None or margin_used < 0 or total_assets is None or total_assets <= 0:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': 'Futu account margin fields unavailable'}
+            margin_utilization = float(margin_used / total_assets)
+            if not math.isfinite(margin_utilization) or margin_utilization < 0:
+                return {'trusted': False, 'supported': True, 'has_options': True,
+                        'error': 'Futu account margin utilization invalid'}
+        except Exception as exc:
+            return {'trusted': False, 'supported': True, 'has_options': True,
+                    'error': f'account margin snapshot failed: {exc}'}
+
+        if freshness_error:
+            return {'trusted': False, 'supported': True, 'has_options': True, 'error': freshness_error}
+
+        return {
+            'trusted': True,
+            'supported': True,
+            'has_options': True,
+            'portfolio_gamma': total_gamma,
+            'margin_used': float(margin_used),
+            'margin_utilization': margin_utilization,
+            'max_spread_pct': max_spread,
+            'as_of': latest_timestamp,
+        }
+
+    def get_clearing_state(self):
+        """读取 Futu 当日订单/持仓清算事实。
+
+        OpenD 当前不提供可验证的提前指派事件字段；因此即使账户查询成功，
+        仍标记 ``supported=False``，避免把仓位差异猜测成指派事件。
+        """
+        try:
+            position_rows = self._query_all_position_rows()
+            order_rows = self._query_order_rows()
+        except Exception as exc:
+            return {'trusted': False, 'supported': True, 'events': (), 'error': str(exc)}
+        explicit_events = []
+        for row in tuple(position_rows) + tuple(order_rows):
+            event_type = _text(_field(row, ('clearing_event', 'assignment_event', 'exercise_event'), ''))
+            symbol = _symbol_from_order(row) or _normalise_symbol(_field(row, ('code', 'symbol'), ''))
+            if event_type and symbol:
+                explicit_events.append({
+                    'symbol': symbol,
+                    'type': event_type,
+                    'event_id': _text(_field(row, ('event_id', 'assignment_id', 'order_id', 'orderId'), '')),
+                    'quantity': _field(row, ('qty', 'quantity', 'dealt_qty'), 0),
+                    'settlement_price': _field(row, ('settlement_price', 'dealt_avg_price'), None),
+                })
+        if explicit_events:
+            return {
+                'trusted': True, 'supported': True, 'has_options': True,
+                'events': tuple(explicit_events),
+            }
+        has_options = False
+        for row in position_rows:
+            try:
+                record = self._position_record(row)
+            except Exception as exc:
+                raw_symbol = _normalise_symbol(_field(row, ('code', 'symbol'), ''))
+                if self._is_option_symbol(raw_symbol):
+                    return {
+                        'trusted': False, 'supported': True, 'has_options': True,
+                        'events': (), 'error': f'option position snapshot invalid: {exc}',
+                    }
+                continue
+            if record.get('option_type') in {'PUT', 'CALL'} and record.get('qty', 0):
+                has_options = True
+                break
+        if not has_options:
+            # OpenD 没有显式清算事件接口不应阻断无期权风险账户的开仓。
+            return {'trusted': True, 'supported': True, 'has_options': False, 'events': ()}
+        return {
+            'trusted': True,
+            'supported': False,
+            'has_options': True,
+            'events': (),
+            'error': 'Futu OpenD does not expose explicit assignment/clearing events',
+        }
 
     @staticmethod
     def aggregate_option_greeks(legs) -> OptionGreeks:
@@ -2449,7 +3473,11 @@ class FutuBrokerAdapter(BaseLiveBroker):
         """终态回调清理当前 run 短期 CSP 标记，下一轮仍以柜台事实为准。"""
         result = super().on_order_status(proxy)
         if not proxy.is_pending() and not proxy.is_accepted():
-            self._option_run_reservations.pop(str(getattr(proxy, 'id', '') or ''), None)
+            order_id = str(getattr(proxy, 'id', '') or '')
+            self._option_run_reservations.pop(order_id, None)
+            combo_map = getattr(self, '_combo_order_legs', None)
+            if isinstance(combo_map, dict):
+                combo_map.pop(order_id, None)
         return result
 
     def convert_order_proxy(self, raw_order) -> 'BaseOrderProxy':
@@ -2468,6 +3496,66 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 matched_data = data
                 break
         multiplier = self._contract_multiplier(matched_data) if matched_data is not None else None
+        order_id = _text(_field(raw_order, ('order_id', 'orderId', 'id', 'orderid'), ''))
+        combo_map = getattr(self, '_combo_order_legs', None)
+        if not isinstance(combo_map, dict):
+            combo_map = {}
+        combo_legs = combo_map.get(order_id)
+        raw_legs = _field(raw_order, ('combo_legs', 'comboLegs', 'legs'), None)
+        if isinstance(raw_legs, pd.DataFrame):
+            raw_legs = _rows(raw_legs)
+        if combo_legs is not None and isinstance(raw_legs, (list, tuple)):
+            # 将回调携带的逐腿成交字段合并回提交时保存的效果/数据映射。
+            by_symbol = {
+                _normalise_symbol(_field(item, ('code', 'symbol'), '')): item
+                for item in raw_legs
+            }
+            merged = []
+            for item in combo_legs:
+                current = dict(item)
+                detail = by_symbol.get(_normalise_symbol(current.get('symbol', '')))
+                if detail is not None:
+                    current.update({
+                        key: value for key, value in (
+                            ('dealt_qty', _field(detail, ('dealt_qty', 'filled_qty'), None)),
+                            ('dealt_avg_price', _field(detail, ('dealt_avg_price', 'avg_fill_price'), None)),
+                            ('order_status', _field(detail, ('order_status', 'status'), None)),
+                        ) if value is not None
+                    })
+                merged.append(current)
+            combo_legs = merged
+        if combo_legs is None and isinstance(raw_legs, (list, tuple)) and len(raw_legs) > 1:
+            combo_legs = []
+            for item in raw_legs:
+                symbol = _normalise_symbol(_field(item, ('code', 'symbol'), ''))
+                data = next(
+                    (candidate for candidate in self.datas
+                     if _normalise_symbol(getattr(candidate, '_name', '')) == symbol),
+                    None,
+                )
+                combo_legs.append({
+                    'symbol': symbol,
+                    'data': data,
+                    'effect': _field(item, ('order_effect', 'position_effect'), None),
+                })
+        order_type_name = _enum_name(_field(raw_order, ('order_type', 'combo_type', 'order_kind'), ''))
+        raw_combo_ref = _text(_field(raw_order, ('combo_id', 'combo_order_id'), ''))
+        combo_flag = bool(combo_legs) or raw_combo_ref.upper() not in {'', '0', 'NONE', 'N/A'} or any(
+            marker in order_type_name for marker in ('COMBO', 'COMBINATION', 'SPREAD')
+        )
+        if combo_flag:
+            if combo_legs is None:
+                combo_legs = [{
+                    'symbol': target_symbol,
+                    'data': matched_data,
+                    'effect': _field(raw_order, ('order_effect', 'position_effect'), None),
+                }] if target_symbol else []
+            return FutuComboOrderProxy(
+                raw_order,
+                legs=combo_legs,
+                is_live=self.is_live,
+                contract_multiplier=multiplier,
+            )
         return FutuOrderProxy(
             raw_order,
             is_live=self.is_live,
@@ -2567,6 +3655,20 @@ class FutuBrokerAdapter(BaseLiveBroker):
             'FUTU_HOST': host,
             'FUTU_PORT': port,
             'FUTU_RSA_KEY_PATH': rsa_path,
+            'FUTU_TRADE_PASSWORD_ENV': conn_cfg.get(
+                'trade_password_env',
+                conn_cfg.get(
+                    'password_env',
+                    getattr(config, 'FUTU_TRADE_PASSWORD_ENV', ''),
+                ),
+            ),
+            'FUTU_TRADE_PASSWORD_MD5_ENV': conn_cfg.get(
+                'trade_password_md5_env',
+                conn_cfg.get(
+                    'password_md5_env',
+                    getattr(config, 'FUTU_TRADE_PASSWORD_MD5_ENV', ''),
+                ),
+            ),
             'FUTU_TRADE_ENV': trade_env,
             'FUTU_FILTER_TRDMARKET': filter_market,
             'FUTU_ACCOUNT_ID': account_id,
@@ -2909,18 +4011,28 @@ class FutuBrokerAdapter(BaseLiveBroker):
             runtime_print('[FutuBroker] User interrupted; closing OpenD contexts.')
         finally:
             try:
+                # 先停止后台风险监控，再关闭 OpenD 上下文，避免 Watchdog 在
+                # 清理阶段继续轮询已关闭的连接。
+                trader.stop()
+            except Exception as exc:
+                runtime_print(f'[FutuBroker] Failed to stop option risk watchdog: {exc}')
+            try:
                 data_manager = getattr(trader, '_data_manager', None)
-                for provider in getattr(data_manager, 'providers', ()) or ():
-                    # 某些 Provider 通过 __getattr__ 暴露动态 API；直接 getattr(provider, 'close')
-                    # 可能被解释为一次远程 ``close`` 查询。只调用类层实际声明的 close 方法。
-                    close_declared = any(
-                        callable(base.__dict__.get('close'))
-                        for base in type(provider).__mro__
-                    )
-                    if close_declared:
-                        close_provider = getattr(provider, 'close')
-                        if callable(close_provider):
-                            close_provider()
+                close_manager = getattr(data_manager, 'close', None)
+                if callable(close_manager):
+                    close_manager()
+                else:
+                    for provider in getattr(data_manager, 'providers', ()) or ():
+                        # 某些 Provider 通过 __getattr__ 暴露动态 API；直接 getattr(provider, 'close')
+                        # 可能被解释为一次远程 ``close`` 查询。只调用类层实际声明的 close 方法。
+                        close_declared = any(
+                            callable(base.__dict__.get('close'))
+                            for base in type(provider).__mro__
+                        )
+                        if close_declared:
+                            close_provider = getattr(provider, 'close')
+                            if callable(close_provider):
+                                close_provider()
             except Exception as exc:
                 runtime_print(f'[FutuBroker] Failed to close data-provider contexts: {exc}')
             finally:

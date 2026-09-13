@@ -1,6 +1,7 @@
 import argparse
 import ast
 import datetime
+import os
 import sys
 
 import pandas
@@ -25,6 +26,35 @@ from recorders.http_recorder import HttpRecorder
 from recorders.manager import RecorderManager
 
 configure_text_stream_error_handling()
+
+
+def _ui_browser_available() -> bool:
+    """判断当前环境是否适合自动打开本地浏览器。"""
+
+    if sys.platform.startswith("linux"):
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
+
+
+def _normalize_timeframe(value: str) -> str:
+    """把命令行/UI 常见周期别名统一为引擎接受的名称。"""
+    text = str(value or '').strip().lower()
+    aliases = {
+        'd': 'Days', 'day': 'Days', 'days': 'Days', '1d': 'Days',
+        'w': 'Weeks', 'week': 'Weeks', 'weeks': 'Weeks', '1w': 'Weeks',
+        'mo': 'Months', 'mon': 'Months', 'month': 'Months', 'months': 'Months',
+        '1mo': 'Months',
+        'm': 'Minutes', 'min': 'Minutes', 'minute': 'Minutes', 'minutes': 'Minutes',
+        '1m': 'Minutes',
+        's': 'Seconds', 'sec': 'Seconds', 'second': 'Seconds', 'seconds': 'Seconds',
+        '1s': 'Seconds',
+    }
+    try:
+        return aliases[text]
+    except KeyError:
+        raise argparse.ArgumentTypeError(
+            'timeframe 必须是 Days/Weeks/Months/Minutes/Seconds 或其常见别名'
+        ) from None
 
 
 def run_backtest(selection_filename, strategy_filename, symbols, cash, commission, slippage, data_source, start_date, end_date,
@@ -150,7 +180,7 @@ def _run_main():
     parser.add_argument('--risk_params', type=str, default='{}',
                         help="风控参数 (JSON字符串, 例如: \"{\'stop_loss\': 0.05}\")")
     bt_timeframes = ['Days', 'Weeks', 'Months', 'Minutes', 'Seconds']
-    parser.add_argument('--timeframe', type=str, default='Days', choices=bt_timeframes,
+    parser.add_argument('--timeframe', type=_normalize_timeframe, default='Days', choices=bt_timeframes,
                         help=f"K线时间维度 (默认: Days). 支持: {', '.join(bt_timeframes)}")
     parser.add_argument('--compression', type=int, default=1,
                         help="K线时间周期 (默认: 1). 结合 timeframe, 例如 30 Minutes")
@@ -199,6 +229,34 @@ def _run_main():
     # 实盘参数
     parser.add_argument('--connect', type=str, default=None,
                         help="实盘连接配置，格式 'broker:env' (例如: 'gm_broker:sim')")
+
+    # 工作台界面
+    parser.add_argument('--ui_ip', type=str, default=None,
+                        help="命令工作台监听地址；与 --ui 一起使用，默认 127.0.0.1")
+    parser.add_argument('--ui_port', type=int, default=None,
+                        help="命令工作台监听端口；与 --ui 一起使用，默认 8765")
+    parser.add_argument('--ui', action='store_true',
+                        help="启动本地命令工作台")
+
+    # 无参数或显式 --ui 时进入本地 Web 工作台；无参数先展示完整 CLI 帮助。
+    raw_cli_args = sys.argv[1:]
+    ui_requested = any(
+        item == "--ui"
+        or item.startswith("--ui_ip=")
+        or item.startswith("--ui_port=")
+        for item in raw_cli_args
+    )
+    if not raw_cli_args or ui_requested or "--ui_ip" in raw_cli_args or "--ui_port" in raw_cli_args:
+        if not raw_cli_args:
+            parser.print_help()
+            print("\n未提供交易参数，正在启动 QuantAda Web 工作台……\n")
+        ui_args = [item for item in raw_cli_args if item != "--ui"]
+        if not _ui_browser_available() and "--no-browser" not in ui_args:
+            ui_args.append("--no-browser")
+        from command_center.web import main as web_main
+
+        ui_exit_code = web_main(argv=ui_args)
+        return ui_exit_code if isinstance(ui_exit_code, int) else 0
 
     # 3. 解析参数
     args = parser.parse_args()

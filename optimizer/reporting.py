@@ -3,6 +3,10 @@ import re
 import pandas as pd
 
 from common.formatters import format_float, format_recent_backtest_metrics
+from common.terminal_log import (
+    OPTIMIZER_AI_ANALYSIS_END_MARKER,
+    OPTIMIZER_AI_ANALYSIS_START_MARKER,
+)
 
 
 def normalize_metric_date(value):
@@ -197,7 +201,7 @@ def print_optimizer_ai_summary(
     test_set_requested=False,
     test_section_title=None,
 ):
-    print("=== 请忽略上文日志输出，请将下文提供给AI辅助分析 ===")
+    print(OPTIMIZER_AI_ANALYSIS_START_MARKER)
     print(">>> 多臂赌博机训练结果汇总(MULTI-METRIC BANDIT SUMMARY)  <<<")
 
     header = (
@@ -268,4 +272,4 @@ def print_optimizer_ai_summary(
         baseline_report=baseline_report,
         baseline_test_report=baseline_test_report,
     )
-    print("=== 请将上文提供给AI辅助分析 ===")
+    print(OPTIMIZER_AI_ANALYSIS_END_MARKER)

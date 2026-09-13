@@ -14,6 +14,7 @@ from command_center.training import (
     recommendation_notes,
     result_to_params,
     scan_training_results,
+    source_strategy_reference,
     suggestions_to_dict,
 )
 
@@ -61,6 +62,20 @@ def test_extract_strategy_params_ignores_method_local_params(tmp_path: Path) -> 
         encoding="utf-8",
     )
     assert extract_strategy_params(source) == {"lookback": 15}
+
+
+def test_extract_strategy_params_keeps_static_none_value(tmp_path: Path) -> None:
+    source = tmp_path / "none_strategy.py"
+    source.write_text("class DemoStrategy:\n    params = {'optional': None}\n", encoding="utf-8")
+    assert extract_strategy_params(source) == {"optional": None}
+
+
+def test_source_strategy_reference_uses_project_module_path(tmp_path: Path) -> None:
+    source = tmp_path / "strategies" / "demo.py"
+    source.parent.mkdir()
+    source.write_text("class Demo: pass\n", encoding="utf-8")
+    assert source_strategy_reference(source, tmp_path) == "strategies.demo"
+    assert source_strategy_reference(Path("C:/outside/demo.py"), tmp_path) is None
 
 
 def test_recommend_ranges_accepts_annotated_params_assignment(tmp_path: Path) -> None:
@@ -139,6 +154,25 @@ def test_recommend_ranges_are_type_aware_and_include_source_metadata(tmp_path: P
     }
     notes = recommendation_notes(suggestions)
     assert any("mode" in note and "固定类别" in note for note in notes)
+
+
+def test_recommend_ranges_do_not_make_nonnegative_option_parameters_negative(tmp_path: Path) -> None:
+    source = tmp_path / "option_strategy.py"
+    source.write_text(
+        "class OptionStrategy:\n"
+        "    params = {\n"
+        "        'min_open_interest': 0.0,\n"
+        "        'contracts': 0,\n"
+        "        'min_delta': -0.15,\n"
+        "    }\n",
+        encoding="utf-8",
+    )
+
+    suggestions = {item.name: item for item in recommend_ranges(source)}
+
+    assert suggestions["min_open_interest"].recommendation["low"] == 0.0
+    assert suggestions["contracts"].recommendation["low"] == 0
+    assert suggestions["min_delta"].recommendation["low"] < 0
 
 
 def test_result_index_scans_logs_and_recovers_params(tmp_path: Path) -> None:
@@ -266,6 +300,7 @@ def test_selection_store_keeps_selected_result_snapshot(tmp_path: Path) -> None:
     assert store.load() == {result.result_id}
     assert store.load_results()[result.result_id]["params"] == {"lookback": 20}
     assert store.load_results()[result.result_id]["main_eval"] == {}
+    assert store.load_results()[result.result_id]["metadata"] == {}
     store.unselect(result.result_id)
     assert store.load() == set()
     assert result.result_id in store.load_results()

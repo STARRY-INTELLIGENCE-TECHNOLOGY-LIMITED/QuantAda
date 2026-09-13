@@ -1,6 +1,7 @@
 from datetime import datetime
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest
 
 import config
@@ -122,6 +123,40 @@ def test_base_safety_multiplier_has_no_fixed_cash_buffer():
     broker = MockBroker(initial_cash=100000.0)
 
     assert broker.safety_multiplier == pytest.approx(1.0013)
+
+
+def test_option_entry_kill_switch_does_not_block_stock_buy():
+    broker = MockBroker(initial_cash=100000.0)
+    broker.set_option_entry_kill_switch(True, reason="option risk")
+
+    order = broker.order_target_value(_make_data("SHSE.600000"), 1000.0)
+
+    assert order is not None
+    assert broker._last_order_target_skip_reason != "option_entry_kill_switch"
+
+
+def test_option_entry_kill_switch_detects_metadata_only_option_feed():
+    broker = MockBroker(initial_cash=100000.0)
+    broker.set_option_entry_kill_switch(True, reason="option risk")
+    data = _make_data("AAPL_OPTION")
+    data.p = type("Params", (), {"dataname": pd.DataFrame({"option_type": ["PUT"]})})()
+
+    order = broker.order_target_value(data, 1000.0)
+
+    assert order is None
+    assert broker._last_order_target_skip_reason == "option_entry_kill_switch"
+
+
+def test_option_target_cannot_cross_zero_in_one_buy_order():
+    broker = MockBroker(initial_cash=100000.0)
+    broker.mock_position = -1
+    data = _make_data("US.AAPL261016P00300000")
+
+    order = broker.order_target_value(data, target=100.0)
+
+    assert order is None
+    assert broker._last_order_target_skip_reason == "option_effect_crosses_zero"
+    assert broker.submitted_orders == []
 
 
 def test_stateless_buy_skips_when_cash_insufficient_even_with_pending_sell():

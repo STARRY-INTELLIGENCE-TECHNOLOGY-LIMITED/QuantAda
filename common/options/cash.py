@@ -33,6 +33,12 @@ def aggregate_assignment_cash(short_puts=(), pending_short_puts=()):
     """汇总真实短 Put 与可信 pending 卖开 Put 的指派义务。"""
     total = Decimal("0")
     for item in tuple(short_puts or ()) + tuple(pending_short_puts or ()):
+        if "reserved_cash" in item:
+            reserved = _decimal(item["reserved_cash"], "reserved_cash")
+            if reserved < 0:
+                raise CSPCashError("reserved_cash must not be negative")
+            total += reserved
+            continue
         total += assignment_cash(
             item["strike"],
             abs(item["contracts"] if "contracts" in item else item["remaining"]),

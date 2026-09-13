@@ -224,3 +224,15 @@ ib_gateway/ibc_windows/**/config-*.ini
 ib_gateway/ibc_windows/settings/
 ib_gateway/ibc_windows/Logs/
 ib_gateway/ib_docker/.env
+
+# Command-center local command set used only for reverse display.
+command_center/local_command_set.ps1
+
+# Command-center private catalog and local credentials are intentionally not tracked.
+.data/command_center/private_catalog.json
+.data/command_center/catalog_private.json
+.data/command_center/private_config.json
+.data/command_center/private_command_set.json
+.data/command_center/command_set.json
+.data/command_center/private_commands.json
+.data/command_center/private_credentials.json

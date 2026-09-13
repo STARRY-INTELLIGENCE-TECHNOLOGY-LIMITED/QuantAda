@@ -96,6 +96,10 @@ class BaseLiveBroker(ABC):
         self._ledger_lock = threading.RLock()
         # 风控锁定黑名单
         self._risk_locked_symbols = set()
+        # 期权开仓阻断按来源独立记录；一个来源恢复时不得清除其它来源的阻断。
+        self._option_entry_blocks = {}
+        self._option_entry_kill_switch = False  # 兼容旧适配器/测试替身读取
+        self._option_entry_kill_reason = None
         # 预热属于组合能力，不进入 broker 继承语义。
         self._data_warm = BrokerDataWarmBridge(self)
 
@@ -138,6 +142,93 @@ class BaseLiveBroker(ABC):
         if isinstance(runtime_config, dict) and name in runtime_config:
             return runtime_config[name]
         return getattr(config, name, default)
+
+    def set_option_entry_kill_switch(self, blocked: bool, *, reason="", source="manual"):
+        """设置指定来源的期权开仓闸门；平仓、撤单和账户查询不受影响。"""
+        source = str(source or "manual").strip() or "manual"
+        blocks = getattr(self, "_option_entry_blocks", None)
+        if not isinstance(blocks, dict):
+            blocks = {}
+            self._option_entry_blocks = blocks
+        if blocked:
+            blocks[source] = str(reason or source)
+        else:
+            blocks.pop(source, None)
+        self._option_entry_kill_switch = bool(blocks)
+        self._option_entry_kill_reason = "; ".join(
+            f"{name}: {detail}" for name, detail in blocks.items()
+        ) or None
+
+    def option_entry_blocked(self) -> bool:
+        """返回当前是否禁止创建新的期权风险敞口。"""
+        blocks = getattr(self, "_option_entry_blocks", None)
+        if isinstance(blocks, dict):
+            return bool(blocks) or bool(getattr(self, "_option_entry_kill_switch", False))
+        return bool(getattr(self, "_option_entry_kill_switch", False))
+
+    @staticmethod
+    def _is_option_data(data) -> bool:
+        """只把可明确解析为期权的标的交给期权开仓闸门。"""
+        option_type = getattr(data, "option_type", None)
+        if isinstance(option_type, str) and option_type.strip().upper() in {"P", "PUT", "C", "CALL"}:
+            return True
+        dataframe = getattr(getattr(data, "p", None), "dataname", None)
+        if isinstance(dataframe, pd.DataFrame):
+            for name in ("option_type", "right", "cp", "put_call"):
+                if name not in dataframe.columns:
+                    continue
+                values = dataframe[name].dropna().astype(str).str.strip().str.upper()
+                if values.isin({"P", "PUT", "C", "CALL"}).any():
+                    return True
+        try:
+            from common.options.analytics import parse_option_symbol
+
+            return bool(parse_option_symbol(getattr(data, "_name", "")).get("option_type"))
+        except Exception:
+            return False
+
+    def clear_option_entry_kill_switch(self, *, source="manual"):
+        """清除指定来源的开仓闸门；不修改其它来源、订单或仓位。"""
+        self.set_option_entry_kill_switch(False, reason="", source=source)
+
+    def get_option_risk_snapshot(self):
+        """返回由券商适配器实现的风险事实快照。
+
+        基类不从历史 DataFrame、缓存或本地估值推导实盘 Gamma/保证金；适配器未
+        实现时显式标记不支持，调用边界负责安全阻断期权新开仓。
+        """
+        return {"trusted": True, "supported": False, "error": "broker risk snapshot unsupported"}
+
+    def submit_option_spread(self, legs, volume=1, **kwargs):
+        """提交券商原子期权组合；不支持时安全失败关闭。"""
+        self._last_order_target_skip_reason = 'atomic_option_spread_unsupported'
+        self._runtime_log('[Broker] atomic option spread is unsupported; no leg was submitted.')
+        return None
+
+    def reconcile_option_settlement(self):
+        """可选的清算对账钩子；默认没有可验证清算接口。"""
+        getter = getattr(self, "get_clearing_state", None)
+        if not callable(getter):
+            return {"trusted": True, "supported": False, "events": (), "adjustments": ()}
+        try:
+            from common.options.settlement import reconcile_settlement_snapshot
+
+            snapshot = getter()
+            result = reconcile_settlement_snapshot(snapshot)
+            supported = snapshot.get("supported", True) if isinstance(snapshot, dict) else False
+            payload = {
+                "trusted": result.trusted,
+                "supported": bool(supported),
+                "events": result.events,
+                "adjustments": result.position_adjustments,
+                "sizing_reset": result.sizing_reset,
+                "error": result.error,
+            }
+            if isinstance(snapshot, dict) and "has_options" in snapshot:
+                payload["has_options"] = bool(snapshot.get("has_options"))
+            return payload
+        except Exception as exc:
+            return {"trusted": False, "events": (), "adjustments": (), "error": str(exc)}
 
     # =========================================================
     #  用户只需实现下述原子接口 (The Minimum Set)
@@ -286,6 +377,16 @@ class BaseLiveBroker(ABC):
             self._runtime_log(f"[Broker] cleanup_overnight_orders pending fetch untrusted: {err}")
             return summary
 
+        unique_pending_orders = []
+        seen_order_ids = set()
+        for pending in pending_orders:
+            order_id = str(pending.get('id', '') or '').strip() if isinstance(pending, dict) else ''
+            if order_id and order_id in seen_order_ids:
+                continue
+            if order_id:
+                seen_order_ids.add(order_id)
+            unique_pending_orders.append(pending)
+        pending_orders = unique_pending_orders
         summary['total'] = len(pending_orders)
         if not pending_orders:
             return summary
@@ -397,6 +498,33 @@ class BaseLiveBroker(ABC):
             return None
         delta_shares = expected_shares - current_size
 
+        if self.option_entry_blocked() and self._is_option_data(data) and delta_shares > 0:
+            # 允许买入平掉已确认的空头；若目标会翻多，只执行至多完整平空
+            # 的数量，不能借平仓路径偷偷创建新的多头敞口。
+            if current_size < 0:
+                delta_shares = min(delta_shares, abs(current_size))
+            else:
+                self._last_order_target_skip_reason = 'option_entry_kill_switch'
+                self._runtime_log(
+                    f"[Broker Risk Block] {data._name} new entry blocked: "
+                    f"{self._option_entry_kill_reason or 'option risk watchdog'}"
+                )
+                return None
+
+        if (
+            self._is_option_data(data)
+            and current_size < 0
+            and delta_shares > abs(current_size)
+        ):
+            # 目标仓位跨过零点时不得把整笔 BUY 伪装成 BUY_TO_CLOSE；
+            # 策略应在下一轮基于已确认仓位显式开多。
+            self._last_order_target_skip_reason = 'option_effect_crosses_zero'
+            self._runtime_log(
+                f'[Broker Risk Block] {data._name} option target crosses zero; '
+                'close the confirmed short position first.'
+            )
+            return None
+
         # 风控拦截：Percent 模式与 Value 模式保持一致
         if data._name in self._risk_locked_symbols and delta_shares > 0:
             self._runtime_log(f"[Broker Risk Block] 🚫 风控拦截: {data._name} 触发风控，买单已被底层静默吃掉。")
@@ -444,6 +572,29 @@ class BaseLiveBroker(ABC):
             runtime_notifications.push_text(msg, level='ERROR')
             return None
         delta_shares = expected_shares - current_size
+
+        if self.option_entry_blocked() and self._is_option_data(data) and delta_shares > 0:
+            if current_size < 0:
+                delta_shares = min(delta_shares, abs(current_size))
+            else:
+                self._last_order_target_skip_reason = 'option_entry_kill_switch'
+                self._runtime_log(
+                    f"[Broker Risk Block] {data._name} new entry blocked: "
+                    f"{self._option_entry_kill_reason or 'option risk watchdog'}"
+                )
+                return None
+
+        if (
+            self._is_option_data(data)
+            and current_size < 0
+            and delta_shares > abs(current_size)
+        ):
+            self._last_order_target_skip_reason = 'option_effect_crosses_zero'
+            self._runtime_log(
+                f'[Broker Risk Block] {data._name} option target crosses zero; '
+                'close the confirmed short position first.'
+            )
+            return None
 
         # 风控拦截
         if data._name in self._risk_locked_symbols and delta_shares > 0:
@@ -1131,6 +1282,15 @@ class BaseLiveBroker(ABC):
 
         # 整个回调必须排队，防止抢占主线程刚发出的订单
         with self._ledger_lock:
+            if bool(getattr(proxy, 'is_combo', False)):
+                # 组合订单同时包含多条腿，不能按单一 BUY/SELL 维护；
+                # Futu pending 快照会按腿展开，基础层这里只保留订单级生命周期。
+                order_state = self._read_order_state(proxy)
+                if order_state['completed'] or order_state['canceled'] or order_state['rejected']:
+                    self._pending_sells.discard(oid)
+                elif order_state['pending'] or order_state['accepted']:
+                    self._pending_sells.add(oid)
+                return proxy
             try:
                 is_buy_order = bool(proxy.is_buy())
             except Exception:

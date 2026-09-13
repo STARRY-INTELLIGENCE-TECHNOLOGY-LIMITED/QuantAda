@@ -46,11 +46,12 @@ DB_URL = "sqlite:///quantada_logs.db"
 | 配置文件 | 主要配置项 | 用途 |
 | --- | --- | --- |
 | `config.py` | `LOT_SIZE`、`DATA_PATH`、`LOG`、`PRINT_PLAN`、`KEEP_OVERNIGHT_ORDERS` | 框架、回测和通用执行 |
-| `configs/providers.py` | `TUSHARE_TOKEN`、`SXSC_TUSHARE_TOKEN`、`TIINGO_TOKEN` | 历史行情 Provider |
-| `configs/futu.py` | `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH`、账户/交易键、`FUTU_BROKER_ENVIRONMENTS` | 富途 OpenD 行情与官方交易连接；RSA 路径为空时使用明文协议 |
-| `configs/alarms.py` | `ALARMS_ENABLED`、`DINGTALK_WEBHOOK`、`WECOM_WEBHOOK`、`ALARM_LEVEL` | 报警通道 |
+| `configs/providers.py` | `TUSHARE_TOKEN`、`SXSC_TUSHARE_TOKEN`、`TIINGO_TOKEN`、`THETADATA_TOKEN`、`DATA_PROVIDER_COMPOSITIONS` | 历史行情 Provider 与可配置组合 |
+| `configs/futu.py` | `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH`、账户/交易键、`FUTU_BROKER_ENVIRONMENTS` | 富途 OpenD 行情与官方交易连接；RSA 路径为空时使用明文协议；常规配置通过 `FUTU_TRADE_PASSWORD_ENV` 或 `FUTU_TRADE_PASSWORD_MD5_ENV` 引用外部环境变量，私有工作台方案可单独保存本机解锁凭据 |
+| `configs/alarms.py` | `ALARMS_ENABLED`、`DINGTALK_WEBHOOK`、`DINGTALK_SECRET`、`WECOM_WEBHOOK`、`ALARM_LEVEL` | 报警通道 |
 | `configs/gm.py` | `GM_TOKEN`、`GM_BROKER_ENVIRONMENTS` | GM Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['gm_broker']`） |
 | `configs/ibkr.py` | `IBKR_HOST`、`IBKR_PORT`、`IBKR_CLIENT_ID`、`IBKR_ORDER_ACCOUNT`、`IB_BROKER_ENVIRONMENTS` | IBKR Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['ib_broker']`） |
+| `configs/options.py` | `OPTION_RISK_WATCHDOG_*` | 实盘期权风险 Watchdog 的安全阈值 |
 
 不要把真实 Token、密码或 Webhook 提交到公开仓库；运行时也可使用 `--config` 覆盖合并后的公共键，例如：
 
@@ -58,14 +59,38 @@ DB_URL = "sqlite:///quantada_logs.db"
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --data_source=tiingo --config "{'PRINT_PLAN': True}"
 ```
 
-### 3) 基础回测示例
+### 3) 命令工作台（Web UI）
+
+本地开发环境推荐先启动命令工作台；桌面系统会自动打开默认浏览器。Linux 无图形界面服务器会自动只启动服务，不强行调用浏览器。
+
+```bash
+python run.py --ui
+```
+
+直接运行 `python run.py` 会先展示完整参数帮助，再启动命令工作台。服务器可显式指定监听地址和端口：
+
+```bash
+python run.py --ui --ui_ip 0.0.0.0 --ui_port 8765 --no-browser
+```
+
+Futu 配置页可编辑账户 ID、账户索引和账户现金币种，期权/全球账户无需再手工修改隐藏的 `config.py`。
+
+仓库内置命令目录只包含脱敏示例；本机私有策略索引和连接默认值可放在 Git 忽略的 `.data/command_center/private_catalog.json`，启动工作台时会优先合并该文件。也可用 `QUANTADA_PRIVATE_CATALOG` 指定其它路径。
+
+默认仅监听 `127.0.0.1`；也可使用 `--ui_ip 0.0.0.0`（或其它明确地址）显式暴露到网络。工作台面向内部使用，当前会话中的 Token、Webhook、账户配置及 Futu 解锁凭据均按原样展示，请勿将监听地址暴露到不受信任网络。
+
+Futu 期权 Credit Spread 使用券商原子组合接口；若当前 OpenD 仿真环境返回“不支持组合期权”，框架会安全拒绝，不会拆分成裸腿。需要同时使用历史 IV/IVP 与实时盘口时，可将 `--data_source` 设置为 `theta+futu` 并选择命令工作台的 `theta_futu_global` 配置档案：通用 `OverlayDataProvider` 负责组合流程，Theta/Futu 适配规则由 `HybridDataProvider` 注入；历史字段来自 ThetaData，实盘当前行由 Futu 快照合并，回测路径不会访问 Futu。私有命令工作台也支持将 Futu 解锁口令保存到 Git 忽略的本机方案文件；内网工作台会按原样显示当前命令与凭据。完整提前指派同步仍需券商提供明确清算事件字段。
+
+Provider 组合在 `configs/providers.py` 的 `DATA_PROVIDER_COMPOSITIONS` 中声明。每项配置指定历史 Provider、实时 Provider 和 `package.module:factory`；新增组合只需实现自己的适配器工厂并注册配置，不需修改 DataManager 或工作台。
+
+### 4) 基础回测示例
 
 ```bash
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519
 python run.py --help
 ```
 
-### 4) 常用命令
+### 5) 常用命令
 
 ```bash
 # 自动调仓样例（含底仓保护）
@@ -91,7 +116,7 @@ python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta -
 python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta --refresh --config "{'CACHE_DATA': True}"
 ```
 
-### 5) 参数优化（Optuna）
+### 6) 参数优化（Optuna）
 
 ```bash
 # 进入优化模式
@@ -101,7 +126,7 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'fast_period': {'type': 'int', 'low': 5, 'high': 30}}" --train_period 20210101-20221231 --test_period 20230101-20231231 --n_trials 50
 ```
 
-### 6) 连接实盘/仿真
+### 7) 连接实盘/仿真
 
 在 `config.py` 统一入口（Broker 默认连接值位于 `configs/gm.py`、`configs/ibkr.py`、`configs/futu.py`）配置 `BROKER_ENVIRONMENTS`，再通过 `--connect=broker:env` 启动：
 
@@ -115,7 +140,7 @@ python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_s
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
 ```
 
-### 7) SDK/插件化模式（策略在仓库外）
+### 8) SDK/插件化模式（策略在仓库外）
 
 ```bash
 # Linux/macOS

@@ -24,6 +24,8 @@ from common.live_execution_budget import (
 from common.live_runtime import runtime_print
 from common.log import extract_order_execution_dt, format_dt, warning as log_warning
 from common.order_quantity import format_quantity, quantity_number
+from common.options.data_safety import sanitize_market_dataframe
+from common.options.risk_watchdog import OptionRiskWatchdog
 from data_providers.manager import DataManager, normalize_source_name, resolve_platform_default_source
 from live_trader.adapters.base_broker import BaseLiveBroker
 from live_trader.data_bridge.data_warm import SchedulePlanner
@@ -131,6 +133,8 @@ class LiveTrader:
         self._intraday_rebase_done_on = {}
         # 每日隔日委托清理执行记录（按自然日）
         self._overnight_cleanup_done_on = None
+        self._option_risk_watchdog = None
+        self._processed_settlement_event_ids = set()
 
     def _load_adapter_classes(self, platform: str):
         """
@@ -275,6 +279,10 @@ class LiveTrader:
 
         # Provider 由引擎按 data_source/平台默认值选择，不再要求 adapter 提供 bridge。
         self._maybe_override_live_data_provider()
+        if self._data_manager is not None:
+            set_live_mode = getattr(self._data_manager, 'set_live_mode', None)
+            if callable(set_live_mode):
+                set_live_mode(is_live)
 
         # 从掘金 context 中动态提取 run() 方法传入的 token 并注入到 data_provider
         if hasattr(context, 'token') and context.token:
@@ -337,6 +345,10 @@ class LiveTrader:
                 getattr(config, 'KEEP_OVERNIGHT_ORDERS', False),
             )
         )
+        if self._data_manager is not None:
+            bind_broker = getattr(self._data_manager, 'bind_broker', None)
+            if callable(bind_broker):
+                bind_broker(self.broker)
         if self._data_manager is not None:
             self._bind_shared_ib_to_data_manager(self._data_manager)
 
@@ -415,7 +427,67 @@ class LiveTrader:
                 failed_names = [name for name, _ in failed_controls]
                 print(f"[Engine Warning] Some risk controls failed to load: {failed_names}")
 
+        self._start_option_risk_watchdog()
+
         print("--- LiveTrader Engine Initialized Successfully ---")
+
+    def _start_option_risk_watchdog(self):
+        """仅为实现了可信期权风险快照的实盘 Broker 启动后台闸门。"""
+        previous_watchdog = getattr(self, '_option_risk_watchdog', None)
+        if previous_watchdog is not None:
+            previous_watchdog.stop()
+            self._option_risk_watchdog = None
+        if not getattr(self.broker, 'is_live', False):
+            return
+        if not bool(self.config.get(
+            'OPTION_RISK_WATCHDOG_ENABLED',
+            getattr(config, 'OPTION_RISK_WATCHDOG_ENABLED', True),
+        )):
+            return
+        getter = getattr(self.broker, 'get_option_risk_snapshot', None)
+        base_getter = getattr(BaseLiveBroker, 'get_option_risk_snapshot', None)
+        if not callable(getter) or getattr(type(self.broker), 'get_option_risk_snapshot', None) is base_getter:
+            return
+        try:
+            self._option_risk_watchdog = OptionRiskWatchdog(
+                self.broker,
+                interval_seconds=self.config.get(
+                    'OPTION_RISK_WATCHDOG_INTERVAL_SECONDS',
+                    getattr(config, 'OPTION_RISK_WATCHDOG_INTERVAL_SECONDS', 60.0),
+                ),
+                max_gamma=self.config.get(
+                    'OPTION_RISK_MAX_GAMMA', getattr(config, 'OPTION_RISK_MAX_GAMMA', None)
+                ),
+                max_margin_utilization=self.config.get(
+                    'OPTION_RISK_MAX_MARGIN_UTILIZATION',
+                    getattr(config, 'OPTION_RISK_MAX_MARGIN_UTILIZATION', 0.90),
+                ),
+                max_spread_pct=self.config.get(
+                    'OPTION_RISK_MAX_SPREAD_PCT',
+                    getattr(config, 'OPTION_RISK_MAX_SPREAD_PCT', 0.50),
+                ),
+            ).start()
+        except Exception as exc:
+            self._option_risk_watchdog = None
+            try:
+                self.broker.set_option_entry_kill_switch(
+                    True, reason=f'watchdog_start_error:{exc}', source='watchdog'
+                )
+            except TypeError:
+                try:
+                    self.broker.set_option_entry_kill_switch(
+                        True, reason=f'watchdog_start_error:{exc}'
+                    )
+                except TypeError:
+                    self.broker.set_option_entry_kill_switch(True)
+            runtime_print(f'[Engine Error] option risk watchdog failed to start: {exc}')
+
+    def stop(self):
+        """停止实盘后台风险监控；不撤销券商委托。"""
+        watchdog = self._option_risk_watchdog
+        if watchdog is not None:
+            watchdog.stop()
+            self._option_risk_watchdog = None
 
 
     def run(self, context):
@@ -497,6 +569,9 @@ class LiveTrader:
                 runtime_log(msg)
                 if hasattr(self, 'alarm_manager') and self.alarm_manager:
                     self.alarm_manager.push_text(msg, level='ERROR')
+                return
+
+            if self.broker.is_live and not self._reconcile_option_settlement():
                 return
 
             # 某些 broker socket 可能已连接但账户状态尚未同步；能区分该状态的 adapter 会暴露短生命周期健康探针，快照不可用时绝不能解释为真实零现金/空仓账户。
@@ -822,6 +897,159 @@ class LiveTrader:
         last_stats['max_attempts'] = max_attempts
         return last_stats
 
+    def _reconcile_option_settlement(self):
+        """在策略运行前读取券商清算事实；未知状态只阻断新开仓。
+
+        风险控制和已有仓位的平仓仍需继续运行，避免清算接口短暂不可用时
+        把退出路径一并锁死。开仓闸门由 Broker 事实边界统一执行。
+        """
+        def block_entries(reason):
+            setter = getattr(self.broker, 'set_option_entry_kill_switch', None)
+            if callable(setter):
+                try:
+                    setter(True, reason=reason, source='settlement')
+                except TypeError:
+                    try:
+                        setter(True, reason=reason)
+                    except TypeError:
+                        setter(True)
+            runtime_print(f'[Engine Warning] option entries blocked: {reason}')
+
+        reconciler = getattr(self.broker, 'reconcile_option_settlement', None)
+        if not callable(reconciler):
+            return True
+        try:
+            result = reconciler()
+        except Exception as exc:
+            result = {'trusted': False, 'error': str(exc)}
+        def _option_risk_known(reconciliation):
+            """只依据账户/券商快照判断是否已有期权风险，不把期权数据 feed 当持仓。"""
+            if isinstance(reconciliation, dict) and 'has_options' in reconciliation:
+                return bool(reconciliation.get('has_options'))
+            getter = getattr(self.broker, 'get_option_risk_snapshot', None)
+            if not callable(getter):
+                return False
+            try:
+                snapshot = getter()
+            except Exception:
+                return False
+            if isinstance(snapshot, dict) and 'has_options' in snapshot:
+                return bool(snapshot.get('has_options'))
+            return False
+
+        if not isinstance(result, dict) or result.get('trusted') is not True:
+            detail = result.get('error') if isinstance(result, dict) else 'invalid settlement result'
+            message = f'[Engine Error] clearing settlement snapshot is untrusted; option entries will be blocked. detail={detail}'
+            runtime_print(message)
+            if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                self.alarm_manager.push_text(message, level='ERROR')
+            # 清算快照不可信时无法证明账户没有期权风险；只阻断期权开仓，
+            # 股票等非期权路径仍可继续。不能因缺少 has_options 字段而放行未知风险。
+            block_entries(detail)
+            return True
+        has_option_risk = _option_risk_known(result)
+        if result.get('supported', True) is not True:
+            # 没有账户期权风险时，OpenD 无显式清算事件并不应阻断新的期权开仓。
+            if has_option_risk:
+                message = '[Engine Error] broker clearing state is unsupported; option entries are blocked.'
+                runtime_print(message)
+                if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                    self.alarm_manager.push_text(message, level='ERROR')
+                block_entries('broker clearing state unsupported')
+                return True
+            clearer = getattr(self.broker, 'clear_option_entry_kill_switch', None)
+            if callable(clearer):
+                try:
+                    clearer(source='settlement')
+                except TypeError:
+                    pass
+        # 清算快照在本轮已可信且支持时，只清除清算来源的闸门，保留 Watchdog
+        # 或人工来源设置的其它阻断。
+        if result.get('supported', True) is True:
+            clearer = getattr(self.broker, 'clear_option_entry_kill_switch', None)
+            if callable(clearer):
+                try:
+                    clearer(source='settlement')
+                except TypeError:
+                    pass
+        events = []
+        processed_events = getattr(self, '_processed_settlement_event_ids', None)
+        if not isinstance(processed_events, set):
+            processed_events = set()
+            self._processed_settlement_event_ids = processed_events
+        event_ids = []
+        current_event_ids = set()
+        for event in tuple(result.get('events') or ()):
+            if not isinstance(event, dict):
+                events.append(event)
+                continue
+            event_id = str(event.get('event_id') or "|".join(
+                str(value)
+                for value in (
+                    event.get('symbol', ''),
+                    str(event.get('type') or event.get('event') or '').upper(),
+                    event.get('quantity', event.get('shares', 0)),
+                    event.get('settlement_price', ''),
+                    event.get('pnl', ''),
+                )
+            ))
+            if event_id in processed_events or event_id in current_event_ids:
+                continue
+            event_ids.append(event_id)
+            current_event_ids.add(event_id)
+            events.append(event)
+        events = tuple(events)
+        if events:
+            runtime_print(f'[Engine] reconciled {len(events)} option clearing event(s) from broker facts.')
+            apply_adjustments = getattr(self.broker, 'apply_option_settlement_adjustments', None)
+            if callable(apply_adjustments):
+                try:
+                    apply_adjustments(tuple(result.get('adjustments') or ()), events=events)
+                except TypeError:
+                    apply_adjustments(tuple(result.get('adjustments') or ()))
+                except Exception as exc:
+                    message = f'[Engine Error] broker settlement adjustments failed: {exc}'
+                    runtime_print(message)
+                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                        self.alarm_manager.push_text(message, level='ERROR')
+                    return False
+            tracker = getattr(self.strategy, 'closed_trade_tracker', None)
+            reconcile_tracker = getattr(tracker, 'reconcile_external_settlement', None)
+            if callable(reconcile_tracker):
+                try:
+                    reconcile_tracker(events)
+                except Exception as exc:
+                    message = f'[Engine Error] closed-trade settlement reconciliation failed: {exc}'
+                    runtime_print(message)
+                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                        self.alarm_manager.push_text(message, level='ERROR')
+                    return False
+            handler = getattr(self.strategy, 'reconcile_settlement', None)
+            if callable(handler):
+                try:
+                    handler(events)
+                except Exception as exc:
+                    message = f'[Engine Error] strategy settlement reconciliation failed: {exc}'
+                    runtime_print(message)
+                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                        self.alarm_manager.push_text(message, level='ERROR')
+                    return False
+        if result.get('sizing_reset') and events:
+            resetter = getattr(self.strategy, 'reset_position_sizing', None)
+            if callable(resetter):
+                try:
+                    resetter()
+                except Exception as exc:
+                    message = f'[Engine Error] strategy sizing reset failed: {exc}'
+                    runtime_print(message)
+                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                        self.alarm_manager.push_text(message, level='ERROR')
+                    return False
+        processed_events.update(event_ids)
+        if len(processed_events) > 5000:
+            self._processed_settlement_event_ids = set(list(processed_events)[-2500:])
+        return True
+
     def _confirm_pending_orders_cleared(self, max_checks=6, sleep_seconds=0.5):
         if not hasattr(self.broker, 'get_pending_orders'):
             return True
@@ -931,10 +1159,13 @@ class LiveTrader:
 
         if is_live:
             # 实盘模式: 仅获取最近的预热数据，用于计算指标
+            now_timestamp = pd.Timestamp(context.now)
             if is_intraday:
-                end_date = context.now.strftime('%Y-%m-%d %H:%M:%S')
+                end_date = now_timestamp.strftime('%Y-%m-%d %H:%M:%S')
             else:
-                end_date = context.now.strftime('%Y-%m-%d')
+                # 日线使用自然日边界；Futu Provider 会将该边界扩展到日末，
+                # 从而在盘中补入当前快照。
+                end_date = now_timestamp.strftime('%Y-%m-%d')
             if is_intraday:
                 unit_seconds = 60 if timeframe == 'Minutes' else 1
                 warmup_delta = pd.Timedelta(
@@ -1083,6 +1314,8 @@ class LiveTrader:
             start_date = _build_window_start() if force_window_rebase else _build_incremental_start(old_df)
             new_df = self.data_provider.get_history(symbol, start_date, end_date,
                                                     timeframe=timeframe, compression=compression)
+            # 部分实时行情只提供 OHLC；成交量缺失不能把整条可靠价格快照判为无效。
+            new_df = sanitize_market_dataframe(new_df, require_ohlcv=False)
             if live_run_budget_expired(self.broker):
                 failed_feeds += total_feeds - index
                 print(f"[Engine Warning] Live data refresh for {symbol} returned after the run deadline.")
@@ -1438,6 +1671,7 @@ def on_order_status_callback(context, raw_order):
                 is_sell_order = bool(order_proxy.is_sell())
             except Exception:
                 is_sell_order = False
+            is_combo_order = bool(getattr(order_proxy, 'is_combo', False))
 
             def _extract_target_qty(proxy, fallback=0):
                 qty = None
@@ -1528,7 +1762,7 @@ def on_order_status_callback(context, raw_order):
                     else:
                         total_qty = _extract_target_qty(order_proxy, fallback=0)
 
-                        action = "BUY" if is_buy_order else "SELL" if is_sell_order else "UNKNOWN"
+                        action = "COMBO" if is_combo_order else "BUY" if is_buy_order else "SELL" if is_sell_order else "UNKNOWN"
                         symbol = order_proxy.data._name if order_proxy.data else "Unknown"
 
                         # 构造消息: ⏳ 代表等待/进行中
@@ -1551,7 +1785,7 @@ def on_order_status_callback(context, raw_order):
                 if not is_rejected and trade_push_key not in terminal_trade_push_dedupe:
                     trade_info = {
                         'symbol': order_proxy.data._name if order_proxy.data else "Unknown",
-                        'action': 'BUY' if is_buy_order else 'SELL' if is_sell_order else 'UNKNOWN',
+                        'action': 'COMBO' if is_combo_order else 'BUY' if is_buy_order else 'SELL' if is_sell_order else 'UNKNOWN',
                         'price': order_proxy.executed.price,
                         'size': _extract_target_qty(order_proxy, fallback=order_proxy.executed.size),
                         'value': order_proxy.executed.value,
@@ -1573,7 +1807,7 @@ def on_order_status_callback(context, raw_order):
             if is_canceled:
                 total_qty = _extract_target_qty(order_proxy, fallback=0)
 
-                action = "BUY" if is_buy_order else "SELL" if is_sell_order else "UNKNOWN"
+                action = "COMBO" if is_combo_order else "BUY" if is_buy_order else "SELL" if is_sell_order else "UNKNOWN"
                 symbol = order_proxy.data._name if order_proxy.data else "Unknown"
                 alarm_manager.push_text(
                     f"🛑 订单已撤销 ({current_status}): {action} "
@@ -1582,7 +1816,7 @@ def on_order_status_callback(context, raw_order):
 
             # 3. 如果卖单成交（有钱回笼），仅同步资金。
             # 无状态模式下不执行延迟队列重放。
-            if is_sell_order and is_completed and order_proxy.executed.size > 0:
+            if (is_sell_order or is_combo_order) and is_completed and order_proxy.executed.size > 0:
                 # 再次确认不是撤单导致的 size>0 (虽然撤单通常 size=0，但为了严谨)
                 if not is_canceled and not is_rejected:
                     runtime_print("[Engine] Sell filled. Syncing broker cash snapshot...")

@@ -35,7 +35,7 @@ class _TwoCspSameBar(BaseStrategy):
         for data in self.broker.datas:
             leg = OptionRiskLeg(
                 data._name,
-                data._name.split("261")[0],
+                "US." + data._name.split(".", 1)[1].split("26", 1)[0],
                 "PUT",
                 -1,
                 float(data.p.dataname["strike"].iloc[0]),
@@ -300,7 +300,7 @@ def test_csp_uncommitted_cash_subtracts_short_position_obligation():
                     100.0,
                 ),
             )
-            self.cash_after = self.broker.get_csp_uncommitted_cash()
+            self.cash_after = self.broker.get_option_uncommitted_cash()
 
     backtester = Backtester(
         datas={"US.AAPL260220P00090000": _option_frame(90.0)},

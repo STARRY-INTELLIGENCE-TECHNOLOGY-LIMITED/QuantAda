@@ -115,6 +115,125 @@ def test_futu_defaults_to_simulated_trade_environment():
     assert broker._trade_env_value() == getattr(futu_module.TrdEnv, 'SIMULATE', 'SIMULATE')
 
 
+def test_futu_real_trade_unlock_reads_named_password_environment(monkeypatch):
+    class UnlockingTrade(FakeTradeContext):
+        def __init__(self):
+            super().__init__()
+            self.unlock_calls = []
+
+        def unlock_trade(self, **kwargs):
+            self.unlock_calls.append(kwargs)
+            return 0, None
+
+    trade = UnlockingTrade()
+    monkeypatch.setenv('TEST_UNLOCK_SLOT', 'fixture')
+    context = SimpleNamespace(
+        futu_trade_context=trade,
+        _futu_runtime_config={
+            'FUTU_TRADE_ENV': 'REAL',
+            'FUTU_TRADE_PASSWORD_ENV': 'TEST_UNLOCK_SLOT',
+            'FUTU_ACCOUNT_CURRENCY': 'USD',
+        },
+    )
+
+    broker = FutuBrokerAdapter(context)
+
+    assert trade.unlock_calls == [
+        {'password': 'fixture', 'is_unlock': True},
+    ]
+    # 同一上下文只解锁一次，后续账户查询不得重复触发柜台接口。
+    assert broker._get_trade_context() is trade
+    assert len(trade.unlock_calls) == 1
+
+
+def test_futu_real_trade_unlock_supports_named_md5_environment(monkeypatch):
+    class UnlockingTrade(FakeTradeContext):
+        def __init__(self):
+            super().__init__()
+            self.unlock_calls = []
+
+        def unlock_trade(self, **kwargs):
+            self.unlock_calls.append(kwargs)
+            return 0, None
+
+    trade = UnlockingTrade()
+    md5_value = 'a' * 32
+    monkeypatch.setenv('TEST_UNLOCK_MD5_SLOT', md5_value)
+    context = SimpleNamespace(
+        futu_trade_context=trade,
+        _futu_runtime_config={
+            'FUTU_TRADE_ENV': 'REAL',
+            'FUTU_TRADE_PASSWORD_MD5_ENV': 'TEST_UNLOCK_MD5_SLOT',
+            'FUTU_ACCOUNT_CURRENCY': 'USD',
+        },
+    )
+
+    FutuBrokerAdapter(context)
+
+    assert trade.unlock_calls == [
+        {'password_md5': md5_value, 'is_unlock': True},
+    ]
+
+
+def test_futu_real_trade_unlock_supports_direct_private_password():
+    class UnlockingTrade(FakeTradeContext):
+        def __init__(self):
+            super().__init__()
+            self.unlock_calls = []
+
+        def unlock_trade(self, **kwargs):
+            self.unlock_calls.append(kwargs)
+            return 0, None
+
+    trade = UnlockingTrade()
+    context = SimpleNamespace(
+        futu_trade_context=trade,
+        _futu_runtime_config={
+            'FUTU_TRADE_ENV': 'REAL',
+            'FUTU_TRADE_PASSWORD': 'fixture',
+            'FUTU_ACCOUNT_CURRENCY': 'USD',
+        },
+    )
+
+    FutuBrokerAdapter(context)
+
+    assert trade.unlock_calls == [
+        {'password': 'fixture', 'is_unlock': True},
+    ]
+
+
+def test_futu_unlock_failure_detaches_injected_context_for_retry(monkeypatch):
+    import threading
+    import live_trader.adapters.futu_broker as futu_module
+
+    class LockedTrade:
+        status = 'READY'
+
+    trade = LockedTrade()
+    broker = object.__new__(FutuBrokerAdapter)
+    broker._context_lock = threading.RLock()
+    broker._context = SimpleNamespace(_futu_runtime_config={
+        'FUTU_TRADE_ENV': 'REAL',
+        'FUTU_TRADE_PASSWORD_ENV': 'MISSING_UNLOCK_SLOT',
+    })
+    broker._trade_ctx = trade
+    broker.trade_ctx = trade
+    broker.trd_ctx = trade
+    broker._owns_trade_ctx = False
+    broker._trade_unlock_context = None
+    broker._trade_unlock_failed_context = None
+    broker._trade_context_init_failed = False
+    broker._trade_context_retry_at = 0.0
+    broker._trade_env = 'REAL'
+    broker._account_currency = 'USD'
+    broker._runtime_log = lambda _message: None
+    monkeypatch.setattr(futu_module, 'OpenSecTradeContext', None)
+
+    assert broker._get_trade_context() is None
+    assert broker._trade_ctx is None
+    assert broker._trade_unlock_failed_context is None
+
+
 def test_futu_quote_context_waits_for_ready_before_event_subscription(monkeypatch):
     import live_trader.adapters.futu_broker as futu_module
 
@@ -198,16 +317,21 @@ def test_futu_mixed_assets_keep_position_and_order_sizing_symbol_scoped():
     class MixedQuote:
         def get_market_snapshot(self, codes):
             rows = {
-                'US.AAPL': {'code': 'US.AAPL', 'last_price': 100.0},
+                'US.AAPL': {
+                    'code': 'US.AAPL', 'last_price': 100.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
+                },
                 'US.AAPL260918P320000': {
                     'code': 'US.AAPL260918P320000',
                     'last_price': 10.0,
                     'option_contract_multiplier': 100.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
                 },
                 'US.NQ260918': {
                     'code': 'US.NQ260918',
                     'last_price': 20.0,
                     'contract_multiplier': 10.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
                 },
             }
             return 0, pd.DataFrame([rows[code] for code in codes if code in rows])
@@ -536,6 +660,27 @@ def test_futu_pending_query_failure_is_fail_closed():
     assert broker.cancel_pending_order('FUTU-1') is False
 
 
+def test_futu_pending_zero_remaining_uses_total_minus_filled_when_partial():
+    broker, _ = _broker()
+    broker._query_order_rows = lambda: [{
+        'order_id': 'PARTIAL-1',
+        'code': 'US.AAPL',
+        'trd_side': 'BUY',
+        'order_status': 'SUBMITTED',
+        'qty': 10,
+        'dealt_qty': 4,
+        'remaining': 0,
+    }]
+
+    assert broker.get_pending_orders() == [{
+        'id': 'PARTIAL-1',
+        'symbol': 'US.AAPL',
+        'direction': 'BUY',
+        'size': 6,
+    }]
+    assert broker._last_pending_orders_fetch_failed is False
+
+
 def test_futu_a_share_position_without_sellable_field_is_not_sellable():
     class NoSellable(FakeTradeContext):
         def position_list_query(self, **kwargs):
@@ -572,7 +717,10 @@ def test_futu_current_price_uses_injected_quote_context_and_fails_closed():
 
     class Quote:
         def get_market_snapshot(self, codes):
-            return 0, pd.DataFrame([{'code': 'US.AAPL', 'last_price': 201.5}])
+            return 0, pd.DataFrame([{
+                'code': 'US.AAPL', 'last_price': 201.5,
+                'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
+            }])
 
     broker._quote_ctx = Quote()
     assert broker.get_current_price(SimpleNamespace(_name='AAPL', close=[200.0])) == 201.5
@@ -582,6 +730,21 @@ def test_futu_current_price_uses_injected_quote_context_and_fails_closed():
             raise RuntimeError('quote unavailable')
 
     broker._quote_ctx = BrokenQuote()
+    assert broker.get_current_price(SimpleNamespace(_name='AAPL', close=[200.0])) == 0.0
+
+
+def test_futu_current_price_rejects_stale_or_unidentified_quote():
+    broker, _ = _broker()
+
+    class StaleQuote:
+        def get_market_snapshot(self, _codes):
+            return 0, pd.DataFrame([{
+                'code': 'US.AAPL',
+                'last_price': 201.5,
+                'update_time': '2020-01-01 10:00:00',
+            }])
+
+    broker._quote_ctx = StaleQuote()
     assert broker.get_current_price(SimpleNamespace(_name='AAPL', close=[200.0])) == 0.0
 
 
@@ -601,6 +764,7 @@ def test_futu_option_multiplier_can_be_discovered_without_injected_quote_context
                     'code': 'US.AAPL260918P320000',
                     'last_price': 10.0,
                     'option_contract_multiplier': 100.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
                 }]
             )
 
@@ -630,6 +794,7 @@ def test_futu_option_contract_size_is_used_when_contract_multiplier_is_zero():
                     'last_price': 10.0,
                     'option_contract_multiplier': 0.0,
                     'option_contract_size': 100.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
                 }]
             )
 
@@ -682,8 +847,9 @@ def test_futu_rejects_short_and_combination_positions():
             }])
 
     broker, _ = _broker(ComboPosition())
-    with pytest.raises(RuntimeError, match='combination position is unsupported'):
-        broker.get_position(SimpleNamespace(_name='US.AAPL'))
+    position = broker.get_position(SimpleNamespace(_name='US.AAPL'))
+    assert position.size == 1
+    assert position.combo_id == 'COMBO-1'
 
 
 def test_futu_a_share_buy_enforces_hundred_share_lot():
@@ -706,7 +872,10 @@ def test_futu_retries_quote_context_after_transient_initialization_failure(monke
             created.append(self)
 
         def get_market_snapshot(self, codes):
-            return 0, pd.DataFrame([{'code': codes[0], 'last_price': 10.0}])
+            return 0, pd.DataFrame([{
+                'code': codes[0], 'last_price': 10.0,
+                'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
+            }])
 
         def close(self):
             return None
@@ -784,7 +953,10 @@ def test_futu_uses_account_currency_for_nav_and_order_unit_value():
         def get_market_snapshot(self, codes):
             code = codes[0]
             if code == 'US.AAPL':
-                return 0, pd.DataFrame([{'code': code, 'last_price': 200.0}])
+                return 0, pd.DataFrame([{
+                    'code': code, 'last_price': 200.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
+                }])
             if code == 'FX.USDHKD':
                 return 0, pd.DataFrame([{'code': code, 'last_price': 7.8}])
             return 0, pd.DataFrame()
@@ -927,6 +1099,7 @@ def test_futu_option_contract_multiplier_scales_target_order_and_reserved_cash()
                     'code': 'US.AAPL260918P320000',
                     'last_price': 10.0,
                     'option_contract_multiplier': 100.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
                 }]
             )
 
@@ -963,6 +1136,7 @@ def test_futu_option_contract_multiplier_is_included_in_portfolio_nav():
                     'code': 'US.AAPL260918P320000',
                     'last_price': 10.0,
                     'option_contract_multiplier': 100.0,
+                    'update_time': pd.Timestamp.now(tz='America/New_York').strftime('%Y-%m-%d %H:%M:%S'),
                 }]
             )
 

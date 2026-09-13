@@ -8,10 +8,27 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 _UNPARSED = object()
+
+
+def _nonnegative_parameter(name: str) -> bool:
+    """识别明显不应搜索为负数的参数名称。"""
+
+    normalized = str(name or "").strip().lower()
+    if not normalized:
+        return False
+    # Delta、评分阈值等参数天然允许负数，不能因名称含有 min/max 就截断。
+    if "delta" in normalized or "score" in normalized:
+        return False
+    markers = (
+        "contract", "count", "quantity", "weight", "fraction", "pct", "percent",
+        "rate", "spread", "open_interest", "gap", "dte", "period", "window",
+        "iv", "volatility", "capital", "cash",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 @dataclass(frozen=True)
@@ -39,6 +56,7 @@ class TrainingResult:
     selected: bool = False
     main_eval: dict[str, str] | None = None
     test_set: dict[str, str] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 def _literal(node: ast.AST | None) -> Any:
@@ -113,6 +131,23 @@ def extract_strategy_params(source_path: Path | str) -> dict[str, Any]:
     return result
 
 
+def source_strategy_reference(source_path: Path | str, project_root: Path | str) -> str | None:
+    """将项目内的 Python 文件转换为可传给 run.py 的模块引用。"""
+
+    path = Path(source_path).resolve()
+    root = Path(project_root).resolve()
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return None
+    if relative.suffix.lower() != ".py":
+        return None
+    parts = list(relative.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts) or None
+
+
 def _suggestion(name: str, value: Any) -> tuple[str, dict[str, Any]]:
     if isinstance(value, bool):
         return "bool", {"type": "categorical", "choices": [False, True]}
@@ -120,14 +155,19 @@ def _suggestion(name: str, value: Any) -> tuple[str, dict[str, Any]]:
         spread = max(2, int(abs(value) * 0.5))
         low = max(1, value - spread) if value > 0 else value - spread
         high = max(value + 1, value + spread)
+        if _nonnegative_parameter(name):
+            low = max(0, low)
         step = max(1, int(round(spread / 5)))
         return "int", {"type": "int", "low": low, "high": high, "step": step}
     if isinstance(value, float):
         spread = max(0.1, abs(value) * 0.5)
         step = 0.01 if spread < 0.2 else 0.1
+        low = value - spread
+        if _nonnegative_parameter(name):
+            low = max(0.0, low)
         return "float", {
             "type": "float",
-            "low": round(value - spread, 8),
+            "low": round(low, 8),
             "high": round(value + spread, 8),
             "step": step,
         }
@@ -181,7 +221,7 @@ def recommendation_notes(suggestions: Iterable[ParameterSuggestion]) -> list[str
         if name.endswith("_a") and name[:-2] + "_b" in names:
             notes.append(f"请确认 {name} < {name[:-2]}_b 的周期关系")
     for item in items:
-        if item.value_type == "str" and item.recommendation.get("type") == "categorical":
+        if item.value_type in {"str", "NoneType"} and item.recommendation.get("type") == "categorical":
             choices = item.recommendation.get("choices", [])
             if len(choices) <= 1:
                 notes.append(f"{item.name} 当前只有一个固定类别，不会增加搜索维度")
@@ -203,19 +243,20 @@ def _parse_params_block(lines: list[str], start: int, limit: int) -> dict[str, A
     if not first:
         return {}
     chunks = [first.group(1).strip()]
-    balance = chunks[0].count("{") - chunks[0].count("}")
     index = start + 1
-    while balance > 0 and index < limit:
+    while True:
+        try:
+            parsed = ast.literal_eval(" ".join(chunks))
+        except (SyntaxError, ValueError, TypeError):
+            parsed = _UNPARSED
+        if isinstance(parsed, dict):
+            return parsed
+        if index >= limit:
+            return {}
         chunk = lines[index].strip()
         if chunk:
             chunks.append(chunk)
-            balance += chunk.count("{") - chunk.count("}")
         index += 1
-    try:
-        parsed = ast.literal_eval(" ".join(chunks))
-    except (SyntaxError, ValueError, TypeError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
 
 
 def _parse_summary_metrics(lines: list[str], start: int, limit: int) -> tuple[dict[str, str], dict[str, str]]:
@@ -333,7 +374,7 @@ class TrainingSelectionStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def save_result(self, result: TrainingResult) -> None:
+    def save_result(self, result: TrainingResult, metadata: Mapping[str, Any] | None = None) -> None:
         """保存一个训练结果快照并将其标记为选中版本。"""
 
         payload = self._read()
@@ -351,6 +392,7 @@ class TrainingSelectionStore:
             "modified_at": result.modified_at,
             "main_eval": result.main_eval or {},
             "test_set": result.test_set or {},
+            "metadata": dict(metadata or result.metadata or {}),
         }
         payload.update(
             {

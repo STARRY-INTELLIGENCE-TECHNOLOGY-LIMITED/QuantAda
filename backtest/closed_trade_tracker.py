@@ -10,6 +10,7 @@ class ClosedTradeTracker:
         self.owner = owner
         self.closed_trades = []
         self._active_trade_states = {}
+        self._processed_settlement_event_ids = set()
 
     def update_active_lows(self):
         for data in getattr(self.owner, "datas", []) or []:
@@ -107,6 +108,60 @@ class ClosedTradeTracker:
             "pnl_pct": pnl_pct,
             "lowest_price_during_trade": lowest_price,
         })
+
+    def reconcile_external_settlement(self, events):
+        """按已确认的外部结算事实关闭本地归因状态，不生成新交易意图。"""
+        for event in events or ():
+            if not isinstance(event, dict):
+                continue
+            symbol = str(event.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            event_id = str(event.get("event_id") or "|".join(
+                str(value)
+                for value in (
+                    symbol,
+                    str(event.get("type") or event.get("event") or "").upper(),
+                    event.get("quantity", event.get("shares", 0)),
+                    event.get("settlement_price", ""),
+                    event.get("pnl", ""),
+                )
+            ))
+            if event_id in self._processed_settlement_event_ids:
+                continue
+            self._processed_settlement_event_ids.add(event_id)
+            state = self._active_trade_states.pop(symbol, None)
+            if state is None:
+                continue
+            settlement_price = event.get("settlement_price")
+            try:
+                settlement_price = float(settlement_price)
+                if not math.isfinite(settlement_price):
+                    settlement_price = None
+            except (TypeError, ValueError, OverflowError):
+                settlement_price = None
+            try:
+                pnl = float(event.get("pnl", 0.0) or 0.0)
+                if not math.isfinite(pnl):
+                    pnl = 0.0
+            except (TypeError, ValueError, OverflowError):
+                pnl = 0.0
+            pnl_pct = event.get("pnl_pct")
+            try:
+                pnl_pct = float(pnl_pct) if pnl_pct is not None else None
+                if pnl_pct is not None and not math.isfinite(pnl_pct):
+                    pnl_pct = None
+            except (TypeError, ValueError, OverflowError):
+                pnl_pct = None
+            self.closed_trades.append({
+                "symbol": symbol,
+                "entry_price": state.get("entry_price"),
+                "exit_price": settlement_price,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "lowest_price_during_trade": state.get("lowest_price_during_trade"),
+                "settlement_event": str(event.get("type", "EXTERNAL_SETTLEMENT")),
+            })
 
     def _track_buy(self, symbol, price, size):
         state = self._active_trade_states.get(symbol)

@@ -5,8 +5,12 @@ BaseStrategy 负责公开的策略 API。本模块负责规范化指标序列、
 """
 
 from collections import OrderedDict
+from bisect import bisect_right
+import math
 
 import pandas as pd
+
+from common.options.data_safety import sanitize_indicator_series
 
 
 class BoundedIndicatorCache(OrderedDict):
@@ -47,7 +51,10 @@ class BoundedIndicatorCache(OrderedDict):
 def _ensure_registries(strategy):
     if not hasattr(strategy, '_indicator_registry'):
         strategy._indicator_registry = {}
+    if not hasattr(strategy, '_fast_dict_registry'):
         strategy._fast_dict_registry = {}
+    if not hasattr(strategy, '_fast_dict_keys_registry'):
+        strategy._fast_dict_keys_registry = {}
 
 
 def _normalize_series_index(series, preserve_timezone=False):
@@ -67,7 +74,12 @@ def register_indicator(strategy, data_name, indicator_name, series):
     if data_name not in strategy._indicator_registry:
         strategy._indicator_registry[data_name] = {}
         strategy._fast_dict_registry[data_name] = {}
+        strategy._fast_dict_keys_registry[data_name] = {}
+    else:
+        strategy._fast_dict_registry.setdefault(data_name, {})
+        strategy._fast_dict_keys_registry.setdefault(data_name, {})
 
+    series = sanitize_indicator_series(series)
     series = _normalize_series_index(
         series,
         preserve_timezone=bool(getattr(strategy.broker, 'is_live', False)),
@@ -95,22 +107,24 @@ def register_indicator(strategy, data_name, indicator_name, series):
                 fast_dict = dict(zip(idx, series.values))
                 cache[fast_key] = fast_dict
             strategy._fast_dict_registry[data_name][indicator_name] = fast_dict
+            strategy._fast_dict_keys_registry[data_name][indicator_name] = tuple(sorted(fast_dict))
             return
         except Exception:
             pass
 
     idx = [dt.to_pydatetime() for dt in series.index]
     strategy._fast_dict_registry[data_name][indicator_name] = dict(zip(idx, series.values))
+    strategy._fast_dict_keys_registry[data_name][indicator_name] = tuple(idx)
 
 
 def get_cached_indicator_series(strategy, data, indicator_name, params_key, compute_func):
     cache = getattr(strategy.broker, 'indicator_cache', None)
     if getattr(strategy.broker, 'is_live', False) or not isinstance(cache, dict):
-        return compute_func()
+        return sanitize_indicator_series(compute_func())
 
     dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
     if not isinstance(dataframe, pd.DataFrame):
-        return compute_func()
+        return sanitize_indicator_series(compute_func())
 
     index = dataframe.index
     cache_key = (
@@ -126,7 +140,19 @@ def get_cached_indicator_series(strategy, data, indicator_name, params_key, comp
     series = cache.get(cache_key)
     if series is None:
         series = compute_func()
+        series = sanitize_indicator_series(series)
         cache[cache_key] = series
+    else:
+        # 命中缓存时保留对象身份；仅在发现非有限值时替换，避免优化器
+        # 每次查询都复制整条序列。
+        try:
+            numeric = pd.to_numeric(series, errors='coerce')
+            if not numeric.map(math.isfinite).all():
+                series = sanitize_indicator_series(series)
+                cache[cache_key] = series
+        except Exception:
+            series = sanitize_indicator_series(series)
+            cache[cache_key] = series
     return series
 
 
@@ -140,6 +166,8 @@ def get_indicator(strategy, data, indicator_name, current_dt):
     if is_live_mode:
         series = strategy._indicator_registry.get(data_name, {}).get(indicator_name)
         if series is not None:
+            if getattr(series, 'empty', False):
+                return None
             # 将查询时间归一化到指标序列的时区；实盘序列保留时区信息，无时区序列继续使用原有的本地墙上时间语义，不截断秒级以下精度。
             try:
                 lookup_dt = pd.Timestamp(current_dt)
@@ -162,6 +190,27 @@ def get_indicator(strategy, data, indicator_name, current_dt):
 
     fast_dict = strategy._fast_dict_registry.get(data_name, {}).get(indicator_name)
     if fast_dict is not None:
-        return fast_dict.get(data_dt)
+        sentinel = object()
+        value = fast_dict.get(data_dt, sentinel)
+        if value is not sentinel:
+            return value
+        # 与实盘 Series.asof 保持一致：当前 bar 缺少精确指标时回退到
+        # 之前最近的一条有限值，而不是因 fast dict 查询返回 None。
+        keys = getattr(strategy, '_fast_dict_keys_registry', {}).get(data_name, {}).get(indicator_name)
+        if keys:
+            try:
+                position = bisect_right(keys, data_dt) - 1
+            except TypeError:
+                return None
+            if position >= 0:
+                return fast_dict[keys[position]]
+            return None
+        try:
+            previous = [key for key in fast_dict if key <= data_dt]
+        except TypeError:
+            return None
+        if previous:
+            return fast_dict[max(previous)]
+        return None
 
     return None

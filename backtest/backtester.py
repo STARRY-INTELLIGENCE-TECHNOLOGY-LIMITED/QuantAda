@@ -93,6 +93,85 @@ def _extract_contract_multiplier(data) -> float:
     return 1.0
 
 
+def _validate_backtest_risk_leg(data, risk_leg) -> None:
+    """校验回测风险腿与当前 DataFeed 的静态合约元数据一致。"""
+    from common.options.analytics import parse_expiry, parse_option_symbol, underlying_key
+
+    try:
+        strike = float(risk_leg.strike)
+        multiplier = float(risk_leg.contract_multiplier)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise ValueError('invalid option risk leg metadata') from None
+    if not math.isfinite(strike) or strike <= 0 or not math.isfinite(multiplier) or multiplier <= 0:
+        raise ValueError('invalid option risk leg metadata')
+    actual_multiplier = float(_extract_contract_multiplier(data))
+    if not math.isfinite(actual_multiplier) or actual_multiplier <= 0:
+        raise ValueError('option contract multiplier is unavailable')
+    if abs(multiplier - actual_multiplier) > max(1e-9, abs(actual_multiplier) * 1e-9):
+        raise ValueError('risk leg multiplier does not match option contract')
+
+    parsed = parse_option_symbol(getattr(data, '_name', ''))
+    # 自定义 DataFeed 可能使用不可解析的显示名称（例如 ``AAPL_OPTION``），
+    # 此时仍需用其静态元数据校验风险腿，不能让错误执行价/方向进入现金模型。
+    dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
+    if isinstance(dataframe, pd.DataFrame) and not dataframe.empty:
+        def last_value(names):
+            for name in names:
+                if name not in dataframe.columns:
+                    continue
+                for value in reversed(dataframe[name].tolist()):
+                    try:
+                        if value is not None and not pd.isna(value):
+                            return value
+                    except (TypeError, ValueError):
+                        if value is not None:
+                            return value
+            return None
+
+        metadata_type = str(last_value(('option_type', 'right', 'cp', 'put_call')) or '').strip().upper()
+        if metadata_type in {'P', 'PUT', 'C', 'CALL'}:
+            expected_type = 'PUT' if metadata_type in {'P', 'PUT'} else 'CALL'
+            option_type = str(getattr(risk_leg, 'option_type', '') or '').strip().upper()
+            if option_type not in {expected_type, expected_type[:1]}:
+                raise ValueError('risk leg option type does not match DataFeed metadata')
+        metadata_strike = last_value(('strike', 'strike_price', 'exercise_price'))
+        if metadata_strike is not None:
+            try:
+                parsed_metadata_strike = float(metadata_strike)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('DataFeed option strike is invalid') from None
+            if not math.isfinite(parsed_metadata_strike) or parsed_metadata_strike <= 0:
+                raise ValueError('DataFeed option strike is invalid')
+            if abs(strike - parsed_metadata_strike) > max(1e-9, abs(parsed_metadata_strike) * 1e-9):
+                raise ValueError('risk leg strike does not match DataFeed metadata')
+        metadata_expiry = parse_expiry(last_value(('expiry', 'expiration', 'expiration_date')))
+        provided_expiry = parse_expiry(getattr(risk_leg, 'expiry', None))
+        if pd.notna(metadata_expiry) and pd.notna(provided_expiry):
+            if pd.Timestamp(metadata_expiry).normalize() != pd.Timestamp(provided_expiry).normalize():
+                raise ValueError('risk leg expiry does not match DataFeed metadata')
+        metadata_underlying = last_value(('underlying', 'underlying_symbol', 'underlying_code'))
+        if metadata_underlying is not None:
+            if underlying_key(metadata_underlying) != underlying_key(getattr(risk_leg, 'underlying', '')):
+                raise ValueError('risk leg underlying does not match DataFeed metadata')
+
+    if not parsed.get('option_type'):
+        return
+    option_type = str(getattr(risk_leg, 'option_type', '') or '').upper()
+    expected_type = str(parsed['option_type']).upper()
+    if option_type not in {expected_type, expected_type[:1]}:
+        raise ValueError('risk leg option type does not match option symbol')
+    parsed_strike = float(parsed['strike'])
+    if abs(strike - parsed_strike) > max(1e-9, abs(parsed_strike) * 1e-9):
+        raise ValueError('risk leg strike does not match option symbol')
+    provided_underlying_raw = str(getattr(risk_leg, 'underlying', '') or '').upper()
+    expected_underlying = str(parsed.get('underlying') or '').upper()
+    if expected_underlying and underlying_key(provided_underlying_raw) != expected_underlying:
+        raise ValueError('risk leg underlying does not match option symbol')
+    provided_expiry = parse_expiry(getattr(risk_leg, 'expiry', None))
+    if pd.notna(provided_expiry) and pd.Timestamp(provided_expiry).normalize() != pd.Timestamp(parsed['expiry']).normalize():
+        raise ValueError('risk leg expiry does not match option symbol')
+
+
 class _ContractMultiplierCommInfo(bt.CommInfoBase):
     """将每份合约的价格、手续费和持仓估值按现金乘数放大。"""
 
@@ -265,9 +344,24 @@ class BacktraderStrategyWrapper(bt.Strategy):
                     index = pd.to_datetime(dataframe.index, errors='coerce')
                     if getattr(index, 'tz', None) is not None and current_dt.tzinfo is None:
                         index = index.tz_localize(None)
+                    elif getattr(index, 'tz', None) is None and current_dt.tzinfo is not None:
+                        current_dt = current_dt.tz_localize(None)
                     visible = dataframe.loc[index <= current_dt]
                     row = visible.iloc[-1] if not visible.empty else None
             if row is None:
+                try:
+                    from common.options.analytics import parse_option_symbol
+
+                    is_option = bool(
+                        parse_option_symbol(getattr(data, '_name', '')).get('option_type')
+                    )
+                except Exception:
+                    is_option = False
+                if is_option:
+                    # 已确认的 Short Put 在缺少当前可见元数据时不能被解释成
+                    # 没有现金义务，否则会放大后续买入能力。
+                    self._last_order_target_skip_reason = 'option_margin_unavailable'
+                    return 0.0
                 continue
             option_type = str(row.get('option_type', '')).upper()
             strike = row.get('strike', row.get('strike_price'))
@@ -294,20 +388,19 @@ class BacktraderStrategyWrapper(bt.Strategy):
             remaining = float(reservation.get('remaining', 0.0))
             if remaining <= 0:
                 continue
-            pending_short_puts.append({
+            pending_item = {
                 'strike': reservation['strike'],
                 'remaining': remaining,
                 'contract_multiplier': reservation['contract_multiplier'],
-            })
+            }
+            if reservation.get('required') is not None:
+                pending_item['reserved_cash'] = reservation['required']
+            pending_short_puts.append(pending_item)
         return float(uncommitted_cash(
             self.getcash(),
             short_puts=short_puts,
             pending_short_puts=pending_short_puts,
         ))
-
-    def get_csp_uncommitted_cash(self):
-        """兼容旧 CSP 策略的现金入口。"""
-        return self.get_option_uncommitted_cash()
 
     def submit_option_order(self, data, volume, order_effect, price=None, **kwargs):
         """回测中提供显式期权效果入口；生命周期事件仍需单独建模。"""
@@ -373,13 +466,25 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 signed_quantity = float(getattr(risk_leg, 'signed_quantity'))
                 strike = float(getattr(risk_leg, 'strike'))
                 multiplier = float(getattr(risk_leg, 'contract_multiplier'))
+                if not all(math.isfinite(value) for value in (strike, multiplier)):
+                    raise ValueError('risk leg strike or multiplier is not finite')
+                if strike <= 0 or multiplier <= 0:
+                    raise ValueError('risk leg strike or multiplier is not positive')
+                _validate_backtest_risk_leg(data, risk_leg)
                 if signed_quantity >= 0 or abs(signed_quantity) < quantity:
                     raise ValueError('SELL_TO_OPEN risk leg must cover the requested short quantity')
                 if option_type in {'PUT', 'P'}:
-                    from common.options.cash import assignment_cash
-
                     available = self.get_option_uncommitted_cash()
+                    from common.options.cash import assignment_cash
                     required = float(assignment_cash(strike, quantity, multiplier))
+                    margin_legs = kwargs.get('_spread_risk_legs')
+                    if margin_legs:
+                        # 价差开仓按定义风险占用现金；未配对空头仍走 CSP 全额指派。
+                        required = float(compute_option_margin(
+                            margin_legs,
+                            cash=max(0.0, float(self.getcash())),
+                            portfolio_margin=True,
+                        ).margin_used)
                     if available < required:
                         # 保留旧 CSP skip reason，便于现有 recorder/策略诊断兼容。
                         self._last_order_target_skip_reason = 'csp_assignment_cash_insufficient'
@@ -419,6 +524,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
                     'remaining': quantity,
                     'initial': quantity,
                     'data': data,
+                    'required': required,
                 }
             return order
         if effect == 'BUY_TO_CLOSE':
@@ -428,6 +534,241 @@ class BacktraderStrategyWrapper(bt.Strategy):
         if effect == 'SELL_TO_CLOSE':
             return self.sell(data=data, size=quantity, price=price)
         return None
+
+    def submit_option_spread(self, legs, volume=1, **kwargs):
+        """回测中同步模拟定义风险组合；不查询 live pending 或网络状态。"""
+        if not isinstance(legs, (list, tuple)) or len(legs) != 2:
+            self._last_order_target_skip_reason = 'invalid_option_spread'
+            return None
+        prepared = []
+        try:
+            quantity = float(volume)
+            if not math.isfinite(quantity) or quantity <= 0:
+                raise ValueError('invalid spread quantity')
+            from common.options.analytics import parse_expiry, parse_option_symbol, underlying_key
+            from common.options.risk import OptionRiskLeg, compute_option_margin
+
+            risk_legs = []
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    raise ValueError('spread leg must be a dict')
+                data = leg['data']
+                effect = leg['effect']
+                price = leg.get('price')
+                risk_leg = leg.get('risk_leg')
+                leg_volume = float(leg.get('volume', quantity))
+                if not math.isfinite(leg_volume) or abs(leg_volume - quantity) > 1e-12:
+                    raise ValueError('spread leg quantities must match')
+                if risk_leg is not None:
+                    if not isinstance(risk_leg, OptionRiskLeg):
+                        raise ValueError('invalid spread risk leg')
+                    risk_legs.append(risk_leg)
+                leg_kwargs = {
+                    key: value
+                    for key, value in leg.items()
+                    if key not in {"data", "effect", "price", "risk_leg", "volume"}
+                }
+                prepared.append((data, effect, price, risk_leg, leg_kwargs))
+            if risk_legs:
+                compute_option_margin(
+                    risk_legs,
+                    cash=max(0.0, float(self.getcash())),
+                    portfolio_margin=True,
+                )
+        except Exception:
+            self._last_order_target_skip_reason = 'invalid_option_spread'
+            return None
+
+        # 先对所有腿做静态预检查，避免第一条腿创建后才发现第二条腿
+        # 资金/仓位边界不满足。回测撮合虽同步，但订单创建接口本身仍可能
+        # 被测试替身拒绝，因此失败时还会取消本次已创建的订单。
+        try:
+            from common.options.contracts import normalize_option_order_effect, validate_option_order_effect
+
+            total_buy_cost = 0.0
+            opening = []
+            for data, effect, price, risk_leg, leg_kwargs in prepared:
+                normalized_effect = normalize_option_order_effect(effect)
+                current = float(self.getposition(data).size)
+                validate_option_order_effect(
+                    normalized_effect,
+                    current,
+                    quantity,
+                    allow_sell_to_open=normalized_effect == 'SELL_TO_OPEN',
+                )
+                if normalized_effect == 'SELL_TO_OPEN':
+                    if risk_leg is None or abs(float(risk_leg.signed_quantity) + quantity) > 1e-12:
+                        raise ValueError('short spread leg quantity does not match')
+                    _validate_backtest_risk_leg(data, risk_leg)
+                    opening.append((normalized_effect, risk_leg))
+                elif normalized_effect == 'BUY_TO_OPEN' and risk_leg is not None:
+                    if abs(float(risk_leg.signed_quantity) - quantity) > 1e-12:
+                        raise ValueError('long spread leg quantity does not match')
+                    _validate_backtest_risk_leg(data, risk_leg)
+                    opening.append((normalized_effect, risk_leg))
+                if normalized_effect == 'BUY_TO_OPEN':
+                    execution_price = float(price if price is not None else data.close[0])
+                    multiplier = float(self.get_contract_multiplier(data))
+                    commission_ratio = float(self.broker.getcommissioninfo(data).p.commission)
+                    cost = quantity * execution_price * multiplier * (1.0 + self.slippage) * (1.0 + commission_ratio)
+                    if not math.isfinite(cost) or cost < 0:
+                        raise ValueError('invalid spread buy cost')
+                    total_buy_cost += cost
+            if opening:
+                short = next((leg for effect, leg in opening if effect == 'SELL_TO_OPEN'), None)
+                long = next((leg for effect, leg in opening if effect == 'BUY_TO_OPEN'), None)
+                if short is None or long is None:
+                    raise ValueError('spread must contain one short Put and one long Put')
+                if str(short.option_type).upper() not in {'PUT', 'P'} or str(long.option_type).upper() not in {'PUT', 'P'}:
+                    raise ValueError('only Put spreads are supported')
+                if underlying_key(short.underlying) != underlying_key(long.underlying):
+                    raise ValueError('spread legs must share underlying')
+                short_expiry = parse_expiry(short.expiry)
+                long_expiry = parse_expiry(long.expiry)
+                same_expiry = (
+                    pd.notna(short_expiry)
+                    and pd.notna(long_expiry)
+                    and pd.Timestamp(short_expiry).normalize() == pd.Timestamp(long_expiry).normalize()
+                )
+                if short.strike <= long.strike or not same_expiry:
+                    raise ValueError('spread strikes or expiry are invalid')
+                if abs(float(short.contract_multiplier) - float(long.contract_multiplier)) > 1e-12:
+                    raise ValueError('spread legs must share contract multiplier')
+            else:
+                # 平仓组合同样必须是同一标的、同一到期日、同一乘数的 Put
+                # Spread。不能因为两条腿都是“平仓效果”就放行混合 Call、跨
+                # 标的或无法识别的合约，否则会把策略错误送入组合撮合。
+                effects = {effect for _data, effect, _price, _risk_leg, _leg_kwargs in prepared}
+                if effects != {'BUY_TO_CLOSE', 'SELL_TO_CLOSE'}:
+                    raise ValueError('spread must contain one BUY_TO_CLOSE and one SELL_TO_CLOSE leg')
+                close_details = []
+                for data, _effect, _price, _risk_leg, _leg_kwargs in prepared:
+                    parsed = parse_option_symbol(getattr(data, '_name', ''))
+                    dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
+
+                    def metadata_value(names):
+                        if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
+                            return None
+                        for name in names:
+                            if name not in dataframe.columns:
+                                continue
+                            for value in reversed(dataframe[name].tolist()):
+                                try:
+                                    if value is not None and not pd.isna(value):
+                                        return value
+                                except (TypeError, ValueError):
+                                    if value is not None:
+                                        return value
+                        return None
+
+                    metadata_type = str(
+                        metadata_value(('option_type', 'right', 'cp', 'put_call')) or ''
+                    ).strip().upper()
+                    option_type = metadata_type or str(parsed.get('option_type') or '').upper()
+                    if option_type not in {'PUT', 'P'}:
+                        raise ValueError('only Put spreads are supported')
+                    strike_raw = metadata_value(('strike', 'strike_price', 'exercise_price'))
+                    strike = float(
+                        strike_raw if strike_raw is not None else parsed.get('strike', float('nan'))
+                    )
+                    expiry_raw = metadata_value(('expiry', 'expiration', 'expiration_date'))
+                    expiry = parse_expiry(
+                        expiry_raw if expiry_raw is not None else parsed.get('expiry')
+                    )
+                    underlying = str(
+                        metadata_value(('underlying', 'underlying_symbol', 'underlying_code'))
+                        or parsed.get('underlying')
+                        or ''
+                    ).upper()
+                    if (
+                        not math.isfinite(strike) or strike <= 0
+                        or pd.isna(expiry) or not underlying
+                    ):
+                        raise ValueError('closing spread option metadata is unavailable')
+                    multiplier = float(self.get_contract_multiplier(data))
+                    if not math.isfinite(multiplier) or multiplier <= 0:
+                        raise ValueError('closing spread contract multiplier is unavailable')
+                    close_details.append({
+                        'effect': _effect,
+                        'underlying': underlying_key(underlying),
+                        'strike': strike,
+                        'expiry': pd.Timestamp(expiry).normalize(),
+                        'multiplier': multiplier,
+                    })
+                buy_close = next(item for item in close_details if item['effect'] == 'BUY_TO_CLOSE')
+                sell_close = next(item for item in close_details if item['effect'] == 'SELL_TO_CLOSE')
+                if buy_close['underlying'] != sell_close['underlying']:
+                    raise ValueError('closing spread legs must share underlying')
+                if buy_close['expiry'] != sell_close['expiry']:
+                    raise ValueError('closing spread legs must share expiry')
+                if abs(buy_close['multiplier'] - sell_close['multiplier']) > max(
+                    1e-9, abs(buy_close['multiplier']) * 1e-9
+                ):
+                    raise ValueError('closing spread legs must share contract multiplier')
+                # Put credit spread 的短腿执行价较高；平仓方向相反时，
+                # BUY_TO_CLOSE 必须对应高执行价短腿。
+                if buy_close['strike'] <= sell_close['strike']:
+                    raise ValueError('closing Put spread strikes are invalid')
+            if total_buy_cost > self.get_option_uncommitted_cash() + 1e-12:
+                self._last_order_target_skip_reason = 'option_spread_cash_insufficient'
+                return None
+        except Exception:
+            self._last_order_target_skip_reason = 'invalid_option_spread'
+            return None
+
+        orders = []
+        initial_positions = {
+            id(data): float(self.getposition(data).size)
+            for data, _effect, _price, _risk_leg, _leg_kwargs in prepared
+        }
+
+        def rollback_created_orders():
+            """组合任一腿提交失败时撤销并尽力回滚已产生的成交。"""
+            for created in orders:
+                try:
+                    self.cancel(created)
+                except Exception:
+                    pass
+            # 正常 Backtrader 回测订单在同一调用内尚未撮合；测试替身或
+            # 自定义 broker 可能同步成交，此时用反向市价单恢复原始仓位。
+            for data, effect, price, _risk_leg, _leg_kwargs in prepared:
+                try:
+                    current = float(self.getposition(data).size)
+                    delta = current - initial_positions.get(id(data), current)
+                    if abs(delta) <= 1e-12:
+                        continue
+                    if delta > 0:
+                        self.sell(data=data, size=delta, price=price)
+                    else:
+                        self.buy(data=data, size=abs(delta), price=price)
+                except Exception as exc:
+                    log.error(f'[Backtest] option spread rollback failed: {exc}')
+
+        spread_kwargs = dict(kwargs)
+        if risk_legs:
+            spread_kwargs['_spread_risk_legs'] = risk_legs
+        for data, effect, price, risk_leg, leg_kwargs in prepared:
+            order_kwargs = dict(spread_kwargs)
+            order_kwargs.update(leg_kwargs)
+            order = self.submit_option_order(
+                data,
+                quantity,
+                effect,
+                price=price,
+                risk_leg=risk_leg,
+                **order_kwargs,
+            )
+            if order is None:
+                self._last_order_target_skip_reason = 'option_spread_leg_rejected'
+                rollback_created_orders()
+                for created in orders:
+                    try:
+                        self._option_cash_reservations.pop(str(created.ref), None)
+                    except Exception:
+                        pass
+                return None
+            orders.append(order)
+        return orders
 
     def getcommissioninfo(self, data):
         """代理调用真实 Broker 的 getcommissioninfo"""
@@ -929,6 +1270,20 @@ class Backtester:
         # 期权/期货等每份合约对应多个基础单位时，回测柜台也必须按同一名义乘数扣款和估值。
         for data in self.cerebro.datas:
             multiplier = _extract_contract_multiplier(data)
+            try:
+                from common.options.analytics import parse_option_symbol
+
+                parsed_option = parse_option_symbol(getattr(data, '_name', ''))
+            except Exception:
+                parsed_option = {}
+            dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
+            metadata_option = isinstance(dataframe, pd.DataFrame) and any(
+                name in dataframe.columns for name in ('option_type', 'right', 'cp', 'put_call')
+            )
+            if (parsed_option.get('option_type') or metadata_option) and multiplier <= 0:
+                raise ValueError(
+                    f"Option DataFeed {getattr(data, '_name', '')!r} requires a positive contract multiplier"
+                )
             if multiplier == 1.0:
                 continue
             self.cerebro.broker.addcommissioninfo(

@@ -9,6 +9,7 @@
 2. `LiveTrader` 只通过反射查找 Broker，adapter 不承担 Provider 装载职责，因此 Broker 不再强依赖某个 Provider。
 3. 历史行情和其他市场数据由 `data_providers` 包中的 `DataManager` 按 `data_source` 或平台默认值选择，并通过引擎现有的数据桥接接口提供给策略。
 4. Broker 可以提供实时行情兜底或调用可选的预热数据，但不得定义或复制 `BaseDataProvider` 桥。Provider 的实现和凭据处理必须保留在 `data_providers`。
+5. `theta+futu` 混合数据源由 `data_providers.HybridDataProvider` 负责；其 Futu 当前快照只在 LiveTrader 实盘模式启用，回测/优化不得触发实时 Futu 请求。
 
 ## 2. 券商最小契约
 1. 必须遵守 `live_trader/adapters/base_broker.py`
@@ -100,15 +101,16 @@
 
 混合资产账户中，`get_position(data)` 必须按目标标的精确查询和匹配；无关股票、期权或其他衍生品不得改变目标标的的仓位结果。`get_cash()` 与 `getvalue()` 是同一账户、同一计价币种下的账户级事实，多个标的共享现金是预期语义；目标订单的在途仓位只计入同一标的，虚拟占资则按账户级买入并发统一扣减。`order_target_*` 只调整传入标的；`execute_rebalance()` 仍是组合级接口，目标列表外的已管理标的会按既有契约清仓。
 
-1. Futu 适配器使用 `OpenSecTradeContext`，连接参数、账户路由、交易环境和订单默认值以 `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH` 等同名公开键维护在 `configs/futu.py`，并由 `config.py` 导入以支持标准 `--config` 覆盖。`FUTU_TRADE_ENV` 默认必须为 `SIMULATE`，只有显式选择实盘环境时才使用 `REAL`；RSA 路径为空时必须关闭协议加密。
+1. Futu 适配器使用 `OpenSecTradeContext`，连接参数、账户路由、交易环境和订单默认值以 `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH` 等同名公开键维护在 `configs/futu.py`，并由 `config.py` 导入以支持标准 `--config` 覆盖。`FUTU_TRADE_ENV` 默认必须为 `SIMULATE`，只有显式选择实盘环境时才使用 `REAL`；RSA 路径为空时必须关闭协议加密。常规配置中的实盘交易解锁只通过 `FUTU_TRADE_PASSWORD_ENV` 或 `FUTU_TRADE_PASSWORD_MD5_ENV` 指向外部环境变量，且两者最多配置一项；私有命令工作台可将明文凭据保存在 Git 忽略的本机私有方案中，内网执行与预览按原样展示。
 2. 交易上下文构造和同步查询必须设置有限超时，不能让 OpenD 不可用时阻塞 worker 退出；适配器只负责交易，历史行情仍由 `data_providers` 包独立选择。
 3. 账户、持仓、订单、撤单和下单必须使用同一 `trd_env`、`acc_id`、`acc_index` 范围；A 股持仓的卖出数量必须优先使用 `can_sell_qty`。
-4. 期权仅承诺框架现有 BUY/SELL 抽象可表达的基础流程；adapter 必须按 `price × contract_multiplier` 计算 NAV、目标仓位、买入资金和 `executed.value`，订单数量仍遵循券商的合约张数语义，不得把该适配器宣传为完整卖方、组合或保证金策略实现。
+4. 期权 adapter 必须按 `price × contract_multiplier` 计算 NAV、目标仓位、买入资金和 `executed.value`，订单数量仍遵循券商的合约张数语义。Futu 已实现显式 Cash-Secured Put/Covered Call 校验、有限 Portfolio Margin 预检和原子 Put Credit Spread；这些是 QuantAda 的受限模型，不代表券商完整保证金复制品。
 5. Futu 的账户摘要和持仓查询必须使用配置的账户计价币种；跨币种估值通过可验证的 FX 报价换算，账户摘要、汇率或行情不可用时必须失败关闭，不能用旧 K 线或局部本地估值继续下单。
 6. Futu schedule 的正式槽位必须先通过 `get_market_state()` 确认所有受管标的处于可交易状态；行情上下文 CLOSED/CLOSING 或查询失败时跳过当前槽位，保留后续重试机会。
 7. Futu 事件模式使用 `CurKlineHandlerBase`/其他 SDK handler 的订阅回调；回调线程只做事件去重和单 worker 派发，策略仍通过 `LiveTrader.run()` 执行完整刷新、风控和订单流程。事件模式不得同时配置 schedule，秒级 K 线订阅必须明确拒绝。
-8. 期权订单效果必须显式区分 `BUY_TO_OPEN`、`SELL_TO_CLOSE`、`SELL_TO_OPEN`、`BUY_TO_CLOSE`。当前 Futu 只允许买开、卖平及已有负仓的买平；未实现保证金前，卖开必须 fail-closed，普通 `SELL` 不得伪装成卖开。成交后的 signed position 变化必须按订单效果计算，不能依赖本地长期虚拟仓位。
-9. Futu 实时期权链、组合保证金和对冲只允许使用有界、当前可信的快照；动态链缺失或过期时禁止换月/对冲。首版风险范围仅为 Cash-Secured Put 与 Covered Call，裸卖和多腿组合必须拒绝；盘中对冲必须重新读取真实持仓、现金、保证金与 Greeks，并遵守最大对冲量和最大换手。
+8. 期权订单效果必须显式区分 `BUY_TO_OPEN`、`SELL_TO_CLOSE`、`SELL_TO_OPEN`、`BUY_TO_CLOSE`。Futu 的单腿 `SELL_TO_OPEN` 需要明确的担保风险腿，Put Credit Spread 必须通过券商原子组合接口；裸卖和不支持的组合仍 fail-closed，普通 `SELL` 不得伪装成卖开。通用目标调仓不得在一个 BUY 中跨过零点。成交后的 signed position 变化必须按订单效果计算，不能依赖本地长期虚拟仓位。
+9. Futu 实时期权链、组合保证金和对冲只允许使用有界、当前可信的快照；动态链缺失或过期时禁止换月/对冲。`get_option_risk_snapshot()` 必须直接查询 Futu 实时报价、Greeks、乘数和账户保证金字段，任一关键事实缺失即标记不可信。若 SDK/交易环境拒绝 `comboorder_tradinginfo_query` 或 `place_combo_order`，必须拒绝组合而不能拆成裸腿；当前仿真环境若返回“不支持组合期权”，属于预期安全失败。组合持仓记录按目标代码聚合数量、成本和可卖量，并保留 `combo_id` 供审计。OpenD 未提供明确提前指派事件字段时，账户已有期权风险的 `get_clearing_state()` 返回 `supported=False`；无期权风险时可返回无事件的可信支持状态，不能猜测指派原因。
+10. Futu 的 ``place_combo_order`` 只能在券商/交易环境明确支持组合期权时启用；`comboorder_tradinginfo_query` 失败即不发起任何腿。仿真环境的“不支持组合期权”不是可通过改单或顺序下单绕过的错误。
 
 ## 10. IBKR 混合资产交易
 

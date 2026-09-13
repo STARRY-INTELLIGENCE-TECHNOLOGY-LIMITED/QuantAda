@@ -85,4 +85,5 @@ from configs.alarms import *
 from configs.futu import *
 from configs.gm import *
 from configs.ibkr import *
+from configs.options import *
 from configs.manager import *

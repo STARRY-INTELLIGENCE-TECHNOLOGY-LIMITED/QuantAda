@@ -256,6 +256,44 @@ def test_futu_option_history_rejects_unsupported_native_periods():
     assert context.history_calls == []
 
 
+def test_futu_option_chain_rejects_wrong_underlying_spot_row():
+    provider = FutuDataProvider(quote_ctx=object())
+    provider.get_market_snapshot = lambda _symbols: pd.DataFrame([{
+        'code': 'US.MSFT',
+        'last_price': 500.0,
+    }])
+    enriched = provider._enrich_option_chain_metadata(
+        pd.DataFrame([{
+            'code': 'US.AAPL260918P300000',
+            'contract_multiplier': 100.0,
+        }]),
+        'US.AAPL',
+    )
+    assert enriched is None
+
+
+def test_futu_local_compression_preserves_latest_option_metadata():
+    frame = pd.DataFrame(
+        {
+            'open': [1.0, 1.1, 1.2], 'high': [1.2, 1.3, 1.4],
+            'low': [0.9, 1.0, 1.1], 'close': [1.1, 1.2, 1.3],
+            'volume': [10, 20, 30],
+            'option_type': ['PUT', 'PUT', 'PUT'],
+            'bid': [1.0, 1.1, 1.2], 'ask': [1.1, 1.2, 1.3],
+            'expiry': ['2026-09-18'] * 3,
+            'delta': [-0.2, -0.21, -0.22],
+        },
+        index=pd.date_range('2026-09-01', periods=3),
+    )
+
+    result = FutuDataProvider._aggregate_rows(frame, 2)
+
+    assert list(result['close']) == [1.2, 1.3]
+    assert list(result['bid']) == [1.1, 1.2]
+    assert list(result['delta']) == [-0.21, -0.22]
+    assert list(result['option_type']) == ['PUT', 'PUT']
+
+
 def test_futu_history_kline_uses_official_page_key_for_option_history():
     first = pd.DataFrame({
         'time_key': ['2024-01-01'],
@@ -322,6 +360,14 @@ def test_futu_get_data_merges_history_with_current_option_snapshot_when_end_is_f
             'low_price': 1.0,
             'last_price': 1.15,
             'volume': 20,
+            'option_type': 'PUT',
+            'option_strike_price': 205.0,
+            'strike_time': '2026-09-09',
+            'bid_price': 1.1,
+            'ask_price': 1.2,
+            'option_open_interest': 10,
+            'option_delta': -0.2,
+            'option_implied_volatility': 0.3,
             'option_contract_multiplier': 100,
         }]),
     )
@@ -337,6 +383,48 @@ def test_futu_get_data_merges_history_with_current_option_snapshot_when_end_is_f
     assert len(result) == 2
     assert result.attrs['future_data_unavailable'] is True
     assert result.iloc[-1]['close'] == 1.15
+    assert result.iloc[-1]['bid'] == 1.1
+    assert result.iloc[-1]['option_type'] == 'PUT'
+    assert result.iloc[-1]['delta'] == -0.2
+
+
+def test_futu_live_current_snapshot_rejects_stale_quote():
+    class StaleQuote(FakeQuoteContext):
+        def __init__(self):
+            super().__init__(snapshot=pd.DataFrame([{
+                'code': 'US.AAPL',
+                'update_time': '2020-01-01 10:00:00',
+                'open_price': 100.0,
+                'high_price': 101.0,
+                'low_price': 99.0,
+                'last_price': 100.0,
+                'volume': 1,
+            }]))
+
+    provider = FutuDataProvider(quote_ctx=StaleQuote())
+    provider.set_live_mode(True)
+
+    assert provider._current_snapshot_kline('US.AAPL') is None
+
+
+def test_futu_live_daily_data_fails_closed_when_current_snapshot_is_unavailable():
+    context = FakeQuoteContext(
+        history=pd.DataFrame({
+            'time_key': ['2026-09-05'],
+            'open': [100.0], 'high': [101.0], 'low': [99.0],
+            'close': [100.5], 'volume': [1000],
+        }),
+        snapshot=pd.DataFrame([{
+            'code': 'US.MSFT',
+            'update_time': '2020-01-01 10:00:00',
+            'open_price': 200.0, 'high_price': 201.0,
+            'low_price': 199.0, 'last_price': 200.0, 'volume': 1,
+        }]),
+    )
+    provider = FutuDataProvider(quote_ctx=context)
+    provider.set_live_mode(True)
+
+    assert provider.get_data('US.AAPL', '2026-09-01', '2099-01-01') is None
 
 
 def test_futu_get_data_merges_stock_snapshot_with_explicit_adjustment_marker():
@@ -440,6 +528,24 @@ def test_futu_option_history_uses_multiplier_from_history_when_snapshot_unavaila
     assert result.attrs['contract_multiplier'] == 100.0
     assert result['contract_multiplier'].iloc[-1] == 100.0
     assert context.snapshot_calls == []
+
+
+def test_futu_option_history_rejects_multiplier_from_mismatched_snapshot_row():
+    history = pd.DataFrame({
+        'time_key': ['2024-01-02'],
+        'open': [1.0], 'high': [1.2], 'low': [0.9],
+        'close': [1.1], 'volume': [100.0],
+    })
+    context = FakeQuoteContext(
+        history=history,
+        snapshot=pd.DataFrame([{
+            'code': 'US.MSFT260918P320000',
+            'option_contract_multiplier': 50.0,
+        }]),
+    )
+    provider = FutuDataProvider(quote_ctx=context)
+
+    assert provider.get_data('US.AAPL260918P320000', '20240101', '20240105') is None
 
 
 def test_futu_derivative_history_uses_unadjusted_prices():

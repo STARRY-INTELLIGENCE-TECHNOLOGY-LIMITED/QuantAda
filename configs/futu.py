@@ -10,6 +10,15 @@ FUTU_PORT = 11111
 # RSA 私钥文件路径；为空时使用明文协议，不启用 RSA 加密。
 FUTU_RSA_KEY_PATH = ''
 
+# 实盘交易解锁凭据只从外部环境变量读取。这里填写变量名，不是密码本身；为空时不自动解锁。
+# 两项最多配置一项，环境变量值不会写入日志、配置快照或订单备注。
+FUTU_TRADE_PASSWORD_ENV = ''
+FUTU_TRADE_PASSWORD_MD5_ENV = ''
+
+# 私有命令工作台可在本地忽略的方案存储中保存明文解锁口令；普通配置默认留空。
+FUTU_TRADE_PASSWORD = ''
+FUTU_TRADE_PASSWORD_MD5 = ''
+
 # 交易上下文默认筛选市场；N/A 表示由 OpenD 返回当前账户可用的证券市场。
 FUTU_FILTER_TRDMARKET = 'N/A'
 

@@ -39,6 +39,21 @@ def test_chain_refresh_is_bounded_and_contract_selection_deterministic():
     assert row['option_symbol'] == 'US.AAPL261016P310000'
 
 
+def test_realtime_caller_timestamp_chain_can_be_selected():
+    from common.options.chain import normalize_option_chain
+
+    chain = normalize_option_chain(
+        _chain().assign(contract_multiplier=100, currency='USD'),
+        'US.AAPL', timestamp='2026-09-01T00:00:00Z',
+        require_quotes=False,
+    )
+    row = select_option_contract(
+        chain, option_type='PUT', max_delta=0.5,
+        now='2026-09-01T00:00:00Z',
+    )
+    assert row['option_symbol'] == 'US.AAPL261016P310000'
+
+
 def test_put_delta_filter_uses_signed_delta_and_target_distance():
     chain = _chain().assign(
         timestamp=pd.Timestamp('2026-09-01T00:00:00Z'),
@@ -59,6 +74,16 @@ def test_option_selector_respects_configured_dte_bounds():
         option_type='PUT',
         min_dte=30,
         max_dte=45,
+        now='2026-09-01T00:00:00Z',
+    )
+    assert row['option_symbol'] == 'US.AAPL261016P310000'
+
+
+def test_option_selector_rejects_zero_last_quote():
+    chain = _chain().copy()
+    chain.loc[0, 'last'] = 0.0
+    row = select_option_contract(
+        chain, option_type='PUT', max_delta=0.5,
         now='2026-09-01T00:00:00Z',
     )
     assert row['option_symbol'] == 'US.AAPL261016P310000'
@@ -96,3 +121,48 @@ def test_delta_hedge_respects_market_and_turnover_guards():
     assert blocked.blocked and blocked.reason == 'market_closed'
     turnover = compute_delta_hedge('US.AAPL', -25, max_shares=100, max_turnover=10)
     assert turnover.blocked and turnover.reason == 'max_turnover'
+
+
+def test_chain_refresh_supports_thetadata_signature_without_timestamp_kwarg():
+    class ThetaLikeProvider:
+        def get_option_chain(self, underlying, expirations=None, normalized=False,
+                             as_of=None, start=None, end=None):
+            assert underlying == 'US.AAPL'
+            assert normalized is True
+            return _chain().assign(
+                timestamp='2026-09-01T00:00:00Z',
+                contract_multiplier=100,
+                currency='USD',
+            )
+
+    snapshot = refresh_option_chain(
+        ThetaLikeProvider(), 'US.AAPL',
+        now='2026-09-01T00:00:00Z',
+        monotonic=iter([0, 0.1]).__next__,
+    )
+    assert snapshot is not None
+
+
+def test_option_selection_uses_as_of_as_visibility_boundary():
+    chain = _chain().assign(
+        timestamp='2026-09-10T00:00:00Z',
+        contract_multiplier=100,
+        currency='USD',
+    )
+    assert select_option_contract(
+        chain,
+        option_type='PUT',
+        as_of='2026-09-01T00:00:00Z',
+        now='2026-09-12T00:00:00Z',
+    ) is None
+
+
+def test_positive_put_delta_bounds_use_absolute_delta():
+    row = select_option_contract(
+        _chain(),
+        option_type='PUT',
+        min_delta=0.25,
+        max_delta=0.35,
+        now='2026-09-01T00:00:00Z',
+    )
+    assert row['option_symbol'] == 'US.AAPL261016P300000'

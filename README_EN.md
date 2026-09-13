@@ -44,11 +44,12 @@ Configuration is split by responsibility. `config.py` lists the `configs` submod
 | Configuration file | Main settings | Purpose |
 | --- | --- | --- |
 | `config.py` | `LOT_SIZE`, `DATA_PATH`, `LOG`, `PRINT_PLAN`, `KEEP_OVERNIGHT_ORDERS` | Framework, backtest, and common execution |
-| `configs/providers.py` | `TUSHARE_TOKEN`, `SXSC_TUSHARE_TOKEN`, `TIINGO_TOKEN` | Historical data providers |
-| `configs/futu.py` | `FUTU_HOST`, `FUTU_PORT`, `FUTU_RSA_KEY_PATH`, account/trading keys, `FUTU_BROKER_ENVIRONMENTS` | Futu OpenD quote and official trading connection; an empty RSA path means plaintext protocol |
-| `configs/alarms.py` | `ALARMS_ENABLED`, `DINGTALK_WEBHOOK`, `WECOM_WEBHOOK`, `ALARM_LEVEL` | Alarm channels |
+| `configs/providers.py` | `TUSHARE_TOKEN`, `SXSC_TUSHARE_TOKEN`, `TIINGO_TOKEN`, `THETADATA_TOKEN`, `DATA_PROVIDER_COMPOSITIONS` | Historical providers and configurable compositions |
+| `configs/futu.py` | `FUTU_HOST`, `FUTU_PORT`, `FUTU_RSA_KEY_PATH`, account/trading keys, `FUTU_BROKER_ENVIRONMENTS` | Futu OpenD quote and official trading connection; an empty RSA path means plaintext protocol; normal config references unlock credentials through `FUTU_TRADE_PASSWORD_ENV` or `FUTU_TRADE_PASSWORD_MD5_ENV`, while private Command Center profiles may store a local credential |
+| `configs/alarms.py` | `ALARMS_ENABLED`, `DINGTALK_WEBHOOK`, `DINGTALK_SECRET`, `WECOM_WEBHOOK`, `ALARM_LEVEL` | Alarm channels |
 | `configs/gm.py` | `GM_TOKEN`, `GM_BROKER_ENVIRONMENTS` | GM broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['gm_broker']`) |
 | `configs/ibkr.py` | `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ORDER_ACCOUNT`, `IB_BROKER_ENVIRONMENTS` | IBKR broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['ib_broker']`) |
+| `configs/options.py` | `OPTION_RISK_WATCHDOG_*` | Live option risk watchdog safety thresholds |
 
 Do not commit real tokens, passwords, or webhooks to a public repository. You can also override a merged public key at runtime, for example:
 
@@ -56,14 +57,31 @@ Do not commit real tokens, passwords, or webhooks to a public repository. You ca
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --data_source=tiingo --config "{'PRINT_PLAN': True}"
 ```
 
-### 3. Basic Backtest
+### 3. Command Center (Web UI)
+
+```bash
+python run.py --ui
+python run.py --ui --ui_ip 0.0.0.0 --ui_port 8765 --no-browser
+```
+
+The Futu section also exposes account ID, account index, and account cash currency, so global/option accounts do not require hidden `config.py` edits.
+
+The repository catalog contains sanitized examples only. Put private strategy indexes and connection defaults in the Git-ignored `.data/command_center/private_catalog.json`; the Command Center merges it with priority at startup. `QUANTADA_PRIVATE_CATALOG` can point to another private JSON file.
+
+The default bind address is `127.0.0.1`. The UI is intended for trusted internal use and displays current session variables, including Futu unlock credentials; only specify `--ui_ip` when you explicitly want to expose another interface.
+
+Futu option credit spreads use the broker's atomic combo-order API. If the current OpenD simulation environment rejects combo options, QuantAda fails closed and does not split the order into naked legs. Use `--data_source=theta+futu` with the Command Center `theta_futu_global` profile when historical IV/IVP should come from ThetaData and the current live row from Futu; the generic `OverlayDataProvider` owns composition while `HybridDataProvider` supplies Theta/Futu-specific mapping. Backtests do not call Futu. The private Command Center may also store a Futu unlock password in the Git-ignored local profile store; trusted internal command previews show current values as-is. Explicit assignment reconciliation still requires broker clearing-event fields.
+
+Provider compositions are declared in `configs/providers.py` under `DATA_PROVIDER_COMPOSITIONS`. Each entry names a historical Provider, a realtime Provider, and a `package.module:factory`; adding another pair only requires a new adapter factory and configuration, not DataManager or Command Center changes.
+
+### 4. Basic Backtest
 
 ```bash
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519
 python run.py --help
 ```
 
-### 4. Common Commands
+### 5. Common Commands
 
 ```bash
 # Auto-rebalancing example with reserve-position protection
@@ -89,7 +107,7 @@ python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta -
 python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta --refresh --config "{'CACHE_DATA': True}"
 ```
 
-### 5. Parameter Optimization (Optuna)
+### 6. Parameter Optimization (Optuna)
 
 ```bash
 # Enter optimization mode
@@ -99,7 +117,7 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'fast_period': {'type': 'int', 'low': 5, 'high': 30}}" --train_period 20210101-20221231 --test_period 20230101-20231231 --n_trials 50
 ```
 
-### 6. Connect to Live Trading or Simulation
+### 7. Connect to Live Trading or Simulation
 
 Configure `BROKER_ENVIRONMENTS` through the `config.py` entry point (broker defaults live in `configs/gm.py`, `configs/ibkr.py`, and `configs/futu.py`), then launch with `--connect=broker:env`:
 
@@ -113,7 +131,7 @@ python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_s
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
 ```
 
-### 7. SDK / Plugin Mode (Strategies Outside This Repository)
+### 8. SDK / Plugin Mode (Strategies Outside This Repository)
 
 ```bash
 # Linux/macOS
