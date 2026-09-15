@@ -111,6 +111,7 @@
 8. 期权订单效果必须显式区分 `BUY_TO_OPEN`、`SELL_TO_CLOSE`、`SELL_TO_OPEN`、`BUY_TO_CLOSE`。Futu 的单腿 `SELL_TO_OPEN` 需要明确的担保风险腿，Put Credit Spread 必须通过券商原子组合接口；裸卖和不支持的组合仍 fail-closed，普通 `SELL` 不得伪装成卖开。通用目标调仓不得在一个 BUY 中跨过零点。成交后的 signed position 变化必须按订单效果计算，不能依赖本地长期虚拟仓位。
 9. Futu 实时期权链、组合保证金和对冲只允许使用有界、当前可信的快照；动态链缺失或过期时禁止换月/对冲。`get_option_risk_snapshot()` 必须直接查询 Futu 实时报价、Greeks、乘数和账户保证金字段，任一关键事实缺失即标记不可信。若 SDK/交易环境拒绝 `comboorder_tradinginfo_query` 或 `place_combo_order`，必须拒绝组合而不能拆成裸腿；当前仿真环境若返回“不支持组合期权”，属于预期安全失败。组合持仓记录按目标代码聚合数量、成本和可卖量，并保留 `combo_id` 供审计。OpenD 未提供明确提前指派事件字段时，账户已有期权风险的 `get_clearing_state()` 返回 `supported=False`；无期权风险时可返回无事件的可信支持状态，不能猜测指派原因。引擎不得仅因清算 `supported=False` 永久阻断期权开仓；只有 `trusted=False` 的清算快照才阻断新开仓。
 10. Futu 的 ``place_combo_order`` 只能在券商/交易环境明确支持组合期权时启用；`comboorder_tradinginfo_query` 失败即不发起任何腿。仿真环境的“不支持组合期权”不是可通过改单或顺序下单绕过的错误。
+11. Futu 同连接 `modify_order(CANCEL)` 成功后，OpenD 可能不推送 `CANCELLED`。适配器必须基于已确认的在途快照补一条 `CANCELLED_ALL` 给引擎订单回调，供撤单 IM 使用；后续真实推送由引擎按 `(order_id, status)` 去重。
 
 ## 10. IBKR 混合资产交易
 

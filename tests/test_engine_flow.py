@@ -1999,6 +1999,8 @@ def test_on_order_status_callback_pushes_cancelled_alarm(monkeypatch):
             pass
 
     monkeypatch.setattr(engine_module, "AlarmManager", lambda: DummyAlarmManager())
+    printed = []
+    monkeypatch.setattr(engine_module, "runtime_print", lambda msg: printed.append(str(msg)))
 
     broker = DummyBroker()
     strategy = DummyStrategy(broker)
@@ -2012,6 +2014,7 @@ def test_on_order_status_callback_pushes_cancelled_alarm(monkeypatch):
     assert "Cancelled" in cancel_msgs[0]["content"]
     assert "PSQ.ARCA" in cancel_msgs[0]["content"]
     assert "0.0000000001" in cancel_msgs[0]["content"]
+    assert any("Notified strategy of order status: Cancelled" in item for item in printed)
 
 
 def test_refresh_live_data_rebases_window_for_daily(monkeypatch):

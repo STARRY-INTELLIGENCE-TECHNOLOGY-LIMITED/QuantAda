@@ -651,6 +651,23 @@ def test_futu_adapter_submits_and_cancels_using_official_api():
     assert fake.modify_calls[0]['modify_order_op'] == 'CANCEL'
 
 
+def test_futu_cancel_pending_order_emits_local_cancelled_callback():
+    """同连接撤单成功后，即使 OpenD 不推送，也要补一条 CANCELLED_ALL 给引擎。"""
+    broker, fake = _broker()
+    seen = []
+    broker._order_status_push = seen.append
+
+    assert broker.cancel_pending_order('FUTU-1') is True
+    assert fake.modify_calls[0]['modify_order_op'] == 'CANCEL'
+    assert len(seen) == 1
+    row = seen[0]
+    assert row['order_id'] == 'FUTU-1'
+    assert row['order_status'] == 'CANCELLED_ALL'
+    assert row['trd_side'] == 'BUY'
+    assert row['qty'] == 75
+    assert row['code']
+
+
 def test_futu_connection_environment_is_not_overwritten_by_config_snapshot():
     fake = FakeTradeContext()
     context = SimpleNamespace(

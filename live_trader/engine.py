@@ -1919,7 +1919,7 @@ def on_order_status_callback(context, raw_order):
             if not msg:
                 msg = getattr(raw_order, 'ord_rej_reason_detail', '')  # 尝试获取拒单原因
 
-            if is_completed:
+            if is_completed or is_canceled:
                 runtime_print(
                     f"[Engine Callback] Notified strategy of order status: {current_status} ({msg})"
                 )

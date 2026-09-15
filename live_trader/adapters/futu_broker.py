@@ -2629,7 +2629,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     f'untrusted snapshot ({self._last_pending_orders_fetch_error})'
                 )
                 return False
-            if not any(_text(item.get('id')) == oid for item in pending):
+            matched = next((item for item in pending if _text(item.get('id')) == oid), None)
+            if matched is None:
                 return False
             context = self._get_trade_context()
             if context is None:
@@ -2658,8 +2659,27 @@ class FutuBrokerAdapter(BaseLiveBroker):
                         acc_index=self._account_index_value(),
                     )
             if isinstance(response, tuple):
-                return len(response) >= 1 and response[0] == RET_OK
-            return response is True or response == RET_OK
+                ok = len(response) >= 1 and response[0] == RET_OK
+            else:
+                ok = response is True or response == RET_OK
+            if ok:
+                # OpenD 同连接 modify_order(CANCEL) 常不推送终态；补一条给引擎撤单 IM。
+                callback = getattr(self, '_order_status_push', None)
+                if callable(callback):
+                    try:
+                        callback({
+                            'order_id': oid,
+                            'code': matched.get('symbol'),
+                            'trd_side': matched.get('direction'),
+                            'qty': matched.get('size'),
+                            'dealt_qty': 0,
+                            'order_status': 'CANCELLED_ALL',
+                        })
+                    except Exception as callback_exc:
+                        self._runtime_log(
+                            f'[FutuBroker] local cancel callback failed ({oid}): {callback_exc}'
+                        )
+            return ok
         except Exception as exc:
             self._runtime_log(f'[FutuBroker] cancel_pending_order failed ({oid}): {exc}')
             return False
@@ -3846,10 +3866,11 @@ class FutuBrokerAdapter(BaseLiveBroker):
         if trade_context is None:
             raise RuntimeError('Futu trade context did not initialize')
 
-        if TradeOrderHandlerBase is not None:
-            def on_order_update(order):
-                on_order_status_callback(ctx, order)
+        def on_order_update(order):
+            on_order_status_callback(ctx, order)
 
+        trader.broker._order_status_push = on_order_update
+        if TradeOrderHandlerBase is not None:
             handler = _FutuTradeOrderHandler(on_order_update)
             set_handler = getattr(trade_context, 'set_handler', None)
             if callable(set_handler):
