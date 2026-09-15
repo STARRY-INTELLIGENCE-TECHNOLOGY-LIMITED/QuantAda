@@ -1040,7 +1040,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             if parsed_schedule is None:
                 _runtime_print(
                     "[GmBroker Warning] Prewarm currently supports schedule format "
-                    "1d|Nm|Nh:HH:MM[:SS]. Prewarm disabled."
+                    "1d|Nm|Nh[:HH:MM[:SS]]. Prewarm disabled."
                 )
             elif prewarm_lead_seconds >= float(parsed_schedule.get('interval_seconds') or 0.0):
                 _runtime_print(

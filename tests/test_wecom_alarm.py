@@ -124,3 +124,84 @@ def test_wecom_retry_once_when_request_raises(monkeypatch):
 
     assert len(sent) == 2, "网络异常时应重试 1 次。"
     assert sleep_calls == [9.0], "异常后重试前应按随机退避秒数 sleep。"
+
+
+def test_wecom_push_trade_appends_payoff_summary(monkeypatch):
+    sent = []
+
+    def fake_post(url, json=None, headers=None, timeout=0):
+        sent.append((url, json, headers, timeout))
+        return _FakeResponse()
+
+    monkeypatch.setattr(wecom_module.config, "WECOM_WEBHOOK", "https://example.invalid/wecom", raising=False)
+    monkeypatch.setattr(wecom_module.requests, "post", fake_post)
+
+    alarm = wecom_module.WeComAlarm()
+    alarm.push_trade({
+        "action": "SELL",
+        "symbol": "US.MARA261016P9000",
+        "price": 0.55,
+        "size": 1,
+        "value": 55.0,
+        "dt": "2026-09-15T10:00:00",
+        "payoff_summary": "- 现货参考价：17.50\n- 最大盈利：55.00\n- 最大亏损：845.00\n- 盈亏平衡点：8.45",
+    })
+
+    assert len(sent) == 1
+    content = sent[0][1]["markdown"]["content"]
+    assert "卖出 成交通知" in content
+    assert "US.MARA261016P9000" in content
+    assert "最大亏损：845.00" in content
+    assert "盈亏平衡点：8.45" in content
+
+
+def test_wecom_push_trade_without_payoff_summary_keeps_stock_layout(monkeypatch):
+    sent = []
+
+    def fake_post(url, json=None, headers=None, timeout=0):
+        sent.append((url, json, headers, timeout))
+        return _FakeResponse()
+
+    monkeypatch.setattr(wecom_module.config, "WECOM_WEBHOOK", "https://example.invalid/wecom", raising=False)
+    monkeypatch.setattr(wecom_module.requests, "post", fake_post)
+
+    alarm = wecom_module.WeComAlarm()
+    alarm.push_trade({
+        "action": "BUY",
+        "symbol": "US.MARA",
+        "price": 17.5,
+        "size": 1,
+        "value": 17.5,
+        "dt": "2026-09-15T10:00:00",
+    })
+
+    content = sent[0][1]["markdown"]["content"]
+    assert "买入 成交通知" in content
+    assert "最大亏损" not in content
+    assert "盈亏平衡点" not in content
+
+
+def test_wecom_push_trade_combo_title(monkeypatch):
+    sent = []
+
+    def fake_post(url, json=None, headers=None, timeout=0):
+        sent.append(json)
+        return _FakeResponse()
+
+    monkeypatch.setattr(wecom_module.config, "WECOM_WEBHOOK", "https://example.invalid/wecom", raising=False)
+    monkeypatch.setattr(wecom_module.requests, "post", fake_post)
+
+    alarm = wecom_module.WeComAlarm()
+    alarm.push_trade({
+        "action": "COMBO_SELL",
+        "symbol": "US.MARA261016P9000",
+        "price": 0.35,
+        "size": 1,
+        "value": 35.0,
+        "dt": "2026-09-15T10:00:00",
+        "payoff_summary": "- 现货参考价：17.50\n- 最大盈利：35.00\n- 最大亏损：65.00\n- 盈亏平衡点：8.65",
+    })
+
+    content = sent[0]["markdown"]["content"]
+    assert "🔴 组合 成交通知" in content
+    assert "最大亏损：65.00" in content

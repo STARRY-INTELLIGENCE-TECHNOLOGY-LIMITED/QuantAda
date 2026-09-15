@@ -4,11 +4,33 @@ import pandas as pd
 import pytest
 
 from common.live_schedule import LiveScheduleRunner
+from live_trader.data_bridge.data_warm import SchedulePlanner
 
 
 def test_live_schedule_runner_rejects_invalid_schedule():
     with pytest.raises(ValueError, match='Unsupported schedule format'):
         LiveScheduleRunner(schedule_rule='bad schedule')
+
+
+@pytest.mark.parametrize(
+    "schedule_rule,freq_n,freq_unit,interval_seconds",
+    [
+        ("5m", 5, "m", 300.0),
+        ("1h", 1, "h", 3600.0),
+        ("1d", 1, "d", 86400.0),
+    ],
+)
+def test_schedule_rule_accepts_frequency_without_clock(
+    schedule_rule, freq_n, freq_unit, interval_seconds,
+):
+    parsed = SchedulePlanner.parse_schedule_rule(schedule_rule)
+    assert parsed is not None
+    assert parsed["freq_n"] == freq_n
+    assert parsed["freq_unit"] == freq_unit
+    assert parsed["target_h"] == parsed["target_m"] == parsed["target_s"] == 0
+    assert parsed["time_str"] == "00:00:00"
+    assert parsed["interval_seconds"] == pytest.approx(interval_seconds)
+    assert parsed["kind"] == ("daily" if freq_unit == "d" else "interval")
 
 
 def test_live_schedule_runner_deduplicates_slots_and_dispatches_worker():

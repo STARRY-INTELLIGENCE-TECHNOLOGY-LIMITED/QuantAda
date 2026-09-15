@@ -44,7 +44,7 @@ class LiveScheduleRunner:
             if self.parsed_schedule is None:
                 raise ValueError(
                     f'Unsupported schedule format: {self.schedule_rule}; '
-                    'expected 1d|Nm|Nh:HH:MM[:SS].'
+                    'expected 1d|Nm|Nh[:HH:MM[:SS]].'
                 )
         if self.parsed_schedule is not None and not isinstance(self.parsed_schedule, dict):
             raise ValueError('parsed_schedule must be a schedule dictionary or None')

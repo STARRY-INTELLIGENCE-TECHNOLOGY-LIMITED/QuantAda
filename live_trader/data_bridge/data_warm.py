@@ -49,13 +49,14 @@ class SchedulePlanner:
     def parse_schedule_rule(schedule_rule: str):
         """
         解析通用实盘调度规则，支持:
-        - 1d:HH:MM[:SS]
-        - Nm:HH:MM[:SS]
-        - Nh:HH:MM[:SS]
+        - 1d[:HH:MM[:SS]]
+        - Nm[:HH:MM[:SS]]
+        - Nh[:HH:MM[:SS]]
 
         语义:
         - 1d: 每日固定时刻触发
         - Nm/Nh: 以 time 为每日 anchor，在当天内按固定频率重复触发
+        - 省略时刻时默认 00:00:00，即从当天零点起按间隔或日线触发
         """
         if not schedule_rule or not isinstance(schedule_rule, str):
             return None
@@ -68,14 +69,14 @@ class SchedulePlanner:
                 "timeframe='Seconds' instead. Supported schedule frequencies: 1d, Nm, Nh."
             )
 
-        matched = re.fullmatch(r'(\d+)([dmh]):(\d{1,2}):(\d{2})(?::(\d{2}))?', raw)
+        matched = re.fullmatch(r'(\d+)([dmh])(?::(\d{1,2}):(\d{2})(?::(\d{2}))?)?', raw)
         if not matched:
             return None
 
         freq_n = int(matched.group(1))
         freq_unit = matched.group(2)
-        target_h = int(matched.group(3))
-        target_m = int(matched.group(4))
+        target_h = int(matched.group(3) or 0)
+        target_m = int(matched.group(4) or 0)
         target_s = int(matched.group(5) or 0)
 
         if freq_n <= 0:

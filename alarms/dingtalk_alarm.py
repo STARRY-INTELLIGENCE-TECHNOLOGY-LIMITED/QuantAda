@@ -91,7 +91,13 @@ class DingTalkAlarm(BaseAlarm):
 
     def push_trade(self, order_info: dict):
         # 交易信息使用 Markdown 表格或列表
-        action_emoji = "🔴 卖出" if order_info.get('action') == 'SELL' else "🟢 买入"
+        action = order_info.get('action')
+        if action in {'SELL', 'COMBO_SELL'}:
+            action_emoji = "🔴 卖出" if action == 'SELL' else "🔴 组合"
+        elif action in {'COMBO', 'COMBO_BUY'}:
+            action_emoji = "🟢 组合"
+        else:
+            action_emoji = "🟢 买入"
 
         md_text = f"""### {action_emoji} 交易成交通知
 - **标的**: {order_info.get('symbol')}
@@ -100,6 +106,9 @@ class DingTalkAlarm(BaseAlarm):
 - **金额**: {order_info.get('value', 0):.2f}
 - **时间**: {order_info.get('dt')}
 """
+        payoff_summary = str(order_info.get("payoff_summary") or "").strip()
+        if payoff_summary:
+            md_text = md_text.rstrip() + "\n" + payoff_summary + "\n"
         payload = {
             "msgtype": "markdown",
             "markdown": {"title": "Trade Notification", "text": md_text}

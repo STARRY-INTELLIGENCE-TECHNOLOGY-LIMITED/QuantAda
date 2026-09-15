@@ -26,7 +26,7 @@ push_status(self, status: str, detail: str = "")
 2. 报文内容要结构化:
 - 文本告警
 - 异常上下文 + 堆栈摘要
-- 成交信息（symbol/action/price/size/dt）
+- 成交信息（symbol/action/price/size/dt；期权成交需附带 payoff_summary）
 - 生命周期状态（STARTED/STOPPED/DEAD）
 3. 保持非阻塞友好（`AlarmManager` 已采用线程分发）。
 4. 不要在适配器内部依赖交易模块对象。

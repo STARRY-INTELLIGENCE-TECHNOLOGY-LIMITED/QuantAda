@@ -17,7 +17,7 @@
 
 ## 3. 交易池契约
 1. `self.broker.datas` 是本策略加载的标的池，策略选股、排名和发单应优先遍历它。
-2. `execute_rebalance()` 只会解析 `broker.datas` 中的目标；无法解析的标的池外标的会被跳过并记录 warning，不会对其发单。若目标与池内标的仅 venue 后缀不同，则保留 base-symbol 兼容映射，推送 WARNING 级 IM 后继续执行本轮计划；这是为离席运行保留的有意容错设计。
+2. `execute_rebalance()` 只会解析 `broker.datas` 中的目标；无法解析的标的池外标的会被跳过并记录 warning，不会对其发单。若目标与池内标的仅已知 IBKR venue 后缀不同（如 `AAPL.ARCA` 与 `AAPL.SMART`），则保留兼容映射，推送 WARNING 级 IM 后继续执行本轮计划。`HK.00700`、`SHSE.600519` 这类市场前缀代码必须精确匹配，不得把 `HK` / `SHSE` 当成共享别名。
 3. 账户中未出现在 `broker.datas` 标的池的持仓默认不属于本策略管理范围，不参与资金盘点，也不会因轮动目标变化被清仓；无需在 `config.py` 增加忽略列表。
 
 ## 4. 指标缓存契约
@@ -28,6 +28,7 @@
 5. 实盘不得依赖该缓存维持正确性；缺少缓存时策略行为必须保持一致。
 6. 优化器指标缓存是有界缓存，允许按 LRU 淘汰旧序列；策略正确性不得依赖缓存命中。
 7. 缓存实现细节属于 `common/indicator_cache.py`；`BaseStrategy` 只保留 `register_indicator()`、`get_indicator()` 等稳定策略 API 入口。
+8. 实盘引擎会原地替换 `data.p.dataname`。只在 `init()` 预计算的指标序列会在后续 live refresh 后过期；必须在 `next()` 按当前 DataFrame 重算，或按行情内容失效缓存。
 
 ## 5. 支持的交易范式
 1. Arbitrary target / signal-driven:
@@ -40,7 +41,7 @@
 ## 6. 当前调仓语义
 1. `execute_rebalance()` 当前是等权接口，不是权重字典接口。
 2. `target_symbols` 传 `data` 对象列表，不传 symbol 字符串。
-3. `top_k` 代表目标持仓槽位数。
+3. `top_k` 代表目标持仓槽位数。若解析后的目标多于 `top_k`，按传入顺序截断并告警，避免按 `capital/top_k` 给额外标的超配。
 4. 需要不等权目标时，应改用 `order_target_percent/value`。
 
 ## 7. 调仓时点门控
@@ -68,3 +69,13 @@
 2. `ranked_candidates` 推荐传 `[(data, score), ...]`，其中 `data` 是当前 broker 管理的数据对象。
 3. 策略不得直接导入 `AlarmManager` 推送排名；通知分发通过 `common.runtime_notifications` 边界完成。
 4. `PRINT_PLAN=True` 时，live 模式即时推送排名；backtest 模式只保留最后一条排名快照并在回测结束时统一推送，回测结束时还会附带执行命令、交易归因和最终绩效摘要。
+
+## 10. 期权标的池展开
+1. 股票/ETF 仍使用静态 `--symbols` 或 selector 一次输出的代码列表。
+2. 期权策略若要把标的池展开为滚动合约，应在策略类上声明 `option_universe`，例如 `option_universe = ("PUT",)` 或 `True`。
+3. 未声明时，运行时不得自动把正股代码展开成期权链，避免股票策略误拉全链。
+4. 展开过滤读取策略 `params` 的 `min_dte`/`max_dte`，以及 `min_delta`/`max_delta`/`protective_put_delta` 的并集；缺少 DTE 窗口时失败关闭。
+5. 回测/优化在取数前按 as_of 抽样历史链并求并集，必须使用 ThetaData 或 `theta+futu` 的历史链，禁止用 Futu 当前链回放。
+6. 实盘每个 schedule slot 用当前链增补合约；账户已有持仓或在途的旧合约必须保留，即使它们还不在当前 datas。pending 快照不可信，或持仓查询异常时，不得把现有期权 feed 当作空仓丢弃。
+7. 策略仍只交易 `self.broker.datas` 中的对象，并在 `next()` 按当前 DTE/Delta 再过滤；不要缓存 init 时的合约列表。
+8. 框架内置期权样例位于 `strategies/options/`，覆盖买开 Put/Call、现金担保短 Put、Covered Call 和原子 Put Credit Spread。运行使用全限定类名；各样例文件顶部有可复制的 `run.py` 命令。裸卖、Call 价差和未实现多腿组合必须失败关闭，不要在样例里顺序拆腿。

@@ -109,3 +109,30 @@ def test_dingtalk_push_status_with_context_keeps_lifecycle_icon(monkeypatch):
     assert dead_payload["msgtype"] == "markdown"
     assert "💀 系统状态: DEAD [IB_BROKER:7497]" in dead_payload["markdown"]["text"]
     assert "✅ 系统状态: ALIVE [IB_BROKER:7497]" in alive_payload["markdown"]["text"]
+
+
+def test_dingtalk_push_trade_appends_payoff_summary(monkeypatch):
+    sent = []
+
+    def fake_post(url, json=None, headers=None, timeout=0):
+        sent.append((url, json, headers, timeout))
+        return _FakeResponse()
+
+    monkeypatch.setattr(dingtalk_module.config, "DINGTALK_WEBHOOK", "https://example.invalid/dingtalk")
+    monkeypatch.setattr(dingtalk_module.config, "DINGTALK_SECRET", "", raising=False)
+    monkeypatch.setattr(dingtalk_module.requests, "post", fake_post)
+
+    alarm = dingtalk_module.DingTalkAlarm()
+    alarm.push_trade({
+        "action": "SELL",
+        "symbol": "US.MARA261016P9000",
+        "price": 0.55,
+        "size": 1,
+        "value": 55.0,
+        "dt": "2026-09-15T10:00:00",
+        "payoff_summary": "- 现货参考价：17.50\n- 最大盈利：55.00\n- 最大亏损：845.00\n- 盈亏平衡点：8.45",
+    })
+
+    content = sent[0][1]["markdown"]["text"]
+    assert "交易成交通知" in content
+    assert "最大亏损：845.00" in content

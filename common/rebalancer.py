@@ -1,5 +1,3 @@
-from abc import ABC, abstractmethod
-
 import config
 
 
@@ -20,14 +18,22 @@ class PortfolioRebalancer:
         :param current_positions: 当前持仓字典 {data_object: market_value}
         :param target_symbols: 目标持仓列表 [data_object]
         :param total_capital: 分配给这些标的的总资金（不含标的池外持仓）
-        :param select_top_k: 目标份数
+        :param select_top_k: 目标持仓槽位数；多于该数量的目标按传入顺序截断
         :param rebalance_threshold: 调仓阈值 (默认 0.05 即 5%)。只有当持仓偏离目标超过此比例时才触发平衡操作。
         :return: 交易计划字典 {'sell_clear': [], 'reduce': [], 'increase': [], 'target_val_per_stock': float}"""
 
-        if select_top_k <= 0:
+        targets = list(target_symbols or [])
+        try:
+            slot_count = int(select_top_k)
+        except (TypeError, ValueError):
+            slot_count = 0
+        if slot_count > 0 and len(targets) > slot_count:
+            targets = targets[:slot_count]
+
+        if slot_count <= 0:
             target_value = 0
         else:
-            target_value = total_capital / select_top_k
+            target_value = total_capital / slot_count
 
         plan = {
             'sell_clear': [],  # 需要清仓的
@@ -35,7 +41,7 @@ class PortfolioRebalancer:
             'increase': [],  # 需要加仓的 (data, target_value)
             'target_per_stock': target_value
         }
-        target_data_ids = {id(data) for data in target_symbols}
+        target_data_ids = {id(data) for data in targets}
         current_data_ids = {id(data) for data in current_positions}
 
         # 2. 识别清仓与减仓
@@ -57,7 +63,7 @@ class PortfolioRebalancer:
                         plan['increase'].append((data, target_value))
 
         # 3. 识别新开仓
-        for data in target_symbols:
+        for data in targets:
             if id(data) not in current_data_ids and target_value > 0:
                 plan['increase'].append((data, target_value))
 
@@ -109,22 +115,3 @@ class PortfolioRebalancer:
 
         return md_str
 
-
-class BaseSizingMethod(ABC):
-    @abstractmethod
-    def calculate_weights(self, target_symbols, context_data) -> dict:
-        """返回 {symbol: weight_percent}"""
-        pass
-
-# 1. 等权
-class EqualWeightSizing(BaseSizingMethod):
-    def calculate_weights(self, target_symbols, context_data):
-        count = len(target_symbols)
-        return {s: 1.0 / count for s in target_symbols} if count > 0 else {}
-
-# 2. 波动率倒数加权
-class VolatilityWeightedSizing(BaseSizingMethod):
-    def calculate_weights(self, target_symbols, context_data):
-        inverses = {s: 1.0 / context_data[s]['atr'] for s in target_symbols}
-        total_inv = sum(inverses.values())
-        return {s: val / total_inv for s, val in inverses.items()}

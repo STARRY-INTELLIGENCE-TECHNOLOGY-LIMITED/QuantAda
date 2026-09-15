@@ -356,7 +356,7 @@ def test_live_refresh_does_not_start_next_feed_after_deadline(fake_clock):
     stats = trader._refresh_live_data(SimpleNamespace(now=pd.Timestamp("2026-07-29 14:45:00")))
 
     assert trader.data_provider.calls == ["SHSE.600000"]
-    assert stats == {"total_feeds": 2, "updated_feeds": 0, "failed_feeds": 2}
+    assert stats == {"total_feeds": 2, "updated_feeds": 0, "failed_feeds": 2, "failed_symbols": ["SHSE.600000", "SHSE.600001"]}
 
 
 def test_rejected_buy_cannot_retry_on_a_later_runs_budget(fake_clock, monkeypatch):

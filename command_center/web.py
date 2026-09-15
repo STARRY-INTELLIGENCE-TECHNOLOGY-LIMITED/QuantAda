@@ -104,6 +104,58 @@ class CommandCenterService:
         return root
 
     @staticmethod
+    def _module_exists_under_roots(reference: str, roots: list[Path]) -> bool:
+        """按模块引用检查源码文件，避免导入执行私有策略。"""
+
+        text = str(reference or "").strip()
+        if not text:
+            return True
+        path = Path(text).expanduser()
+        if path.suffix.lower() == ".py" and path.is_file():
+            return True
+        parts = [part for part in text.split(".") if part]
+        if not parts:
+            return False
+        for root in roots:
+            for end in range(len(parts), 0, -1):
+                module_path = root.joinpath(*parts[:end])
+                if module_path.with_suffix(".py").is_file():
+                    return True
+                if (module_path / "__init__.py").is_file():
+                    return True
+        return False
+
+    def _module_resolves_from_pythonpath(
+        self,
+        reference: str,
+        variables: Mapping[str, str],
+    ) -> bool:
+        """检查策略是否能从当前项目或 PYTHONPATH 源码根目录解析。"""
+
+        roots = [self.project_root]
+        raw_values = (
+            str(variables.get("PYTHONPATH") or ""),
+            str(os.environ.get("PYTHONPATH") or ""),
+        )
+        seen = {str(self.project_root).lower()}
+        for raw in raw_values:
+            for value in raw.split(os.pathsep):
+                value = value.strip().strip('"')
+                if not value:
+                    continue
+                try:
+                    path = Path(value).expanduser().resolve()
+                except OSError:
+                    path = Path(value).expanduser()
+                if not path.is_dir():
+                    continue
+                marker = str(path).lower()
+                if marker not in seen:
+                    seen.add(marker)
+                    roots.append(path)
+        return self._module_exists_under_roots(reference, roots)
+
+    @staticmethod
     def _private_credential_names() -> tuple[str, str]:
         """返回允许保存到本机私有方案的 Futu 明文凭据字段。"""
         return "FUTU_TRADE_PASSWORD", "FUTU_TRADE_PASSWORD_MD5"
@@ -710,16 +762,24 @@ class CommandCenterService:
             strict=bool(payload.get("strict", False)) or preset.mode == "live",
         )
         warnings = list(generated.warnings)
-        # 默认目录包含可选的私有策略包；没有源码根目录时明确提示，避免执行阶段才导入失败。
+        # 校验私有策略包的实际可解析性，避免把导入失败留到执行阶段。
         validation_root = source_root or self.project_root
         for reference, label in ((preset.strategy, '策略'), (preset.selection, '选股器')):
             if reference and '.' in str(reference):
                 package = str(reference).split('.')[0]
                 if not (validation_root / package).exists():
+                    if self._module_resolves_from_pythonpath(str(reference), variables):
+                        continue
                     if source_root:
-                        warnings.append(f"{label}模块 {reference} 不在 source_root={source_root} 内")
+                        message = f"{label}模块 {reference} 不在 source_root={source_root} 内"
                     else:
-                        warnings.append(f"{label}模块 {reference} 不在当前项目内；请配置 source_root 外部源码根目录")
+                        message = (
+                            f"{label}模块 {reference} 不在当前项目或 PYTHONPATH 中；"
+                            "请配置 source_root 或 PYTHONPATH 外部源码根目录"
+                        )
+                    if preset.origin == "私有命令集":
+                        raise ValueError(message)
+                    warnings.append(message)
         public_variables = {str(key): str(value) for key, value in generated.variables.items()}
         result = {
             "argv": list(generated.argv),

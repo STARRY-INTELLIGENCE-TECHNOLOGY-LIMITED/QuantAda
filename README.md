@@ -79,7 +79,7 @@ Futu 配置页可编辑账户 ID、账户索引和账户现金币种，期权/�
 
 默认仅监听 `127.0.0.1`；也可使用 `--ui_ip 0.0.0.0`（或其它明确地址）显式暴露到网络。工作台面向内部使用，当前会话中的 Token、Webhook、账户配置及 Futu 解锁凭据均按原样展示，请勿将监听地址暴露到不受信任网络。
 
-Futu 期权 Credit Spread 使用券商原子组合接口；若当前 OpenD 仿真环境返回“不支持组合期权”，框架会安全拒绝，不会拆分成裸腿。需要同时使用历史 IV/IVP 与实时盘口时，可将 `--data_source` 设置为 `theta+futu` 并选择命令工作台的 `theta_futu_global` 配置档案：通用 `OverlayDataProvider` 负责组合流程，Theta/Futu 适配规则由 `HybridDataProvider` 注入；历史字段来自 ThetaData，实盘当前行由 Futu 快照合并，回测路径不会访问 Futu。私有命令工作台也支持将 Futu 解锁口令保存到 Git 忽略的本机方案文件；内网工作台会按原样显示当前命令与凭据。完整提前指派同步仍需券商提供明确清算事件字段。
+Futu 期权 Credit Spread 使用券商原子组合接口；若当前 OpenD 仿真环境返回“不支持组合期权”，框架会安全拒绝，不会拆分成裸腿。需要同时使用历史 IV/IVP 与实时盘口时，可将 `--data_source` 设置为 `theta+futu` 并选择命令工作台的 `theta_futu_global` 配置档案：通用 `OverlayDataProvider` 负责组合流程，Theta/Futu 适配规则由 `HybridDataProvider` 注入；历史字段来自 ThetaData，实盘当前行由 Futu 快照合并，回测路径不会访问 Futu。声明了 `option_universe` 的期权策略可用正股/ETF 池自动展开历史或当前期权链，不必把到期合约写死在 `--symbols`。私有命令工作台也支持将 Futu 解锁口令保存到 Git 忽略的本机方案文件；内网工作台会按原样显示当前命令与凭据。完整提前指派同步仍需券商提供明确清算事件字段。
 
 Provider 组合在 `configs/providers.py` 的 `DATA_PROVIDER_COMPOSITIONS` 中声明。每项配置指定历史 Provider、实时 Provider 和 `package.module:factory`；新增组合只需实现自己的适配器工厂并注册配置，不需修改 DataManager 或工作台。
 
@@ -131,13 +131,21 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 在 `config.py` 统一入口（Broker 默认连接值位于 `configs/gm.py`、`configs/ibkr.py`、`configs/futu.py`）配置 `BROKER_ENVIRONMENTS`，再通过 `--connect=broker:env` 启动：
 
 ```bash
-python run.py sample_macd_cross_strategy --connect=gm_broker:sim
-python run.py sample_macd_cross_strategy --connect=gm_broker:real
-python run.py sample_macd_cross_strategy --connect=ib_broker:sim
+python run.py sample_auto_rebalance_strategy --connect=gm_broker:sim --symbols=SHSE.510300
+python run.py sample_auto_rebalance_strategy --connect=gm_broker:real --symbols=SHSE.510300
+python run.py sample_auto_rebalance_strategy --connect=ib_broker:sim --symbols=US.AAPL
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:sim --data_source=futu --symbols=HK.00700
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_source=futu --symbols=HK.00700
 # Futu 行情订阅事件触发（使用 futu_broker:real_event；不与 schedule 同时启用）
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
+```
+
+`sample_macd_cross_strategy` 依赖 Backtrader 指标和 `broker.buy()`，只适用于本地回测/优化，不要用于 `--connect`。
+
+期权样例在 `strategies/options/`，覆盖买开 Put/Call、现金担保短 Put、Covered Call 和原子 Put Credit Spread。请使用全限定类名，并用 `--symbols US.MARA` 这类正股代码让 `option_universe` 展开，不要手写静态期权代码。完整开仓/平仓命令写在各样例文件顶部。
+
+```bash
+python run.py strategies.options.sample_put_credit_spread_strategy.SamplePutCreditSpreadStrategy --symbols=US.MARA --data_source=futu --connect=futu_broker:real --no_plot
 ```
 
 ### 8) SDK/插件化模式（策略在仓库外）

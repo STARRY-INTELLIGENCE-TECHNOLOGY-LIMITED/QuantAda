@@ -1,3 +1,19 @@
+"""极简全自动轮动样例 SampleAutoRebalanceStrategy：按动量选 TopK，等权调仓。
+
+复制执行。`--params` 与类默认参数一致。
+
+回测:
+python run.py sample_auto_rebalance_strategy \\
+  --symbols SHSE.510300,SHSE.510500,SZSE.159915,SHSE.511880 --start_date 20230101 \\
+  --params "{'selectTopK': 1, 'roc_period': 20, 'rebalance_threshold': 0.05, \\
+'rebalance_when': 'daily'}"
+
+实盘:
+python run.py sample_auto_rebalance_strategy --connect futu_broker:sim \\
+  --data_source futu --symbols HK.00700 \\
+  --params "{'selectTopK': 1, 'roc_period': 20, 'rebalance_threshold': 0.05, \\
+'rebalance_when': 'daily'}"
+"""
 import pandas as pd
 from strategies.base_strategy import BaseStrategy
 from common import mytt
@@ -23,25 +39,51 @@ class SampleAutoRebalanceStrategy(BaseStrategy):
         """
         准备阶段：游戏开始前，系统会调用一次这里。
         """
-        self.log("策略初始化：正在提前计算指标，让回测飞起来...")
+        self.log("策略初始化：预计算动量指标。实盘刷新行情后会在 next() 里按最新 DataFrame 重算。")
         self.roc_signals = {}
+        self._sync_roc_signals()
 
-        # 💡 为什么要在这里提前算？
-        # 为了防止“看到未来”的作弊行为，也为了让回测速度提升百倍。
-        # 我们在这里一口气用 MyTT 算出所有历史数据的 ROC（动量）涨幅。
+    def _sync_roc_signals(self):
+        """按当前行情重算 ROC，并注册到框架指标接口。
+
+        回测通常一次加载完整历史，用 asof(当前K) 取值，不会看到未来。
+        实盘引擎会原地替换 data.p.dataname；live 路径不会复用过期指标缓存。
+        没有 DataFrame 的测试桩会跳过计算，只把已注入的 roc_signals 注册进去。
+        """
+        if not hasattr(self, 'roc_signals') or self.roc_signals is None:
+            self.roc_signals = {}
+
+        period = self.p.roc_period
         for data in self.broker.datas:
-            df = data.p.dataname
-            if isinstance(df, pd.DataFrame):
-                # 用 MyTT 一行代码算出 20 日涨幅，并按日期存好
-                roc_array, _ = mytt.ROC(df['close'].values, self.p.roc_period)
-                self.roc_signals[data._name] = pd.Series(roc_array, index=df.index)
+            df = getattr(getattr(data, 'p', None), 'dataname', None)
+            if isinstance(df, pd.DataFrame) and not df.empty and 'close' in df.columns:
+                def _compute(frame=df, roc_period=period):
+                    roc_array, _ = mytt.ROC(frame['close'].values, roc_period)
+                    return pd.Series(roc_array, index=frame.index)
+
+                series = self._get_cached_indicator_series(
+                    data,
+                    'roc',
+                    (period,),
+                    _compute,
+                )
+                self.roc_signals[data._name] = series
+
+            series = self.roc_signals.get(data._name)
+            if series is not None:
+                self.register_indicator(data._name, 'roc', series)
 
     def next(self):
         """
         执行阶段：回测或实盘中，每一天（或每根 K 线）都会执行一次这里。
         """
         # 获取“今天”的日期
-        current_dt = self.broker.datetime.datetime(0).replace(tzinfo=None)
+        current_dt = self.broker.datetime.datetime(0)
+        if getattr(current_dt, 'tzinfo', None) is not None:
+            current_dt = current_dt.replace(tzinfo=None)
+
+        # 实盘 refresh 会更新 dataname；每根 K 都按当前行情同步指标。
+        self._sync_roc_signals()
 
         # ==========================================
         # 第一步：打分选秀（只看可交易的池子）
@@ -49,21 +91,19 @@ class SampleAutoRebalanceStrategy(BaseStrategy):
         valid_candidates = []
 
         for data in self.broker.datas:
-            try:
-                # 拿到这只标的在“今天”的动量得分
-                score = self.roc_signals[data._name].asof(current_dt)
-
-                # 只要得分 > 0（代表处于上涨趋势），就有资格进入候选名单
-                if pd.notna(score) and score > 0:
-                    valid_candidates.append((data, score))
-            except:
-                pass  # 如果上市时间太短数据不足，直接跳过
+            score = self.get_indicator(data, 'roc', current_dt)
+            # 只要得分 > 0（代表处于上涨趋势），就有资格进入候选名单
+            if score is None or pd.isna(score):
+                continue
+            score = float(score)
+            if score > 0:
+                valid_candidates.append((data, score))
 
         # ==========================================
         # 第二步：排出名次，选出大哥
         # ==========================================
         # 按照得分从高到低排序
-        valid_candidates.sort(key=lambda x: x[1], reverse=True)
+        valid_candidates.sort(key=lambda item: item[1], reverse=True)
         self.publish_rankings(valid_candidates, title="ranked_symbols", dt=current_dt)
 
         # 挑出前 selectTopK 名（按照配置，这里会挑出第 1 名）
@@ -79,5 +119,6 @@ class SampleAutoRebalanceStrategy(BaseStrategy):
         self.execute_rebalance(
             target_symbols=targets,
             top_k=self.p.selectTopK,
-            rebalance_threshold=self.p.rebalance_threshold
+            rebalance_threshold=self.p.rebalance_threshold,
+            rebalance_when=self.p.rebalance_when,
         )

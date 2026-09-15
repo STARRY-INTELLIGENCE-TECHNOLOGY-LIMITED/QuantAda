@@ -7,6 +7,7 @@ from common.options.payoff import (
     PayoffInputError,
     UnderlyingLeg,
     analyze_payoff,
+    format_payoff_fill_summary,
     format_payoff_plan,
 )
 from strategies.base_strategy import BaseStrategy
@@ -38,6 +39,20 @@ def test_covered_call_is_bounded_and_naked_call_loss_is_unbounded():
     assert covered.max_profit == pytest.approx(1500)
     assert naked.unbounded_loss is True
     assert naked.max_loss is None
+
+
+def test_payoff_fill_summary_is_short_and_omits_leg_table():
+    analysis = analyze_payoff([
+        OptionLeg("SPY-P100", "PUT", -1, 100, 5, 100),
+    ], spot=100)
+    content = format_payoff_fill_summary(analysis)
+
+    assert "现货参考价：100.00" in content
+    assert "最大盈利：500.00" in content
+    assert "最大亏损：9,500.00" in content
+    assert "盈亏平衡点：95.00" in content
+    assert "盈利区间" not in content
+    assert "SPY-P100" not in content
 
 
 def test_payoff_plan_contains_leg_table_and_ranges():

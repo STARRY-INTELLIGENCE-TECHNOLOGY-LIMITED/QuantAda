@@ -178,7 +178,7 @@ def get_indicator(strategy, data, indicator_name, current_dt):
                     else:
                         lookup_dt = lookup_dt.tz_convert(series_tz)
                 elif lookup_dt.tzinfo is not None:
-                    lookup_dt = lookup_dt.tz_localize(None)
+                    lookup_dt = lookup_dt.tz_convert(None)
             except (TypeError, ValueError, OverflowError):
                 lookup_dt = current_dt
             return series.asof(lookup_dt)

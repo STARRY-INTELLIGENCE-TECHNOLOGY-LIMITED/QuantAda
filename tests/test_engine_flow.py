@@ -1578,6 +1578,192 @@ def test_on_order_status_callback_terminal_fill_pushes_once_with_target_qty(monk
     assert pushed_trades[0]["size"] == 100, "成交推送数量应为最终目标数量(totalQuantity)。"
     assert pushed_trades[0]["symbol"] == "SPY.ARCA"
     assert pushed_trades[0]["dt"] == "2026-02-17T10:17:32", "成交推送时间应优先使用真实执行时间。"
+    assert "payoff_summary" not in pushed_trades[0]
+
+
+def test_on_order_status_callback_option_fill_attaches_payoff_summary(monkeypatch):
+    """期权终态成交应附带到期损益附录，且不得改变股票成交推送字段。"""
+    import live_trader.engine as engine_module
+
+    class DummyOrderProxy:
+        def __init__(self):
+            self.id = "OPTION_FILLED_1"
+            self.status = "Filled"
+            self.data = SimpleNamespace(_name="US.MARA261016P9000")
+            self.order_effect = "SELL_TO_OPEN"
+            self.executed = SimpleNamespace(
+                size=1.0,
+                price=0.55,
+                value=55.0,
+                comm=0.0,
+                dt=datetime(2026, 9, 15, 10, 17, 32),
+            )
+            self.trade = SimpleNamespace(order=SimpleNamespace(totalQuantity=1.0))
+
+        def is_completed(self):
+            return True
+
+        def is_buy(self):
+            return False
+
+        def is_sell(self):
+            return True
+
+        def is_rejected(self):
+            return False
+
+        def is_canceled(self):
+            return False
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
+            return False
+
+    class DummyBroker:
+        def __init__(self):
+            self.proxy = DummyOrderProxy()
+            self.datas = [
+                SimpleNamespace(_name="US.MARA"),
+                SimpleNamespace(_name="US.MARA261016P9000"),
+            ]
+            self._positions = {
+                "US.MARA": SimpleNamespace(size=0, price=0.0),
+                "US.MARA261016P9000": SimpleNamespace(size=0, price=0.0),
+            }
+            self._prices = {"US.MARA": 17.5, "US.MARA261016P9000": 0.55}
+
+        def convert_order_proxy(self, raw_order):
+            return self.proxy
+
+        def on_order_status(self, proxy):
+            return None
+
+        def get_position(self, data):
+            return self._positions[data._name]
+
+        def get_current_price(self, data):
+            return self._prices[data._name]
+
+        def get_contract_multiplier(self, data):
+            return 100.0 if data._name != "US.MARA" else 1.0
+
+    class DummyStrategy:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def notify_order(self, order):
+            pass
+
+    pushed_trades = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pass
+
+        def push_trade(self, trade_info):
+            pushed_trades.append(trade_info)
+
+    monkeypatch.setattr(engine_module, "AlarmManager", lambda: DummyAlarmManager())
+
+    broker = DummyBroker()
+    strategy = DummyStrategy(broker)
+    context = SimpleNamespace(strategy_instance=strategy, now=datetime(2026, 9, 15, 10, 17, 0))
+    engine_module.on_order_status_callback(context, SimpleNamespace(statusMsg="filled"))
+
+    assert len(pushed_trades) == 1
+    assert pushed_trades[0]["symbol"] == "US.MARA261016P9000"
+    assert pushed_trades[0]["action"] == "SELL"
+    assert "最大亏损：845.00" in pushed_trades[0]["payoff_summary"]
+    assert "盈亏平衡点：8.45" in pushed_trades[0]["payoff_summary"]
+
+
+def test_on_order_status_callback_option_fill_still_pushes_when_payoff_fails(monkeypatch):
+    """损益附录构建失败时仍推送成交，且不带附录。"""
+    import live_trader.engine as engine_module
+
+    class DummyOrderProxy:
+        def __init__(self):
+            self.id = "OPTION_FILLED_2"
+            self.status = "Filled"
+            self.data = SimpleNamespace(_name="US.MARA261016P9000")
+            self.order_effect = "SELL_TO_OPEN"
+            self.executed = SimpleNamespace(
+                size=1.0,
+                price=0.55,
+                value=55.0,
+                comm=0.0,
+                dt=datetime(2026, 9, 15, 10, 17, 32),
+            )
+            self.trade = SimpleNamespace(order=SimpleNamespace(totalQuantity=1.0))
+
+        def is_completed(self):
+            return True
+
+        def is_buy(self):
+            return False
+
+        def is_sell(self):
+            return True
+
+        def is_rejected(self):
+            return False
+
+        def is_canceled(self):
+            return False
+
+        def is_pending(self):
+            return False
+
+        def is_accepted(self):
+            return False
+
+    class DummyBroker:
+        def __init__(self):
+            self.proxy = DummyOrderProxy()
+            self.datas = [SimpleNamespace(_name="US.MARA261016P9000")]
+
+        def convert_order_proxy(self, raw_order):
+            return self.proxy
+
+        def on_order_status(self, proxy):
+            return None
+
+        def get_position(self, data):
+            raise RuntimeError("position snapshot failed")
+
+        def get_current_price(self, data):
+            return 0.55
+
+        def get_contract_multiplier(self, data):
+            return 100.0
+
+    class DummyStrategy:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def notify_order(self, order):
+            pass
+
+    pushed_trades = []
+
+    class DummyAlarmManager:
+        def push_text(self, content, level="INFO"):
+            pass
+
+        def push_trade(self, trade_info):
+            pushed_trades.append(trade_info)
+
+    monkeypatch.setattr(engine_module, "AlarmManager", lambda: DummyAlarmManager())
+    broker = DummyBroker()
+    strategy = DummyStrategy(broker)
+    context = SimpleNamespace(strategy_instance=strategy, now=datetime(2026, 9, 15, 10, 17, 0))
+    engine_module.on_order_status_callback(context, SimpleNamespace(statusMsg="filled"))
+
+    assert len(pushed_trades) == 1
+    assert pushed_trades[0]["symbol"] == "US.MARA261016P9000"
+    assert "payoff_summary" not in pushed_trades[0]
 
 
 def test_live_fill_without_broker_timestamp_does_not_reuse_schedule_time(monkeypatch):
@@ -2147,7 +2333,7 @@ def test_refresh_live_seconds_uses_bounded_bar_window():
     )
 
     assert calls == [("2026-02-10 08:46:40", "2026-02-10 10:10:00", "Seconds", 5)]
-    assert stats == {"total_feeds": 1, "updated_feeds": 1, "failed_feeds": 0}
+    assert stats == {"total_feeds": 1, "updated_feeds": 1, "failed_feeds": 0, "failed_symbols": []}
 
 
 def test_live_run_recovers_data_feeds_when_init_has_none(monkeypatch):
@@ -2355,6 +2541,193 @@ def test_live_run_skips_after_refresh_retry_exhausted(monkeypatch):
     assert len(dummy_alarm.text_calls) == 1, "重试耗尽后应只推送一次最终失败报警。"
     assert "已重试" in dummy_alarm.text_calls[0]["content"]
     assert dummy_alarm.text_calls[0]["level"] == "ERROR"
+
+
+
+
+class OptionUniverseStrategy(CounterStrategy):
+    params = {"min_dte": 30, "max_dte": 45, "min_delta": -0.15, "max_delta": -0.10}
+    option_universe = ("PUT",)
+
+
+def _attach_dummy_alarm(engine):
+    class DummyAlarmManager:
+        def __init__(self):
+            self.text_calls = []
+
+        def push_text(self, content, level="INFO"):
+            self.text_calls.append({"content": content, "level": level})
+
+    dummy_alarm = DummyAlarmManager()
+    engine.alarm_manager = dummy_alarm
+    return dummy_alarm
+
+
+def test_live_run_continues_when_candidate_option_feed_fails(monkeypatch):
+    """滚动期权候选没有 K 线时，不应跳过股票路径或重试整轮刷新。"""
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: OptionUniverseStrategy,
+    )
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    engine = LiveTrader({
+        "strategy_name": "OptionUniverseStrategy",
+        "platform": "mock_engine",
+        "symbols": ["US.SPY"],
+        "cash": 100000.0,
+        "params": {"min_dte": 30, "max_dte": 45},
+    })
+    context = MockContext(now=datetime(2026, 9, 14, 9, 30, 0))
+    engine.init(context)
+    engine.broker.mock_position = 0
+    engine._sync_live_option_universe = lambda _ctx: None
+    dummy_alarm = _attach_dummy_alarm(engine)
+
+    option_feed = SimpleNamespace(_name="US.SPY261016P00450000")
+    engine.broker.set_datas(list(engine.broker.datas) + [option_feed])
+
+    refresh_calls = {"count": 0}
+
+    def _refresh(_ctx):
+        refresh_calls["count"] += 1
+        return {
+            "total_feeds": 2,
+            "updated_feeds": 1,
+            "failed_feeds": 1,
+            "failed_symbols": ["US.SPY261016P00450000"],
+        }
+
+    engine._refresh_live_data = _refresh
+    engine.run(context)
+
+    names = [str(getattr(data, "_name", "")) for data in engine.broker.datas]
+    assert refresh_calls["count"] == 1
+    assert engine.strategy.next_calls == 1
+    assert dummy_alarm.text_calls == []
+    assert "US.SPY261016P00450000" not in names
+    assert "US.SPY" in names
+
+
+def test_live_run_skips_when_held_option_feed_fails(monkeypatch):
+    """仍有持仓的期权刷新失败时，整轮必须失败关闭。"""
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: OptionUniverseStrategy,
+    )
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    engine = LiveTrader({
+        "strategy_name": "OptionUniverseStrategy",
+        "platform": "mock_engine",
+        "symbols": ["US.SPY"],
+        "cash": 100000.0,
+        "params": {"min_dte": 30, "max_dte": 45},
+    })
+    context = MockContext(now=datetime(2026, 9, 14, 9, 30, 0))
+    engine.init(context)
+    engine._sync_live_option_universe = lambda _ctx: None
+    dummy_alarm = _attach_dummy_alarm(engine)
+
+    option_feed = SimpleNamespace(_name="US.SPY261016P00450000")
+    engine.broker.set_datas(list(engine.broker.datas) + [option_feed])
+    engine.broker.get_position = lambda data: SimpleNamespace(
+        size=-1 if str(getattr(data, "_name", "")).startswith("US.SPY26") else 0
+    )
+
+    refresh_calls = {"count": 0}
+
+    def _refresh(_ctx):
+        refresh_calls["count"] += 1
+        return {
+            "total_feeds": 2,
+            "updated_feeds": 1,
+            "failed_feeds": 1,
+            "failed_symbols": ["US.SPY261016P00450000"],
+        }
+
+    engine._refresh_live_data = _refresh
+    engine.run(context)
+
+    assert refresh_calls["count"] == engine._LIVE_REFRESH_MAX_ATTEMPTS
+    assert engine.strategy.next_calls == 0
+    assert dummy_alarm.text_calls
+    assert dummy_alarm.text_calls[0]["level"] == "ERROR"
+
+
+
+def test_live_run_continues_when_unknown_option_feed_fails(monkeypatch):
+    """持仓查询失败的滚动期权刷新失败时，既不跳过整轮也不当空仓丢掉。"""
+    import live_trader.engine as engine_module
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: OptionUniverseStrategy,
+    )
+    monkeypatch.setattr(engine_module.time, "sleep", lambda _: None)
+
+    engine = LiveTrader({
+        "strategy_name": "OptionUniverseStrategy",
+        "platform": "mock_engine",
+        "symbols": ["US.SPY"],
+        "cash": 100000.0,
+        "params": {"min_dte": 30, "max_dte": 45},
+    })
+    context = MockContext(now=datetime(2026, 9, 14, 9, 30, 0))
+    engine.init(context)
+    engine._sync_live_option_universe = lambda _ctx: None
+    dummy_alarm = _attach_dummy_alarm(engine)
+
+    option_feed = SimpleNamespace(_name="US.SPY261016P00450000")
+    engine.broker.set_datas(list(engine.broker.datas) + [option_feed])
+
+    def _boom(_data):
+        raise RuntimeError("position timeout")
+
+    engine.broker.get_position = _boom
+
+    refresh_calls = {"count": 0}
+
+    def _refresh(_ctx):
+        refresh_calls["count"] += 1
+        return {
+            "total_feeds": 2,
+            "updated_feeds": 1,
+            "failed_feeds": 1,
+            "failed_symbols": ["US.SPY261016P00450000"],
+        }
+
+    engine._refresh_live_data = _refresh
+    engine.run(context)
+
+    names = [str(getattr(data, "_name", "")) for data in engine.broker.datas]
+    assert refresh_calls["count"] == 1
+    assert engine.strategy.next_calls == 1
+    assert dummy_alarm.text_calls == []
+    assert "US.SPY261016P00450000" in names
+    assert "US.SPY" in names
 
 
 def test_live_run_continues_when_overnight_cleanup_barrier_not_cleared_after_retries(monkeypatch):

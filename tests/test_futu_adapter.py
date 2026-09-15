@@ -350,8 +350,9 @@ def test_futu_mixed_assets_keep_position_and_order_sizing_symbol_scoped():
     assert broker.get_current_price(future) == 20.0
     assert broker.get_contract_multiplier(future) == 10.0
     assert broker.get_position_market_value(future, 3, price=20.0) == 600.0
-    assert all(query['code'] in {'US.AAPL', 'US.AAPL260918P320000', 'US.NQ260918'}
+    assert all(query.get('code') in {'', 'US.AAPL', 'US.AAPL260918P320000', 'US.NQ260918'}
                for query in trade.position_queries)
+    assert any(query.get('code') in {'', None} for query in trade.position_queries)
     assert broker.get_cash() == 10000.0
     assert broker._get_portfolio_nav() == 12000.0
     assert broker.get_expected_size(stock) == 13
@@ -615,6 +616,23 @@ def test_futu_cash_prefers_account_currency_specific_buying_power():
     assert broker.get_cash() == pytest.approx(123.45)
 
 
+def test_futu_cash_prefers_account_currency_total_over_usd_bucket():
+    class MixedCurrencyCash(FakeTradeContext):
+        def accinfo_query(self, **kwargs):
+            return 0, pd.DataFrame([{
+                'available_funds': 'N/A',
+                'usd_net_cash_power': 6.53,
+                'us_cash': 6.32,
+                'cash': 2683.61,
+                'net_cash_power': 0.0,
+                'total_assets': 2648.33,
+            }])
+
+    broker, _ = _broker(MixedCurrencyCash())
+
+    assert broker.get_cash() == pytest.approx(2683.61)
+
+
 def test_futu_adapter_submits_and_cancels_using_official_api():
     broker, fake = _broker()
     data = SimpleNamespace(_name='US.AAPL', close=[200.0])
@@ -679,6 +697,88 @@ def test_futu_pending_zero_remaining_uses_total_minus_filled_when_partial():
         'size': 6,
     }]
     assert broker._last_pending_orders_fetch_failed is False
+
+
+def test_futu_pending_buy_back_maps_to_buy_and_ignores_filled():
+    broker, _ = _broker()
+    broker._query_order_rows = lambda: [
+        {
+            'order_id': 'FH-FILLED-BACK',
+            'code': 'US.MARA261016P9000',
+            'trd_side': 'BUY_BACK',
+            'order_status': 'FILLED_ALL',
+            'qty': 1,
+            'dealt_qty': 1,
+        },
+        {
+            'order_id': 'FH-PENDING-BACK',
+            'code': 'US.MARA261016P8000',
+            'trd_side': 'BUY_BACK',
+            'order_status': 'SUBMITTED',
+            'qty': 1,
+            'dealt_qty': 0,
+        },
+    ]
+    assert broker.get_pending_orders() == [{
+        'id': 'FH-PENDING-BACK',
+        'symbol': 'US.MARA261016P8000',
+        'direction': 'BUY',
+        'size': 1,
+    }]
+    assert broker._last_pending_orders_fetch_failed is False
+
+
+def test_futu_combo_pending_buy_back_legs_are_trusted():
+    """组合在途腿带 BUY_BACK 时应归一为 BUY，并允许按同一订单号撤单。"""
+    broker, fake = _broker()
+    broker._query_order_rows = lambda: [{
+        'order_id': 'FH-COMBO-1',
+        'code': 'US.MARA261009P09/10',
+        'trd_side': 'BUY',
+        'order_status': 'SUBMITTED',
+        'qty': 1,
+        'dealt_qty': 0,
+        'order_type': 'NORMAL',
+        'strategy_type': 'SPREAD',
+        'combo_legs': [
+            SimpleNamespace(code='US.MARA261009P10000', trd_side='BUY_BACK'),
+            SimpleNamespace(code='US.MARA261009P9000', trd_side='SELL'),
+        ],
+    }]
+
+    pending = broker.get_pending_orders()
+    assert broker._last_pending_orders_fetch_failed is False
+    assert pending == [
+        {
+            'id': 'FH-COMBO-1',
+            'symbol': 'US.MARA261009P10000',
+            'direction': 'BUY',
+            'size': 1,
+        },
+        {
+            'id': 'FH-COMBO-1',
+            'symbol': 'US.MARA261009P9000',
+            'direction': 'SELL',
+            'size': 1,
+        },
+    ]
+    assert broker.cancel_pending_order('FH-COMBO-1') is True
+    assert fake.modify_calls[0]['order_id'] == 'FH-COMBO-1'
+    assert fake.modify_calls[0]['modify_order_op'] == 'CANCEL'
+
+
+def test_futu_order_proxy_treats_buy_back_as_buy():
+    proxy = FutuOrderProxy({
+        'order_id': 'FH-BACK',
+        'code': 'US.MARA261016P9000',
+        'trd_side': 'BUY_BACK',
+        'order_status': 'FILLED_ALL',
+        'qty': 1,
+        'dealt_qty': 1,
+        'dealt_avg_price': 0.22,
+    })
+    assert proxy.is_buy() is True
+    assert proxy.is_sell() is False
 
 
 def test_futu_a_share_position_without_sellable_field_is_not_sellable():

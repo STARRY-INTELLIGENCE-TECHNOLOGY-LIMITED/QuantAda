@@ -1,6 +1,8 @@
+import datetime as _dt
+
 import pandas as pd
 
-from data_providers.thetadata_provider import ThetaDataProvider
+from data_providers.thetadata_provider import ThetaDataProvider, _vendor_today
 
 
 class _FakeTheta:
@@ -272,7 +274,7 @@ def test_future_end_is_clipped_and_marked():
     result = ThetaDataProvider(client=fake).get_data("US.AAPL", "20240101", "20990101")
     assert result is not None
     assert result.attrs["future_data_unavailable"] is True
-    assert fake.calls[0][1]["end_date"] <= pd.Timestamp.today().date()
+    assert fake.calls[0][1]["end_date"] <= _vendor_today()
 
 
 def test_integer_yyyymmdd_input_is_supported():
@@ -280,3 +282,59 @@ def test_integer_yyyymmdd_input_is_supported():
     result = ThetaDataProvider(client=fake).get_data("US.AAPL", 20240101, 20240105)
     assert result is not None
     assert fake.calls[0][1]["start_date"].isoformat() == "2024-01-01"
+
+def test_option_history_end_is_clipped_to_vendor_today(monkeypatch):
+    vendor_today = _dt.date(2026, 9, 14)
+    monkeypatch.setattr("data_providers.thetadata_provider._vendor_today", lambda: vendor_today)
+    fake = _FakeTheta()
+    result = ThetaDataProvider(client=fake).get_data(
+        "US.MARA261009P00010000", "20260801", "20260915"
+    )
+    assert result is not None
+    assert result.attrs["future_data_unavailable"] is True
+    assert fake.calls[0][0] == "option_history_eod"
+    assert fake.calls[0][1]["end_date"] == vendor_today
+
+def test_historical_chain_uses_eod_greeks_not_snapshot():
+    class HistoricalTheta(_FakeTheta):
+        def option_history_greeks_eod(self, **kwargs):
+            self.calls.append(("option_history_greeks_eod", kwargs))
+            return pd.DataFrame({
+                "symbol": ["AAPL"],
+                "expiration": [20240119],
+                "strike": [150],
+                "right": ["PUT"],
+                "timestamp": ["2024-01-02T16:00:00-05:00"],
+                "open": [1.0], "high": [1.3], "low": [0.9], "close": [1.2],
+                "volume": [10], "bid": [1.1], "ask": [1.3],
+                "delta": [-0.1], "implied_vol": [0.2],
+                "underlying_price": [155],
+            })
+
+        def option_snapshot_greeks_all(self, **kwargs):
+            self.calls.append(("option_snapshot_greeks_all", kwargs))
+            raise AssertionError("snapshot must not backfill historical as_of")
+
+    fake = HistoricalTheta()
+    chain = ThetaDataProvider(client=fake).get_option_chain(
+        "US.AAPL", as_of="2024-01-02", normalized=True
+    )
+    assert chain is not None
+    assert chain.iloc[0]["option_symbol"] == "US.AAPL240119P00150000"
+    assert chain.iloc[0]["delta"] == -0.1
+    assert any(name == "option_history_greeks_eod" for name, _ in fake.calls)
+    assert not any(str(name).startswith("option_snapshot") for name, _ in fake.calls)
+
+
+def test_future_as_of_historical_chain_is_rejected(monkeypatch):
+    monkeypatch.setattr(
+        "data_providers.thetadata_provider._vendor_today",
+        lambda: _dt.date(2026, 9, 14),
+    )
+    fake = _FakeTheta()
+    result = ThetaDataProvider(client=fake).get_option_chain(
+        "US.AAPL", as_of="20260915", normalized=True
+    )
+    assert result is None
+    assert fake.calls == []
+

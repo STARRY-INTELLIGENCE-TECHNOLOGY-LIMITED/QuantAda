@@ -70,7 +70,7 @@ The repository catalog contains sanitized examples only. Put private strategy in
 
 The default bind address is `127.0.0.1`. The UI is intended for trusted internal use and displays current session variables, including Futu unlock credentials; only specify `--ui_ip` when you explicitly want to expose another interface.
 
-Futu option credit spreads use the broker's atomic combo-order API. If the current OpenD simulation environment rejects combo options, QuantAda fails closed and does not split the order into naked legs. Use `--data_source=theta+futu` with the Command Center `theta_futu_global` profile when historical IV/IVP should come from ThetaData and the current live row from Futu; the generic `OverlayDataProvider` owns composition while `HybridDataProvider` supplies Theta/Futu-specific mapping. Backtests do not call Futu. The private Command Center may also store a Futu unlock password in the Git-ignored local profile store; trusted internal command previews show current values as-is. Explicit assignment reconciliation still requires broker clearing-event fields.
+Futu option credit spreads use the broker's atomic combo-order API. If the current OpenD simulation environment rejects combo options, QuantAda fails closed and does not split the order into naked legs. Use `--data_source=theta+futu` with the Command Center `theta_futu_global` profile when historical IV/IVP should come from ThetaData and the current live row from Futu; the generic `OverlayDataProvider` owns composition while `HybridDataProvider` supplies Theta/Futu-specific mapping. Option strategies that set `option_universe` can expand an underlying pool into historical or live option contracts instead of hard-coding expiries in `--symbols`. Backtests do not call Futu. The private Command Center may also store a Futu unlock password in the Git-ignored local profile store; trusted internal command previews show current values as-is. Explicit assignment reconciliation still requires broker clearing-event fields.
 
 Provider compositions are declared in `configs/providers.py` under `DATA_PROVIDER_COMPOSITIONS`. Each entry names a historical Provider, a realtime Provider, and a `package.module:factory`; adding another pair only requires a new adapter factory and configuration, not DataManager or Command Center changes.
 
@@ -122,13 +122,21 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 Configure `BROKER_ENVIRONMENTS` through the `config.py` entry point (broker defaults live in `configs/gm.py`, `configs/ibkr.py`, and `configs/futu.py`), then launch with `--connect=broker:env`:
 
 ```bash
-python run.py sample_macd_cross_strategy --connect=gm_broker:sim
-python run.py sample_macd_cross_strategy --connect=gm_broker:real
-python run.py sample_macd_cross_strategy --connect=ib_broker:sim
+python run.py sample_auto_rebalance_strategy --connect=gm_broker:sim --symbols=SHSE.510300
+python run.py sample_auto_rebalance_strategy --connect=gm_broker:real --symbols=SHSE.510300
+python run.py sample_auto_rebalance_strategy --connect=ib_broker:sim --symbols=US.AAPL
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:sim --data_source=futu --symbols=HK.00700
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_source=futu --symbols=HK.00700
 # Futu quote-subscription event trigger (use futu_broker:real_event; do not combine with schedule)
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
+```
+
+`sample_macd_cross_strategy` depends on Backtrader indicators and `broker.buy()`, so it is backtest/optimizer only. Do not launch it with `--connect`.
+
+Option samples live in `strategies/options/` and cover long put/call, cash-secured short put, covered call, and atomic put credit spreads. Use the fully qualified class name and pass the underlying in `--symbols` so `option_universe` can expand contracts. Copy the full open/close commands from the top of each sample file.
+
+```bash
+python run.py strategies.options.sample_put_credit_spread_strategy.SamplePutCreditSpreadStrategy --symbols=US.MARA --data_source=futu --connect=futu_broker:real --no_plot
 ```
 
 ### 8. SDK / Plugin Mode (Strategies Outside This Repository)

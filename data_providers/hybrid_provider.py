@@ -24,6 +24,7 @@ class HybridDataProvider(BaseDataProvider):
 
     PRIORITY = 95
     HYBRID_ONLY = True
+    HISTORICAL_OPTION_CHAIN = True
     _MARKET_TIMEZONES = {
         "US": "America/New_York",
         "HK": "Asia/Hong_Kong",
@@ -340,6 +341,46 @@ class HybridDataProvider(BaseDataProvider):
                 result, iv_series, window=252, explicit=False
             )
         return sanitize_market_dataframe(result, require_ohlcv=True)
+
+    def get_option_chain(self, underlying, start=None, end=None, as_of=None,
+                           normalized=True, **kwargs):
+        """回测走 Theta 历史链；实盘当前链走 Futu，不回退到历史末行。"""
+        if self.live_mode and as_of is None:
+            futu = self.futu_provider
+            method = None
+            if normalized:
+                method = getattr(futu, "get_option_chain_normalized", None)
+            if not callable(method):
+                method = getattr(futu, "get_option_chain", None)
+            if not callable(method):
+                return None
+            try:
+                return method(
+                    underlying,
+                    start=start,
+                    end=end,
+                    normalized=normalized,
+                    timestamp=kwargs.get("timestamp"),
+                    as_of=as_of,
+                )
+            except TypeError:
+                try:
+                    return method(underlying, start=start, end=end)
+                except TypeError:
+                    return method(underlying)
+            except Exception:
+                return None
+        theta = self.theta_provider
+        getter = getattr(theta, "get_option_chain", None)
+        if not callable(getter):
+            return None
+        return getter(
+            underlying,
+            start=start,
+            end=end,
+            as_of=as_of,
+            normalized=normalized,
+        )
 
     def get_data(self, symbol: str, start_date=None, end_date=None,
                  timeframe: str = "Days", compression: int = 1,

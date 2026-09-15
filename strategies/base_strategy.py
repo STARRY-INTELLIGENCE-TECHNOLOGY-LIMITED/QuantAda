@@ -8,6 +8,12 @@ import config
 from common.formatters import format_ranked_candidates_markdown
 from common import indicator_cache, runtime_notifications
 from common.log import extract_order_execution_dt
+from common.symbols import (
+    normalize_symbol_key,
+    symbol_lookup_keys,
+    strip_known_venue_suffix,
+    symbols_match,
+)
 
 
 class BaseStrategy(ABC):
@@ -195,7 +201,9 @@ class BaseStrategy(ABC):
                     )
                     raise RuntimeError(f"pending-order snapshot is untrusted: {detail}")
                 for po in pending_orders:
-                    sym = str(po['symbol']).upper()
+                    sym = normalize_symbol_key(po['symbol'])
+                    if not sym:
+                        continue
                     if sym not in pending_map:
                         pending_map[sym] = {'BUY': 0.0, 'SELL': 0.0}
                     pending_map[sym][po['direction']] += po['size']
@@ -203,13 +211,13 @@ class BaseStrategy(ABC):
                 # engine 会在 strategy.next() 前探测 pending 状态，但此处的第二次快照仍可能失败；把失败当成空快照会重复提交已在途的 SELL。
                 raise RuntimeError(f"获取在途订单失败，本轮调仓已中止: {e}") from e
 
-        # 辅助查表函数 (支持 IBKR 截断后缀模糊匹配，如 'QQQ.ISLAND' 匹配 'QQQ')
+        # 只把已知 venue 后缀当成同一标的；HK.00700 不得匹配到 HK.09988。
         def get_pending(data_name, direction):
-            exact = data_name.upper()
-            base = exact.split('.')[0]
-            if exact in pending_map: return pending_map[exact][direction]
-            if base in pending_map: return pending_map[base][direction]
-            return 0.0
+            total = 0.0
+            for symbol, sizes in pending_map.items():
+                if symbols_match(symbol, data_name):
+                    total += sizes[direction]
+            return total
 
         # 2. 盘点所有数据源
         for d in self.broker.datas:
@@ -462,11 +470,11 @@ class BaseStrategy(ABC):
         # 仅在 strategy 配置的标的池内解析目标；标的池外持仓有意不受管理，不会意外成为调仓目标。
         symbol_map = {}
         for data in getattr(self.broker, 'datas', []) or []:
-            full_name = str(getattr(data, '_name', '') or '').strip().upper()
+            full_name = normalize_symbol_key(getattr(data, '_name', ''))
             if not full_name:
                 continue
-            symbol_map.setdefault(full_name, data)
-            symbol_map.setdefault(full_name.split('.')[0], data)
+            for key in symbol_lookup_keys(full_name):
+                symbol_map.setdefault(key, data)
 
         resolved_targets = []
         seen_targets = set()
@@ -474,17 +482,17 @@ class BaseStrategy(ABC):
         aliased_targets = []
         for raw_target in target_symbols or []:
             raw_name = getattr(raw_target, '_name', raw_target)
-            full_name = str(raw_name or '').strip().upper()
+            full_name = normalize_symbol_key(raw_name)
             if not full_name:
                 continue
             resolved = symbol_map.get(full_name)
             if resolved is None:
-                # 为保障离席运行：selector 返回同一证券但 venue 后缀不同时，保留历史 base symbol fallback，使用已加载的标的池对象继续计划。
-                # 这是带告警的兼容路径，不应因此丢弃整轮计划。
-                base_name = full_name.split('.')[0]
-                resolved = symbol_map.get(base_name)
-                if resolved is not None and '.' in full_name:
-                    aliased_targets.append((str(raw_name), str(getattr(resolved, '_name', resolved))))
+                # 离席容错只认已知 venue 后缀，例如 AAPL.ARCA -> AAPL.SMART；市场前缀不得互为别名。
+                alias_key = strip_known_venue_suffix(full_name)
+                if alias_key != full_name:
+                    resolved = symbol_map.get(alias_key)
+                    if resolved is not None:
+                        aliased_targets.append((str(raw_name), str(getattr(resolved, '_name', resolved))))
             if resolved is None:
                 unknown_targets.append(str(raw_name))
                 continue
@@ -517,6 +525,23 @@ class BaseStrategy(ABC):
                 runtime_notifications.push_text(alias_msg, level='WARNING')
                 warned_aliases.add(warning_key)
                 self._rebalance_alias_warning_keys = warned_aliases
+
+        try:
+            slot_count = int(top_k)
+        except (TypeError, ValueError):
+            slot_count = 0
+        if slot_count > 0 and len(resolved_targets) > slot_count:
+            extra_targets = [
+                str(getattr(item, '_name', item))
+                for item in resolved_targets[slot_count:]
+            ]
+            resolved_targets = resolved_targets[:slot_count]
+            msg = (
+                "[Rebalance Warning] execute_rebalance 目标数量超过 top_k，已按排名截断到槽位数，避免等权超配。"
+                f" top_k={slot_count}, dropped_targets={extra_targets}"
+            )
+            self.log(msg)
+            runtime_notifications.push_text(msg, level='WARNING')
 
         # 1. 底层框架只盘点当前策略标的池内的真实资金与持仓。
         allocatable_capital, current_positions = self.get_strategy_isolated_capital()

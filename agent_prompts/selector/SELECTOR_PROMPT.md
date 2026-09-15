@@ -21,6 +21,7 @@ def run_selection(self) -> Union[list[str], pandas.DataFrame]:
 - 优先返回 `list[str]`（标的代码列表）。
 - 若返回 `DataFrame`，标的代码必须作为 index。
 5. 不要在选股器里下单，不要调用 broker。
+6. 实盘选股器在进程启动/数据恢复时运行，构成 `broker.datas` 标的池；每日换股应在策略 `next()` 中从该池挑选子集，而不是假设每根 K 都会重跑 selector。
 
 ## 工程约束
 1. 可使用 `self.data_manager.get_data(...)` 拉取数据。

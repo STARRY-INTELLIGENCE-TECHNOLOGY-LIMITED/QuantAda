@@ -4,8 +4,17 @@ from .base_strategy import BaseStrategy
 
 
 class SampleMacdCrossStrategy(BaseStrategy):
-    """
-    MACD金叉死叉策略的纯净实现。
+    """MACD 金叉死叉样本 SampleMacdCrossStrategy，仅用于本地回测和优化。
+
+    它依赖 Backtrader 的指标工厂、`broker.dataclose` 和 `broker.buy()`。
+    实盘 `BaseLiveBroker` 不提供这些接口，请不要用 `--connect` 启动本策略。
+    需要同一套代码同时服务回测和实盘时，请使用 `sample_auto_rebalance_strategy`
+    或 `order_target_percent` / `order_target_value`。
+
+    复制执行。`--params` 与类默认参数一致。
+
+    python run.py sample_macd_cross_strategy --symbols SHSE.600519 \\
+      --params "{'exitbars': 5}"
     """
     params = {
         'exitbars': 5,

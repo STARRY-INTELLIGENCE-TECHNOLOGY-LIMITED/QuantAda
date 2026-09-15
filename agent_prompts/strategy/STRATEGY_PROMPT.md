@@ -22,6 +22,7 @@
 
 2. **向量化计算优先 (Vectorized Computation)**
    - 策略层可以通过 `data.p.dataname` 获取包含完整历史 K 线的 Pandas DataFrame。
+   - 实盘每次 `run()` 会原地更新该 DataFrame。禁止只在 `init()` 计算一次指标后长期 `asof()`；`next()` 必须按当前行情重算或按行情指纹失效缓存。
    - 强烈建议在 `next()` 周期或自定义方法中，使用 Pandas 的向量化操作（或框架提供的 `indicators.py` / `mytt.py`）进行全量计算，避免低效的 `for` 循环单行迭代。
    - 若需要加速优化器重复 trial，可只缓存由行情数据和参数决定的只读指标序列；优化器缓存有上限且允许淘汰，策略正确性不能依赖缓存命中。不要缓存现金、持仓、订单、目标标的、拒单重试或跨 K 交易意图。
    - 策略只调用 `register_indicator()` / `get_indicator()` 等公开 API；不要直接操作底层缓存字典或在 `BaseStrategy` 中追加缓存实现。
@@ -32,7 +33,10 @@
 4. **交易池遍历约定**
    - 轮动选股、排名和交易决策优先遍历 `self.broker.datas`，它就是当前策略加载的标的池。
    - 账户中未加载进 `self.broker.datas` 的持仓默认不属于本策略管理范围；不要把标的池外对象加入 `target_symbols`。
-   - 若目标仅与池内标的 venue 后缀不同，框架会保留兼容映射、推送 WARNING 级 IM 并继续执行当前计划；这是有意的离席运行容错，不应改为静默中止整轮。
+   - 若目标仅与池内标的已知 IBKR venue 后缀不同，框架会保留兼容映射、推送 WARNING 级 IM 并继续执行当前计划；这是有意的离席运行容错，不应改为静默中止整轮。`HK.*` / `SHSE.*` 等市场前缀代码必须精确匹配。
+   - 传入 `execute_rebalance` 的目标多于 `top_k` 时，框架按顺序截断到槽位数并告警，不要依赖“多传目标、少设 top_k”来放大仓位。
+   - 期权滚动合约不要手写静态期权代码当标的池。需要展开时在策略类声明 `option_universe = ("PUT",)` 或 `True`，并提供 `min_dte`/`max_dte`；运行时会把正股池展开为历史/当前链候选。`next()` 必须遍历当前 `self.broker.datas`，不要冻结 init 时的合约列表。实盘无 K 线的滚动候选会被丢弃；账户已持仓或在途的旧合约会被增补进 datas，这些合约刷新失败仍会跳过整轮。公开样例在 `strategies/options/`：`SampleLongPutStrategy` / `SampleLongCallStrategy` / `SampleCashSecuredPutStrategy` / `SampleCoveredCallStrategy` / `SamplePutCreditSpreadStrategy`；各文件顶部有可复制的 `run.py` 命令。
+
 
 ---
 

@@ -539,6 +539,52 @@ def test_command_center_loads_private_catalog_from_source_root(tmp_path):
     assert service.catalog.preset("private-source").strategy == "private.alpha"
 
 
+def test_private_preset_accepts_strategy_resolved_from_pythonpath(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    project = tmp_path / "project"
+    private_root = tmp_path / "private-strategies"
+    module = private_root / "private_strategies" / "alpha.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("class Alpha:\n    params = {}\n", encoding="utf-8")
+    catalog_dir = project / ".data" / "command_center"
+    catalog_dir.mkdir(parents=True)
+    (catalog_dir / "private_catalog.json").write_text(
+        json.dumps(
+            {
+                "variables": {"PYTHONPATH": str(private_root)},
+                "presets": [
+                    {
+                        "id": "private-pythonpath",
+                        "title": "PYTHONPATH 私有方案",
+                        "market": "全球",
+                        "mode": "backtest",
+                        "strategy": "private_strategies.alpha.Alpha",
+                        "origin": "私有命令集",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = CommandCenterService(project).generate({"profile_id": "private-pythonpath"})
+
+    assert result["warnings"] == []
+
+
+def test_private_preset_raises_when_strategy_not_in_pythonpath(tmp_path):
+    catalog_dir = tmp_path / ".data" / "command_center"
+    catalog_dir.mkdir(parents=True)
+    (catalog_dir / "private_catalog.json").write_text(
+        '{"presets": [{"id": "private-missing", "strategy": "private.alpha.Alpha", '
+        '"origin": "私有命令集"}]}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="PYTHONPATH"):
+        CommandCenterService(tmp_path).generate({"profile_id": "private-missing"})
+
+
 def test_private_trade_password_is_used_for_execution_and_visible_in_preview(tmp_path):
     service = CommandCenterService(tmp_path)
     saved = service.save_profile(

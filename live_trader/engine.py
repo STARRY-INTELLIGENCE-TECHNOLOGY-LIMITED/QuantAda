@@ -28,6 +28,7 @@ from common.options.data_safety import sanitize_market_dataframe
 from common.options.risk_watchdog import OptionRiskWatchdog
 from data_providers.manager import DataManager, normalize_source_name, resolve_platform_default_source
 from live_trader.adapters.base_broker import BaseLiveBroker
+from live_trader.option_fill_payoff import collect_option_fill_payoff_summary
 from live_trader.data_bridge.data_warm import SchedulePlanner
 from live_trader.data_bridge.provider_bridge import _DataManagerProvider, _DataManagerProxy
 from run import get_class_from_name
@@ -354,6 +355,15 @@ class LiveTrader:
 
         symbols = self._determine_symbols()
         if not symbols: raise ValueError("No symbols to trade.")
+        try:
+            symbols = self._expand_option_universe(
+                symbols, live=is_live, as_of=getattr(context, "now", None),
+            )
+        except ValueError as exc:
+            if is_live:
+                print(f"[Engine Warning] option universe expansion skipped: {exc}")
+            else:
+                raise
 
         # 获取 timeframe 和 compression
         timeframe = self.config.get('timeframe', 'Days')
@@ -516,6 +526,7 @@ class LiveTrader:
             # 只有在实盘模式下，每次 schedule 触发 run 时，才需要重新拉取数据
             if self.broker.is_live:
                 runtime_log("[Engine] Live Mode: Refreshing data...")
+                self._sync_live_option_universe(context)
                 refresh_stats = self._refresh_live_data_with_retry(context)
                 total_feeds = int(refresh_stats.get('total_feeds', 0))
                 updated_feeds = int(refresh_stats.get('updated_feeds', 0))
@@ -523,8 +534,10 @@ class LiveTrader:
                 refresh_attempts = int(refresh_stats.get('attempts_used', 1) or 1)
 
                 # 刷新质量门控:
-                # - 只要有任一标的刷新失败，直接跳过本轮，避免缺失数据触发错误调仓。
-                if total_feeds > 0 and failed_feeds > 0:
+                # - 正股/指数，以及仍有持仓、在途或持仓未知的期权失败，跳过整轮。
+                # - 滚动期权候选没有 K 线时丢弃该合约并继续，避免一张死合约挡住股票和出场。
+                required_failed, optional_failed = self._classify_live_refresh_failures(refresh_stats)
+                if required_failed:
                     warn_msg = (
                         f"[Engine Error] Live data refresh incomplete: "
                         f"{updated_feeds}/{total_feeds} updated, {failed_feeds} failed "
@@ -541,6 +554,26 @@ class LiveTrader:
                             level='ERROR'
                         )
                     return
+                if optional_failed:
+                    drop = {
+                        str(symbol).strip().upper()
+                        for symbol in optional_failed
+                        if str(symbol).strip()
+                    }
+                    kept = []
+                    dropped = []
+                    for data_feed in list(getattr(self.broker, "datas", []) or []):
+                        name = str(getattr(data_feed, "_name", "") or "").strip()
+                        if name.upper() in drop:
+                            dropped.append(name)
+                            continue
+                        kept.append(data_feed)
+                    if dropped:
+                        self.broker.set_datas(kept)
+                        runtime_log(
+                            "[Engine Warning] dropped option candidate feeds without live history: "
+                            f"{dropped}. Continue this run."
+                        )
 
                 if live_run_budget_expired(self.broker):
                     msg = "[Engine Error] Live run execution budget exhausted during data refresh; skipping strategy."
@@ -857,6 +890,7 @@ class LiveTrader:
             'total_feeds': 0,
             'updated_feeds': 0,
             'failed_feeds': 0,
+            'failed_symbols': [],
         }
         attempts_used = 0
 
@@ -872,9 +906,11 @@ class LiveTrader:
                 'total_feeds': total_feeds,
                 'updated_feeds': updated_feeds,
                 'failed_feeds': failed_feeds,
+                'failed_symbols': list(refresh_stats.get('failed_symbols') or []),
             }
+            required_failed, _optional_failed = self._classify_live_refresh_failures(last_stats)
 
-            if total_feeds <= 0 or failed_feeds <= 0:
+            if total_feeds <= 0 or not required_failed:
                 if attempt > 1:
                     print(
                         "[Engine] Live data refresh recovered "
@@ -922,21 +958,6 @@ class LiveTrader:
             result = reconciler()
         except Exception as exc:
             result = {'trusted': False, 'error': str(exc)}
-        def _option_risk_known(reconciliation):
-            """只依据账户/券商快照判断是否已有期权风险，不把期权数据 feed 当持仓。"""
-            if isinstance(reconciliation, dict) and 'has_options' in reconciliation:
-                return bool(reconciliation.get('has_options'))
-            getter = getattr(self.broker, 'get_option_risk_snapshot', None)
-            if not callable(getter):
-                return False
-            try:
-                snapshot = getter()
-            except Exception:
-                return False
-            if isinstance(snapshot, dict) and 'has_options' in snapshot:
-                return bool(snapshot.get('has_options'))
-            return False
-
         if not isinstance(result, dict) or result.get('trusted') is not True:
             detail = result.get('error') if isinstance(result, dict) else 'invalid settlement result'
             message = f'[Engine Error] clearing settlement snapshot is untrusted; option entries will be blocked. detail={detail}'
@@ -947,31 +968,19 @@ class LiveTrader:
             # 股票等非期权路径仍可继续。不能因缺少 has_options 字段而放行未知风险。
             block_entries(detail)
             return True
-        has_option_risk = _option_risk_known(result)
         if result.get('supported', True) is not True:
-            # 没有账户期权风险时，OpenD 无显式清算事件并不应阻断新的期权开仓。
-            if has_option_risk:
-                message = '[Engine Error] broker clearing state is unsupported; option entries are blocked.'
-                runtime_print(message)
-                if hasattr(self, 'alarm_manager') and self.alarm_manager:
-                    self.alarm_manager.push_text(message, level='ERROR')
-                block_entries('broker clearing state unsupported')
-                return True
-            clearer = getattr(self.broker, 'clear_option_entry_kill_switch', None)
-            if callable(clearer):
-                try:
-                    clearer(source='settlement')
-                except TypeError:
-                    pass
-        # 清算快照在本轮已可信且支持时，只清除清算来源的闸门，保留 Watchdog
-        # 或人工来源设置的其它阻断。
-        if result.get('supported', True) is True:
-            clearer = getattr(self.broker, 'clear_option_entry_kill_switch', None)
-            if callable(clearer):
-                try:
-                    clearer(source='settlement')
-                except TypeError:
-                    pass
+            # OpenD 没有清算事件流只表示不能回调指派，不把已有期权仓位当成开仓永久闸门。
+            runtime_print(
+                '[Engine Warning] broker clearing events unsupported; '
+                'continue without assignment callbacks.'
+            )
+        # 清算快照本轮可信时，只清除清算来源闸门，保留 Watchdog 或人工阻断。
+        clearer = getattr(self.broker, 'clear_option_entry_kill_switch', None)
+        if callable(clearer):
+            try:
+                clearer(source='settlement')
+            except TypeError:
+                pass
         events = []
         processed_events = getattr(self, '_processed_settlement_event_ids', None)
         if not isinstance(processed_events, set):
@@ -1097,6 +1106,151 @@ class LiveTrader:
         # 2. 转发给风控模块 (如果有)
         if self.risk_control:
             self.risk_control.notify_order(order)
+
+    def _expand_option_universe(self, symbols, *, live, as_of=None):
+        """按策略 option_universe 声明展开标的池；未声明时原样返回。"""
+        from data_providers.option_universe import expand_option_universe
+        if self._data_manager is None:
+            return list(symbols or [])
+        config_map = self.config if isinstance(self.config, dict) else {}
+        return expand_option_universe(
+            symbols,
+            strategy_class=self.strategy_class,
+            params=config_map.get("params") or {},
+            data_manager=self._data_manager,
+            specified_sources=config_map.get("data_source"),
+            start_date=config_map.get("start_date"),
+            end_date=config_map.get("end_date"),
+            live=live,
+            as_of=as_of,
+        )
+
+
+    def _classify_live_refresh_failures(self, refresh_stats):
+        """把刷新失败拆成必须跳过的标的，以及滚动期权候选上可丢弃的失败。"""
+        stats = refresh_stats if isinstance(refresh_stats, dict) else {}
+        failed_feeds = int(stats.get("failed_feeds", 0) or 0)
+        failed_symbols = [
+            str(symbol).strip()
+            for symbol in (stats.get("failed_symbols") or [])
+            if str(symbol).strip()
+        ]
+        if failed_feeds > 0 and not failed_symbols:
+            return ["*"], []
+
+        from common.options.universe import is_option_contract_symbol, resolve_option_universe_spec
+        rolling = resolve_option_universe_spec(
+            self.strategy_class,
+            (self.config or {}).get("params") if isinstance(self.config, dict) else None,
+        ) is not None
+        held, pending, pending_trusted, unknown = self._option_position_and_pending_symbols()
+        current = [
+            str(getattr(data, "_name", "") or "").strip()
+            for data in getattr(self.broker, "datas", []) or []
+        ]
+        protect = set(held)
+        if pending_trusted:
+            protect.update(pending)
+        else:
+            protect.update(item.upper() for item in current if item)
+
+        required_failed = []
+        optional_failed = []
+        for symbol in failed_symbols:
+            key = symbol.upper()
+            required = (not rolling) or (not is_option_contract_symbol(symbol)) or (key in protect)
+            if required:
+                required_failed.append(symbol)
+            elif key not in unknown:
+                # 未持仓且在途可信的滚动期权候选失败时，丢弃该合约并继续本轮。
+                optional_failed.append(symbol)
+            # unknown 既不跳过整轮，也不从 datas 丢掉，避免把查询失败当成空仓。
+        return required_failed, optional_failed
+
+    def _option_position_and_pending_symbols(self):
+        """读取当前期权相关持仓和在途委托代码。查询异常记入 unknown，供 universe 保留旧合约；不把未知仓位当成已确认持仓去跳过整轮。"""
+        held = set()
+        unknown = set()
+        for data in getattr(self.broker, "datas", []) or []:
+            getter = getattr(self.broker, "get_position", None) or getattr(self.broker, "getposition", None)
+            try:
+                position = getter(data) if callable(getter) else None
+                size = float(getattr(position, "size", 0) or 0)
+            except Exception:
+                size = None
+            name = str(getattr(data, "_name", "") or "").strip()
+            if name and size is None:
+                unknown.add(name.upper())
+            elif name and size != 0:
+                held.add(name.upper())
+        lister = getattr(self.broker, 'list_held_option_symbols', None)
+        if callable(lister):
+            try:
+                for symbol in lister() or []:
+                    name = str(symbol or '').strip()
+                    if name:
+                        held.add(name.upper())
+            except Exception:
+                # 账户期权清单失败时，仍保留 datas 内已查询到的持仓，不把整轮锁死。
+                pass
+        pending = set()
+        trusted = True
+        pending_getter = getattr(self.broker, "get_pending_orders", None)
+        if callable(pending_getter):
+            if getattr(self.broker, "_last_pending_orders_fetch_failed", False):
+                trusted = False
+            else:
+                try:
+                    for item in pending_getter() or []:
+                        symbol = str((item or {}).get("symbol") or "").strip()
+                        if symbol:
+                            pending.add(symbol.upper())
+                except Exception:
+                    trusted = False
+        return held, pending, trusted, unknown
+
+    def _sync_live_option_universe(self, context):
+        """实盘每个 slot 用当前链增补合约，并保留仍有仓位/在途的旧合约。"""
+        from common.options.universe import reconcile_live_option_symbols, resolve_option_universe_spec
+        if resolve_option_universe_spec(self.strategy_class, (self.config or {}).get("params")) is None:
+            return
+        source = list(self._resolved_symbols or self._determine_symbols() or [])
+        try:
+            discovered_all = self._expand_option_universe(
+                source, live=True, as_of=getattr(context, "now", None),
+            )
+        except ValueError as exc:
+            print(f"[Engine Warning] live option universe not updated: {exc}")
+            return
+        from common.options.universe import split_symbol_pool
+        _underlyings, discovered = split_symbol_pool(discovered_all)
+        held, pending, trusted, unknown = self._option_position_and_pending_symbols()
+        current = [str(getattr(data, "_name", "") or "") for data in getattr(self.broker, "datas", []) or []]
+        target = reconcile_live_option_symbols(
+            source,
+            discovered,
+            held_symbols=held | unknown,
+            pending_symbols=pending,
+            pending_trusted=trusted,
+            current_symbols=current,
+        )
+        existing = {
+            str(getattr(data, "_name", "") or ""): data
+            for data in getattr(self.broker, "datas", []) or []
+            if str(getattr(data, "_name", "") or "")
+        }
+        missing = [symbol for symbol in target if symbol not in existing]
+        timeframe = self.config.get("timeframe", "Days") if self.config else "Days"
+        compression = self.config.get("compression", 1) if self.config else 1
+        if missing:
+            fetched = self._fetch_all_history_data(
+                missing, context, is_live=True, timeframe=timeframe, compression=compression,
+            )
+            existing.update(fetched)
+            print(f"[Engine] Live option universe added: {list(fetched)}")
+        ordered = [existing[symbol] for symbol in target if symbol in existing]
+        if ordered:
+            self.broker.set_datas(ordered)
 
     def _determine_symbols(self) -> list:
         """根据最终配置决定交易的标的列表"""
@@ -1293,9 +1447,27 @@ class LiveTrader:
         total_feeds = len(data_feeds)
         updated_feeds = 0
         failed_feeds = 0
+        failed_symbols = []
+
+        def _mark_failed(symbol_name):
+            nonlocal failed_feeds
+            failed_feeds += 1
+            name = str(symbol_name or "").strip()
+            if name:
+                failed_symbols.append(name)
+
+        def _mark_remaining(start_index):
+            nonlocal failed_feeds
+            leftover = data_feeds[start_index:]
+            failed_feeds += len(leftover)
+            for item in leftover:
+                name = str(getattr(item, "_name", "") or "").strip()
+                if name:
+                    failed_symbols.append(name)
+
         for index, data_feed in enumerate(data_feeds):
             if live_run_budget_expired(self.broker):
-                failed_feeds += total_feeds - index
+                _mark_remaining(index)
                 print("[Engine Warning] Live data refresh stopped at the run deadline.")
                 break
             symbol = data_feed._name
@@ -1317,7 +1489,7 @@ class LiveTrader:
             # 部分实时行情只提供 OHLC；成交量缺失不能把整条可靠价格快照判为无效。
             new_df = sanitize_market_dataframe(new_df, require_ohlcv=False)
             if live_run_budget_expired(self.broker):
-                failed_feeds += total_feeds - index
+                _mark_remaining(index)
                 print(f"[Engine Warning] Live data refresh for {symbol} returned after the run deadline.")
                 break
 
@@ -1333,7 +1505,7 @@ class LiveTrader:
                         refreshed_df = refreshed_df[refreshed_df.index >= cutoff_ts]
                         if refreshed_df.empty:
                             print(f"  Warning: Rebased window is empty for {symbol}, keeping previous data.")
-                            failed_feeds += 1
+                            _mark_failed(symbol)
                             continue
                         data_feed.p.dataname = refreshed_df
                         if is_intraday:
@@ -1358,15 +1530,16 @@ class LiveTrader:
                         updated_feeds += 1
                 else:
                     print(f"  Warning: Cannot update data for {symbol}. Structure mismatch.")
-                    failed_feeds += 1
+                    _mark_failed(symbol)
             else:
                 print(f"  Warning: No new data fetched for {symbol} during refresh.")
-                failed_feeds += 1
+                _mark_failed(symbol)
 
         return {
             'total_feeds': total_feeds,
             'updated_feeds': updated_feeds,
             'failed_feeds': failed_feeds,
+            'failed_symbols': failed_symbols,
         }
 
     # 风控检查辅助方法
@@ -1442,11 +1615,12 @@ class LiveTrader:
                     # 关键点：订单正在交易所排队或处理中。
                     # 此时绝对不能再次发送订单，也不能清除状态。
                     self.broker.log(f"[Risk] Pending exit order for {data_name} is active. Waiting for execution...")
-                    triggered_action = True  # 标记为 True，告诉 engine 跳过 strategy.next()
+                    # 仅对该标的 lock_for_risk；run() 仍会执行 strategy.next()，让其他标的继续调仓。
+                    triggered_action = True
                     continue
 
                 else:
-                    # 其他未知状态，保守起见视为 Pending
+                    # 其他未知状态，保守起见视为 Pending，避免误清后重复发平仓单。
                     triggered_action = True
                     continue
 
@@ -1598,6 +1772,12 @@ class LiveTrader:
         if not symbols:
             print("[Engine Warning] Recovery skipped: selector returned no symbols.")
             return False
+        try:
+            symbols = self._expand_option_universe(
+                symbols, live=True, as_of=getattr(context, "now", None),
+            )
+        except ValueError as exc:
+            print(f"[Engine Warning] Recovery option universe expansion skipped: {exc}")
 
         timeframe = self.config.get('timeframe', 'Days')
         compression = self.config.get('compression', 1)
@@ -1783,14 +1963,40 @@ def on_order_status_callback(context, raw_order):
             if is_completed and exec_size > 0:
                 # 排除已被拒绝的废单(虽然废单size通常为0，为了严谨双重检查)
                 if not is_rejected and trade_push_key not in terminal_trade_push_dedupe:
+                    combo_effects = {
+                        str(item or '').upper()
+                        for item in (getattr(order_proxy, 'combo_effects', None) or ())
+                    }
+                    if is_combo_order:
+                        trade_action = 'COMBO_SELL' if 'SELL_TO_OPEN' in combo_effects else 'COMBO_BUY'
+                    elif is_buy_order:
+                        trade_action = 'BUY'
+                    elif is_sell_order:
+                        trade_action = 'SELL'
+                    else:
+                        trade_action = 'UNKNOWN'
                     trade_info = {
                         'symbol': order_proxy.data._name if order_proxy.data else "Unknown",
-                        'action': 'COMBO' if is_combo_order else 'BUY' if is_buy_order else 'SELL' if is_sell_order else 'UNKNOWN',
+                        'action': trade_action,
                         'price': order_proxy.executed.price,
                         'size': _extract_target_qty(order_proxy, fallback=order_proxy.executed.size),
                         'value': order_proxy.executed.value,
                         'dt': format_dt(exec_dt),
                     }
+                    payoff_summary = collect_option_fill_payoff_summary(
+                        broker,
+                        fill_symbol=trade_info['symbol'],
+                        fill_price=exec_price,
+                        fill_size=exec_size,
+                        order_effect=getattr(order_proxy, 'order_effect', None),
+                        is_buy=is_buy_order,
+                        is_sell=is_sell_order,
+                        is_combo=is_combo_order,
+                        fill_data=getattr(order_proxy, 'data', None),
+                        combo_legs=getattr(order_proxy, 'combo_legs', None),
+                    )
+                    if payoff_summary:
+                        trade_info['payoff_summary'] = payoff_summary
                     alarm_manager.push_trade(trade_info)
                     terminal_trade_push_dedupe.add(trade_push_key)
                     if len(terminal_trade_push_dedupe) > 5000:

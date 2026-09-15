@@ -397,6 +397,49 @@ class DataManager:
         print(f"Error: All data providers failed for symbol {symbol}.")
         return None
 
+    def get_option_chain(self, underlying: str, specified_sources: str = None, **kwargs):
+        """查询期权链；不走 CSV 缓存，失败时返回 None。"""
+        providers = []
+        if specified_sources:
+            for name in self._split_source_names(specified_sources):
+                try:
+                    provider = self._provider_for_source(name)
+                except Exception as exc:
+                    print(f"Error: Failed to construct data source {name!r}: {exc}")
+                    continue
+                if provider is not None:
+                    providers.append(provider)
+        else:
+            providers = list(self._all_provider_instances())
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_option_chain")
+            if method is None:
+                continue
+            call_kwargs = dict(kwargs)
+            try:
+                signature = inspect.signature(method)
+            except (TypeError, ValueError):
+                signature = None
+            if signature is not None and not any(
+                item.kind == inspect.Parameter.VAR_KEYWORD
+                for item in signature.parameters.values()
+            ):
+                call_kwargs = {
+                    key: value
+                    for key, value in call_kwargs.items()
+                    if key in signature.parameters
+                }
+            try:
+                result = method(underlying, **call_kwargs)
+            except TypeError:
+                continue
+            except Exception as exc:
+                print(f"[DataManager] option chain failed for {underlying}: {exc}")
+                continue
+            if result is not None:
+                return result
+        return None
+
     def _load_complete_cache(self, symbol, start_date, end_date, timeframe, compression, refresh):
         """读取覆盖请求窗口的缓存；缺口或刷新请求均返回 None。"""
         if not getattr(config, 'CACHE_DATA', False) or refresh:

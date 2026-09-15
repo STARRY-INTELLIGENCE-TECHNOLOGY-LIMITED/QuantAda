@@ -36,11 +36,11 @@
 6. 隔夜清理失败会最多重试 5 次；若仍未清空，在继续本轮执行前会记录详细日志并推送 ERROR 级别报警。
 7. `get_pending_orders` 统一契约要求包含 `id` 字段，并由适配器实现 `cancel_pending_order(order_id)` 支持按单撤单。
 8. 策略侧当前的等权调仓接口为 `execute_rebalance(target_symbols, top_k, rebalance_threshold)`；`target_symbols` 传 `data` 对象列表，不传权重字典。调仓时点统一使用 `rebalance_when`：固定频率可用 `bar/daily/weekly/monthly`，不定期正式调仓可用 `next/skip`。
-9. 策略轮动交易循环优先遍历 `self.broker.datas`，它就是当前策略加载的标的池；账户中未加载进该池的持仓默认自动忽略，不参与调仓或清仓。目标若仅与池内标的 venue 后缀不同，保留兼容映射并推送 WARNING 级 IM 后继续执行，这是有意的离席运行容错设计。
+9. 策略轮动交易循环优先遍历 `self.broker.datas`，它就是当前策略加载的标的池；账户中未加载进该池的持仓默认自动忽略，不参与调仓或清仓。目标若仅与池内标的已知 IBKR venue 后缀不同，保留兼容映射并推送 WARNING 级 IM 后继续执行；市场前缀代码必须精确匹配。`top_k` 是槽位数，多余目标会被截断。
 10. 实盘 adapter 模块只需暴露 Broker 类；`LiveTrader` 只反射 Broker，历史行情 Provider 由 `data_providers` 包和 `DataManager` 独立选择。
 11. 风控支持逗号分隔的多模块链式加载；`risk_params` 可为平铺 dict，也可为 `{risk_name: {...}}` 的 scoped 结构。
-12. 实盘引擎自愈基线：当轮 live data refresh 不完整会跳过执行；`datas` 为空会尝试恢复；每轮策略执行前的 pending 快照异常或不可信会失败关闭；僵尸 `strategy.order` 会自动清锁。
-13. live data refresh 不完整时，可在同一轮内做有限次重试；重试仍失败才跳过并告警。
+12. 实盘引擎自愈基线：必需行情 live data refresh 失败会跳过执行；滚动期权候选无 K 线只丢弃该合约；`datas` 为空会尝试恢复；每轮策略执行前的 pending 快照异常或不可信会失败关闭；僵尸 `strategy.order` 会自动清锁。
+13. live data refresh 只对必需失败做有限次重试；重试仍失败才跳过并告警。
 14. GM/IB 的 schedule 运行支持 prewarm；相关生成/修复应保留 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 15. schedule 附近的 IM 报警支持时间窗；默认用 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可按连接覆盖。
 16. 初次 `STARTED` 必须在 worker 进入 broker SDK 前发送，并在同一 worker 进程内去重；定时 `ALIVE` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。受监督 worker 内部重启和终止不推 `STOPPED` / `DEAD`；只有操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。`1d` schedule 在每个自然日正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`，非日线不发送；GM 维护期低频探测必须复用该恢复边界（更早 prewarm 优先），不得完全停探或让等待跨过下一 slot，且只允许存在于 live Phoenix 路径。

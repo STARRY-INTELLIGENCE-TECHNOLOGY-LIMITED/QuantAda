@@ -910,3 +910,114 @@ def test_positions_outside_symbol_pool_are_ignored_by_default(monkeypatch):
     assert outside_pool not in captured["current_positions"]
     assert outside_pool not in captured["plan"]["sell_clear"]
     assert captured["plan"]["sell_clear"] == [managed]
+
+
+def test_execute_rebalance_does_not_alias_futu_market_prefix(monkeypatch):
+    """HK.09988 不得被映射到池内第一只 HK 标的。"""
+    import common.order_executor as order_executor_module
+    import common.rebalancer as rebalancer_module
+
+    calculate_calls = []
+    pushed = []
+
+    def fake_calculate_plan(**kwargs):
+        calculate_calls.append(kwargs)
+        return {"sell_clear": [], "reduce": [], "increase": [], "target_per_stock": 0.0}
+
+    class DummyExecutor:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def execute_plan(self, plan):
+            return None
+
+    monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "calculate_plan", staticmethod(fake_calculate_plan))
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(
+        "strategies.base_strategy.runtime_notifications.push_text",
+        lambda content, level="INFO": pushed.append((content, level)) or True,
+    )
+
+    held = DummyData("HK.00700")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[held])
+    strategy = DummyStrategy(broker=broker, params={})
+
+    strategy.execute_rebalance(
+        target_symbols=[SimpleNamespace(_name="HK.09988")],
+        top_k=1,
+        rebalance_threshold=0.2,
+        rebalance_when="next",
+    )
+
+    assert calculate_calls[0]["target_symbols"] == []
+    assert any("unknown_targets" in content for content, _level in pushed)
+
+
+def test_execute_rebalance_truncates_targets_to_top_k(monkeypatch):
+    import common.order_executor as order_executor_module
+    import common.rebalancer as rebalancer_module
+
+    calculate_calls = []
+    pushed = []
+
+    def fake_calculate_plan(**kwargs):
+        calculate_calls.append(kwargs)
+        return {"sell_clear": [], "reduce": [], "increase": [], "target_per_stock": 0.0}
+
+    class DummyExecutor:
+        def __init__(self, broker):
+            self.broker = broker
+
+        def execute_plan(self, plan):
+            return None
+
+    monkeypatch.setattr(rebalancer_module.PortfolioRebalancer, "calculate_plan", staticmethod(fake_calculate_plan))
+    monkeypatch.setattr(order_executor_module, "OrderExecutor", DummyExecutor)
+    monkeypatch.setattr(
+        "strategies.base_strategy.runtime_notifications.push_text",
+        lambda content, level="INFO": pushed.append((content, level)) or True,
+    )
+
+    first = DummyData("AAPL.SMART")
+    second = DummyData("MSFT.SMART")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[first, second])
+    strategy = DummyStrategy(broker=broker, params={})
+
+    strategy.execute_rebalance(
+        target_symbols=[first, second],
+        top_k=1,
+        rebalance_threshold=0.2,
+        rebalance_when="next",
+    )
+
+    assert calculate_calls[0]["target_symbols"] == [first]
+    assert calculate_calls[0]["select_top_k"] == 1
+    assert any("超过 top_k" in content for content, _level in pushed)
+
+
+def test_strategy_isolated_capital_matches_venue_pending_bidirectionally():
+    data = DummyData("QQQ")
+    broker = DummyBroker(cash=1000.0, rebalance_cash=1000.0, datas=[data])
+    broker.getposition = lambda _data: SimpleNamespace(size=0.0, price=0.0)
+    broker.get_pending_orders = lambda: [
+        {"id": "1", "symbol": "QQQ.ISLAND", "direction": "BUY", "size": 2.0},
+    ]
+    strategy = DummyStrategy(broker=broker, params={})
+
+    _allocatable, positions = strategy.get_strategy_isolated_capital()
+    assert positions[data] == pytest.approx(200.0)
+
+
+def test_strategy_isolated_capital_does_not_mix_futu_market_prefix_pending():
+    held = DummyData("HK.00700")
+    other = DummyData("HK.09988")
+    broker = DummyBroker(cash=0.0, rebalance_cash=0.0, datas=[held, other])
+    broker.getposition = lambda _data: SimpleNamespace(size=0.0, price=0.0)
+    broker.get_pending_orders = lambda: [
+        {"id": "1", "symbol": "HK.00700", "direction": "BUY", "size": 1.0},
+    ]
+    strategy = DummyStrategy(broker=broker, params={})
+
+    _allocatable, positions = strategy.get_strategy_isolated_capital()
+    assert held in positions
+    assert other not in positions

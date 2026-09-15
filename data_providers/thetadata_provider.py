@@ -14,6 +14,7 @@ import math
 import os
 import re
 import threading
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -32,6 +33,14 @@ _MAX_AUTO_CHAIN_EXPIRATIONS = 16
 
 _OCC_RE = re.compile(r"^US\.([A-Z0-9]+?)(\d{6})([CP])(\d{8})$", re.IGNORECASE)
 _REQUIRED = ("open", "high", "low", "close", "volume")
+
+
+_VENDOR_TZ = ZoneInfo("America/New_York")
+
+
+def _vendor_today():
+    """Theta 历史接口按美东日历判断今天，避免本地日期把美东未结束交易日当成未来。"""
+    return _dt.datetime.now(_VENDOR_TZ).date()
 
 
 def _as_date(value):
@@ -152,6 +161,7 @@ class ThetaDataProvider(BaseDataProvider):
     """通过 ThetaData 获取美国股票和期权历史数据。"""
 
     PRIORITY = 45
+    HISTORICAL_OPTION_CHAIN = True
 
     @staticmethod
     def _option_multiplier():
@@ -438,7 +448,7 @@ class ThetaDataProvider(BaseDataProvider):
         start = _as_date(start_date)
         end = _as_date(end_date)
         if start is None and end is None:
-            end = _dt.date.today()
+            end = _vendor_today()
             start = end - _dt.timedelta(days=365)
         elif start is None:
             start = end - _dt.timedelta(days=365)
@@ -446,7 +456,7 @@ class ThetaDataProvider(BaseDataProvider):
             end = start + _dt.timedelta(days=365)
         if start > end:
             return None
-        today = _dt.date.today()
+        today = _vendor_today()
         requested_end = end
         if start > today:
             return None
@@ -607,7 +617,7 @@ class ThetaDataProvider(BaseDataProvider):
         return result
 
     def get_option_chain(self, underlying, expirations=None, normalized=False, as_of=None, start=None, end=None):
-        """获取 ThetaData 期权链快照；历史回测应传入当日可见的 ``as_of``。"""
+        """获取 ThetaData 期权链；传入 as_of 时走当日 EOD，未传时才用当前快照。"""
         if (start is not None or end is not None) and as_of is None:
             print("[ThetaData] historical option-chain requests require as_of to prevent lookahead")
             return None
@@ -616,6 +626,11 @@ class ThetaDataProvider(BaseDataProvider):
             return None
         code = raw_underlying.removeprefix("US.")
         if not code:
+            return None
+        as_of_date = _as_date(as_of)
+        if as_of is not None and as_of_date is None:
+            return None
+        if as_of_date is not None and as_of_date > _vendor_today():
             return None
         if expirations is None:
             raw_expirations = self._call("option_list_expirations", symbol=code)
@@ -627,16 +642,40 @@ class ThetaDataProvider(BaseDataProvider):
                 return None
             expiration_values = ThetaDataProvider._parse_timestamps(exp_df, exp_col)
             expirations = [x.date() for x in expiration_values.dropna().tolist()]
-            # 该接口返回从上市至今的全部到期日。自动发现时只请求仍可能
-            # 有快照的近月合约，避免标准订阅在数百个历史到期日上重复失败。
+            # 自动发现时只取 as_of/今天之后最近的到期日，避免在全部历史到期日上打满请求。
             if len(expirations) > _MAX_AUTO_CHAIN_EXPIRATIONS:
-                today = _dt.date.today()
-                future = sorted({value for value in expirations if value >= today})
+                cutoff = as_of_date or _vendor_today()
+                future = sorted({value for value in expirations if value >= cutoff})
                 if future:
                     expirations = future[:_MAX_AUTO_CHAIN_EXPIRATIONS]
         rows = []
         for expiration in expirations:
             frame = None
+            expiry = _as_date(expiration)
+            if as_of_date is not None:
+                # 历史链必须用当日 EOD，不能把当前 snapshot 伪装成 as_of。
+                for base_method in (
+                    "option_history_greeks_eod",
+                    "option_history_eod",
+                ):
+                    raw = self._call(
+                        base_method,
+                        symbol=code,
+                        expiration=expiry,
+                        start_date=as_of_date,
+                        end_date=as_of_date,
+                        strike="*",
+                        right="both",
+                    )
+                    candidate = _to_pandas(raw)
+                    if candidate is not None and not candidate.empty:
+                        frame = candidate
+                        break
+                if frame is not None and not frame.empty:
+                    frame = self._prepare_chain_frame(frame, code, expiry)
+                    frame["timestamp"] = pd.Timestamp(as_of_date, tz="UTC")
+                    rows.append(frame)
+                continue
             # Greeks all 需要 Professional；Standard 订阅仍可使用一阶 Greeks，
             # 再由 OHLC/OI 快照补齐成交与未平仓量字段。
             for base_method in (
@@ -647,7 +686,7 @@ class ThetaDataProvider(BaseDataProvider):
                 raw = self._call(
                     base_method,
                     symbol=code,
-                    expiration=_as_date(expiration),
+                    expiration=expiry,
                     strike="*",
                     right="both",
                 )
@@ -656,7 +695,7 @@ class ThetaDataProvider(BaseDataProvider):
                     frame = candidate
                     break
             if frame is not None and not frame.empty:
-                frame = self._prepare_chain_frame(frame, code, _as_date(expiration))
+                frame = self._prepare_chain_frame(frame, code, expiry)
                 for enrich_method in (
                     "option_snapshot_quote",
                     "option_snapshot_ohlc",
@@ -665,7 +704,7 @@ class ThetaDataProvider(BaseDataProvider):
                     enrich_raw = self._call(
                         enrich_method,
                         symbol=code,
-                        expiration=_as_date(expiration),
+                        expiration=expiry,
                         strike="*",
                         right="both",
                     )
@@ -673,7 +712,7 @@ class ThetaDataProvider(BaseDataProvider):
                     if enrich is not None and not enrich.empty:
                         frame = self._merge_chain_columns(
                             frame,
-                            self._prepare_chain_frame(enrich, code, _as_date(expiration)),
+                            self._prepare_chain_frame(enrich, code, expiry),
                         )
                 rows.append(frame)
         if not rows:
@@ -713,8 +752,13 @@ class ThetaDataProvider(BaseDataProvider):
         if parsed is None:
             return None
         root, expiry, strike, right = parsed
+        today = _vendor_today()
         start = _as_date(start_date) or expiry - _dt.timedelta(days=365)
-        end = _as_date(end_date) or _dt.date.today()
+        end = _as_date(end_date) or today
+        if start > today:
+            return None
+        if end > today:
+            end = today
         if start > end:
             return None
         normalized = str(timeframe or "").strip().lower()

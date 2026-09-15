@@ -125,6 +125,35 @@ def test_futu_short_option_can_only_use_buy_to_close_and_sell_to_open_is_blocked
     assert len(trade.place_calls) == 1
 
 
+def test_futu_short_option_negative_qty_is_signed_short():
+    option = 'US.AAPL260918P320000'
+    broker, _ = _broker(pd.DataFrame([{
+        'code': option,
+        'position_market': 'US',
+        'qty': -2,
+        'can_sell_qty': -2,
+        'average_cost': 10.0,
+    }]))
+    data = SimpleNamespace(_name=option)
+
+    assert broker.get_position(data).size == -2
+
+
+def test_futu_long_side_negative_qty_fails_closed():
+    option = 'US.AAPL260918P320000'
+    broker, _ = _broker(pd.DataFrame([{
+        'code': option,
+        'position_market': 'US',
+        'position_side': 'LONG',
+        'qty': -1,
+        'average_cost': 10.0,
+    }]))
+    data = SimpleNamespace(_name=option)
+
+    with pytest.raises(RuntimeError, match='conflicting long side'):
+        broker.get_position(data)
+
+
 def test_futu_broker_margin_snapshot_uses_real_cash_and_managed_underlying():
     broker, _ = _broker()
     data = SimpleNamespace(_name='US.AAPL')
@@ -296,6 +325,72 @@ def test_futu_spread_uses_combo_api_as_one_broker_order(monkeypatch):
     assert len(trade.combo_place_calls) == 1
     assert trade.place_calls == []
     assert broker._option_run_reservations["COMBO-1"]["remaining"] == 1
+
+
+def test_futu_close_spread_sends_integer_position_id(monkeypatch):
+    _enable_combo_api(monkeypatch)
+    short_symbol = 'US.AAPL260918P320000'
+    long_symbol = 'US.AAPL260918P300000'
+
+    class ComboTrade(_Trade):
+        def __init__(self):
+            super().__init__(pd.DataFrame([
+                {
+                    'code': short_symbol, 'position_market': 'US',
+                    'position_side': 'SHORT', 'qty': 1,
+                    'average_cost': 5.0, 'option_contract_multiplier': 100,
+                    'position_id': '12345',
+                },
+                {
+                    'code': long_symbol, 'position_market': 'US',
+                    'qty': 1, 'can_sell_qty': 1, 'average_cost': 1.0,
+                    'option_contract_multiplier': 100,
+                    'position_id': '67890',
+                },
+            ]))
+            self.combo_info_calls = []
+            self.combo_place_calls = []
+
+        def comboorder_tradinginfo_query(self, *args, **kwargs):
+            self.combo_info_calls.append((args, kwargs))
+            legs = args[0] if args else kwargs.get('combo_leg_list')
+            for leg in legs:
+                if getattr(leg, 'position_id', None) is None:
+                    raise TypeError("'str' object cannot be interpreted as an integer")
+                if not isinstance(leg.position_id, int):
+                    raise TypeError("'str' object cannot be interpreted as an integer")
+            return 0, pd.DataFrame([{'initial_margin_change': 0}])
+
+        def place_combo_order(self, *args, **kwargs):
+            self.combo_place_calls.append((args, kwargs))
+            return 0, pd.DataFrame([{
+                'order_id': 'COMBO-CLOSE-1',
+                'code': short_symbol,
+                'trd_side': 'BUY',
+                'order_status': 'SUBMITTED',
+                'qty': kwargs['qty'],
+                'price': kwargs['price'],
+            }])
+
+    trade = ComboTrade()
+    context = SimpleNamespace(
+        futu_trade_context=trade,
+        _futu_runtime_config={'FUTU_ACCOUNT_CURRENCY': 'USD'},
+    )
+    broker = FutuBrokerAdapter(context)
+    broker._contract_multipliers[short_symbol] = 100.0
+    broker._contract_multipliers[long_symbol] = 100.0
+    result = broker.submit_option_spread([
+        {'data': SimpleNamespace(_name=short_symbol), 'volume': 1,
+         'effect': 'BUY_TO_CLOSE', 'price': 1.2},
+        {'data': SimpleNamespace(_name=long_symbol), 'volume': 1,
+         'effect': 'SELL_TO_CLOSE', 'price': 0.4},
+    ])
+
+    assert result is not None
+    assert result.id == 'COMBO-CLOSE-1'
+    legs = trade.combo_info_calls[0][0][0]
+    assert sorted(leg.position_id for leg in legs) == [12345, 67890]
 
 
 def test_futu_close_spread_rejects_mismatched_contract_multiplier(monkeypatch):
@@ -588,6 +683,25 @@ def test_futu_csp_cash_ignores_margin_buying_power_and_uses_cash_field():
     assert broker.get_option_uncommitted_cash() == 5_000
 
 
+def test_futu_csp_cash_uses_account_currency_cash_not_usd_bucket():
+    class MixedCurrency(_Trade):
+        def accinfo_query(self, **_kwargs):
+            return 0, pd.DataFrame([{
+                'usd_net_cash_power': 6.53,
+                'us_cash': 6.32,
+                'available_funds': 'N/A',
+                'cash': 2683.61,
+                'total_assets': 2648.33,
+            }])
+
+    broker, _ = _broker()
+    broker._trade_ctx = MixedCurrency()
+    broker.trade_ctx = broker._trade_ctx
+    broker.trd_ctx = broker._trade_ctx
+
+    assert float(broker.get_option_uncommitted_cash()) == pytest.approx(2683.61)
+
+
 def test_futu_non_option_rebalance_keeps_normal_cash_semantics():
     class PowerOnly(_Trade):
         def accinfo_query(self, **_kwargs):
@@ -603,3 +717,65 @@ def test_futu_non_option_rebalance_keeps_normal_cash_semantics():
     broker.trd_ctx = broker._trade_ctx
 
     assert broker.get_rebalance_cash() == 100_000
+
+
+def test_futu_get_position_reuses_short_lived_all_position_snapshot(monkeypatch):
+    option = "US.AAPL260918P320000"
+    broker, trade = _broker(pd.DataFrame([{
+        "code": option,
+        "position_market": "US",
+        "position_side": "SHORT",
+        "qty": 2,
+        "average_cost": 10.0,
+    }]))
+    calls = {"count": 0}
+    original = trade.position_list_query
+
+    def wrapped(**kwargs):
+        calls["count"] += 1
+        return original(**kwargs)
+
+    trade.position_list_query = wrapped
+    clock = {"now": 100.0}
+    monkeypatch.setattr(futu_module.time, "monotonic", lambda: clock["now"])
+    data = SimpleNamespace(_name=option)
+    other = SimpleNamespace(_name="US.AAPL")
+    assert broker.get_position(data).size == -2
+    clock["now"] = 104.0
+    assert broker.get_position(other).size == 0
+    assert calls["count"] == 1
+    clock["now"] = 100.0 + futu_module._POSITION_SNAPSHOT_CACHE_SECONDS + 0.1
+    assert broker.get_position(data).size == -2
+    assert calls["count"] == 2
+
+def test_list_held_option_symbols_includes_short_put():
+    option = "US.MARA261016P9000"
+    broker, _trade = _broker(pd.DataFrame([{
+        "code": option,
+        "position_market": "US",
+        "position_side": "SHORT",
+        "qty": 1,
+        "average_cost": 0.40,
+        "option_contract_multiplier": 100,
+    }]))
+    assert option in broker.list_held_option_symbols()
+
+
+def test_option_multiplier_uses_snapshot_when_not_in_datas():
+    option = "US.MARA261016P9000"
+    broker, _trade = _broker()
+    broker.datas = []
+    broker._contract_multipliers.clear()
+
+    class Quote:
+        def get_market_snapshot(self, symbols):
+            assert symbols == [option]
+            return 0, pd.DataFrame([{
+                "code": option,
+                "option_contract_multiplier": 100,
+            }])
+
+    broker._get_quote_context = lambda: Quote()
+    assert broker._option_multiplier_for_symbol(option) == 100.0
+    assert broker._contract_multipliers[option] == 100.0
+

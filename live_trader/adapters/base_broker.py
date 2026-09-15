@@ -23,6 +23,7 @@ from common.order_quantity import (
     subtract_quantities,
     sum_quantities,
 )
+from common.symbols import symbols_match
 
 from ..data_bridge.data_warm import BrokerDataWarmBridge
 
@@ -1473,8 +1474,8 @@ class BaseLiveBroker(ABC):
             for po in pending_orders:
                 sym = str(po['symbol']).upper()
                 data_name = data._name.upper()
-                # 兼容 QQQ.ISLAND 和 QQQ 的匹配
-                if sym == data_name or sym == data_name.split('.')[0]:
+                # 只匹配已知 venue 后缀别名，避免 HK.00700 误吃到 HK.09988 的在途单。
+                if symbols_match(sym, data_name):
                     pending_size = decimal_quantity(po.get('size', 0), absolute=True)
                     if str(po.get('direction', '')).upper() == 'BUY':
                         expected_parts.append(pending_size)

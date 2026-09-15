@@ -1536,3 +1536,35 @@ def test_manual_force_reset_recovery():
     assert broker.get_cash() == pytest.approx(real_cash), (
         "强制重置后可用现金未恢复到真实余额，虚拟账本仍在错误占资！"
     )
+
+
+def test_expected_size_matches_venue_pending_bidirectionally():
+    broker = MockBroker(initial_cash=100000.0)
+    data = _make_data("QQQ")
+    broker.submitted_orders.append(
+        {
+            "id": "ORDER_VENUE",
+            "side": "BUY",
+            "volume": 10,
+            "symbol": "QQQ.ISLAND",
+            "status": "Submitted",
+        }
+    )
+
+    assert broker.get_expected_size(data) == 10
+
+
+def test_expected_size_does_not_mix_futu_market_prefix_pending():
+    broker = MockBroker(initial_cash=100000.0)
+    broker.submitted_orders.append(
+        {
+            "id": "ORDER_HK",
+            "side": "BUY",
+            "volume": 100,
+            "symbol": "HK.00700",
+            "status": "Submitted",
+        }
+    )
+
+    assert broker.get_expected_size(_make_data("HK.00700")) == 100
+    assert broker.get_expected_size(_make_data("HK.09988")) == 0

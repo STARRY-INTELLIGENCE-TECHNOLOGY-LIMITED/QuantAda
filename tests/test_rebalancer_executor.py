@@ -1743,3 +1743,51 @@ def test_order_executor_treats_backtest_benign_sell_skip_as_noop_and_continues_b
     assert "SELL order not submitted" not in out
     assert "Planned BUY orders are skipped" not in out
     assert pushed == []
+
+
+def test_calculate_plan_truncates_targets_to_select_top_k(monkeypatch):
+    import common.rebalancer as rebalancer_module
+
+    monkeypatch.setattr(rebalancer_module.config, "PRINT_PLAN", False)
+
+    class DummyData:
+        def __init__(self, name):
+            self._name = name
+
+    first = DummyData("AAA")
+    second = DummyData("BBB")
+    third = DummyData("CCC")
+    plan = rebalancer_module.PortfolioRebalancer.calculate_plan(
+        current_positions={},
+        target_symbols=[first, second, third],
+        total_capital=1000.0,
+        select_top_k=2,
+        rebalance_threshold=0.0,
+    )
+
+    assert plan["target_per_stock"] == 500.0
+    assert [item[0]._name for item in plan["increase"]] == ["AAA", "BBB"]
+
+
+def test_order_executor_matches_venue_pending_buy_bidirectionally():
+    from common.order_executor import OrderExecutor
+
+    class Broker:
+        def get_pending_orders(self):
+            return [{"id": "1", "symbol": "QQQ.ISLAND", "direction": "BUY", "size": 10}]
+
+    executor = OrderExecutor(Broker())
+    assert executor._has_remote_pending_buy(SimpleNamespace(_name="QQQ")) is True
+    assert executor._has_remote_pending_buy(SimpleNamespace(_name="MSFT")) is False
+
+
+def test_order_executor_does_not_treat_futu_market_prefix_as_same_symbol():
+    from common.order_executor import OrderExecutor
+
+    class Broker:
+        def get_pending_orders(self):
+            return [{"id": "1", "symbol": "HK.00700", "direction": "BUY", "size": 100}]
+
+    executor = OrderExecutor(Broker())
+    assert executor._has_remote_pending_buy(SimpleNamespace(_name="HK.00700")) is True
+    assert executor._has_remote_pending_buy(SimpleNamespace(_name="HK.09988")) is False

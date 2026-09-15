@@ -296,6 +296,43 @@ def test_engine_does_not_treat_option_data_feeds_as_existing_option_risk():
     assert trader._reconcile_option_settlement() is True
 
 
+
+def test_engine_does_not_block_entries_when_clearing_events_unsupported_with_option_risk():
+    from live_trader.engine import LiveTrader
+
+    class Broker:
+        is_live = True
+
+        def __init__(self):
+            self.blocks = {}
+
+        def reconcile_option_settlement(self):
+            return {
+                "trusted": True,
+                "supported": False,
+                "has_options": True,
+                "events": (),
+            }
+
+        def set_option_entry_kill_switch(self, blocked, *, reason="", source="manual"):
+            if blocked:
+                self.blocks[source] = reason
+            else:
+                self.blocks.pop(source, None)
+
+        def clear_option_entry_kill_switch(self, source="manual"):
+            self.blocks.pop(source, None)
+
+    broker = Broker()
+    trader = object.__new__(LiveTrader)
+    trader.broker = broker
+    trader.alarm_manager = None
+    trader._processed_settlement_event_ids = set()
+
+    assert trader._reconcile_option_settlement() is True
+    assert "settlement" not in broker.blocks
+
+
 def test_engine_blocks_option_entries_when_settlement_snapshot_is_untrusted_without_presence_flag():
     from live_trader.engine import LiveTrader
 
@@ -520,3 +557,102 @@ def test_futu_risk_snapshot_rejects_negative_gamma_fact():
     broker.close()
 
     assert snapshot["trusted"] is False
+
+
+def test_futu_risk_snapshot_accepts_negative_qty_short_option():
+    from live_trader.adapters.futu_broker import FutuBrokerAdapter
+
+    option = "US.AAPL260918P320000"
+    now = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %H:%M:%S")
+
+    class Trade:
+        def accinfo_query(self, **_kwargs):
+            return 0, pd.DataFrame([{
+                "cash": 10_000, "total_assets": 10_000, "initial_margin": 1_000,
+            }])
+
+        def position_list_query(self, **_kwargs):
+            return 0, pd.DataFrame([{
+                "code": option, "position_market": "US", "qty": -1,
+                "can_sell_qty": -1, "average_cost": 5.0,
+                "option_contract_multiplier": 100,
+            }])
+
+        def order_list_query(self, **_kwargs):
+            return 0, pd.DataFrame()
+
+    class Quote:
+        def get_market_snapshot(self, _codes):
+            return 0, pd.DataFrame([
+                {"code": option, "bid_price": 4.9, "ask_price": 5.1, "last_price": 5,
+                 "option_gamma": 0.02, "option_contract_multiplier": 100,
+                 "update_time": now},
+                {"code": "US.AAPL", "last_price": 300, "update_time": now},
+            ])
+
+    broker = FutuBrokerAdapter(SimpleNamespace(
+        futu_trade_context=Trade(), futu_quote_context=Quote(),
+        _futu_runtime_config={"FUTU_ACCOUNT_CURRENCY": "USD"},
+    ))
+    snapshot = broker.get_option_risk_snapshot()
+    broker.close()
+
+    assert snapshot["trusted"] is True
+    assert snapshot["has_options"] is True
+    assert snapshot["portfolio_gamma"] == -0.02 * 100
+
+
+def test_futu_risk_snapshot_skips_invalid_non_option_row():
+    from live_trader.adapters.futu_broker import FutuBrokerAdapter
+
+    class Trade:
+        def accinfo_query(self, **_kwargs):
+            return 0, pd.DataFrame([{"cash": 10_000, "total_assets": 10_000}])
+
+        def position_list_query(self, **_kwargs):
+            return 0, pd.DataFrame([
+                {"code": "US.AAPL", "position_market": "US", "qty": 10},
+                {"code": "USDJPY", "qty": 1, "average_cost": "N/A"},
+            ])
+
+        def order_list_query(self, **_kwargs):
+            return 0, pd.DataFrame()
+
+    broker = FutuBrokerAdapter(SimpleNamespace(
+        futu_trade_context=Trade(),
+        _futu_runtime_config={"FUTU_ACCOUNT_CURRENCY": "USD"},
+    ))
+    snapshot = broker.get_option_risk_snapshot()
+    broker.close()
+
+    assert snapshot["trusted"] is True
+    assert snapshot["has_options"] is False
+
+
+def test_futu_risk_snapshot_still_untrusted_on_invalid_option_row():
+    from live_trader.adapters.futu_broker import FutuBrokerAdapter
+
+    option = "US.AAPL260918P320000"
+
+    class Trade:
+        def accinfo_query(self, **_kwargs):
+            return 0, pd.DataFrame([{"cash": 10_000, "total_assets": 10_000}])
+
+        def position_list_query(self, **_kwargs):
+            return 0, pd.DataFrame([
+                {"code": "US.AAPL", "position_market": "US", "qty": 10},
+                {"code": option, "position_market": "US", "qty": 1},
+            ])
+
+        def order_list_query(self, **_kwargs):
+            return 0, pd.DataFrame()
+
+    broker = FutuBrokerAdapter(SimpleNamespace(
+        futu_trade_context=Trade(),
+        _futu_runtime_config={"FUTU_ACCOUNT_CURRENCY": "USD"},
+    ))
+    snapshot = broker.get_option_risk_snapshot()
+    broker.close()
+
+    assert snapshot["trusted"] is False
+    assert "position row invalid" in snapshot["error"]

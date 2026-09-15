@@ -534,6 +534,7 @@ class OptimizationJob:
             self.risk_control_classes = shared_context["risk_control_classes"]
             self.data_manager = shared_context["data_manager"]
             self.target_symbols = shared_context["target_symbols"]
+            self._source_symbols = list(shared_context.get("source_symbols", self.target_symbols) or [])
             self.raw_datas = shared_context["raw_datas"]
             self.train_datas = shared_context["train_datas"]
             self.test_datas = shared_context["test_datas"]
@@ -586,6 +587,7 @@ class OptimizationJob:
         if not self.target_symbols:
             print("\nError: No symbols found for optimization.")
             sys.exit(1)
+        self._source_symbols = list(self.target_symbols)
 
         self.raw_datas = self._fetch_all_data()
         self.train_datas, self.test_datas, self.train_range, self.test_range = self._split_data()
@@ -605,6 +607,7 @@ class OptimizationJob:
             "risk_control_classes": self.risk_control_classes,
             "data_manager": self.data_manager,
             "target_symbols": self.target_symbols,
+            "source_symbols": getattr(self, "_source_symbols", self.target_symbols),
             "raw_datas": self.raw_datas,
             "train_datas": self.train_datas,
             "test_datas": self.test_datas,
@@ -1119,6 +1122,19 @@ class OptimizationJob:
                 print(f"  => Fetching data from {req_fetch_start} to {req_end}")
 
         self._raw_data_fetch_range = (req_fetch_start, req_end)
+
+        from data_providers.option_universe import expand_option_universe
+        source_symbols = list(getattr(self, "_source_symbols", self.target_symbols) or [])
+        self.target_symbols = expand_option_universe(
+            source_symbols,
+            strategy_class=self.strategy_class,
+            params=self.fixed_params,
+            data_manager=self.data_manager,
+            specified_sources=getattr(self.args, "data_source", None),
+            start_date=req_fetch_start,
+            end_date=req_end,
+            live=False,
+        )
 
         datas = {}
         for symbol in self.target_symbols:

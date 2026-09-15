@@ -57,7 +57,7 @@
 - `@classmethod` `launch(cls, conn_cfg: dict, strategy_path: str, params: dict, **kwargs)`: [可选实现] 命令行实盘启动入口，负责初始化券商 SDK、建立连接并挂载事件循环。
 - 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
 - 多账户券商的现金、持仓、pending 和下单必须使用同一明确账户。GM adapter 当前只支持券商会话绑定的单一账户，使用 SDK 默认单账户语义，不增加账户选择配置；IB 等多账户 adapter 仍须按其连接配置明确筛选目标账户。明确筛选目标账户后，其他账户有仓而目标账户为空属于合法零仓，不能误报为快照故障。
-- schedule 只兼容 `1d|Nm|Nh:HH:MM[:SS]`；配置 `Ns` 必须明确报错，并引导使用长连接事件回调与 `timeframe='Seconds'`。分钟级事件循环轮询和 SDK 超时必须随周期缩短，不能让一次调用跨过下一轮。
+- schedule 只兼容 `1d|Nm|Nh[:HH:MM[:SS]]`；省略时刻时默认 `00:00:00`。配置 `Ns` 必须明确报错，并引导使用长连接事件回调与 `timeframe='Seconds'`。分钟级事件循环轮询和 SDK 超时必须随周期缩短，不能让一次调用跨过下一轮。
 - `DataProvider` 不参与 Broker 的运行时选择。策略使用引擎注入的 Provider，Provider 实现和数据源凭据处理必须放在 `data_providers` 包中。
 
 ---

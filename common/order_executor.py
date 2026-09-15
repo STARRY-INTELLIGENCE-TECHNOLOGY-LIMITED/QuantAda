@@ -15,6 +15,7 @@ from common.order_quantity import (
     quantity_at_most,
     subtract_quantities,
 )
+from common.symbols import symbols_match
 
 
 class OrderExecutor:
@@ -265,11 +266,7 @@ class OrderExecutor:
         return str(value or '').strip().upper()
 
     def _symbol_matches_data(self, symbol, data):
-        symbol_key = self._symbol_key(symbol)
-        data_key = self._symbol_key(data)
-        if not symbol_key or not data_key:
-            return False
-        return symbol_key == data_key or symbol_key == data_key.split('.')[0]
+        return symbols_match(symbol, data)
 
     def _has_pending_buy(self, data):
         data_key = self._symbol_key(data)

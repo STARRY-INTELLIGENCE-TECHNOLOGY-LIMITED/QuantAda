@@ -92,7 +92,24 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     print(f"  Initial Cash: {cash:,.2f}")
     print(f"  Commission: {commission:.4f}")
 
-    # --- 3. 获取数据 ---
+    strategy_class = get_class_from_name(strategy_filename, ['strategies'])
+    try:
+        from data_providers.option_universe import expand_option_universe
+        symbols = expand_option_universe(
+            symbols,
+            strategy_class=strategy_class,
+            params=params,
+            data_manager=data_manager,
+            specified_sources=data_source,
+            start_date=start_date,
+            end_date=end_date,
+            live=False,
+        )
+    except ValueError as exc:
+        print(f"\nFatal: {exc}")
+        return
+    print(f"  Tradable symbols: {', '.join(str(item) for item in symbols)}")
+
     print("\n--- Fetching Data ---")
     print(f"  Requesting data from: {start_date or 'origin'} to {end_date or 'latest'}")
 
@@ -119,7 +136,6 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
 
     # --- 4. 初始化回测器并运行 ---
     print("\n--- Initializing Backtester ---")
-    strategy_class = get_class_from_name(strategy_filename, ['strategies'])
 
     risk_control_classes = []
     if risk_filename:

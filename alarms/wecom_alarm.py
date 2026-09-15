@@ -80,8 +80,15 @@ class WeComAlarm(BaseAlarm):
 
     def push_trade(self, order_info: dict):
         action = order_info.get('action')
-        color = "warning" if action == 'SELL' else "info"
-        action_text = "🔴 卖出" if action == 'SELL' else "🟢 买入"
+        if action in {'SELL', 'COMBO_SELL'}:
+            color = "warning"
+            action_text = "🔴 卖出" if action == 'SELL' else "🔴 组合"
+        elif action in {'COMBO', 'COMBO_BUY'}:
+            color = "info"
+            action_text = "🟢 组合"
+        else:
+            color = "info"
+            action_text = "🟢 买入"
 
         md_text = f"""### <font color=\"{color}\">{action_text} 成交通知</font>
 **标的**: {order_info.get('symbol')}
@@ -90,6 +97,9 @@ class WeComAlarm(BaseAlarm):
 **金额**: {order_info.get('value', 0):.2f}
 **时间**: <font color=\"comment\">{order_info.get('dt')}</font>
 """
+        payoff_summary = str(order_info.get("payoff_summary") or "").strip()
+        if payoff_summary:
+            md_text = md_text.rstrip() + "\n" + payoff_summary + "\n"
         payload = {
             "msgtype": "markdown",
             "markdown": {"content": md_text}

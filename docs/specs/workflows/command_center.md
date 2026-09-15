@@ -28,7 +28,7 @@ Futu 变量还必须包含 `FUTU_ACCOUNT_ID`、`FUTU_ACCOUNT_INDEX` 和 `FUTU_AC
 
 策略字段使用单一可编辑组合框，允许手动输入任意模块路径，也可从目录建议中选择，避免输入框与下拉框割裂。新建配置默认不填策略；策略输入或选择后，工作台静态读取项目内源码的类级 `params` 并填充策略参数列表，读取失败时保留手动编辑能力。
 
-工作台可通过 `--source-root`/`--strategy-root` 或请求中的 `source_root` 指定外部策略仓库。源码分析允许该根目录内的任意 Python 文件；执行命令时将源码根目录加入子进程 `PYTHONPATH`，并把外部文件路径转换为模块引用。未配置外部根目录而引用不存在的私有模块时，命令生成必须给出明确警告。
+工作台可通过 `--source-root`/`--strategy-root` 或请求中的 `source_root` 指定外部策略仓库。源码分析允许该根目录内的任意 Python 文件；执行命令时将源码根目录加入子进程 `PYTHONPATH`，并把外部文件路径转换为模块引用。未配置 `source_root` 时，命令生成应继续检查当前项目和 `PYTHONPATH` 中的模块；私有命令集仍无法解析时直接抛错，公开方案保留明确警告。
 
 `--params`、`--risk_params`、`--config` 和 `--opt_params` 使用 Python 字典字面量，由 `repr(dict)` 生成，以兼容 `run.py` 的 `ast.literal_eval`。
 

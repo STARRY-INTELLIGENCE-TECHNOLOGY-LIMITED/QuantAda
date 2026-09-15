@@ -237,6 +237,23 @@ def _format_number(value, currency=""):
     return f"{currency}{value:,.2f}"
 
 
+def format_payoff_fill_summary(analysis: PayoffAnalysis) -> str:
+    """把到期损益压缩成成交推送附录，只保留现货价、最大盈亏和平衡点。"""
+    if analysis.spot is not None:
+        spot_text = f"{analysis.spot:,.2f}"
+    else:
+        spot_text = "未提供"
+    breakeven_text = (
+        ", ".join(f"{value:,.2f}" for value in analysis.breakevens) or "无"
+    )
+    return "\n".join([
+        f"- 现货参考价：{spot_text}",
+        f"- 最大盈利：{_format_number(analysis.max_profit, analysis.currency)}",
+        f"- 最大亏损：{_format_number(analysis.max_loss, analysis.currency)}",
+        f"- 盈亏平衡点：{breakeven_text}",
+    ])
+
+
 def format_payoff_plan(title, analysis: PayoffAnalysis, legs=()):
     """把损益分析转换为适合 IM Plan 的 Markdown 文本。"""
     def ranges(values, unbounded=False):
@@ -288,5 +305,6 @@ __all__ = [
     "PayoffAnalysis",
     "payoff_at_expiry",
     "analyze_payoff",
+    "format_payoff_fill_summary",
     "format_payoff_plan",
 ]

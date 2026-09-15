@@ -110,6 +110,7 @@ _CONTEXT_INIT_TIMEOUT_SECONDS = 5.0
 _QUERY_TIMEOUT_SECONDS = 5.0
 _QUOTE_CONTEXT_RETRY_BACKOFF_SECONDS = 5.0
 _FX_RATE_CACHE_SECONDS = 30.0
+_POSITION_SNAPSHOT_CACHE_SECONDS = 8.0
 _MARKET_CURRENCIES = {
     'HK': 'HKD',
     'SH': 'CNH',
@@ -279,6 +280,20 @@ def _enum_name(value):
     """读取 SDK 枚举或字符串的稳定大写名称。"""
     raw = getattr(value, 'value', value)
     return _text(raw).upper().replace('-', '_').replace(' ', '_')
+
+
+_FUTU_BUY_SIDES = frozenset({'BUY', 'BUY_BACK'})
+_FUTU_SELL_SIDES = frozenset({'SELL', 'SELL_SHORT'})
+
+
+def _order_direction(value):
+    """把 Futu 买卖方向归一成 BUY/SELL；平空 BUY_BACK 视为买入。"""
+    side = _enum_name(value)
+    if side in _FUTU_BUY_SIDES:
+        return 'BUY'
+    if side in _FUTU_SELL_SIDES:
+        return 'SELL'
+    return side
 
 
 def _rows(value):
@@ -671,10 +686,10 @@ class FutuOrderProxy(BaseOrderProxy):
         return self.is_pending()
 
     def is_buy(self) -> bool:
-        return _enum_name(_field(self.raw_order, ('trd_side', 'side', 'action'), '')) == 'BUY'
+        return _order_direction(_field(self.raw_order, ('trd_side', 'side', 'action'), '')) == 'BUY'
 
     def is_sell(self) -> bool:
-        return _enum_name(_field(self.raw_order, ('trd_side', 'side', 'action'), '')) == 'SELL'
+        return _order_direction(_field(self.raw_order, ('trd_side', 'side', 'action'), '')) == 'SELL'
 
     def signed_position_delta(self, filled_size=None):
         """返回已成交部分对应的 signed position 增量。"""
@@ -891,6 +906,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
         # 组合回调可能不携带腿明细，按订单 ID 保留本次提交的腿映射。
         self._combo_order_legs = {}
         self._fx_rate_cache = {}
+        self._position_rows_cache = None
+        self._position_rows_cache_lock = threading.Lock()
         self._quote_context_retry_at = 0.0
 
         if self._trade_ctx is None:
@@ -904,6 +921,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
         """跨 bar 清理短期 CSP 受理标记，下一轮重新以券商快照重建。"""
         if self._datetime is not None and dt != self._datetime:
             self._option_run_reservations.clear()
+            self._clear_position_rows_cache()
         return super().set_datetime(dt)
 
     @staticmethod
@@ -986,19 +1004,21 @@ class FutuBrokerAdapter(BaseLiveBroker):
         return math.isfinite(age) and age >= -5.0 and age <= max_age
 
     def _cash_field_names(self):
-        """返回账户计价币种对应的实时购买力字段，并保留旧版字段回退。"""
+        """返回账户计价币种现金；币种分桶字段仅在总额缺失时回退。"""
         currency = self._account_currency_name()
         specific = _CURRENCY_CASH_FIELDS.get(currency, ())
         # power 是含保证金假设的最大购买力，不等同于可用现金，不能作为现金回退。
-        return tuple(specific) + ('available_funds', 'net_cash_power', 'cash')
+        # cash 已是账户计价币种总额（含其它币种折算）；us_cash / usd_net_cash_power
+        # 只是美元桶剩余，排在前面会把多币种账户误判成几美元。
+        return ('available_funds', 'cash') + tuple(specific) + ('net_cash_power',)
 
     def _settled_cash_field_names(self):
         """返回不含购买力/保证金字段的现金字段。"""
         currency = self._account_currency_name()
-        # ``available_funds`` 是现金字段；明确排除 ``*_net_cash_power`` 和
-        # ``net_cash_power``，后者可能包含券商保证金购买力。
-        return tuple(_CURRENCY_SETTLED_CASH_FIELDS.get(currency, ())) + (
-            'cash', 'available_funds'
+        # 账户计价币种 cash 优先；us_cash 只是美元现金桶，不能挡住折算后的总额。
+        # 明确排除 ``*_net_cash_power`` 和 ``net_cash_power``，后者可能含保证金。
+        return ('cash', 'available_funds') + tuple(
+            _CURRENCY_SETTLED_CASH_FIELDS.get(currency, ())
         )
 
     def _fetch_settled_cash(self) -> float:
@@ -1835,8 +1855,13 @@ class FutuBrokerAdapter(BaseLiveBroker):
             self._last_position_snapshot_fetch_error = exc
             raise
 
-    def _query_all_position_rows(self):
-        """查询同一账户全部仓位，供账户级期权义务盘点使用。"""
+    def _clear_position_rows_cache(self):
+        """丢弃短时仓位快照，下一笔查询回到券商事实。"""
+        with self._position_rows_cache_lock:
+            self._position_rows_cache = None
+
+    def _fetch_all_position_rows(self):
+        """直接查询同一账户全部仓位，不读短时缓存。"""
         context = self._get_trade_context()
         if context is None:
             raise RuntimeError('Futu trade context is unavailable')
@@ -1865,6 +1890,19 @@ class FutuBrokerAdapter(BaseLiveBroker):
             self._last_position_snapshot_fetch_error = exc
             raise
 
+
+    def _query_all_position_rows(self):
+        """查询同一账户全部仓位；短时复用快照，避免期权池逐标的打满限额。"""
+        now = time.monotonic()
+        with self._position_rows_cache_lock:
+            cached = self._position_rows_cache
+            if cached is not None and now - cached[0] <= _POSITION_SNAPSHOT_CACHE_SECONDS:
+                return list(cached[1])
+        rows = self._fetch_all_position_rows()
+        with self._position_rows_cache_lock:
+            self._position_rows_cache = (time.monotonic(), list(rows))
+        return list(rows)
+
     def _option_multiplier_for_symbol(self, symbol, row=None):
         """从仓位、缓存或已加载 data 读取真实期权乘数；缺失即失败关闭。"""
         normalized = _normalise_symbol(symbol)
@@ -1882,7 +1920,39 @@ class FutuBrokerAdapter(BaseLiveBroker):
             parsed = _decimal(value, None)
             if parsed is not None and parsed > 0:
                 return float(parsed)
+        refreshed = self._refresh_option_multiplier_from_snapshot(normalized)
+        if refreshed is not None and refreshed > 0:
+            return float(refreshed)
         raise RuntimeError(f'Futu option contract multiplier unavailable: {normalized}')
+
+    def _refresh_option_multiplier_from_snapshot(self, symbol):
+        """用 Futu 实时快照补齐期权乘数；没有可信元数据时返回 None。"""
+        normalized = _normalise_symbol(symbol)
+        quote_context = self._get_quote_context() if normalized else None
+        if quote_context is None:
+            return None
+        try:
+            with self._context_lock:
+                response = quote_context.get_market_snapshot([normalized])
+            if not isinstance(response, tuple) or len(response) < 2 or response[0] != RET_OK:
+                return None
+            for row in _rows(response[1]):
+                row_symbol = _normalise_symbol(
+                    _field(row, ('code', 'symbol'), ''),
+                    _field(row, 'market', ''),
+                )
+                if not row_symbol or row_symbol != normalized:
+                    continue
+                self._cache_contract_multiplier(row_symbol, row)
+                parsed = _option_multiplier_from_row(row)
+                if parsed is not None and parsed > 0:
+                    return float(parsed)
+                cached = _decimal(self._contract_multipliers.get(normalized), None)
+                if cached is not None and cached > 0:
+                    return float(cached)
+            return None
+        except Exception:
+            return None
 
     @staticmethod
     def _pending_remaining_quantity(row):
@@ -1907,6 +1977,33 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 return Decimal('0')
             raise RuntimeError('Futu pending order has no verifiable remaining quantity')
         return remaining
+
+    def list_held_option_symbols(self):
+        """列出账户中已确认的期权持仓代码，供实盘滚动池保留链外旧合约。"""
+        symbols = []
+        seen = set()
+        for row in self._query_all_position_rows():
+            signed_qty = None
+            option_type = None
+            try:
+                record = self._position_record(row)
+                symbol = _normalise_symbol(record.get('symbol', ''))
+                signed_qty = record.get('signed_qty')
+                option_type = record.get('option_type')
+            except Exception:
+                raw_code = _field(row, ('code', 'symbol', 'stock_code'), '')
+                market_hint = _field(row, ('position_market', 'market'), '')
+                symbol = _normalise_symbol(raw_code, market_hint)
+            key = symbol.upper()
+            if not symbol or key in seen:
+                continue
+            if option_type not in {'PUT', 'CALL'} and not self._is_option_symbol(symbol):
+                continue
+            if signed_qty == 0:
+                continue
+            seen.add(key)
+            symbols.append(symbol)
+        return symbols
 
     def get_option_assignment_obligations(self):
         """从真实短 Put、pending 卖开 Put 和当前 run 受理量重建指派义务。"""
@@ -2074,8 +2171,16 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 break
         if qty is None:
             raise RuntimeError(f'Futu position has invalid quantity: {raw_qty!r}')
+        position_side = _enum_name(_field(row, 'position_side', ''))
         if qty < 0:
-            raise RuntimeError(f'Futu position has negative quantity: {raw_qty!r}')
+            # Futu 空仓可用负数量表示方向；张数取绝对值。与 LONG 同时出现视为柜台事实冲突。
+            if position_side == 'LONG':
+                raise RuntimeError(
+                    f'Futu position has conflicting long side with negative quantity: {raw_qty!r}'
+                )
+            qty = abs(qty)
+            if position_side not in {'SHORT', 'SHORT_SELL', 'SHORTSELL'}:
+                position_side = 'SHORT'
         raw_sellable = None
         sellable = None
         invalid_sellable = None
@@ -2122,7 +2227,6 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 if candidate is not None and candidate > 0:
                     raw_multiplier = candidate
                     break
-        position_side = _enum_name(_field(row, 'position_side', ''))
         is_short = position_side in {'SHORT', 'SHORT_SELL', 'SHORTSELL'}
         if (
             option_detail
@@ -2153,7 +2257,9 @@ class FutuBrokerAdapter(BaseLiveBroker):
         # COMBINED/带 combo_id 的记录仍按代码解析；get_position() 会对同一标的
         # 的腿记录做精确聚合，不再把组合持仓误判为不可用快照。
         if sellable is not None and sellable < 0:
-            raise RuntimeError(f'Futu position has negative sellable quantity: {raw_sellable!r}')
+            if not is_short:
+                raise RuntimeError(f'Futu position has negative sellable quantity: {raw_sellable!r}')
+            sellable = abs(sellable)
         return {
             'symbol': symbol,
             'qty': qty,
@@ -2184,7 +2290,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
         target = _normalise_symbol(getattr(data, '_name', ''))
         if not target:
             raise RuntimeError('Futu position query requires data._name')
-        rows = self._query_position_rows(target)
+        rows = self._query_all_position_rows()
         target_rows = []
         for row in rows:
             row_symbol = _normalise_symbol(
@@ -2377,20 +2483,20 @@ class FutuBrokerAdapter(BaseLiveBroker):
             for row in self._query_order_rows():
                 order_id = _text(_field(row, ('order_id', 'orderId', 'id'), ''))
                 symbol = _symbol_from_order(row)
-                side = _enum_name(_field(row, ('trd_side', 'side', 'action'), ''))
                 status = _enum_name(_field(row, ('order_status', 'status'), ''))
                 if not order_id or order_id.upper() in {'N/A', 'NA', 'NONE', 'NAN', 'NULL'}:
                     raise RuntimeError('Futu pending order is missing order_id')
                 if not symbol:
                     raise RuntimeError(f'Futu pending order is missing code: id={order_id!r}')
-                if side not in {'BUY', 'SELL'}:
-                    raise RuntimeError(
-                        f'Futu pending order has unknown direction: id={order_id!r}, side={side!r}'
-                    )
                 if not status:
                     raise RuntimeError(f'Futu pending order is missing status: id={order_id!r}')
                 if status in self._TERMINAL_STATUSES:
                     continue
+                side = _order_direction(_field(row, ('trd_side', 'side', 'action'), ''))
+                if side not in {'BUY', 'SELL'}:
+                    raise RuntimeError(
+                        f'Futu pending order has unknown direction: id={order_id!r}, side={side!r}'
+                    )
                 if status not in self._PENDING_STATUSES:
                     raise RuntimeError(
                         f'Futu pending order has unknown non-terminal status: id={order_id!r}, status={status!r}'
@@ -2436,11 +2542,18 @@ class FutuBrokerAdapter(BaseLiveBroker):
                         {
                             'symbol': _normalise_symbol(_field(item, ('code', 'symbol'), '')),
                             'effect': None,
-                            'direction': _enum_name(_field(item, ('trd_side', 'side'), '')),
+                            'direction': _order_direction(_field(item, ('trd_side', 'side'), '')),
                         }
                         for item in raw_combo_legs
                     ]
-                combo_type = _enum_name(_field(row, ('order_type', 'combo_type', 'order_kind'), ''))
+                combo_type = ' '.join(
+                    part
+                    for part in (
+                        _enum_name(_field(row, ('order_type',), '')),
+                        _enum_name(_field(row, ('combo_type', 'order_kind', 'strategy_type'), '')),
+                    )
+                    if part
+                )
                 combo_ref = _text(_field(row, ('combo_id', 'combo_order_id'), ''))
                 combo_marked = (
                     combo_ref.upper() not in {'', '0', 'NONE', 'N/A'}
@@ -2466,7 +2579,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
                             effect = normalize_option_order_effect(effect)
                             leg_direction = order_effect_side(effect)
                         else:
-                            leg_direction = _enum_name(leg.get('direction', ''))
+                            leg_direction = _order_direction(leg.get('direction', ''))
                         if leg_direction not in {'BUY', 'SELL'}:
                             raise RuntimeError(
                                 f'Futu combo pending leg has unknown direction: id={order_id!r}'
@@ -2719,6 +2832,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 self._runtime_log(message)
                 runtime_notifications.push_text(message, level='ERROR')
                 return None
+            self._clear_position_rows_cache()
             proxy.submitted_size = quantity_number(quantity)
             proxy.requested_size = quantity_number(quantity)
             if side_name == 'BUY':
@@ -3009,8 +3123,11 @@ class FutuBrokerAdapter(BaseLiveBroker):
                 combo_leg.code = item['symbol']
                 combo_leg.trd_side = _enum_value(TrdSide, 'SELL' if item['effect'] in {'SELL_TO_OPEN', 'SELL_TO_CLOSE'} else 'BUY', 'SELL')
                 combo_leg.qty_ratio = 1.0
-                if closing and item['position_id']:
-                    combo_leg.position_id = item['position_id']
+                if closing:
+                    # Futu protobuf 的 positionID 是整数；字符串会在 trading-info 打包时抛 TypeError。
+                    parsed_pid = _decimal(item.get('position_id'), None)
+                    if parsed_pid is not None and parsed_pid > 0 and parsed_pid == parsed_pid.to_integral_value():
+                        combo_leg.position_id = int(parsed_pid)
                 combo_legs.append(combo_leg)
             trading_info = getattr(context, 'comboorder_tradinginfo_query', None)
             if not callable(trading_info):
@@ -3092,6 +3209,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
             if not proxy.id:
                 raise RuntimeError('Futu combo order returned no order id')
             self._combo_order_legs[str(proxy.id)] = tuple(dict(item) for item in normalized)
+            self._clear_position_rows_cache()
             proxy.submitted_size = quantity_number(quantity)
             proxy.requested_size = quantity_number(quantity)
             if short is not None:
@@ -3181,7 +3299,16 @@ class FutuBrokerAdapter(BaseLiveBroker):
             try:
                 record = self._position_record(raw_row)
             except Exception as exc:
-                return {'trusted': False, 'supported': True, 'has_options': False,
+                raw_code = _field(raw_row, ('code', 'symbol', 'stock_code'), '')
+                market_hint = _field(raw_row, ('position_market', 'market'), '')
+                symbol = _normalise_symbol(raw_code, market_hint)
+                if symbol and not self._is_option_symbol(symbol):
+                    runtime_print(
+                        f'[FutuBroker] skip non-option position row {symbol}: {exc}'
+                    )
+                    continue
+                return {'trusted': False, 'supported': True,
+                        'has_options': bool(symbol),
                         'error': f'position row invalid: {exc}'}
             if record.get('option_type') not in {'PUT', 'CALL'}:
                 continue
@@ -3606,7 +3733,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
             if parsed_schedule is None:
                 raise ValueError(
                     f'Unsupported Futu schedule format: {schedule_rule}; '
-                    'expected 1d|Nm|Nh:HH:MM[:SS].'
+                    'expected 1d|Nm|Nh[:HH:MM[:SS]].'
                 )
 
         timezone_name = conn_cfg.get('timezone')
