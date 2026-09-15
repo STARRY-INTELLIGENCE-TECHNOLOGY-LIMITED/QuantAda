@@ -1123,18 +1123,20 @@ class OptimizationJob:
 
         self._raw_data_fetch_range = (req_fetch_start, req_end)
 
-        from data_providers.option_universe import expand_option_universe
-        source_symbols = list(getattr(self, "_source_symbols", self.target_symbols) or [])
-        self.target_symbols = expand_option_universe(
-            source_symbols,
-            strategy_class=self.strategy_class,
-            params=self.fixed_params,
-            data_manager=self.data_manager,
-            specified_sources=getattr(self.args, "data_source", None),
-            start_date=req_fetch_start,
-            end_date=req_end,
-            live=False,
-        )
+        strategy_class = getattr(self, "strategy_class", None)
+        if strategy_class is not None:
+            from data_providers.option_universe import expand_option_universe
+            source_symbols = list(getattr(self, "_source_symbols", self.target_symbols) or [])
+            self.target_symbols = expand_option_universe(
+                source_symbols,
+                strategy_class=strategy_class,
+                params=getattr(self, "fixed_params", None) or {},
+                data_manager=self.data_manager,
+                specified_sources=getattr(self.args, "data_source", None),
+                start_date=req_fetch_start,
+                end_date=req_end,
+                live=False,
+            )
 
         datas = {}
         for symbol in self.target_symbols:

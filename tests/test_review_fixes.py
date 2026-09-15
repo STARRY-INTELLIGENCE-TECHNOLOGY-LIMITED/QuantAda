@@ -81,7 +81,7 @@ def test_futu_combined_option_positions_are_aggregated():
 
     symbol = "US.AAPL260918P320000"
     broker = object.__new__(FutuBrokerAdapter)
-    broker._query_position_rows = lambda _code: [
+    broker._query_all_position_rows = lambda: [
         {
             "code": symbol,
             "position_market": "US",
@@ -103,7 +103,7 @@ def test_futu_option_position_without_side_or_sellable_fails_closed():
 
     symbol = "US.AAPL260918P320000"
     broker = object.__new__(FutuBrokerAdapter)
-    broker._query_position_rows = lambda _code: [{
+    broker._query_all_position_rows = lambda: [{
         "code": symbol,
         "position_market": "US",
         "qty": 1,
@@ -121,7 +121,7 @@ def test_futu_combined_non_option_position_is_not_silently_dropped():
     from live_trader.adapters.futu_broker import FutuBrokerAdapter
 
     broker = object.__new__(FutuBrokerAdapter)
-    broker._query_position_rows = lambda _code: [{
+    broker._query_all_position_rows = lambda: [{
         "code": "US.AAPL", "position_market": "US", "position_type": "COMBINED",
         "combo_id": "combo-stock", "qty": 2, "can_sell_qty": 2, "average_cost": 100,
     }]
@@ -455,6 +455,7 @@ def test_futu_option_lot_size_cannot_be_used_as_contract_multiplier():
         "lot_size": 1,
     }]
     broker._query_order_rows = lambda: []
+    broker._get_quote_context = lambda: None
 
     import pytest
 
