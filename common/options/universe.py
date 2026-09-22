@@ -15,6 +15,7 @@ DEFAULT_AS_OF_STEP_DAYS = 7
 DEFAULT_DELTA_BUFFER = 0.05
 MAX_CANDIDATES_PER_SNAPSHOT = 64
 MAX_UNION_PER_UNDERLYING = 256
+HISTORICAL_MAX_UNION_PER_UNDERLYING = 1024
 _DELTA_PARAM_NAMES = ("min_delta", "max_delta", "protective_put_delta")
 
 
@@ -116,6 +117,13 @@ def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
             delta_values.append(number)
     min_delta = min(delta_values) if delta_values else None
     max_delta = max(delta_values) if delta_values else None
+    protective_delta = _finite_param(merged, "protective_put_delta")
+    delta_targets = None
+    if min_delta is not None and max_delta is not None and protective_delta is not None:
+        delta_targets = (
+            (float(min_delta) + float(max_delta)) / 2.0,
+            float(protective_delta),
+        )
     min_open_interest = _finite_param(
         overrides if "min_open_interest" in overrides else merged,
         "min_open_interest",
@@ -130,6 +138,7 @@ def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
         "max_dte": max_dte,
         "min_delta": min_delta,
         "max_delta": max_delta,
+        "delta_targets": delta_targets,
         "min_open_interest": float(min_open_interest),
     }
 
@@ -207,9 +216,18 @@ def select_chain_candidates(chain, *, as_of, spec: dict, limit: int = MAX_CANDID
     min_delta = spec.get("min_delta")
     max_delta = spec.get("max_delta")
     min_open_interest = float(spec.get("min_open_interest") or 0.0)
+    target_deltas = []
+    raw_targets = spec.get("delta_targets")
+    if raw_targets:
+        for raw_target in raw_targets:
+            target = safe_number(raw_target)
+            if target == target:
+                target_deltas.append(float(target))
     target_delta = None
     if min_delta is not None and max_delta is not None:
         target_delta = (float(min_delta) + float(max_delta)) / 2.0
+    if not target_deltas and target_delta is not None:
+        target_deltas = [target_delta]
 
     scored = []
     for _, row in chain.iterrows():
@@ -238,14 +256,36 @@ def select_chain_candidates(chain, *, as_of, spec: dict, limit: int = MAX_CANDID
         if open_interest != open_interest or open_interest < min_open_interest:
             continue
         strike = safe_number(row.get("strike"), 0.0)
-        delta_distance = abs(delta - target_delta) if target_delta is not None and delta == delta else 0.0
-        scored.append((delta_distance, strike if strike == strike else 0.0, symbol))
+        target_index = 0
+        if target_deltas and delta == delta:
+            distances = [abs(delta - target) for target in target_deltas]
+            target_index = min(range(len(distances)), key=lambda index: distances[index])
+            delta_distance = distances[target_index]
+        else:
+            delta_distance = 0.0
+        scored.append((
+            delta_distance,
+            strike if strike == strike else 0.0,
+            symbol,
+            target_index,
+        ))
 
     scored.sort(key=lambda item: (item[0], item[1], item[2]))
-    cap = max(1, int(limit or MAX_CANDIDATES_PER_SNAPSHOT))
+    cap = max(len(target_deltas), 1, int(limit or MAX_CANDIDATES_PER_SNAPSHOT))
     unique = []
     seen = set()
-    for _distance, _strike, symbol in scored:
+    # 每个 Delta 锚点至少保留一个最近候选；剩余名额再按整体距离填充。
+    # PCS 的保护腿因此不会被短腿中心附近的合约全部挤掉。
+    prioritized = []
+    for target_index in range(len(target_deltas)):
+        candidate = next(
+            (item for item in scored if item[3] == target_index),
+            None,
+        )
+        if candidate is not None:
+            prioritized.append(candidate)
+    ordered = prioritized + [item for item in scored if item not in prioritized]
+    for _distance, _strike, symbol, _target_index in ordered:
         key = symbol.upper()
         if key in seen:
             continue
@@ -313,6 +353,7 @@ __all__ = [
     "DEFAULT_AS_OF_STEP_DAYS",
     "MAX_CANDIDATES_PER_SNAPSHOT",
     "MAX_UNION_PER_UNDERLYING",
+    "HISTORICAL_MAX_UNION_PER_UNDERLYING",
     "historical_as_of_dates",
     "is_option_contract_symbol",
     "merge_universe_symbols",

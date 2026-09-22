@@ -15,10 +15,10 @@ LIVE_RUN_MAX_EXECUTION_SECONDS = 600
 # 年交易日，如果是加密货币请设置为365
 ANNUAL_FACTOR = 252
 
-# 数据缓存路径
+# 运行时数据根目录。行情 CSV 缓存在 DATA_PATH/market_cache/，日志等其它文件仍可放在根下。
 DATA_PATH = '.data'
 
-# 缓存数据；启用后单一显式在线 data_source 会优先复用完整 CSV 缓存。
+# 缓存数据；启用后单一显式在线 data_source 会优先复用 market_cache 中的完整 CSV。
 # 使用 --refresh 可绕过缓存重新拉取并合并，显式 data_source=csv 仍可离线读取。
 CACHE_DATA = False
 

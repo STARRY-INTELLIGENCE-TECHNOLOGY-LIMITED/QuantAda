@@ -26,17 +26,20 @@ from __future__ import annotations
 
 from common.options.analytics import safe_number
 from common.options.risk import OptionRiskLeg
-from strategies.base_strategy import BaseStrategy
-from strategies.options.support import (
+from common.data_view import (
     bar_datetime,
-    dte_days,
-    iter_option_rows,
-    matches_chain_window,
-    option_limit_price,
     pending_symbols,
     position_price,
     position_size,
     require_close_column,
+)
+from strategies.base_strategy import BaseStrategy
+from strategies.options.support import (
+    dte_days,
+    iter_option_rows,
+    matches_chain_window,
+    option_limit_price,
+    reserved_underlying_keys,
     underlying_feed,
 )
 
@@ -88,7 +91,7 @@ class SampleCoveredCallStrategy(BaseStrategy):
             return
         pending = pending_symbols(self.broker)
         candidates = []
-        occupied = set()
+        occupied = reserved_underlying_keys(self.broker, {"CALL"})
 
         for data, _row, meta, quote in iter_option_rows(self.broker, current_dt, {"CALL"}):
             symbol = meta["symbol"]

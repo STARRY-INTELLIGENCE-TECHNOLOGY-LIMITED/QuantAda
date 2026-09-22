@@ -105,8 +105,9 @@ def calculate_winning_trade_mae(closed_trades):
     """
     计算最终以正 PnL 平仓的交易的 MAE。
 
-    MAE 遵循约定公式：
-    lowest_price_during_trade / entry_price - 1
+    多头和空头都用负值表示逆向偏移：
+    - 多头：lowest_price_during_trade / entry_price - 1
+    - 空头：entry_price / highest_price_during_trade - 1
     """
     maes = []
     winning_trade_count = 0
@@ -118,11 +119,22 @@ def calculate_winning_trade_mae(closed_trades):
 
         winning_trade_count += 1
         entry_price = _to_finite_float(_get_trade_field(trade, "entry_price"))
-        lowest_price = _to_finite_float(_get_trade_field(trade, "lowest_price_during_trade"))
-        if entry_price is None or entry_price <= 0 or lowest_price is None:
+        side = str(_get_trade_field(trade, "side", "long") or "long").lower()
+        if side == "short":
+            adverse_price = _to_finite_float(
+                _get_trade_field(trade, "highest_price_during_trade")
+            )
+        else:
+            adverse_price = _to_finite_float(
+                _get_trade_field(trade, "lowest_price_during_trade")
+            )
+        if entry_price is None or entry_price <= 0 or adverse_price is None or adverse_price <= 0:
             continue
 
-        maes.append(lowest_price / entry_price - 1.0)
+        if side == "short":
+            maes.append(entry_price / adverse_price - 1.0)
+        else:
+            maes.append(adverse_price / entry_price - 1.0)
 
     return {
         "winning_trade_count": winning_trade_count,

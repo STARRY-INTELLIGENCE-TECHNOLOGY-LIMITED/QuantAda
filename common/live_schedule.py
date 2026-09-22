@@ -15,7 +15,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from common.live_runtime import runtime_print
-from live_trader.data_bridge.data_warm import SchedulePlanner
+from common.schedule_planner import SchedulePlanner
 
 
 class LiveScheduleRunner:
@@ -44,8 +44,11 @@ class LiveScheduleRunner:
             if self.parsed_schedule is None:
                 raise ValueError(
                     f'Unsupported schedule format: {self.schedule_rule}; '
-                    'expected 1d|Nm|Nh[:HH:MM[:SS]].'
+                    'expected Nd|Nw|Nm|Nh[:HH:MM[:SS]].'
                 )
+            SchedulePlanner.assert_repeating_live_schedule(
+                self.parsed_schedule, self.schedule_rule
+            )
         if self.parsed_schedule is not None and not isinstance(self.parsed_schedule, dict):
             raise ValueError('parsed_schedule must be a schedule dictionary or None')
         if self.parsed_schedule is not None and not self.schedule_rule:

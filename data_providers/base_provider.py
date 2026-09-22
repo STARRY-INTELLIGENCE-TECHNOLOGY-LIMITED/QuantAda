@@ -3,6 +3,10 @@ from abc import ABC, abstractmethod
 import pandas as pd
 
 
+# 数据源瞬时失败的默认总尝试次数；作为模块常量，不另开配置项。
+REQUEST_ATTEMPTS = 5
+
+
 class BaseDataProvider(ABC):
     """
     数据提供者的抽象基类
@@ -28,3 +32,7 @@ class BaseDataProvider(ABC):
         且以'datetime'为索引
         """
         pass
+
+    def close(self) -> None:
+        """关闭 Provider 持有的连接；无状态 Provider 默认无需处理。"""
+        return None

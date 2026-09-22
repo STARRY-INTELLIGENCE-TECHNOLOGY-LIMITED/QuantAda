@@ -43,18 +43,21 @@ python run.py strategies.options.sample_long_option_strategy.SampleLongCallStrat
 from __future__ import annotations
 
 from common.options.analytics import safe_number
+from common.data_view import (
+    bar_datetime,
+    pending_symbols,
+    position_price,
+    position_size,
+    require_close_column,
+)
 from strategies.base_strategy import BaseStrategy
 from strategies.options.support import (
-    bar_datetime,
     chain_window_reject_reason,
     dte_days,
     iter_option_rows,
     matches_chain_window,
     option_limit_price,
-    pending_symbols,
-    position_price,
-    position_size,
-    require_close_column,
+    reserved_underlying_keys,
 )
 
 
@@ -101,7 +104,7 @@ class _SampleLongOptionStrategy(BaseStrategy):
         wanted = str(self.option_type).upper()
         candidates = []
         rejects = {}
-        occupied = set()
+        occupied = reserved_underlying_keys(self.broker, {wanted})
         option_rows = 0
 
         for data, _row, meta, quote in iter_option_rows(self.broker, current_dt, {wanted}):

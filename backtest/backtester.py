@@ -267,6 +267,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         # 回测撮合通常同步完成，但 Backtrader 的通知与策略回调仍可能跨一个
         # bar，必须按订单生命周期保留该短期账本，防止同一 bar 重复卖开。
         self._option_cash_reservations = {}
+        self._option_spread_seq = 0
         self.dataclose = self.datas[0].close
         self.strategy = strategy_class(broker=self, params=params)
         self.risk_controls = []
@@ -411,6 +412,23 @@ class BacktraderStrategyWrapper(bt.Strategy):
         )
         from common.options.risk import compute_option_margin
 
+        def annotate(order, **extra):
+            if order is None:
+                return None
+            payload = {
+                "option_order_effect": effect,
+            }
+            for key in ("option_spread_id", "option_spread_leg"):
+                value = kwargs.get(key)
+                if value is not None:
+                    payload[key] = value
+            payload.update(extra)
+            try:
+                order.addinfo(**payload)
+            except Exception:
+                pass
+            return order
+
         try:
             effect = normalize_option_order_effect(order_effect)
             quantity = float(volume)
@@ -507,16 +525,13 @@ class BacktraderStrategyWrapper(bt.Strategy):
             order = self.sell(data=data, size=quantity, price=price)
             if order is None:
                 return None
-            try:
-                order.addinfo(
-                    option_order_effect=effect,
-                    option_assignment_cash=required,
-                    option_strike=strike,
-                    option_contract_multiplier=multiplier,
-                    option_requested_quantity=quantity,
-                )
-            except Exception:
-                pass
+            annotate(
+                order,
+                option_assignment_cash=required,
+                option_strike=strike,
+                option_contract_multiplier=multiplier,
+                option_requested_quantity=quantity,
+            )
             if option_type in {'PUT', 'P'}:
                 self._option_cash_reservations[str(order.ref)] = {
                     'strike': strike,
@@ -528,11 +543,14 @@ class BacktraderStrategyWrapper(bt.Strategy):
                 }
             return order
         if effect == 'BUY_TO_CLOSE':
-            return self.buy(data=data, size=quantity, price=price)
+            return annotate(self.buy(data=data, size=quantity, price=price))
         if effect == 'BUY_TO_OPEN':
-            return self.buy(data=data, size=quantity, price=price)
+            return annotate(
+                self.buy(data=data, size=quantity, price=price),
+                option_contract_multiplier=float(self.get_contract_multiplier(data)),
+            )
         if effect == 'SELL_TO_CLOSE':
-            return self.sell(data=data, size=quantity, price=price)
+            return annotate(self.sell(data=data, size=quantity, price=price))
         return None
 
     def submit_option_spread(self, legs, volume=1, **kwargs):
@@ -540,6 +558,9 @@ class BacktraderStrategyWrapper(bt.Strategy):
         if not isinstance(legs, (list, tuple)) or len(legs) != 2:
             self._last_order_target_skip_reason = 'invalid_option_spread'
             return None
+        spread_seq = int(self.__dict__.get("_option_spread_seq", 0)) + 1
+        self._option_spread_seq = spread_seq
+        spread_id = f"spread:{spread_seq}"
         prepared = []
         try:
             quantity = float(volume)
@@ -747,9 +768,11 @@ class BacktraderStrategyWrapper(bt.Strategy):
         spread_kwargs = dict(kwargs)
         if risk_legs:
             spread_kwargs['_spread_risk_legs'] = risk_legs
-        for data, effect, price, risk_leg, leg_kwargs in prepared:
+        for leg_index, (data, effect, price, risk_leg, leg_kwargs) in enumerate(prepared):
             order_kwargs = dict(spread_kwargs)
             order_kwargs.update(leg_kwargs)
+            order_kwargs["option_spread_id"] = spread_id
+            order_kwargs["option_spread_leg"] = leg_index
             order = self.submit_option_order(
                 data,
                 quantity,
@@ -1237,11 +1260,87 @@ class Backtester:
             print(msg)
 
     def _init_data_feeds(self):
+        """注册行情。短命期权对齐正股时钟；缺 K 与到期后补 0，避免把旧价当成当日报价。"""
+        from common.options.analytics import parse_option_symbol
+
+        start = pd.to_datetime(self.start_date) if self.start_date else None
+        end = pd.to_datetime(self.end_date) if self.end_date else None
+        underlyings = {}
+        options = {}
+        skipped_empty = 0
+
+        def _naive_frame(df):
+            frame = df
+            if not isinstance(frame.index, pd.DatetimeIndex):
+                frame = frame.copy(deep=False)
+                frame.index = pd.to_datetime(frame.index, errors="coerce")
+            if isinstance(frame.index, pd.DatetimeIndex) and frame.index.tz is not None:
+                frame = frame.copy(deep=False)
+                frame.index = frame.index.tz_convert("UTC").tz_localize(None)
+            return frame[~frame.index.isna()] if isinstance(frame.index, pd.DatetimeIndex) else frame
+
+        def _in_window(frame):
+            visible = frame
+            if start is not None:
+                visible = visible[visible.index >= start]
+            if end is not None:
+                visible = visible[visible.index <= end]
+            return visible
+
         for symbol, df in self.datas.items():
+            if df is None or getattr(df, "empty", True):
+                skipped_empty += 1
+                continue
+            frame = _naive_frame(df)
+            visible = _in_window(frame)
+            if visible.empty:
+                skipped_empty += 1
+                continue
+            if parse_option_symbol(symbol).get("option_type"):
+                options[symbol] = frame
+            else:
+                underlyings[symbol] = frame
+        if skipped_empty:
+            self.log(f"  Skipped {skipped_empty} empty data feeds outside the backtest window.")
+        clock = None
+        for frame in underlyings.values():
+            visible = _in_window(frame)
+            clock = visible.index if clock is None else clock.union(visible.index)
+        if clock is not None:
+            clock = clock.sort_values()
+        prepared = {}
+        for symbol in self.datas:
+            if symbol in underlyings:
+                prepared[symbol] = underlyings[symbol]
+            elif symbol in options:
+                frame = options[symbol]
+                if clock is not None:
+                    aligned = frame.reindex(clock)
+                    expiry = parse_option_symbol(symbol).get("expiry")
+                    expiry_day = None if expiry is None else pd.Timestamp(expiry)
+                    if expiry_day is not None and not pd.isna(expiry_day):
+                        expiry_day = expiry_day.tz_localize(None) if expiry_day.tzinfo is not None else expiry_day
+                        expiry_day = expiry_day.normalize()
+                    clock_days = pd.DatetimeIndex(pd.to_datetime(aligned.index, errors="coerce")).tz_localize(None) if getattr(aligned.index, "tz", None) is not None else pd.DatetimeIndex(pd.to_datetime(aligned.index, errors="coerce"))
+                    clock_days = clock_days.normalize()
+                    alive = pd.Series(True, index=aligned.index)
+                    if expiry_day is not None:
+                        alive = pd.Series(clock_days <= expiry_day, index=aligned.index)
+                    for column in ("open", "high", "low", "close", "bid", "ask", "bid_price", "ask_price", "last"):
+                        if column not in aligned.columns:
+                            continue
+                        series = pd.to_numeric(aligned[column], errors="coerce")
+                        series = series.where(alive, 0.0).fillna(0.0)
+                        aligned[column] = series
+                    if "volume" in aligned.columns:
+                        aligned["volume"] = pd.to_numeric(aligned["volume"], errors="coerce").fillna(0.0)
+                    frame = aligned
+                prepared[symbol] = frame
+        for symbol, df in prepared.items():
             feed = bt.feeds.PandasData(
                 dataname=df,
-                fromdate=pd.to_datetime(self.start_date) if self.start_date else None,
-                todate=pd.to_datetime(self.end_date) if self.end_date else None,
+                fromdate=start,
+                todate=end,
                 name=symbol,
                 timeframe=self.timeframe,
                 compression=self.compression

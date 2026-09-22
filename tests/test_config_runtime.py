@@ -138,6 +138,7 @@ def test_csv_provider_resolves_data_path_when_constructed(monkeypatch, tmp_path)
 
     assert provider.data_path == str(configured_path)
     assert configured_path.is_dir()
+    assert (configured_path / "market_cache").is_dir()
 
 
 def test_tushare_provider_resolves_token_when_constructed(monkeypatch):
@@ -181,3 +182,13 @@ def test_tiingo_provider_resolves_token_when_constructed(monkeypatch):
 
     assert provider.client is not None
     assert captured["options"]["api_key"] == "runtime-token"
+
+
+def test_csv_provider_creates_missing_parent_and_cache_subdir(tmp_path):
+    import data_providers.csv_provider as csv_module
+
+    configured_path = tmp_path / "missing-parent" / "runtime-data"
+    assert not configured_path.exists()
+    provider = csv_module.CsvDataProvider(data_path=str(configured_path))
+    assert provider.data_path == str(configured_path)
+    assert (configured_path / "market_cache").is_dir()

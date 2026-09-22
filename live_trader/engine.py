@@ -752,6 +752,7 @@ class LiveTrader:
             import pandas as pd
             schedule_rule = self.config.get('schedule_rule')
             parsed_schedule = SchedulePlanner.parse_schedule_rule(schedule_rule) if schedule_rule else None
+            SchedulePlanner.assert_repeating_live_schedule(parsed_schedule, schedule_rule)
             if parsed_schedule:
                 anchor_now = pd.Timestamp(context.now) + pd.Timedelta(seconds=1)
                 next_expected = SchedulePlanner.resolve_next_schedule_slot(anchor_now, parsed_schedule)

@@ -4,6 +4,13 @@ from data_providers.base_provider import BaseDataProvider
 from data_providers.manager import DataManager, resolve_platform_default_source
 
 
+def _market_cache_csv(tmp_path, filename):
+    folder = tmp_path / "market_cache"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / filename
+
+
+
 def test_platform_default_data_source_is_owned_by_data_providers():
     assert resolve_platform_default_source("ib") == "ibkr"
     assert resolve_platform_default_source("ib_broker") == "ibkr"
@@ -31,7 +38,7 @@ def test_cache_data_merges_segments_without_duplicate_timestamps(tmp_path, monke
                           index=pd.to_datetime(['2024-01-01', '2024-01-02']))
     manager._cache_data(first, 'US.AAPL')
     manager._cache_data(second, 'US.AAPL')
-    cached = pd.read_csv(tmp_path / 'US_AAPL.csv', index_col='datetime', parse_dates=True)
+    cached = pd.read_csv(_market_cache_csv(tmp_path, 'US_AAPL.csv'), index_col='datetime', parse_dates=True)
     assert len(cached) == 2
     assert float(cached.loc['2024-01-01', 'close']) == 3.5
 
@@ -41,11 +48,11 @@ def test_cache_data_recovers_from_corrupt_file(tmp_path, monkeypatch):
     monkeypatch.setattr(config, 'CACHE_DATA', True)
     manager = object.__new__(DataManager)
     manager.data_path = str(tmp_path)
-    (tmp_path / 'US_AAPL.csv').write_text('not,a,valid,cache\n', encoding='utf-8')
+    (_market_cache_csv(tmp_path, 'US_AAPL.csv')).write_text('not,a,valid,cache\n', encoding='utf-8')
     frame = pd.DataFrame({'open': [1], 'high': [1], 'low': [1], 'close': [1], 'volume': [1]},
                          index=pd.to_datetime(['2024-01-01']))
     manager._cache_data(frame, 'US.AAPL')
-    cached = pd.read_csv(tmp_path / 'US_AAPL.csv', index_col='datetime', parse_dates=True)
+    cached = pd.read_csv(_market_cache_csv(tmp_path, 'US_AAPL.csv'), index_col='datetime', parse_dates=True)
     assert len(cached) == 1
 
 
@@ -54,7 +61,7 @@ def test_cache_data_removes_nonfinite_rows_from_existing_cache(tmp_path, monkeyp
     monkeypatch.setattr(config, 'CACHE_DATA', True)
     manager = object.__new__(DataManager)
     manager.data_path = str(tmp_path)
-    path = tmp_path / 'US_AAPL.csv'
+    path = _market_cache_csv(tmp_path, 'US_AAPL.csv')
     path.write_text(
         'datetime,open,high,low,close,volume\n'
         '2024-01-01,1,2,0.5,inf,10\n'
@@ -73,7 +80,7 @@ def test_cache_data_removes_nonfinite_rows_from_existing_cache(tmp_path, monkeyp
     assert cached[['open', 'high', 'low', 'close', 'volume']].notna().all().all()
 
 
-def test_hybrid_provider_result_is_not_written_to_persistent_cache(monkeypatch):
+def test_hybrid_live_result_is_not_written_to_persistent_cache(monkeypatch):
     class HybridProvider(BaseDataProvider):
         HYBRID_ONLY = True
 
@@ -85,6 +92,7 @@ def test_hybrid_provider_result_is_not_written_to_persistent_cache(monkeypatch):
             )
 
     manager = object.__new__(DataManager)
+    manager._live_mode = True
     writes = []
     manager._cache_data = lambda *args, **kwargs: writes.append(True)
 
@@ -94,6 +102,30 @@ def test_hybrid_provider_result_is_not_written_to_persistent_cache(monkeypatch):
 
     assert result is not None
     assert writes == []
+
+
+def test_hybrid_backtest_result_is_written_to_persistent_cache(monkeypatch):
+    class HybridProvider(BaseDataProvider):
+        HYBRID_ONLY = True
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            return pd.DataFrame(
+                {'open': [1], 'high': [1], 'low': [1], 'close': [1], 'volume': [1]},
+                index=pd.to_datetime(['2024-01-01']),
+            )
+
+    manager = object.__new__(DataManager)
+    manager._live_mode = False
+    writes = []
+    manager._cache_data = lambda *args, **kwargs: writes.append(True)
+
+    result = manager._fetch_from_providers(
+        'US.AAPL', '20240101', '20240101', [HybridProvider()], 'Days', 1
+    )
+
+    assert result is not None
+    assert writes == [True]
 
 
 def test_single_online_source_reuses_complete_cache_and_refresh_bypasses_it(tmp_path, monkeypatch):
@@ -139,7 +171,190 @@ def test_single_online_source_reuses_complete_cache_and_refresh_bypasses_it(tmp_
     assert first is not None and second is not None and refreshed is not None
     assert len(calls) == 2
     pd.testing.assert_frame_equal(first, second, check_names=False)
-    assert (tmp_path / 'US_AAPL240119P00150000.csv').is_file()
+    assert (_market_cache_csv(tmp_path, 'US_AAPL240119P00150000.csv')).is_file()
+
+
+def test_get_data_does_not_print_per_symbol_fetch_chatter(tmp_path, monkeypatch, capsys):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            return pd.DataFrame(
+                {
+                    "open": [100.0], "high": [101.0], "low": [99.0],
+                    "close": [100.5], "volume": [100],
+                },
+                index=pd.to_datetime(["2024-01-02"]),
+            )
+
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [ThetaDataProvider()],
+    )
+    manager = DataManager()
+    capsys.readouterr()
+    result = manager.get_data(
+        "US.SPY", "20240102", "20240102", specified_sources="theta"
+    )
+    out = capsys.readouterr().out
+    assert result is not None
+    assert "Using specified data sources" not in out
+    assert "Attempting to fetch data" not in out
+    assert "Successfully fetched data" not in out
+    assert "cached to" not in out
+    assert "Filtering final data" not in out
+    assert "Using complete cached data" not in out
+
+
+def test_option_cache_through_expiry_covers_long_request_window(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    pd.DataFrame(
+        {
+            "open": [1.0, 1.2],
+            "high": [1.3, 1.4],
+            "low": [0.9, 1.1],
+            "close": [1.2, 1.3],
+            "volume": [10, 11],
+        },
+        index=pd.to_datetime(["2024-01-02", "2024-01-19"]),
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            calls.append((symbol, start_date, end_date))
+            return pd.DataFrame(
+                {
+                    "open": [9.0], "high": [9.0], "low": [9.0],
+                    "close": [9.0], "volume": [1],
+                },
+                index=pd.to_datetime(["2024-01-02"]),
+            )
+
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [ThetaDataProvider()],
+    )
+    manager = DataManager()
+    result = manager.get_data(
+        "US.AAPL240119P00150000",
+        "20220101",
+        "20250105",
+        specified_sources="theta",
+    )
+
+    assert calls == []
+    assert result is not None
+    assert list(result.index.strftime("%Y-%m-%d")) == ["2024-01-02", "2024-01-19"]
+
+
+def test_option_cache_covering_contract_life_is_complete(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    expiry = pd.Timestamp("2024-01-19")
+    index = pd.bdate_range(expiry - pd.Timedelta(days=45), expiry)
+    pd.DataFrame(
+        {
+            "open": [1.0] * len(index),
+            "high": [1.2] * len(index),
+            "low": [0.9] * len(index),
+            "close": [1.1] * len(index),
+            "volume": [10] * len(index),
+        },
+        index=index,
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            calls.append((symbol, start_date, end_date))
+            return None
+
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [ThetaDataProvider()],
+    )
+    manager = DataManager()
+    result = manager.get_data(
+        "US.AAPL240119P00150000",
+        "20220101",
+        "20250105",
+        specified_sources="theta",
+    )
+
+    assert calls == []
+    assert result is not None
+    assert result.index.min() <= expiry - pd.Timedelta(days=45)
+    assert result.index.max() >= expiry
+
+
+def test_option_cache_missing_expiry_is_incomplete(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    pd.DataFrame(
+        {
+            "open": [1.0],
+            "high": [1.2],
+            "low": [0.9],
+            "close": [1.1],
+            "volume": [10],
+        },
+        index=pd.to_datetime(["2024-01-02"]),
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            calls.append((symbol, start_date, end_date))
+            return pd.DataFrame(
+                {
+                    "open": [9.0], "high": [9.0], "low": [9.0],
+                    "close": [9.0], "volume": [1],
+                },
+                index=pd.to_datetime(["2024-01-19"]),
+            )
+
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [ThetaDataProvider()],
+    )
+    manager = DataManager()
+    result = manager.get_data(
+        "US.AAPL240119P00150000",
+        "20220101",
+        "20250105",
+        specified_sources="theta",
+    )
+
+    assert calls == [("US.AAPL240119P00150000", "20220101", "20250105")]
+    assert result is not None
+    assert list(result.index.strftime("%Y-%m-%d")) == ["2024-01-19"]
 
 
 def test_live_mode_bypasses_complete_cache_for_explicit_online_source(tmp_path, monkeypatch):
@@ -150,7 +365,7 @@ def test_live_mode_bypasses_complete_cache_for_explicit_online_source(tmp_path, 
     pd.DataFrame(
         {'open': [1], 'high': [1], 'low': [1], 'close': [1], 'volume': [1]},
         index=pd.to_datetime(['2024-01-01']),
-    ).rename_axis('datetime').to_csv(tmp_path / 'US_AAPL.csv')
+    ).rename_axis('datetime').to_csv(_market_cache_csv(tmp_path, 'US_AAPL.csv'))
 
     class OnlineProvider(BaseDataProvider):
         PRIORITY = 1
@@ -191,7 +406,7 @@ def test_incomplete_cache_falls_back_to_online_source(tmp_path, monkeypatch):
     pd.DataFrame(
         {'open': [1], 'high': [1], 'low': [1], 'close': [1], 'volume': [1]},
         index=pd.to_datetime(['2024-01-03']),
-    ).rename_axis('datetime').to_csv(tmp_path / 'US_AAPL.csv')
+    ).rename_axis('datetime').to_csv(_market_cache_csv(tmp_path, 'US_AAPL.csv'))
 
     class ThetaDataProvider(BaseDataProvider):
         PRIORITY = 1
@@ -298,6 +513,67 @@ def test_data_manager_close_does_not_call_dynamic_provider_attribute():
     manager.close()
 
     assert provider.calls == []
+
+
+def test_base_provider_close_defaults_to_noop():
+    class StatelessProvider(BaseDataProvider):
+        def get_data(self, *args, **kwargs):
+            return None
+
+    assert StatelessProvider().close() is None
+
+
+def test_data_manager_closes_short_lived_provider_without_closing_futu():
+    class ThetaDataProvider(BaseDataProvider):
+        def __init__(self):
+            self.closed = 0
+
+        def get_data(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            self.closed += 1
+
+    class FutuDataProvider(BaseDataProvider):
+        def __init__(self):
+            self.closed = 0
+
+        def get_data(self, *args, **kwargs):
+            return None
+
+    class HybridDataProvider:
+        def __init__(self, theta):
+            self.theta_provider = theta
+
+    theta = ThetaDataProvider()
+    futu = FutuDataProvider()
+    manager = object.__new__(DataManager)
+    manager.providers = [theta, futu]
+    manager._composed_providers = {"hybrid": HybridDataProvider(theta)}
+
+    assert manager.close_after_fetch() == 1
+    assert theta.closed == 1
+    assert futu.closed == 0
+
+
+def test_data_manager_close_after_fetch_preserves_injected_futu_context():
+    from data_providers.futu_provider import FutuDataProvider
+
+    class InjectedContext:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    context = InjectedContext()
+    provider = FutuDataProvider(quote_ctx=context)
+    manager = object.__new__(DataManager)
+    manager.providers = [provider]
+    manager._composed_providers = {}
+
+    assert manager.close_after_fetch() == 1
+    assert context.closed is False
 
 
 def test_data_manager_runtime_injection_does_not_call_dynamic_provider_attribute():
@@ -452,3 +728,64 @@ def test_data_manager_keeps_intraday_bars_for_date_only_end_boundary(monkeypatch
         pd.Timestamp("2024-01-02 09:30:00"),
         pd.Timestamp("2024-01-02 15:00:00"),
     ]
+
+
+def test_daily_cache_treats_weekend_end_as_complete(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    pd.DataFrame(
+        {
+            "open": [1.0, 2.0],
+            "high": [1.0, 2.0],
+            "low": [1.0, 2.0],
+            "close": [1.0, 2.0],
+            "volume": [10, 20],
+        },
+        index=pd.to_datetime(["2024-01-02", "2024-01-05"]),
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_SPY.csv"))
+    calls = []
+
+    class FutuDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            calls.append((symbol, start_date, end_date))
+            return pd.DataFrame(
+                {"open": [9], "high": [9], "low": [9], "close": [9], "volume": [1]},
+                index=pd.to_datetime(["2024-01-05"]),
+            )
+
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [FutuDataProvider()],
+    )
+    manager = DataManager()
+    result = manager.get_data(
+        "US.SPY",
+        "20240102",
+        "20240106",
+        specified_sources="futu",
+    )
+    assert calls == []
+    assert result is not None
+    assert list(result.index.strftime("%Y-%m-%d")) == ["2024-01-02", "2024-01-05"]
+
+
+def test_cache_write_creates_missing_data_path_and_subdir(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    missing = tmp_path / "missing-parent" / "runtime-data"
+    manager = object.__new__(DataManager)
+    manager.data_path = str(missing)
+    frame = pd.DataFrame(
+        {"open": [1], "high": [1], "low": [1], "close": [1], "volume": [1]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+    manager._cache_data(frame, "US.AAPL")
+    cached = missing / "market_cache" / "US_AAPL.csv"
+    assert cached.is_file()

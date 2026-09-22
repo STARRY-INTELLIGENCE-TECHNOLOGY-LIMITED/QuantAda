@@ -231,6 +231,14 @@ class FutuDataProvider(BaseDataProvider):
         """根据 RSA 路径配置全局协议；空路径明确关闭加密。"""
         if SysConfig is None:
             return
+        # SDK 默认会把连接成功/线程状态写到 stdout；框架保留自己的错误日志，
+        # 关闭 SDK 控制台噪声，避免训练和实盘日志被连接心跳刷屏。
+        disable_console_log = getattr(SysConfig, 'enable_console_log', None)
+        if callable(disable_console_log):
+            try:
+                disable_console_log(False)
+            except Exception:
+                pass
         rsa_path = os.path.expandvars(os.path.expanduser(self.rsa_key_path))
         if rsa_path:
             if not os.path.isfile(rsa_path):

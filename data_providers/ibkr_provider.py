@@ -35,7 +35,7 @@ except Exception:
     util = None
 
 import config
-from data_providers.base_provider import BaseDataProvider
+from data_providers.base_provider import BaseDataProvider, REQUEST_ATTEMPTS
 
 
 class IbkrDataProvider(BaseDataProvider):
@@ -171,8 +171,7 @@ class IbkrDataProvider(BaseDataProvider):
         ib_client_logger.setLevel(logging.CRITICAL)
 
         try:
-            max_retries = 5  # 减少重试次数，5次足够了
-            for attempt in range(max_retries):
+            for attempt in range(REQUEST_ATTEMPTS):
                 try:
                     self._call_ib(
                         'connect', self.host, self.port, clientId=self.client_id

@@ -5,6 +5,7 @@
 
 import base64
 import os
+import re
 import sys
 
 from common.terminal_log import OPTIMIZER_TERMINAL_LOG_ENV, get_optimizer_terminal_log_path
@@ -26,6 +27,24 @@ def _ps_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _windows_forwarded_env_commands():
+    """把当前进程环境写入提权 PowerShell；runas 不会继承会话环境变量。"""
+    commands = []
+    for key, value in sorted(os.environ.items()):
+        if not key or str(key).upper() == "QUANTADA_DISABLE_AUTO_ELEVATE":
+            continue
+        if _ENV_NAME_RE.fullmatch(str(key)) is None:
+            continue
+        text_value = "" if value is None else str(value)
+        if "\x00" in text_value or "\r" in text_value or "\n" in text_value:
+            continue
+        commands.append("$env:" + key + "=" + _ps_quote(text_value))
+    return commands
+
+
 def _build_windows_powershell_start_info():
     script_argv = [os.path.abspath(sys.argv[0])] + list(sys.argv[1:])
     python_args = ["-X", "utf8"] + script_argv
@@ -36,10 +55,13 @@ def _build_windows_powershell_start_info():
         "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
         f"Set-Location -LiteralPath {_ps_quote(os.getcwd())}",
         "chcp 65001 >$null",
+    ]
+    env_cmds.extend(_windows_forwarded_env_commands())
+    env_cmds.extend([
         "$env:PYTHONIOENCODING='utf-8'",
         "$env:PYTHONUTF8='1'",
         "$env:QUANTADA_DISABLE_AUTO_ELEVATE='1'",
-    ]
+    ])
     if terminal_log_path:
         safe_log_path = str(terminal_log_path).replace("'", "''")
         env_cmds.append(f"$env:{OPTIMIZER_TERMINAL_LOG_ENV}='{safe_log_path}'")

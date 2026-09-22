@@ -2,7 +2,7 @@ import math
 import time
 
 import config
-from live_trader.data_bridge.data_warm import SchedulePlanner
+from common.schedule_planner import SchedulePlanner
 
 
 _DEADLINE_ATTR = '_live_run_deadline_monotonic'

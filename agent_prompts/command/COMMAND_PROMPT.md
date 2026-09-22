@@ -16,6 +16,7 @@
 - 资金与成本: `[cash/commission/slippage，可空]`
 - 实盘连接: `[可空，格式 broker:env，例如 gm_broker:sim]`
 - 额外配置覆写: `[可空，--config 的 Python dict 字符串]`
+- 优化启动调度: `[可空，--opt_schedule，支持 HH:MM[:SS] 或 Nd|Nw|Nm|Nh[:HH:MM[:SS]]]`
 - 操作系统: `[Windows PowerShell | Linux/macOS Bash]`
 
 ## 规则
@@ -40,7 +41,8 @@
    - 币市数量精度通过正小数配置，例如 `{'LOT_SIZE': 0.00000001, 'BROKER_LOT_LIMITS': 0.1, 'KEEP_OVERNIGHT_ORDERS': True}`；不得把数量参数改写为整数
 8. `--config` 接受 `config.py` 入口按责任域模块 `import *` 平铺的全部大写键；入口不自动扫描目录，新增责任域由维护者显式增加一行导入。用户不需要区分配置来源，也不应被额外的运行时白名单限制。旧名称/拼写错误会明确打印警告并被忽略，生成命令时必须使用当前键名。
 9. 当 `mode=optimize` 时，框架会自动将终端滚动输出异步归档到 `.data/optimizer`；不要要求用户手动传任何内部日志路径参数。
-10. 当需要查看月度收益热力图时，使用 `--plot_scope monthly_heatmap`；也可和组合图逗号组合，例如 `--plot_scope portfolio_equity,portfolio_drawdown,monthly_heatmap`。
+10. 当 `mode=optimize` 使用 `--opt_schedule` 时，将它作为进程启动等待，不要改写 broker 实盘 `schedule`；`HH:MM[:SS]` 等待当天或次日该时刻后再推断日期，周期规则等待下一次槽位。
+11. 当需要查看月度收益热力图时，使用 `--plot_scope monthly_heatmap`；也可和组合图逗号组合，例如 `--plot_scope portfolio_equity,portfolio_drawdown,monthly_heatmap`。
 
 ## 输出格式
 请严格按以下结构输出:

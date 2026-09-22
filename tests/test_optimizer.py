@@ -158,6 +158,32 @@ def test_run_optimizer_mode_prints_test_backtest_section(monkeypatch, capsys):
     assert "Optuna log files:   1" in out
 
 
+def test_run_optimizer_mode_waits_after_elevation_for_opt_schedule(monkeypatch):
+    monkeypatch.setattr(optimizer, "OptimizationJob", _DummyOptimizationJob)
+    monkeypatch.setattr(
+        optimizer.process_elevation,
+        "request_optimizer_elevation_if_needed",
+        lambda *_args: False,
+    )
+    waited = []
+    monkeypatch.setattr(
+        optimizer.SchedulePlanner,
+        "wait_until_schedule",
+        lambda schedule, **_kwargs: waited.append(schedule),
+    )
+
+    args = _build_args(opt_schedule="2d:02:00")
+    code = optimizer.run_optimizer_mode(
+        args=args,
+        fixed_params={"lookback": 20},
+        risk_params={},
+        symbol_list=["AAPL"],
+    )
+
+    assert code == 0
+    assert waited == ["2d:02:00"]
+
+
 def test_run_optimizer_mode_skips_test_backtest_section_without_test_config(monkeypatch, capsys):
     monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
     monkeypatch.setattr(optimizer, "OptimizationJob", _DummyOptimizationJob)
@@ -403,6 +429,31 @@ def test_slice_datas_keeps_fixed_warmup_rows_before_logical_start():
     assert job.warmup_days == 400
     assert got["AAPL"].index.min() == pd.Timestamp("2023-11-28")
     assert got["AAPL"].index.max() == pd.Timestamp("2025-06-30")
+
+
+def test_slice_datas_normalizes_tz_aware_option_index():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    idx = pd.date_range("2023-01-01", "2025-06-30", freq="D", tz="UTC")
+    job.raw_datas = {
+        "US.QQQ250117P00400000": pd.DataFrame(
+            {
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 100.0,
+            },
+            index=idx,
+        )
+    }
+
+    got = job.slice_datas("20250101", "20250630")
+
+    frame = got["US.QQQ250117P00400000"]
+    assert frame.index.tz is None
+    assert frame.index.min() == pd.Timestamp("2023-11-28")
+    assert frame.index.max() == pd.Timestamp("2025-06-30")
 
 
 def test_split_data_dynamic_refit_has_no_test_range():
@@ -758,6 +809,85 @@ def test_main_eval_backtest_reuses_preloaded_raw_datas_without_provider_fetch(mo
     assert DummyBacktester.last_kwargs["end_date"] == "20260616"
 
 
+def test_fetch_datas_for_window_reuses_tz_aware_preloaded_data():
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("provider fetch should not run when tz-aware raw_datas already cover the window")
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    idx = pd.date_range("2019-11-12", "2026-06-16", freq="D", tz="UTC")
+    job.raw_datas = {
+        "US.SPY": pd.DataFrame(
+            {
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 100.0,
+            },
+            index=idx,
+        )
+    }
+    job.target_symbols = ["US.SPY"]
+    job.data_manager = DummyDataManager()
+    job._window_data_cache = {}
+    job._raw_data_fetch_range = ("20191112", "20260616")
+    job.args = SimpleNamespace(
+        data_source="theta",
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    )
+
+    got = job._fetch_datas_for_window("20201216", "20260616")
+
+    assert calls == []
+    assert "US.SPY" in got
+    assert got["US.SPY"].index.tz is None
+    expected_warmup_start = (
+        pd.Timestamp("2020-12-16") - pd.DateOffset(days=optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS)
+    )
+    assert got["US.SPY"].index.min() == expected_warmup_start
+    assert got["US.SPY"].index.max() == pd.Timestamp("2026-06-16")
+
+
+def test_fetch_datas_for_window_logs_progress_not_per_symbol_short_tail(capsys):
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = 0
+    idx = pd.bdate_range("2026-09-01", "2026-09-18")
+    frame = pd.DataFrame(
+        {"open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0},
+        index=idx,
+    )
+    job.raw_datas = {
+        "US.DIA261009P00501000": frame,
+        "US.SPY": frame,
+    }
+    job.target_symbols = ["US.SPY", "US.DIA261009P00501000"]
+    job.data_manager = SimpleNamespace(get_data=lambda *args, **kwargs: None)
+    job._window_data_cache = {}
+    job._raw_data_fetch_range = ("20260901", "20260920")
+    job.args = SimpleNamespace(
+        data_source="theta+futu",
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    )
+
+    got = job._fetch_datas_for_window("20260901", "20260920")
+    out = capsys.readouterr().out
+    assert "US.SPY" in got
+    assert "US.DIA261009P00501000" in got
+    assert "Reusing preloaded data for US.DIA261009P00501000" not in out
+    assert "Align window" in out
+    assert "reuse=2" in out
+    assert "short_tail=2" in out
+
+
 def test_request_elevation_skips_for_single_worker(monkeypatch):
     args = SimpleNamespace(n_jobs=1)
     monkeypatch.delenv("QUANTADA_DISABLE_AUTO_ELEVATE", raising=False)
@@ -816,6 +946,32 @@ def test_windows_elevation_command_keeps_console_open(monkeypatch):
     assert r"& 'C:\Python\python.exe' '-X' 'utf8'" in decoded
     assert r"'E:\Lin\Github\QuantAda\run.py'" in decoded
     assert "Elevated run finished" in decoded
+
+
+def test_windows_elevation_command_forwards_process_env(monkeypatch):
+    monkeypatch.setattr(process_elevation.sys, "argv", ["run.py", "--opt_params", "{'x': 1}"])
+    monkeypatch.setattr(process_elevation.sys, "executable", r"C:\Python\python.exe")
+    monkeypatch.setattr(process_elevation.os.path, "abspath", lambda path: rf"E:\Lin\Github\QuantAda\{path}")
+    monkeypatch.setattr(process_elevation.os, "getcwd", lambda: r"E:\Lin\Github\QuantAda")
+    monkeypatch.setenv("POWERSHELL", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    monkeypatch.setenv("THETADATA_API_KEY", "td1_test_token")
+    monkeypatch.setenv("FUTU_HOST", "120.79.20.238")
+    monkeypatch.setenv("FUTU_PORT", "11111")
+    monkeypatch.setenv("PYTHONPATH", r"E:\Lin\Github\Quant-MAGI-CASPER-3")
+    monkeypatch.setenv("QUANTADA_DISABLE_AUTO_ELEVATE", "0")
+
+    _, params = process_elevation.build_windows_elevated_console_command()
+    decoded = _decode_encoded_command(params)
+
+    assert "$env:THETADATA_API_KEY='td1_test_token'" in decoded
+    assert "$env:FUTU_HOST='120.79.20.238'" in decoded
+    assert "$env:FUTU_PORT='11111'" in decoded
+    assert r"$env:PYTHONPATH='E:\Lin\Github\Quant-MAGI-CASPER-3'" in decoded
+    assert "$env:QUANTADA_DISABLE_AUTO_ELEVATE='0'" not in decoded
+    disable_idx = decoded.rindex("$env:QUANTADA_DISABLE_AUTO_ELEVATE='1'")
+    python_idx = decoded.index(r"& 'C:\Python\python.exe'")
+    theta_idx = decoded.index("$env:THETADATA_API_KEY='td1_test_token'")
+    assert theta_idx < disable_idx < python_idx
 
 
 def test_optimizer_terminal_log_path_uses_optuna_style_name(tmp_path, monkeypatch):
@@ -1360,3 +1516,57 @@ def test_multiprocess_optimization_drops_tpe_candidates_only_when_spawn_payload_
     )
 
     assert captured["tpe_n_ei_candidates"] == 12
+
+
+def test_finite_grid_search_space_is_materialized_without_duplicate_values():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.opt_params_def = {
+        "min_dte": {"type": "int", "low": 25, "high": 35, "step": 5},
+        "profit_take_fraction": {"type": "float", "low": 0.4, "high": 0.6, "step": 0.1},
+        "mode": {"type": "categorical", "choices": ["a", "b"]},
+    }
+
+    grid = job._build_grid_search_space()
+
+    assert grid == {
+        "min_dte": [25, 30, 35],
+        "profit_take_fraction": [0.4, 0.5, 0.6],
+        "mode": ["a", "b"],
+    }
+
+
+def test_optimizer_infers_omitted_window_after_schedule_wait(monkeypatch):
+    events = []
+
+    def wait(schedule, **_kwargs):
+        events.append(("wait", schedule))
+        return None
+
+    def infer(args):
+        events.append(("infer", args.start_date, args.end_date))
+        args.end_date = "20260922"
+        args.start_date = "20230922"
+
+    monkeypatch.setattr(optimizer, "OptimizationJob", _DummyOptimizationJob)
+    monkeypatch.setattr(
+        optimizer.process_elevation,
+        "request_optimizer_elevation_if_needed",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(optimizer.SchedulePlanner, "wait_until_schedule", wait)
+    monkeypatch.setattr(optimizer, "infer_omitted_backtest_window", infer)
+
+    args = _build_args(opt_schedule="02:00", start_date=None, end_date=None)
+    code = optimizer.run_optimizer_mode(
+        args=args,
+        fixed_params={"lookback": 20},
+        risk_params={},
+        symbol_list=["AAPL"],
+    )
+
+    assert code == 0
+    assert events[0] == ("wait", "02:00")
+    assert events[1][0] == "infer"
+    assert events[1][1:] == (None, None)
+    assert args.start_date == "20230922"
+    assert args.end_date == "20260922"

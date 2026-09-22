@@ -21,15 +21,23 @@ import pandas as pd
 import config
 from common.options.analytics import iv_percentile
 from common.options.chain import normalize_option_chain
-from .base_provider import BaseDataProvider
+from .base_provider import BaseDataProvider, REQUEST_ATTEMPTS
 
 
 THETADATA_API_KEY = os.getenv("THETADATA_API_KEY", "").strip()
 # 以下为低频、实现固定的安全默认值；如需调整应通过代码评审修改。
 _OPTION_CONTRACT_MULTIPLIER = 100.0
 _ENRICH_OPTIONS = True
-_REQUEST_TIMEOUT_SECONDS = 20.0
+_REQUEST_TIMEOUT_SECONDS = 60.0
+_BULK_REQUEST_TIMEOUT_SECONDS = 120.0
 _MAX_AUTO_CHAIN_EXPIRATIONS = 16
+_AUTO_CHAIN_STRIKE_RANGE = 40
+_DEFAULT_AUTO_MAX_DTE = 90
+_EOD_RETRY_CHUNK_DAYS = 365
+_EOD_MAX_REQUEST_DAYS = 365
+_INTRADAY_CHUNK_DAYS = 30
+# 同一进程只允许一个 Theta session；并发只复用该 session 的 gRPC 通道。
+_MAX_CONCURRENT_CALLS = 4
 
 _OCC_RE = re.compile(r"^US\.([A-Z0-9]+?)(\d{6})([CP])(\d{8})$", re.IGNORECASE)
 _REQUIRED = ("open", "high", "low", "close", "volume")
@@ -54,6 +62,56 @@ def _as_date(value):
         return pd.Timestamp(value).date()
     except Exception:
         return None
+
+
+def _bounded_int(value, default=None):
+    """把可选整数配置转成 int；无效时返回默认值。"""
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _normalize_chain_right(value):
+    """把链查询方向规范为 ThetaData 的 put/call/both。"""
+    text = str(value or "both").strip().lower()
+    if text in {"p", "put"}:
+        return "put"
+    if text in {"c", "call"}:
+        return "call"
+    return "both"
+
+
+def _is_empty_theta_error(error):
+    """识别 Theta SDK 的空结果异常；这类失败没有可操作细节。"""
+    return "no data found" in str(error or "").lower()
+
+
+def _is_current_day_theta_error(error):
+    """当日 EOD/全链 wildcard 会被 Theta 拒绝，不属瞬时失败。"""
+    return "cannot fetch current-day data" in str(error or "").lower()
+
+
+def _is_invalid_theta_argument(error):
+    """识别请求形状错误；INVALID_ARGUMENT 重试不会变成功。"""
+    text = str(error or "").lower()
+    return "invalid_argument" in text or "statuscode.invalid_argument" in text
+
+
+def _clip_option_history_window(start, end, expiry):
+    """把单一期权请求裁到合约寿命，并保证不超过 EOD 接口的最大跨度。"""
+    if expiry is None:
+        return start, end
+    max_span = max(1, int(_EOD_MAX_REQUEST_DAYS) - 1)
+    life_start = expiry - _dt.timedelta(days=max_span)
+    life_end = expiry
+    if start is None or start < life_start:
+        start = life_start
+    if end is None or end > life_end:
+        end = life_end
+    return start, end
 
 
 def _to_pandas(value):
@@ -191,8 +249,17 @@ class ThetaDataProvider(BaseDataProvider):
             )
         )
         self._client_lock = threading.RLock()
+        self._call_sema = threading.BoundedSemaphore(_MAX_CONCURRENT_CALLS)
+        self._stats_lock = threading.Lock()
+        self._thread_stats = threading.local()
+        self._inflight = 0
+        self._client_stale = False
         self._client_error = None
         self._unsupported_methods = set()
+        self._owns_client = client is None
+        self._expiration_cache = {}
+        self._empty_result_count = 0
+        self._retryable_fail_count = 0
 
     def _get_client(self):
         """惰性创建 ThetaClient；不在 Provider 构造阶段执行网络认证。"""
@@ -204,18 +271,31 @@ class ThetaDataProvider(BaseDataProvider):
                 or self.token.upper() in {"YOUR_TOKEN_HERE", "EXTERNAL_MODE"}
             ):
                 return None
+            timeout = self._timeout_seconds()
             try:
                 module = importlib.import_module("thetadata")
                 cls = getattr(module, "ThetaClient", None)
                 if cls is None:
                     raise ImportError("thetadata.ThetaClient 不存在")
-                # pandas 返回值便于与框架既有标准化逻辑衔接。
-                timeout = self._timeout_seconds()
+            except Exception as exc:
+                self._client_error = exc
+                print(f"[ThetaData] SDK unavailable: {exc}; 请安装 requirements.txt 中的 thetadata/python-dotenv")
+                return None
+
+            last_error = None
+            for attempt in range(1, REQUEST_ATTEMPTS + 1):
                 outcome = {}
+                state = {"timed_out": False}
 
                 def construct():
                     try:
-                        outcome["client"] = cls(api_key=self.token, dataframe_type="pandas")
+                        client = cls(api_key=self.token, dataframe_type="pandas")
+                        if state["timed_out"]:
+                            close = getattr(client, "close", None)
+                            if callable(close):
+                                close()
+                        else:
+                            outcome["client"] = client
                     except Exception as exc:
                         outcome["error"] = exc
 
@@ -223,27 +303,128 @@ class ThetaDataProvider(BaseDataProvider):
                 worker.start()
                 worker.join(timeout)
                 if worker.is_alive():
-                    raise TimeoutError(f"ThetaData client initialization timed out after {timeout:.1f}s")
-                if "error" in outcome:
-                    raise outcome["error"]
-                self.client = outcome.get("client")
-                if self.client is None:
-                    raise RuntimeError("ThetaData client initialization returned no client")
-                self._client_error = None
-                return self.client
-            except Exception as exc:
-                self._client_error = exc
-                print(f"[ThetaData] client unavailable: {exc}; 请解除 requirements.txt 中 thetadata/python-dotenv 注释后安装")
-                return None
+                    state["timed_out"] = True
+                    last_error = TimeoutError(
+                        f"ThetaData client initialization timed out after {timeout:.1f}s"
+                    )
+                    # 未结束的 SDK 构造线程可能仍持有 gRPC 连接，不能并发创建第二个 session。
+                    worker.join(1.0)
+                    if worker.is_alive():
+                        print(
+                            f"[ThetaData] client initialization attempt {attempt}/{REQUEST_ATTEMPTS} "
+                            f"timed out after {timeout:.1f}s; retry skipped because the SDK thread is still active."
+                        )
+                        break
+                elif "error" in outcome:
+                    last_error = outcome["error"]
+                    print(
+                        f"[ThetaData] client initialization attempt {attempt}/{REQUEST_ATTEMPTS} "
+                        f"failed: {last_error}"
+                    )
+                else:
+                    client = outcome.get("client")
+                    if client is not None:
+                        self.client = client
+                        self._client_error = None
+                        return client
+                    last_error = RuntimeError("ThetaData client initialization returned no client")
+
+                if attempt < REQUEST_ATTEMPTS:
+                    print(f"[ThetaData] retrying client initialization ({attempt + 1}/{REQUEST_ATTEMPTS})")
+
+            self._client_error = last_error
+            print(
+                f"[ThetaData] client initialization failed after {REQUEST_ATTEMPTS} attempts: "
+                f"{last_error}. Check HTTP_PROXY/HTTPS_PROXY and network access; "
+                "the next data request will start a new initialization attempt."
+            )
+            return None
 
     @staticmethod
-    def _timeout_seconds():
+    def _is_bulk_kwargs(kwargs) -> bool:
+        """识别全链/全到期日等大载荷请求，以便使用更长的有界超时。"""
+        if "strike" in kwargs:
+            strike = str(kwargs.get("strike") or "").strip()
+            if strike in {"", "*"}:
+                return True
+        expiration = kwargs.get("expiration")
+        if expiration is not None and str(expiration).strip() in {"", "*"}:
+            return True
+        return False
+
+    @staticmethod
+    def _timeout_seconds(bulk=False):
         """读取并限制 Provider 内置的单次 ThetaData 操作超时。"""
+        source = _BULK_REQUEST_TIMEOUT_SECONDS if bulk else _REQUEST_TIMEOUT_SECONDS
+        fallback = 120.0 if bulk else 60.0
         try:
-            timeout = float(_REQUEST_TIMEOUT_SECONDS)
+            timeout = float(source)
         except (TypeError, ValueError, OverflowError):
-            timeout = 20.0
+            timeout = fallback
         return max(0.1, min(timeout, 300.0))
+
+    def _reset_owned_client_locked(self):
+        """在已持有客户端锁时关闭自建 session，避免并发认证换出新的 session id。"""
+        if not self._owns_client:
+            return
+        client, self.client = self.client, None
+        if client is None:
+            return
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _reset_owned_client(self):
+        """超时后丢掉自建 gRPC 客户端，避免挂起流拖慢后续请求。"""
+        with self._client_lock:
+            self._reset_owned_client_locked()
+
+    def _mark_client_stale(self, reset_if_exclusive=False):
+        """会话失效时优先标记；仅当没有其它 in-flight 请求时才关闭并允许重认证。"""
+        with self._client_lock:
+            if reset_if_exclusive and self._inflight <= 1:
+                self._reset_owned_client_locked()
+                self._client_stale = False
+                return True
+            self._client_stale = True
+            return False
+
+    def _is_unsupported(self, method):
+        """线程安全地读取 SDK 方法黑名单。"""
+        with self._client_lock:
+            return method in self._unsupported_methods
+
+    def _mark_unsupported(self, method):
+        """线程安全地记录当前订阅不支持的 SDK 方法。"""
+        with self._client_lock:
+            self._unsupported_methods.add(method)
+
+    def _bump_empty(self):
+        """累计空结果；进程计数与当前线程计数分开，避免并发互相偷计数。"""
+        self._thread_stats.empty = int(getattr(self._thread_stats, "empty", 0) or 0) + 1
+        with self._stats_lock:
+            self._empty_result_count += 1
+
+    def _bump_fail(self):
+        """累计超时/瞬时失败；供进度行和后置补偿使用。"""
+        self._thread_stats.fail = int(getattr(self._thread_stats, "fail", 0) or 0) + 1
+        with self._stats_lock:
+            self._retryable_fail_count += 1
+
+    def _take_thread_or_global(self, thread_attr, global_attr):
+        """优先取出当前线程计数，没有则退回进程计数。"""
+        local = int(getattr(self._thread_stats, thread_attr, 0) or 0)
+        setattr(self._thread_stats, thread_attr, 0)
+        with self._stats_lock:
+            global_value = int(getattr(self, global_attr) or 0)
+            if local:
+                setattr(self, global_attr, max(0, global_value - local))
+                return local
+            setattr(self, global_attr, 0)
+            return global_value
 
     @staticmethod
     def _parse_option(symbol):
@@ -370,49 +551,113 @@ class ThetaDataProvider(BaseDataProvider):
         return merged
 
     def _call(self, method, **kwargs):
-        """执行 SDK 调用并将权限、网络和空数据错误降级为 None。"""
-        client = self._get_client()
-        if client is None:
+        """执行 SDK 调用；同一 session 允许有界并发，超时和瞬时错误有界重试。"""
+        if self._is_unsupported(method):
             return None
-        if method in self._unsupported_methods:
-            return None
-        timeout = self._timeout_seconds()
+        timeout = self._timeout_seconds(bulk=self._is_bulk_kwargs(kwargs))
+        last_error = None
+        timed_out = False
+        acquired = False
+        counted = False
         try:
-            callable_method = getattr(client, method)
-        except Exception as exc:
-            print(f"[ThetaData] {method} failed: {exc}")
-            return None
-        outcome = {}
+            self._call_sema.acquire()
+            acquired = True
+            with self._client_lock:
+                if self._client_stale and self._inflight == 0:
+                    self._reset_owned_client_locked()
+                    self._client_stale = False
+                self._inflight += 1
+                counted = True
+            for _attempt in range(REQUEST_ATTEMPTS):
+                if self._is_unsupported(method):
+                    return None
+                client = self._get_client()
+                if client is None:
+                    return None
+                try:
+                    callable_method = getattr(client, method)
+                except Exception as exc:
+                    print(f"[ThetaData] {method} failed: {exc}")
+                    return None
+                outcome = {}
 
-        def invoke():
-            try:
-                outcome["value"] = callable_method(**kwargs)
-            except Exception as exc:  # SDK 异常只影响当前标的
-                outcome["error"] = exc
+                def invoke():
+                    try:
+                        outcome["value"] = callable_method(**kwargs)
+                    except Exception as exc:
+                        outcome["error"] = exc
 
-        worker = threading.Thread(target=invoke, name="thetadata-request", daemon=True)
-        worker.start()
-        worker.join(timeout)
-        if worker.is_alive():
-            print(f"[ThetaData] {method} timed out after {timeout:.1f}s")
+                worker = threading.Thread(target=invoke, name="thetadata-request", daemon=True)
+                worker.start()
+                worker.join(timeout)
+                if worker.is_alive():
+                    # 其它请求仍在使用当前 session 时不能重认证，否则会触发不同 session id 拦截。
+                    exclusive = self._mark_client_stale(reset_if_exclusive=True)
+                    timed_out = True
+                    last_error = None
+                    if exclusive:
+                        continue
+                    break
+                if "error" in outcome:
+                    error = outcome["error"]
+                    message = str(error)
+                    if "permission_denied" in message.lower() or "professional subscription" in message.lower():
+                        self._mark_unsupported(method)
+                        print(f"[ThetaData] {method} failed: {error}")
+                        return None
+                    if _is_empty_theta_error(error) or _is_current_day_theta_error(error):
+                        self._bump_empty()
+                        return None
+                    if _is_invalid_theta_argument(error):
+                        print(f"[ThetaData] {method} failed: {error}")
+                        self._bump_fail()
+                        return None
+                    lowered = message.lower()
+                    if "invalid session id" in lowered or "unauthenticated" in lowered:
+                        exclusive = self._mark_client_stale(reset_if_exclusive=True)
+                        last_error = error
+                        timed_out = False
+                        if exclusive:
+                            continue
+                        break
+                    last_error = error
+                    timed_out = False
+                    continue
+                return outcome.get("value")
+            if timed_out or last_error is None:
+                print(f"[ThetaData] {method} timed out after {timeout:.1f}s")
+            else:
+                print(f"[ThetaData] {method} failed: {last_error}")
+            self._bump_fail()
             return None
-        if "error" in outcome:
-            error = outcome["error"]
-            message = str(error)
-            # 权限错误对同一订阅在本次运行中是稳定的，记忆方法名可
-            # 避免自动链查询在数十个到期日上重复发起必然失败的 RPC。
-            if "permission_denied" in message.lower() or "professional subscription" in message.lower():
-                self._unsupported_methods.add(method)
-            print(f"[ThetaData] {method} failed: {error}")
-            return None
-        return outcome.get("value")
+        finally:
+            if counted:
+                with self._client_lock:
+                    self._inflight = max(0, int(self._inflight) - 1)
+                    if self._client_stale and self._inflight == 0:
+                        self._reset_owned_client_locked()
+                        self._client_stale = False
+            if acquired:
+                self._call_sema.release()
 
-    def _chunked_history(self, method, start, end, **kwargs):
-        """按 ThetaData 的约一个月跨日限制拆分分钟历史请求。"""
+    def take_empty_result_count(self):
+        """取出并清零空结果计数，供 OptionUniverse 进度行汇总。"""
+        return self._take_thread_or_global("empty", "_empty_result_count")
+
+    def take_retryable_fail_count(self):
+        """取出并清零超时/瞬时失败计数，供进度行与后置补偿使用。"""
+        return self._take_thread_or_global("fail", "_retryable_fail_count")
+
+    def _chunked_history(self, method, start, end, chunk_days=_INTRADAY_CHUNK_DAYS, **kwargs):
+        """按跨日限制拆分历史请求；分钟默认约一个月，EOD 失败重试可用年块。"""
+        try:
+            span = max(1, int(chunk_days or _INTRADAY_CHUNK_DAYS))
+        except (TypeError, ValueError, OverflowError):
+            span = _INTRADAY_CHUNK_DAYS
         frames = []
         cursor = start
         while cursor <= end:
-            chunk_end = min(end, cursor + _dt.timedelta(days=30) - _dt.timedelta(days=1))
+            chunk_end = min(end, cursor + _dt.timedelta(days=span) - _dt.timedelta(days=1))
             frame = self._call(
                 method,
                 start_date=cursor,
@@ -424,6 +669,25 @@ class ThetaDataProvider(BaseDataProvider):
                 frames.append(converted)
             cursor = chunk_end + _dt.timedelta(days=1)
         return pd.concat(frames, ignore_index=True, sort=False) if frames else None
+
+    def _history_or_chunk(self, method, start, end, chunk_days, **kwargs):
+        """跨度达到接口上限时直接分块，避免先打一次必然失败的超限请求。"""
+        if start is None or end is None:
+            return None
+        try:
+            width = max(1, int(chunk_days))
+        except (TypeError, ValueError, OverflowError):
+            width = _EOD_MAX_REQUEST_DAYS
+        if (end - start).days >= width:
+            return self._chunked_history(method, start, end, chunk_days=width, **kwargs)
+        fails_before = int(self._retryable_fail_count)
+        raw = self._call(method, start_date=start, end_date=end, **kwargs)
+        converted = _to_pandas(raw)
+        if converted is not None and not converted.empty:
+            return converted
+        if self._retryable_fail_count > fails_before and (end - start).days > 1:
+            return self._chunked_history(method, start, end, chunk_days=width, **kwargs)
+        return converted
 
     def get_data(
         self,
@@ -473,11 +737,15 @@ class ThetaDataProvider(BaseDataProvider):
         parsed = self._parse_option(normalized)
         if parsed:
             root, expiry, strike, right = parsed
+            start, end = _clip_option_history_window(start, end, expiry)
+            if start > end:
+                return None
             if str(timeframe or "").strip().lower() in {"days", "day", "d"} and period == 1:
-                raw = self._call(
+                raw = self._history_or_chunk(
                     "option_history_eod",
-                    start_date=start,
-                    end_date=end,
+                    start,
+                    end,
+                    _EOD_RETRY_CHUNK_DAYS,
                     symbol=root,
                     expiration=expiry,
                     strike=strike,
@@ -499,7 +767,13 @@ class ThetaDataProvider(BaseDataProvider):
                 return None
         else:
             if str(timeframe or "").strip().lower() in {"days", "day", "d"} and period == 1:
-                raw = self._call("stock_history_eod", start_date=start, end_date=end, symbol=code)
+                raw = self._history_or_chunk(
+                    "stock_history_eod",
+                    start,
+                    end,
+                    _EOD_RETRY_CHUNK_DAYS,
+                    symbol=code,
+                )
             elif is_intraday and period in {1, 5, 15, 60}:
                 raw = self._chunked_history(
                     "stock_history_ohlc",
@@ -555,10 +829,25 @@ class ThetaDataProvider(BaseDataProvider):
                 }
                 if is_intraday:
                     greeks_kwargs["interval"] = f"{period}m"
-                greeks = self._call(
-                    greeks_method,
-                    **greeks_kwargs,
-                )
+                    greeks_kwargs.pop("start_date", None)
+                    greeks_kwargs.pop("end_date", None)
+                    greeks = self._history_or_chunk(
+                        greeks_method,
+                        start,
+                        end,
+                        _INTRADAY_CHUNK_DAYS,
+                        **greeks_kwargs,
+                    )
+                else:
+                    greeks_kwargs.pop("start_date", None)
+                    greeks_kwargs.pop("end_date", None)
+                    greeks = self._history_or_chunk(
+                        greeks_method,
+                        start,
+                        end,
+                        _EOD_RETRY_CHUNK_DAYS,
+                        **greeks_kwargs,
+                    )
                 result_attrs = dict(result.attrs)
                 result = self._merge_metadata(
                     result,
@@ -572,12 +861,13 @@ class ThetaDataProvider(BaseDataProvider):
                         "rho": ("rho",),
                     },
                 )
-                open_interest = self._call(
+                open_interest = self._history_or_chunk(
                     "option_history_open_interest",
+                    start,
+                    end,
+                    _EOD_RETRY_CHUNK_DAYS,
                     symbol=root,
                     expiration=expiry,
-                    start_date=start,
-                    end_date=end,
                     strike=strike,
                     right=right,
                 )
@@ -616,7 +906,81 @@ class ThetaDataProvider(BaseDataProvider):
             result.attrs.update(attrs)
         return result
 
-    def get_option_chain(self, underlying, expirations=None, normalized=False, as_of=None, start=None, end=None):
+    def _list_expirations(self, code):
+        """列出并缓存某标的的到期日，避免每个 as_of 都打满 list 接口。"""
+        with self._client_lock:
+            cached = self._expiration_cache.get(code)
+            if cached is not None:
+                return list(cached)
+        raw_expirations = self._call("option_list_expirations", symbol=code)
+        exp_df = _to_pandas(raw_expirations)
+        if exp_df is None or exp_df.empty:
+            return []
+        exp_col = _column(exp_df, ("expiration", "expiry", "date"))
+        if exp_col is None:
+            return []
+        expiration_values = ThetaDataProvider._parse_timestamps(exp_df, exp_col)
+        expirations = [value.date() for value in expiration_values.dropna().tolist()]
+        with self._client_lock:
+            self._expiration_cache.setdefault(code, expirations)
+            return list(self._expiration_cache[code])
+
+    @staticmethod
+    def _spread_dates(dates, limit):
+        """按时间顺序均匀抽样到期日，保证 DTE 窗口两端都有覆盖。"""
+        items = [item for item in dates if item is not None]
+        try:
+            cap = int(limit)
+        except (TypeError, ValueError, OverflowError):
+            return items
+        if cap <= 0 or len(items) <= cap:
+            return items
+        if cap == 1:
+            return items[:1]
+        chosen = []
+        seen = set()
+        last = len(items) - 1
+        for index in range(cap):
+            cursor = int(index * last / (cap - 1))
+            while cursor in seen and cursor < last:
+                cursor += 1
+            if cursor in seen:
+                continue
+            seen.add(cursor)
+            chosen.append(items[cursor])
+        return chosen
+
+    @staticmethod
+    def _select_chain_expirations(expirations, as_of_date, min_dte, max_dte):
+        """按 as_of 的 DTE 窗口挑选到期日；优先周五，避免日频到期日占满上限。"""
+        eligible = []
+        for expiry in sorted({value for value in expirations if value is not None}):
+            dte = (expiry - as_of_date).days
+            if dte < min_dte or dte > max_dte:
+                continue
+            eligible.append(expiry)
+        fridays = [item for item in eligible if item.weekday() == 4]
+        if fridays:
+            if len(fridays) <= _MAX_AUTO_CHAIN_EXPIRATIONS:
+                return fridays
+            return ThetaDataProvider._spread_dates(fridays, _MAX_AUTO_CHAIN_EXPIRATIONS)
+        if len(eligible) <= _MAX_AUTO_CHAIN_EXPIRATIONS:
+            return eligible
+        return ThetaDataProvider._spread_dates(eligible, _MAX_AUTO_CHAIN_EXPIRATIONS)
+
+    def get_option_chain(
+        self,
+        underlying,
+        expirations=None,
+        normalized=False,
+        as_of=None,
+        start=None,
+        end=None,
+        min_dte=None,
+        max_dte=None,
+        strike_range=None,
+        right=None,
+    ):
         """获取 ThetaData 期权链；传入 as_of 时走当日 EOD，未传时才用当前快照。"""
         if (start is not None or end is not None) and as_of is None:
             print("[ThetaData] historical option-chain requests require as_of to prevent lookahead")
@@ -630,42 +994,85 @@ class ThetaDataProvider(BaseDataProvider):
         as_of_date = _as_date(as_of)
         if as_of is not None and as_of_date is None:
             return None
-        if as_of_date is not None and as_of_date > _vendor_today():
+        # 当日 EOD 尚未完成；expiration=* 会被 Theta 拒绝，也不得回退当前快照冒充历史链。
+        if as_of_date is not None and as_of_date >= _vendor_today():
             return None
-        if expirations is None:
-            raw_expirations = self._call("option_list_expirations", symbol=code)
-            exp_df = _to_pandas(raw_expirations)
-            if exp_df is None or exp_df.empty:
+        auto_expirations = expirations is None
+        if auto_expirations:
+            expirations = self._list_expirations(code)
+            if not expirations:
                 return None
-            exp_col = _column(exp_df, ("expiration", "expiry", "date"))
-            if exp_col is None:
+        else:
+            parsed_expirations = [_as_date(item) for item in expirations]
+            expirations = [item for item in parsed_expirations if item is not None]
+            if not expirations:
                 return None
-            expiration_values = ThetaDataProvider._parse_timestamps(exp_df, exp_col)
-            expirations = [x.date() for x in expiration_values.dropna().tolist()]
-            # 自动发现时只取 as_of/今天之后最近的到期日，避免在全部历史到期日上打满请求。
-            if len(expirations) > _MAX_AUTO_CHAIN_EXPIRATIONS:
-                cutoff = as_of_date or _vendor_today()
-                future = sorted({value for value in expirations if value >= cutoff})
-                if future:
-                    expirations = future[:_MAX_AUTO_CHAIN_EXPIRATIONS]
+        right_value = _normalize_chain_right(right)
+        min_dte_value = _bounded_int(min_dte, 0)
+        if min_dte_value is None or min_dte_value < 0:
+            min_dte_value = 0
+        if max_dte is None:
+            max_dte_value = _DEFAULT_AUTO_MAX_DTE if auto_expirations else None
+        else:
+            max_dte_value = _bounded_int(max_dte, _DEFAULT_AUTO_MAX_DTE if auto_expirations else None)
+        if as_of_date is not None and (auto_expirations or min_dte is not None or max_dte is not None):
+            high = _DEFAULT_AUTO_MAX_DTE if max_dte_value is None else max_dte_value
+            expirations = self._select_chain_expirations(
+                expirations,
+                as_of_date,
+                min_dte_value,
+                high,
+            )
+            if not expirations:
+                return None
+        elif auto_expirations:
+            cutoff = as_of_date or _vendor_today()
+            future = sorted({value for value in expirations if value >= cutoff})
+            expirations = future[:_MAX_AUTO_CHAIN_EXPIRATIONS] if future else expirations[:_MAX_AUTO_CHAIN_EXPIRATIONS]
+        range_value = _bounded_int(strike_range)
+        if range_value is None and auto_expirations and as_of_date is not None:
+            range_value = _AUTO_CHAIN_STRIKE_RANGE
+        if range_value is not None and range_value <= 0:
+            range_value = None
         rows = []
+        # ThetaData 支持 expiration='*'；历史链优先走一次批量 RPC，避免每个
+        # as_of 对多个到期日逐个请求。显式 expirations 仍保留精确路径。
+        if as_of_date is not None and auto_expirations:
+            batch = self._get_historical_chain_batch(
+                code,
+                as_of_date,
+                expirations,
+                right_value,
+                range_value,
+            )
+            if batch is not None:
+                rows.append(batch)
+                expirations = []
+
         for expiration in expirations:
             frame = None
             expiry = _as_date(expiration)
             if as_of_date is not None:
                 # 历史链必须用当日 EOD，不能把当前 snapshot 伪装成 as_of。
+                if expiry is None:
+                    continue
+                call_kwargs = {
+                    "symbol": code,
+                    "expiration": expiry,
+                    "start_date": as_of_date,
+                    "end_date": as_of_date,
+                    "strike": "*",
+                    "right": right_value,
+                }
+                if range_value is not None:
+                    call_kwargs["strike_range"] = range_value
                 for base_method in (
                     "option_history_greeks_eod",
                     "option_history_eod",
                 ):
                     raw = self._call(
                         base_method,
-                        symbol=code,
-                        expiration=expiry,
-                        start_date=as_of_date,
-                        end_date=as_of_date,
-                        strike="*",
-                        right="both",
+                        **call_kwargs,
                     )
                     candidate = _to_pandas(raw)
                     if candidate is not None and not candidate.empty:
@@ -678,6 +1085,16 @@ class ThetaDataProvider(BaseDataProvider):
                 continue
             # Greeks all 需要 Professional；Standard 订阅仍可使用一阶 Greeks，
             # 再由 OHLC/OI 快照补齐成交与未平仓量字段。
+            if expiry is None:
+                continue
+            snap_kwargs = {
+                "symbol": code,
+                "expiration": expiry,
+                "strike": "*",
+                "right": right_value,
+            }
+            if range_value is not None:
+                snap_kwargs["strike_range"] = range_value
             for base_method in (
                 "option_snapshot_greeks_all",
                 "option_snapshot_greeks_first_order",
@@ -685,10 +1102,7 @@ class ThetaDataProvider(BaseDataProvider):
             ):
                 raw = self._call(
                     base_method,
-                    symbol=code,
-                    expiration=expiry,
-                    strike="*",
-                    right="both",
+                    **snap_kwargs,
                 )
                 candidate = _to_pandas(raw)
                 if candidate is not None and not candidate.empty:
@@ -703,10 +1117,7 @@ class ThetaDataProvider(BaseDataProvider):
                 ):
                     enrich_raw = self._call(
                         enrich_method,
-                        symbol=code,
-                        expiration=expiry,
-                        strike="*",
-                        right="both",
+                        **snap_kwargs,
                     )
                     enrich = _to_pandas(enrich_raw)
                     if enrich is not None and not enrich.empty:
@@ -759,6 +1170,7 @@ class ThetaDataProvider(BaseDataProvider):
             return None
         if end > today:
             end = today
+        start, end = _clip_option_history_window(start, end, expiry)
         if start > end:
             return None
         normalized = str(timeframe or "").strip().lower()
@@ -767,12 +1179,13 @@ class ThetaDataProvider(BaseDataProvider):
         except (TypeError, ValueError, OverflowError):
             return None
         if method.endswith("_eod") or method == "option_history_open_interest":
-            raw = self._call(
+            raw = self._history_or_chunk(
                 method,
+                start,
+                end,
+                _EOD_RETRY_CHUNK_DAYS,
                 symbol=root,
                 expiration=expiry,
-                start_date=start,
-                end_date=end,
                 strike=strike,
                 right=right,
             )
@@ -866,17 +1279,82 @@ class ThetaDataProvider(BaseDataProvider):
                 left[column] = left[column].where(left[column].notna(), right[column])
         return left.reset_index()
 
+    def _get_historical_chain_batch(
+        self,
+        code,
+        as_of_date,
+        expirations,
+        right_value,
+        range_value,
+    ):
+        """用一次 wildcard 历史请求取得一个 as_of 的整条链，再本地筛选到期日。"""
+        if as_of_date >= _vendor_today():
+            return None
+        allowed = {pd.Timestamp(item).date() for item in expirations if item is not None}
+        if not allowed:
+            return None
+        request = {
+            "symbol": code,
+            "expiration": "*",
+            "start_date": as_of_date,
+            "end_date": as_of_date,
+            "strike": "*",
+            "right": right_value,
+        }
+        if range_value is not None:
+            request["strike_range"] = range_value
+
+        frame = None
+        for method in ("option_history_greeks_eod", "option_history_eod"):
+            candidate = _to_pandas(self._call(method, **request))
+            if candidate is not None and not candidate.empty:
+                frame = candidate
+                break
+        if frame is None or frame.empty:
+            return None
+
+        prepared = self._prepare_chain_frame(frame, code, None)
+        if "expiry" not in prepared.columns:
+            return None
+        if "option_symbol" not in prepared.columns:
+            strike_col = _column(prepared, ("strike", "strike_price", "exercise_price"))
+            right_col = _column(prepared, ("right", "option_type", "call_put", "cp", "type"))
+            if strike_col is None or right_col is None:
+                return None
+
+            def make_symbol(row):
+                try:
+                    expiry = _as_date(row.get("expiry"))
+                    strike = float(row[strike_col])
+                    right = str(row[right_col]).strip().upper()
+                    right = "C" if right in {"C", "CALL", "1"} else "P" if right in {"P", "PUT", "2"} else ""
+                    if expiry is None or not right or not math.isfinite(strike) or strike <= 0:
+                        return None
+                    return f"US.{code}{expiry.strftime('%y%m%d')}{right}{int(round(strike * 1000)):08d}"
+                except (TypeError, ValueError, OverflowError):
+                    return None
+
+            prepared["option_symbol"] = prepared.apply(make_symbol, axis=1)
+        expiry_values = pd.to_datetime(prepared["expiry"], errors="coerce", utc=True)
+        prepared = prepared.loc[expiry_values.dt.date.isin(allowed)].copy()
+        if prepared.empty:
+            return None
+        prepared["timestamp"] = pd.Timestamp(as_of_date, tz="UTC")
+        return prepared
+
     def close(self):
         """关闭 ThetaData 客户端（若 SDK 提供 close）。"""
         with self._client_lock:
+            self._client_stale = False
             client, self.client = self.client, None
-            if client is not None:
-                close = getattr(client, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
+            if client is None:
+                return
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
 
 __all__ = ["ThetaDataProvider"]

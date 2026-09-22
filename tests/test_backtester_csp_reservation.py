@@ -329,3 +329,74 @@ def test_short_option_risk_leg_must_be_negative():
     result = backtester.run()[0]
     assert result.strategy.result is None
     assert result.getposition(result.datas[0]).size == 0
+
+
+def test_backtester_attribution_groups_put_credit_spread_legs():
+    class SpreadProbe(BaseStrategy):
+        def init(self):
+            self.phase = 0
+
+        def next(self):
+            short, hedge = self.broker.datas
+            if self.phase == 0:
+                self.broker.submit_option_spread(
+                    [
+                        {
+                            "data": short,
+                            "volume": 1,
+                            "effect": "SELL_TO_OPEN",
+                            "price": 1.0,
+                            "risk_leg": OptionRiskLeg(
+                                short._name, "SPY", "PUT", -1, 100.0, 1.0, 100.0, 100.0,
+                                expiry="2026-02-20", historical_volatility=0.2,
+                            ),
+                        },
+                        {
+                            "data": hedge,
+                            "volume": 1,
+                            "effect": "BUY_TO_OPEN",
+                            "price": 0.3,
+                            "risk_leg": OptionRiskLeg(
+                                hedge._name, "SPY", "PUT", 1, 90.0, 0.3, 100.0, 100.0,
+                                expiry="2026-02-20", historical_volatility=0.2,
+                            ),
+                        },
+                    ],
+                    volume=1,
+                )
+            elif self.phase == 2:
+                self.broker.submit_option_spread(
+                    [
+                        {"data": short, "volume": 1, "effect": "BUY_TO_CLOSE", "price": 0.5},
+                        {"data": hedge, "volume": 1, "effect": "SELL_TO_CLOSE", "price": 0.1},
+                    ],
+                    volume=1,
+                )
+            self.phase += 1
+
+    short = _option_frame(100.0)
+    hedge = _option_frame(90.0)
+    long_index = pd.date_range("2026-01-02", periods=4, freq="D")
+    short = pd.concat([short, short]).copy()
+    hedge = pd.concat([hedge, hedge]).copy()
+    short.index = long_index
+    hedge.index = long_index
+    backtester = Backtester(
+        datas={
+            "US.SPY260220P00100000": short,
+            "US.SPY260220P00090000": hedge,
+        },
+        strategy_class=SpreadProbe,
+        cash=20_000.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+    )
+    result = backtester.run()[0]
+    closed = result.closed_trades
+
+    assert len(closed) == 1
+    assert closed[0]["side"] == "short"
+    assert closed[0]["spread_id"]
+    assert len(closed[0]["spread_legs"]) == 2

@@ -30,17 +30,21 @@ from __future__ import annotations
 
 from common.options.analytics import safe_number
 from common.options.risk import OptionRiskLeg
-from strategies.base_strategy import BaseStrategy
-from strategies.options.support import (
+from common.data_view import (
     bar_datetime,
-    dte_days,
-    iter_option_rows,
-    matches_chain_window,
-    option_limit_price,
     pending_symbols,
     position_price,
     position_size,
     require_close_column,
+)
+from strategies.base_strategy import BaseStrategy
+from strategies.options.support import (
+    dte_days,
+    held_protective_put,
+    iter_option_rows,
+    matches_chain_window,
+    option_limit_price,
+    reserved_underlying_keys,
     underlying_feed,
 )
 
@@ -98,18 +102,7 @@ class SamplePutCreditSpreadStrategy(BaseStrategy):
         return sorted(candidates, key=lambda item: (item["delta_distance"], item["meta"]["strike"], item["meta"]["symbol"]))[0]
 
     def _held_protective_put(self, short_meta, current_dt):
-        candidates = []
-        for data, _row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"}):
-            if meta["underlying_key"] != short_meta["underlying_key"]:
-                continue
-            if meta["expiry"] != short_meta["expiry"] or meta["strike"] >= short_meta["strike"]:
-                continue
-            if position_size(self.broker, data) <= 0:
-                continue
-            candidates.append({"data": data, "meta": meta, "quote": quote})
-        if not candidates:
-            return None
-        return sorted(candidates, key=lambda item: (item["meta"]["strike"], item["meta"]["symbol"]))[0]
+        return held_protective_put(self.broker, short_meta, current_dt)
 
     def next(self):
         self.last_signals = []
@@ -121,7 +114,7 @@ class SamplePutCreditSpreadStrategy(BaseStrategy):
             return
         pending = pending_symbols(self.broker)
         candidates = []
-        occupied = set()
+        occupied = reserved_underlying_keys(self.broker, {"PUT"})
 
         for data, _row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"}):
             symbol = meta["symbol"]
@@ -147,7 +140,9 @@ class SamplePutCreditSpreadStrategy(BaseStrategy):
                     protective = self._held_protective_put(meta, current_dt)
                     spread = getattr(self.broker, "submit_option_spread", None)
                     order = None
-                    if protective is not None and callable(spread):
+                    if protective is not None and protective.get("quote") is None:
+                        signal["blocked_reason"] = "protective_put_quote_unavailable"
+                    elif protective is not None and callable(spread):
                         close_buy = option_limit_price(self.broker, data, quote, "BUY_TO_CLOSE")
                         close_sell = option_limit_price(
                             self.broker, protective["data"], protective["quote"], "SELL_TO_CLOSE"
@@ -171,7 +166,7 @@ class SamplePutCreditSpreadStrategy(BaseStrategy):
                         )
                         signal["spread"] = True
                         signal["protective_symbol"] = protective["meta"]["symbol"]
-                    if order is None:
+                    if order is None and signal.get("blocked_reason") != "protective_put_quote_unavailable":
                         submitter = getattr(self.broker, "submit_option_order", None)
                         if callable(submitter):
                             order = submitter(

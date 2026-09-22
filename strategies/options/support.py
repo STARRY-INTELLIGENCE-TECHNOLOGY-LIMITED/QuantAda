@@ -1,4 +1,4 @@
-"""期权样例策略共用的只读行情、仓位和过滤工具。"""
+"""期权样例专用过滤工具；通用行情和仓位视图由 ``common.data_view`` 提供。"""
 
 from __future__ import annotations
 
@@ -6,43 +6,15 @@ import math
 
 import pandas as pd
 
+from common.data_view import (
+    bar_datetime,
+    pending_symbols,
+    position_price,
+    position_size,
+    require_close_column,
+    visible_row,
+)
 from common.options.analytics import parse_option_symbol, safe_number, underlying_key
-
-
-def bar_datetime(data, broker=None):
-    """获取当前 K 线时间；实盘优先用 broker 时钟，避免日线 00:00 挡住当日快照。"""
-    live_now = getattr(broker, "_datetime", None) if broker is not None else None
-    accessor = getattr(getattr(data, "datetime", None), "datetime", None)
-    if callable(accessor):
-        current = accessor(0)
-    else:
-        dataframe = getattr(getattr(data, "p", None), "dataname", None)
-        if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
-            current = live_now
-        else:
-            current = dataframe.index[-1]
-    timestamp = None if current is None else pd.Timestamp(current)
-    if timestamp is not None and timestamp.tzinfo is not None:
-        timestamp = timestamp.tz_localize(None)
-    if live_now is not None:
-        stamp = pd.Timestamp(live_now)
-        if stamp.tzinfo is not None:
-            stamp = stamp.tz_localize(None)
-        if timestamp is None or stamp > timestamp:
-            return stamp
-    return timestamp
-
-
-def visible_row(data, current_dt):
-    """返回不超过当前时间的最后一行行情。"""
-    dataframe = getattr(getattr(data, "p", None), "dataname", None)
-    if not isinstance(dataframe, pd.DataFrame) or dataframe.empty or current_dt is None:
-        return None
-    index = pd.to_datetime(dataframe.index, errors="coerce")
-    if getattr(index, "tz", None) is not None:
-        index = index.tz_localize(None)
-    visible = dataframe.loc[index <= current_dt]
-    return visible.iloc[-1] if not visible.empty else None
 
 
 def option_contract(data, row):
@@ -132,43 +104,6 @@ def dte_days(expiry, current_dt):
     return int((pd.Timestamp(expiry).normalize() - pd.Timestamp(current_dt).normalize()).days)
 
 
-def position_size(broker, data):
-    """读取已确认仓位数量；没有持仓接口时视为 0。"""
-    getter = getattr(broker, "get_position", None) or getattr(broker, "getposition", None)
-    if not callable(getter):
-        return 0.0
-    position = getter(data)
-    return safe_number(getattr(position, "size", 0), 0.0)
-
-
-def position_price(broker, data):
-    """读取持仓成本价，供止盈判断。"""
-    getter = getattr(broker, "get_position", None) or getattr(broker, "getposition", None)
-    if not callable(getter):
-        return 0.0
-    position = getter(data)
-    return abs(safe_number(getattr(position, "price", 0), 0.0))
-
-
-def pending_symbols(broker):
-    """读取在途期权代码。实盘快照不可信时失败关闭，避免重复开仓。"""
-    if not getattr(broker, "is_live", False):
-        return set()
-    getter = getattr(broker, "get_pending_orders", None)
-    if not callable(getter):
-        return set()
-    if getattr(broker, "_last_pending_orders_fetch_failed", False):
-        raise RuntimeError("option sample stopped: pending snapshot is untrusted")
-    symbols = set()
-    for item in getter() or []:
-        if not isinstance(item, dict):
-            continue
-        symbol = str(item.get("symbol", "") or "").strip().upper()
-        if symbol:
-            symbols.add(symbol)
-    return symbols
-
-
 def underlying_feed(broker, key):
     """按归一化底层代码找到正股/ETF 行情。"""
     target = underlying_key(key)
@@ -181,14 +116,22 @@ def underlying_feed(broker, key):
     return None
 
 
+def _normalize_option_types(option_types):
+    """把 PUT/CALL 别名收成策略过滤用的标准集合。"""
+    if option_types is None:
+        return None
+    allowed = {str(item).strip().upper() for item in option_types}
+    return {
+        "PUT" if item in {"P", "PUT"} else "CALL" if item in {"C", "CALL"} else item
+        for item in allowed
+    }
+
+
 def iter_option_rows(broker, current_dt, option_types=None):
     """遍历当前可见的期权行情行。"""
-    allowed = None
-    if option_types is not None:
-        allowed = {str(item).strip().upper() for item in option_types}
-        allowed = {"PUT" if item in {"P", "PUT"} else "CALL" if item in {"C", "CALL"} else item for item in allowed}
+    allowed = _normalize_option_types(option_types)
     for data in getattr(broker, "datas", []) or []:
-        row = visible_row(data, current_dt)
+        row = visible_row(data, current_dt, require_current_quote=True)
         if row is None:
             continue
         meta = option_contract(data, row)
@@ -198,6 +141,80 @@ def iter_option_rows(broker, current_dt, option_types=None):
             continue
         yield data, row, meta, quote_snapshot(row)
 
+
+def _metadata_row(data):
+    """读取 feed 最后一行元数据；报价是否可交易由调用方另判。"""
+    dataframe = getattr(getattr(data, "p", None), "dataname", None)
+    if isinstance(dataframe, pd.DataFrame) and not dataframe.empty:
+        return dataframe.iloc[-1]
+    return None
+
+
+def iter_held_options(broker, option_types=None):
+    """遍历已确认期权持仓；缺当日报价时也必须看见，不能当成空仓。"""
+    allowed = _normalize_option_types(option_types)
+    for data in getattr(broker, "datas", []) or []:
+        size = position_size(broker, data)
+        if size == 0:
+            continue
+        meta = option_contract(data, _metadata_row(data))
+        if meta is None:
+            continue
+        if allowed is not None and meta["option_type"] not in allowed:
+            continue
+        yield data, size, meta
+
+
+def reserved_underlying_keys(broker, option_types=None):
+    """持仓和在途期权占用的底层。零填充或缺 K 不能把已有仓位让出名额。"""
+    allowed = _normalize_option_types(option_types)
+    keys = set()
+    for _data, _size, meta in iter_held_options(broker, allowed):
+        key = meta.get("underlying_key")
+        if key:
+            keys.add(key)
+    for symbol in pending_symbols(broker):
+        parsed = parse_option_symbol(symbol)
+        option_type = str(parsed.get("option_type") or "").strip().upper()
+        if option_type in {"P", "PUT"}:
+            option_type = "PUT"
+        elif option_type in {"C", "CALL"}:
+            option_type = "CALL"
+        else:
+            continue
+        if allowed is not None and option_type not in allowed:
+            continue
+        key = underlying_key(parsed.get("underlying", ""))
+        if key:
+            keys.add(key)
+    return keys
+
+
+def held_protective_put(broker, short_meta, current_dt):
+    """同到期、更低执行价且实际持有的保护腿。没有当日报价时 quote/row 为 None。"""
+    candidates = []
+    short_key = short_meta.get("underlying_key")
+    short_expiry = short_meta.get("expiry")
+    short_strike = short_meta.get("strike")
+    for data, size, meta in iter_held_options(broker, {"PUT"}):
+        if size <= 0 or meta.get("underlying_key") != short_key:
+            continue
+        if meta.get("expiry") != short_expiry or meta.get("strike", 0) >= short_strike:
+            continue
+        row = visible_row(data, current_dt, require_current_quote=True)
+        candidates.append({
+            "data": data,
+            "meta": meta,
+            "quote": quote_snapshot(row) if row is not None else None,
+            "row": row,
+            "size": size,
+        })
+    if not candidates:
+        return None
+    return sorted(
+        candidates,
+        key=lambda item: (item["meta"]["strike"], item["meta"]["symbol"]),
+    )[0]
 
 def matches_chain_window(meta, quote, current_dt, params):
     """按 DTE、Delta、价差和持仓量过滤；IVP 缺省且下限为 0 时放行。"""
@@ -281,12 +298,3 @@ def option_limit_price(broker, data, quote, effect):
         tick = 0.05
         price = price + tick if buy else max(tick, price - tick)
     return float(price)
-
-
-def require_close_column(broker):
-    """初始化时确认每个 feed 都有 close 列。"""
-    for data in getattr(broker, "datas", []) or []:
-        dataframe = getattr(getattr(data, "p", None), "dataname", None)
-        name = getattr(data, "_name", data)
-        if not isinstance(dataframe, pd.DataFrame) or "close" not in dataframe.columns:
-            raise TypeError(f"期权样例策略要求 {name!r} 提供 close 列。")

@@ -1155,6 +1155,12 @@ class FutuBrokerAdapter(BaseLiveBroker):
         """根据 RSA 路径配置全局协议；空路径明确关闭加密。"""
         if SysConfig is None:
             return
+        disable_console_log = getattr(SysConfig, 'enable_console_log', None)
+        if callable(disable_console_log):
+            try:
+                disable_console_log(False)
+            except Exception:
+                pass
         rsa_path = os.path.expandvars(os.path.expanduser(self._rsa_key_path))
         if rsa_path:
             if not os.path.isfile(rsa_path):
@@ -3753,8 +3759,9 @@ class FutuBrokerAdapter(BaseLiveBroker):
             if parsed_schedule is None:
                 raise ValueError(
                     f'Unsupported Futu schedule format: {schedule_rule}; '
-                    'expected 1d|Nm|Nh[:HH:MM[:SS]].'
+                    'expected Nd|Nw|Nm|Nh[:HH:MM[:SS]].'
                 )
+            SchedulePlanner.assert_repeating_live_schedule(parsed_schedule, schedule_rule)
 
         timezone_name = conn_cfg.get('timezone')
         target_tz = None

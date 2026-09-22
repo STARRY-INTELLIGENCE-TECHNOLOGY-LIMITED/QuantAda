@@ -11,6 +11,7 @@ import pandas as pd
 import config
 from common.options.analytics import iv_percentile, parse_option_symbol
 from common.options.data_safety import sanitize_market_dataframe
+from common.options.universe import is_option_contract_symbol
 from live_trader.adapters.futu_symbols import normalize_futu_symbol
 
 from .base_provider import BaseDataProvider
@@ -20,7 +21,7 @@ from .thetadata_provider import ThetaDataProvider
 
 
 class HybridDataProvider(BaseDataProvider):
-    """回测使用 ThetaData，实盘在最新行叠加 Futu 实时事实。"""
+    """正股历史只用 Futu，不回退 Theta；期权历史与 as_of 链走 ThetaData。实盘正股和期权都叠加 Futu 当前快照。"""
 
     PRIORITY = 95
     HYBRID_ONLY = True
@@ -185,7 +186,7 @@ class HybridDataProvider(BaseDataProvider):
         )
 
     def _merge_live_quote(self, frame, symbol, timeframe, futu_symbol, futu_provider=None):
-        """把 Futu 当前快照合并到 Theta 历史末端。"""
+        """把 Futu 当前快照合并到历史末端。"""
 
         provider = futu_provider or self.futu_provider
         getter = getattr(provider, 'get_market_snapshot', None)
@@ -380,16 +381,62 @@ class HybridDataProvider(BaseDataProvider):
             end=end,
             as_of=as_of,
             normalized=normalized,
+            **kwargs,
         )
+
+    def take_empty_result_count(self):
+        """转发 Theta 空结果计数；正股 Futu 路径没有该计数。"""
+        getter = getattr(self.theta_provider, "take_empty_result_count", None)
+        if not callable(getter):
+            return 0
+        try:
+            return int(getter() or 0)
+        except Exception:
+            return 0
+
+    def take_retryable_fail_count(self):
+        """转发 Theta 超时/瞬时失败计数。"""
+        getter = getattr(self.theta_provider, "take_retryable_fail_count", None)
+        if not callable(getter):
+            return 0
+        try:
+            return int(getter() or 0)
+        except Exception:
+            return 0
 
     def get_data(self, symbol: str, start_date=None, end_date=None,
                  timeframe: str = "Days", compression: int = 1,
                  refresh: bool = False) -> pd.DataFrame:
-        """获取 Theta 历史，并仅在实盘模式叠加 Futu 当前快照。"""
+        """期权走 Theta 历史；正股走 Futu 历史且不回退 Theta。实盘再叠加 Futu 当前快照。"""
 
-        return self._overlay.get_data(
-            symbol, start_date, end_date, timeframe, compression, refresh=refresh
+        if is_option_contract_symbol(symbol):
+            return self._overlay.get_data(
+                symbol, start_date, end_date, timeframe, compression, refresh=refresh
+            )
+        getter = getattr(self.futu_provider, "get_data", None)
+        frame = None
+        if callable(getter):
+            try:
+                frame = getter(symbol, start_date, end_date, timeframe, compression)
+            except Exception:
+                frame = None
+        if frame is None or getattr(frame, "empty", False):
+            # theta+futu 的正股历史必须来自 Futu/OpenD；Theta 股票历史需要更高订阅，
+            # 不能在 OpenD 断连时静默改换数据源。
+            return None
+        if not self.live_mode:
+            return frame
+        _historical_symbol, futu_symbol = self._provider_symbols(symbol)
+        merged = self._merge_live_overlay(
+            frame,
+            symbol=symbol,
+            timeframe=timeframe,
+            realtime_provider=self.futu_provider,
+            realtime_symbol=futu_symbol,
         )
+        if merged is None or getattr(merged, "empty", False):
+            return frame
+        return merged
 
     def close(self):
         """关闭混合层内部创建的 Provider 连接。"""

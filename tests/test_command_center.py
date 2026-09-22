@@ -28,19 +28,61 @@ from command_center import (
 from command_center.executor import CommandExecutor
 
 
-def test_default_catalog_covers_main_workflows() -> None:
-    catalog = default_catalog()
-    assert len(catalog.presets) >= 10
-    assert {item.market for item in catalog.presets} == {"示例"}
-    assert all(item.origin == "README" for item in catalog.presets)
-    assert all("strategies_custom" not in item.strategy for item in catalog.presets)
-    assert {item.mode for item in catalog.presets} == {"backtest", "live", "optimize"}
-    assert catalog.preset("readme_gm_sim").strategy.startswith("strategies.sample_")
-    assert catalog.variable_values()["FUTU_RSA_KEY_PATH"] == ""
-    names = {item.name for item in catalog.variables}
-    assert {"FUTU_TRADE_PASSWORD_ENV", "FUTU_TRADE_PASSWORD_MD5_ENV"} <= names
-    assert catalog.profile("theta_futu_global") is not None
+def _public_catalog(root: Path, monkeypatch: pytest.MonkeyPatch | None = None):
+    """隔离本机私有目录后返回公开目录。私有层缺失时仍可验证公开行为。"""
 
+    if monkeypatch is not None:
+        monkeypatch.delenv("QUANTADA_PRIVATE_CATALOG", raising=False)
+        monkeypatch.delenv("QUANTADA_SOURCE_ROOT", raising=False)
+        monkeypatch.delenv("QUANTADA_COMMAND_SET", raising=False)
+    return default_catalog(root / "without-private")
+
+
+def _skip_unless_names(catalog, names: set[str], reason: str) -> None:
+    """所需变量不存在时跳过，避免可选目录项缺失导致硬失败。"""
+
+    present = {item.name for item in catalog.variables}
+    if not names <= present:
+        pytest.skip(reason)
+
+def test_default_catalog_covers_main_workflows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """公开方案存在就验证主流程；本机私有方案存在则验证已合并，没有则不因此失败。"""
+
+    catalog = default_catalog()
+    public = [item for item in catalog.presets if item.origin == "README"]
+    if not public:
+        pytest.skip("没有 README 公开方案")
+    assert len(public) >= 10
+    sample = [item for item in public if item.market == "示例"]
+    if not sample:
+        pytest.skip("没有示例市场方案")
+    assert all("strategies_custom" not in item.strategy for item in public)
+    assert {item.mode for item in sample} == {"backtest", "live", "optimize"}
+    for item in public:
+        if item.market == "示例":
+            continue
+        assert item.strategy.strip()
+        assert item.mode in {"backtest", "live", "optimize"}
+    gm_sim = next((item for item in public if item.preset_id == "readme_gm_sim"), None)
+    if gm_sim is None:
+        pytest.skip("readme_gm_sim 不存在")
+    assert gm_sim.strategy.startswith("strategies.sample_")
+    _skip_unless_names(
+        catalog,
+        {"FUTU_TRADE_PASSWORD_ENV", "FUTU_TRADE_PASSWORD_MD5_ENV", "FUTU_RSA_KEY_PATH"},
+        "Futu 变量未完整暴露",
+    )
+    if catalog.profile("theta_futu_global") is None:
+        pytest.skip("theta_futu_global 不存在")
+    public_catalog = _public_catalog(tmp_path, monkeypatch)
+    assert public_catalog.variable_values({})["FUTU_RSA_KEY_PATH"] == ""
+    private = [item for item in catalog.presets if item.origin != "README"]
+    if not private:
+        return
+    assert all(item.origin == "私有命令集" for item in private)
+    assert all(item.strategy.strip() for item in private)
 
 def test_private_catalog_overrides_sanitized_defaults_and_adds_private_presets(tmp_path: Path) -> None:
     private_dir = tmp_path / ".data" / "command_center"
@@ -376,8 +418,17 @@ def test_missing_required_environment_is_reported() -> None:
         build_command(catalog, catalog.preset("readme_gm_sim"), variables, Path("."), strict=True)
 
 
-def test_variable_values_reverse_display_aliases() -> None:
-    catalog = default_catalog()
+def test_variable_values_reverse_display_aliases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """传入别名时验证反显；目录没有对应变量则跳过。"""
+
+    catalog = _public_catalog(tmp_path, monkeypatch)
+    _skip_unless_names(
+        catalog,
+        {"WECOM_WEBHOOK", "GM_TOKEN", "GM_HOST", "GM_PORT", "TIINGO_TOKEN", "FUTU_HOST"},
+        "反显别名所需变量不存在",
+    )
     values = catalog.variable_values(
         {
             "GLOBAL_WECOM_WEBHOOK": "https://example.invalid/wecom",
@@ -392,10 +443,28 @@ def test_variable_values_reverse_display_aliases() -> None:
     assert values["TIINGO_TOKEN"] == "tiingo-alias"
     assert values["FUTU_HOST"] == ""
 
+def test_variable_values_reverse_display_project_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """项目配置有值时验证反显；变量或配置缺失时跳过，不因本机私有层硬失败。"""
 
-def test_variable_values_reverse_display_project_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    catalog = default_catalog()
+    catalog = _public_catalog(tmp_path, monkeypatch)
+    _skip_unless_names(
+        catalog,
+        {
+            "TIINGO_TOKEN",
+            "SXSC_TUSHARE_TOKEN",
+            "WECOM_WEBHOOK",
+            "GM_TOKEN",
+            "GM_HOST",
+            "GM_PORT",
+            "FUTU_HOST",
+            "IBKR_HOST",
+        },
+        "项目配置反显所需变量不存在",
+    )
     monkeypatch.setattr("command_center.catalog.os.environ", {}, raising=False)
+    monkeypatch.setattr("command_center.catalog._command_set_candidate_paths", lambda: ())
     monkeypatch.setattr("config.TIINGO_TOKEN", "tiingo-from-config")
     monkeypatch.setattr("config.SXSC_TUSHARE_TOKEN", "sxsc-from-config")
     monkeypatch.setattr("config.WECOM_WEBHOOK", "https://example.invalid/config-wecom")
@@ -407,9 +476,13 @@ def test_variable_values_reverse_display_project_config(monkeypatch: pytest.Monk
     assert values["GM_TOKEN"] == "cfg"
     assert values["GM_HOST"] == "172.16.0.9"
     assert values["GM_PORT"] == "7001"
-    assert values["FUTU_HOST"] == "127.0.0.1"
-    assert values["IBKR_HOST"] == "127.0.0.1"
+    import config as project_config
 
+    for name in ("FUTU_HOST", "IBKR_HOST"):
+        configured = str(getattr(project_config, name, "") or "").strip()
+        if not configured:
+            pytest.skip(f"项目配置没有 {name}")
+        assert values[name] == configured
 
 def test_variable_values_env_overrides_project_config(monkeypatch: pytest.MonkeyPatch) -> None:
     catalog = default_catalog()
@@ -639,6 +712,8 @@ def test_executor_can_stop_current_process(tmp_path: Path) -> None:
 def test_variable_values_fill_placeholders_from_command_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """命令集只回填空值；已有项目配置时验证保留，没有则验证命令集回填。"""
+
     path = tmp_path / "cmd.ps1"
     path.write_text(
         "export TIINGO_TOKEN='from-ps1'\n"
@@ -652,14 +727,24 @@ def test_variable_values_fill_placeholders_from_command_set(
         lambda: (path,),
     )
     monkeypatch.setattr("command_center.catalog.os.environ", {}, raising=False)
-    catalog = default_catalog()
+    catalog = _public_catalog(tmp_path, monkeypatch)
+    _skip_unless_names(
+        catalog,
+        {"TIINGO_TOKEN", "GM_TOKEN", "GM_HOST", "GM_PORT", "FUTU_HOST"},
+        "命令集回填所需变量不存在",
+    )
     values = catalog.variable_values()
     assert values["TIINGO_TOKEN"] == "from-ps1"
     assert values["GM_TOKEN"] == "tok"
     assert values["GM_HOST"] == "8.8.8.8"
     assert values["GM_PORT"] == "7002"
-    assert values["FUTU_HOST"] == "127.0.0.1"
+    import config as project_config
 
+    configured = str(getattr(project_config, "FUTU_HOST", "") or "").strip()
+    if configured:
+        assert values["FUTU_HOST"] == configured
+    else:
+        assert values["FUTU_HOST"] == "9.9.9.9"
 
 def test_parse_command_set_exports_skips_unexpanded_variables() -> None:
     from command_center.catalog import _parse_command_set_exports

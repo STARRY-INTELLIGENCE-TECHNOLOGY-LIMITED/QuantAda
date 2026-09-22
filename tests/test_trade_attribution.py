@@ -107,6 +107,23 @@ def test_calculate_winning_trade_mae_uses_winning_trades_with_valid_prices():
     assert result["worst_mae"] == pytest.approx(-0.10)
 
 
+def test_calculate_winning_trade_mae_uses_high_for_short_puts():
+    result = calculate_winning_trade_mae([
+        {
+            "symbol": "US.SPY260918P00600000",
+            "side": "short",
+            "pnl": 20.0,
+            "entry_price": 5.0,
+            "highest_price_during_trade": 7.0,
+        },
+    ])
+
+    assert result["winning_trade_count"] == 1
+    assert result["mae_sample_count"] == 1
+    assert result["average_mae"] == pytest.approx(5.0 / 7.0 - 1.0)
+    assert result["worst_mae"] == pytest.approx(5.0 / 7.0 - 1.0)
+
+
 def test_format_trade_micro_attribution_report_prints_expected_ascii_sections():
     report = format_trade_micro_attribution_report([
         {"symbol": "AAA", "pnl": 10.0, "entry_price": 100.0, "lowest_price_during_trade": 90.0},

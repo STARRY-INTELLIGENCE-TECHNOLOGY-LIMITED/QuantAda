@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 
 from common.live_schedule import LiveScheduleRunner
-from live_trader.data_bridge.data_warm import SchedulePlanner
+from common.schedule_planner import SchedulePlanner
 
 
 def test_live_schedule_runner_rejects_invalid_schedule():
@@ -18,6 +18,9 @@ def test_live_schedule_runner_rejects_invalid_schedule():
         ("5m", 5, "m", 300.0),
         ("1h", 1, "h", 3600.0),
         ("1d", 1, "d", 86400.0),
+        ("1w", 1, "w", 7 * 86400.0),
+        ("2d", 2, "d", 2 * 86400.0),
+        ("2w", 2, "w", 14 * 86400.0),
     ],
 )
 def test_schedule_rule_accepts_frequency_without_clock(
@@ -30,7 +33,75 @@ def test_schedule_rule_accepts_frequency_without_clock(
     assert parsed["target_h"] == parsed["target_m"] == parsed["target_s"] == 0
     assert parsed["time_str"] == "00:00:00"
     assert parsed["interval_seconds"] == pytest.approx(interval_seconds)
-    assert parsed["kind"] == ("daily" if freq_unit == "d" else "interval")
+    expected_kind = {
+        "d": "daily" if freq_n == 1 else "calendar_interval",
+        "w": "weekly" if freq_n == 1 else "calendar_interval",
+    }.get(freq_unit, "interval")
+    assert parsed["kind"] == expected_kind
+
+
+def test_schedule_rule_accepts_one_time_local_clock():
+    parsed = SchedulePlanner.parse_schedule_rule("02:00")
+
+    assert parsed["kind"] == "once"
+    assert parsed["time_str"] == "02:00:00"
+    assert parsed["interval_seconds"] == 0.0
+
+
+def test_weekly_schedule_uses_monday_anchor():
+    parsed = SchedulePlanner.parse_schedule_rule("1w:02:00:00")
+
+    before_anchor = SchedulePlanner.resolve_next_schedule_slot(
+        pd.Timestamp("2026-08-31 01:00:00"), parsed,
+    )
+    after_anchor = SchedulePlanner.resolve_next_schedule_slot(
+        pd.Timestamp("2026-09-01 03:00:00"), parsed,
+    )
+
+    assert before_anchor == pd.Timestamp("2026-08-31 02:00:00")
+    assert after_anchor == pd.Timestamp("2026-09-07 02:00:00")
+
+
+def test_multi_day_and_multi_week_schedules_keep_stable_calendar_anchors():
+    day_rule = SchedulePlanner.parse_schedule_rule("2d:02:00:00")
+    week_rule = SchedulePlanner.parse_schedule_rule("2w:02:00:00")
+
+    assert SchedulePlanner.resolve_next_schedule_slot(
+        pd.Timestamp("2026-09-01 03:00:00"), day_rule,
+    ) == pd.Timestamp("2026-09-02 02:00:00")
+    assert SchedulePlanner.resolve_next_schedule_slot(
+        pd.Timestamp("2026-09-01 03:00:00"), week_rule,
+    ) == pd.Timestamp("2026-09-14 02:00:00")
+
+
+def test_wait_until_schedule_sleeps_until_next_slot():
+    waits = []
+    next_slot = SchedulePlanner.wait_until_schedule(
+        "02:00",
+        now=pd.Timestamp("2026-08-31 01:00:00"),
+        sleep_func=waits.append,
+    )
+
+    assert next_slot == pd.Timestamp("2026-08-31 02:00:00")
+    assert waits == [3600.0]
+
+
+def test_wait_until_missed_one_time_schedule_waits_until_next_day():
+    waits = []
+    now = pd.Timestamp("2026-08-31 03:00:00")
+    next_slot = SchedulePlanner.wait_until_schedule(
+        "02:00",
+        now=now,
+        sleep_func=waits.append,
+    )
+
+    assert next_slot == pd.Timestamp("2026-09-01 02:00:00")
+    assert waits == [23 * 3600.0]
+
+
+def test_live_schedule_runner_rejects_one_time_clock():
+    with pytest.raises(ValueError, match="One-time schedule"):
+        LiveScheduleRunner(schedule_rule="02:00")
 
 
 def test_live_schedule_runner_deduplicates_slots_and_dispatches_worker():

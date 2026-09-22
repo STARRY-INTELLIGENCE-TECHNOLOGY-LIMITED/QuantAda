@@ -91,7 +91,7 @@
 2. 不要假设所有 broker 对 `start_date`、schedule、回放模式的解释一致。
 3. 若某 adapter 支持 live + replay/backtest 复合模式，应在该 adapter 文档或实现中明确说明。
 4. 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
-5. schedule 只兼容 `1d|Nm|Nh[:HH:MM[:SS]]`；省略时刻时默认 `00:00:00`。配置 `Ns` 必须明确报错并引导使用长连接事件回调与 `timeframe='Seconds'`，不得静默降级为不运行策略。分钟级 SDK 轮询和单次调用超时应随实际周期缩短，避免跨入下一周期。
+5. schedule 兼容 `Nd|Nw|Nm|Nh[:HH:MM[:SS]]`；`N` 为正整数，`Nw` 以本机时间周一为周锚点，省略时刻时默认 `00:00:00`。配置 `Ns` 必须明确报错并引导使用长连接事件回调与 `timeframe='Seconds'`，不得静默降级为不运行策略。分钟级 SDK 轮询和单次调用超时应随实际周期缩短，避免跨入下一周期。
 6. 若 schedule 回调与订单状态回调共享单线程 SDK 事件循环（包括 GM schedule、IB `ib.sleep()` 主循环），不能在回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将 slot 调度到单个短生命周期工作线程，并让 SDK 回调线程立即返回。重叠 slot 只记录并跳过；worker 失败时必须释放该 slot 的去重键，允许后续同槽位重试；回测/优化不得创建该工作线程。
 7. 对 24x7 市场使用 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日及正常长周期 bar 间隔必须同时保留柜台订单及本地 `_active_buys`、`_pending_sells`、虚拟占资跟踪；仍以实时柜台快照和终态回调为事实来源。
 

@@ -3039,10 +3039,11 @@ class IBBrokerAdapter(BaseLiveBroker):
         if schedule_rule:
             try:
                 parsed_schedule = SchedulePlanner.parse_schedule_rule(schedule_rule)
+                SchedulePlanner.assert_repeating_live_schedule(parsed_schedule, schedule_rule)
                 if parsed_schedule is None:
                     _runtime_print(
                         f">>> ⚠️ Unsupported schedule format for IB adapter: {schedule_rule}. "
-                        "Expected: 1d|Nm|Nh[:HH:MM[:SS]]"
+                        "Expected: Nd|Nw|Nm|Nh[:HH:MM[:SS]]"
                     )
             except ValueError as e:
                 _runtime_print(f">>> ❌ Invalid schedule config: {schedule_rule}. Error: {e}")

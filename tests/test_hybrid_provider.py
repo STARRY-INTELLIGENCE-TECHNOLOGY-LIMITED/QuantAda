@@ -1,3 +1,5 @@
+import threading
+
 import pandas as pd
 
 from data_providers.hybrid_provider import HybridDataProvider
@@ -218,6 +220,7 @@ def test_data_manager_supports_custom_composition_alias_key(monkeypatch):
     manager.providers = []
     manager.provider_map = {"historical_test": Historical(), "realtime_test": Realtime()}
     manager._composed_providers = {}
+    manager._provider_lock = threading.Lock()
     manager._live_mode = False
     manager._bound_broker = None
     monkeypatch.setattr(
@@ -318,6 +321,7 @@ def test_data_manager_builds_composition_from_configuration(monkeypatch):
     manager.providers = []
     manager.provider_map = {"historical_test": Historical(), "realtime_test": Realtime()}
     manager._composed_providers = {}
+    manager._provider_lock = threading.Lock()
     manager._live_mode = False
     manager._bound_broker = None
     monkeypatch.setattr(
@@ -354,6 +358,7 @@ def test_data_manager_composition_alias_is_lazy_and_receives_live_mode(monkeypat
         "realtime_test": object(),
     }
     manager._composed_providers = {}
+    manager._provider_lock = threading.Lock()
     manager._live_mode = True
     manager._bound_broker = None
     monkeypatch.setattr(
@@ -370,3 +375,83 @@ def test_data_manager_composition_alias_is_lazy_and_receives_live_mode(monkeypat
     provider = manager._provider_for_source("test_overlay")
 
     assert provider.live_mode is True
+
+
+def _stock_frame():
+    return pd.DataFrame(
+        {
+            "open": [100.0],
+            "high": [101.0],
+            "low": [99.0],
+            "close": [100.5],
+            "volume": [1000.0],
+        },
+        index=pd.date_range("2026-08-01", periods=1, tz="UTC"),
+    )
+
+
+def test_hybrid_provider_stock_history_uses_futu_not_theta():
+    class Theta:
+        def get_data(self, *args):
+            raise AssertionError("stock history must not fall back to Theta")
+
+    class Futu:
+        def get_data(self, *args):
+            return _stock_frame()
+
+    provider = HybridDataProvider(theta_provider=Theta(), futu_provider=Futu())
+    result = provider.get_data("US.SPY", "20260801", "20260801")
+    assert float(result.iloc[-1]["close"]) == 100.5
+
+
+def test_hybrid_provider_live_stock_merges_futu_snapshot():
+    class Theta:
+        def get_data(self, *args):
+            raise AssertionError("live stock overlay must keep Futu history")
+
+    class Futu:
+        def get_data(self, *args):
+            return _stock_frame()
+
+        def get_market_snapshot(self, _symbols):
+            timestamp = pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %H:%M:%S")
+            return pd.DataFrame([{
+                "code": "US.SPY",
+                "update_time": timestamp,
+                "open_price": 110.0,
+                "high_price": 111.0,
+                "low_price": 109.0,
+                "last_price": 110.5,
+                "volume": 2000,
+            }])
+
+    provider = HybridDataProvider(theta_provider=Theta(), futu_provider=Futu())
+    provider.set_live_mode(True)
+    result = provider.get_data("US.SPY", "20260801", "20260801")
+    assert float(result.iloc[-1]["close"]) == 110.5
+
+
+def test_hybrid_provider_live_stock_keeps_history_when_snapshot_stale():
+    class Theta:
+        def get_data(self, *args):
+            raise AssertionError("stale stock snapshot must not fall back to Theta")
+
+    class Futu:
+        def get_data(self, *args):
+            return _stock_frame()
+
+        def get_market_snapshot(self, _symbols):
+            return pd.DataFrame([{
+                "code": "US.SPY",
+                "update_time": "2020-01-01 10:00:00",
+                "open_price": 2.0,
+                "high_price": 2.2,
+                "low_price": 1.8,
+                "last_price": 2.1,
+                "volume": 1,
+            }])
+
+    provider = HybridDataProvider(theta_provider=Theta(), futu_provider=Futu())
+    provider.set_live_mode(True)
+    result = provider.get_data("US.SPY", "20260801", "20260801")
+    assert float(result.iloc[-1]["close"]) == 100.5

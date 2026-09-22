@@ -40,7 +40,7 @@ import threading
 import time
 import traceback
 import webbrowser
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import shared_memory
 
@@ -48,7 +48,7 @@ import numpy as np
 import optuna
 import optuna.visualization as vis
 import pandas as pd
-from optuna.samplers import TPESampler
+from optuna.samplers import GridSampler, TPESampler
 
 import config
 from backtest.backtester import Backtester
@@ -56,6 +56,7 @@ from common.formatters import format_float, format_recent_backtest_metrics
 from common.indicator_cache import BoundedIndicatorCache
 from common.loader import get_class_from_name, parse_period_string
 from common import process_elevation
+from common.schedule_planner import SchedulePlanner
 from common.terminal_log import (
     build_optimizer_terminal_log_path,
     get_optimizer_terminal_log_path,
@@ -230,6 +231,21 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
         terminal_tee.close()
 
 
+def infer_omitted_backtest_window(args):
+    """缺省 start/end 按调用时刻补全。调度等待必须先完成，再调用本函数。"""
+    if not getattr(args, "end_date", None):
+        args.end_date = datetime.datetime.now().strftime("%Y%m%d")
+    if not getattr(args, "start_date", None) and not getattr(args, "connect", None):
+        end_dt = pd.to_datetime(args.end_date)
+        start_dt = end_dt - pd.DateOffset(years=3)
+        args.start_date = start_dt.strftime("%Y%m%d")
+        print(
+            "\n[System] start_date omitted. Auto-inferred to: "
+            f"{args.start_date} (3 years lookback)."
+        )
+
+
+
 def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
     """
     运行优化模式主流程（从 run.py 下沉的编排逻辑）。
@@ -255,6 +271,16 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
     resolve_worker_count = getattr(OptimizationJob, "_resolve_worker_count", lambda _requested_jobs: 1)
     if process_elevation.request_optimizer_elevation_if_needed(args, resolve_worker_count):
         return 0
+
+    opt_schedule = getattr(args, "opt_schedule", None)
+    if opt_schedule:
+        try:
+            SchedulePlanner.wait_until_schedule(opt_schedule, log_func=print)
+        except ValueError as exc:
+            print(f"[Optimizer] Invalid --opt_schedule: {exc}")
+            return 1
+
+    infer_omitted_backtest_window(args)
 
     config.LOG = False
     logging.getLogger("optuna").setLevel(logging.INFO)
@@ -589,8 +615,12 @@ class OptimizationJob:
             sys.exit(1)
         self._source_symbols = list(self.target_symbols)
 
-        self.raw_datas = self._fetch_all_data()
-        self.train_datas, self.test_datas, self.train_range, self.test_range = self._split_data()
+        try:
+            self.raw_datas = self._fetch_all_data()
+            self.train_datas, self.test_datas, self.train_range, self.test_range = self._split_data()
+        finally:
+            # 数据窗口已经落入内存；后续 trial 不再依赖在线 Provider 会话。
+            self.data_manager.close_after_fetch()
         self._window_data_cache = {}
         if not hasattr(self, "_raw_data_fetch_range"):
             self._raw_data_fetch_range = (None, None)
@@ -938,6 +968,7 @@ class OptimizationJob:
         n_trials,
         log_file,
         prefer_fork_cow=False,
+        grid_search_space=None,
     ):
         if not log_file:
             raise RuntimeError("Multi-process mode requires a shared JournalStorage log file.")
@@ -1015,6 +1046,7 @@ class OptimizationJob:
                         worker_idx,
                         seed_base + worker_idx,
                         tpe_n_ei_candidates,
+                        grid_search_space=grid_search_space,
                     )
                 )
 
@@ -1136,11 +1168,24 @@ class OptimizationJob:
                 start_date=req_fetch_start,
                 end_date=req_end,
                 live=False,
+                refresh=bool(getattr(self.args, "refresh", False)),
             )
 
         datas = {}
-        for symbol in self.target_symbols:
-            # 优先使用缓存
+        skipped = []
+        symbols = list(self.target_symbols or [])
+        total = len(symbols)
+        started = time.monotonic()
+        last_progress = started
+        completed = 0
+        # 并发期权链/行情拉取只服务已声明 option_universe 的策略；普通股票
+        # 训练保留原顺序和单通道 Provider 访问，避免改变券商/CSV 读取语义。
+        option_strategy = bool(
+            getattr(getattr(self, "strategy_class", None), "option_universe", None)
+        )
+        fetch_workers = max(1, min(4, total)) if option_strategy and total else 1
+
+        def fetch_symbol(symbol):
             df = self.data_manager.get_data(
                 symbol,
                 start_date=req_fetch_start,
@@ -1150,10 +1195,53 @@ class OptimizationJob:
                 compression=self.args.compression,
                 refresh=self.args.refresh
             )
+            return symbol, df
+
+        def consume_symbol(symbol, df):
+            nonlocal completed, last_progress
+            completed += 1
             if df is not None and not df.empty:
                 datas[symbol] = df
+                status = "ok"
             else:
+                skipped.append(symbol)
                 print(f"Warning: No data for {symbol}, skipping.")
+                status = "skip"
+            now = time.monotonic()
+            if completed == 1 or completed == total or now - last_progress >= 30:
+                print(
+                    f"[Auto-Fetch] {completed}/{total} {symbol} {status} "
+                    f"elapsed={now - started:.0f}s"
+                )
+                last_progress = now
+
+        if total == 1:
+            symbol, df = fetch_symbol(symbols[0])
+            consume_symbol(symbol, df)
+        elif total > 1:
+            with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
+                futures = [pool.submit(fetch_symbol, symbol) for symbol in symbols]
+                for future in as_completed(futures):
+                    symbol, df = future.result()
+                    consume_symbol(symbol, df)
+
+        if skipped:
+            print(f"[Auto-Fetch] retry {len(skipped)} skipped symbols")
+            still_missing = []
+            retry_workers = max(1, min(4, len(skipped))) if option_strategy else 1
+            if len(skipped) == 1:
+                retry_pairs = [fetch_symbol(skipped[0])]
+            else:
+                with ThreadPoolExecutor(max_workers=retry_workers) as pool:
+                    retry_pairs = list(pool.map(lambda symbol: fetch_symbol(symbol), skipped))
+            for symbol, df in retry_pairs:
+                if df is not None and not df.empty:
+                    datas[symbol] = df
+                    print(f"[Auto-Fetch] retry {symbol} ok")
+                else:
+                    still_missing.append(symbol)
+                    print(f"Warning: No data for {symbol}, skipping.")
+            skipped = still_missing
 
         if not datas:
             raise ValueError("No data fetched. Check symbols, selection or date range.")
@@ -1593,6 +1681,28 @@ class OptimizationJob:
         )
         return estimated
 
+    def _build_grid_search_space(self):
+        """为有限离散参数空间构造去重网格，避免 TPE 重复采样同一组合。"""
+        grid = {}
+        for name, config in self.opt_params_def.items():
+            p_type = config.get("type")
+            if p_type == "int":
+                low = int(config["low"])
+                high = int(config["high"])
+                step = max(1, int(config.get("step", 1) or 1))
+                grid[name] = list(range(low, high + 1, step))
+            elif p_type == "float" and config.get("step") is not None:
+                low = float(config["low"])
+                high = float(config["high"])
+                step = float(config["step"])
+                count = int(math.floor((high - low) / step + 1e-10))
+                grid[name] = [round(low + index * step, 12) for index in range(count + 1)]
+            elif p_type == "categorical":
+                grid[name] = list(config.get("choices", []))
+            else:
+                return None
+        return grid or None
+
     @staticmethod
     def _estimate_param_cardinality(param_cfg):
         """
@@ -1750,6 +1860,16 @@ class OptimizationJob:
                 'years': years,
                 'monthly_win_rate': monthly_win_rate,
             }
+            if getattr(self.strategy_class, "option_universe", None):
+                try:
+                    from backtest.option_stats import summarize_option_trades
+
+                    closed_trade_getter = getattr(bt_instance, 'get_closed_trades', None)
+                    closed_trades = closed_trade_getter() if callable(closed_trade_getter) else []
+                    stats.update(summarize_option_trades(closed_trades, years=years))
+                except Exception:
+                    # 旧版/替身 Backtester 没有归因接口时保持原有 metric 兼容性。
+                    pass
 
             if self.args.metric in ['sharpe', 'calmar', 'return']:
                 metric_val = bt_instance.get_custom_metric(self.args.metric)
@@ -1838,23 +1958,27 @@ class OptimizationJob:
             raise
 
     def prepare_data_index(self, df: pd.DataFrame) -> pd.DataFrame:
-        """确保 DataFrame 的索引是 DatetimeIndex"""
-        if isinstance(df.index, pd.DatetimeIndex):
-            return df
+        """确保索引为 naive DatetimeIndex，避免 tz-aware 期权数据与窗口边界比较失败。"""
+        if not isinstance(df.index, pd.DatetimeIndex):
+            date_cols = ['date', 'datetime', 'trade_date', 'Date', 'Datetime']
+            converted = False
+            for col in date_cols:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col])
+                    df.set_index(col, inplace=True)
+                    converted = True
+                    break
+            if not converted:
+                try:
+                    df.index = pd.to_datetime(df.index)
+                except Exception:
+                    return df
 
-        date_cols = ['date', 'datetime', 'trade_date', 'Date', 'Datetime']
-        for col in date_cols:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col])
-                df.set_index(col, inplace=True)
-                return df
-
-        try:
-            df.index = pd.to_datetime(df.index)
+        if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
             return df
-        except:
-            pass
-        return df
+        prepared = df.copy(deep=False)
+        prepared.index = df.index.tz_convert("UTC").tz_localize(None)
+        return prepared
 
     def slice_datas(self, start_date: str, end_date: str):
         """根据日期切分数据字典，并保留逻辑起点前的指标预热数据。"""
@@ -2025,6 +2149,9 @@ class OptimizationJob:
         cache_key = f"{start_date}:{end_date}:warmup{self.warmup_days}"
         if cache_key in self._window_data_cache:
             print(f"[Optimizer] Reusing cached window data: {start_date} to {end_date}")
+            close_after_fetch = getattr(self.data_manager, "close_after_fetch", None)
+            if callable(close_after_fetch):
+                close_after_fetch()
             return self._window_data_cache[cache_key]
 
         datas = {}
@@ -2042,7 +2169,16 @@ class OptimizationJob:
         except Exception:
             preloaded_request_covers_window = False
 
-        for symbol in self.target_symbols:
+        symbols = list(self.target_symbols or [])
+        total = len(symbols)
+        reused = fetched = skipped = short_tail = 0
+        started = time.monotonic()
+        last_progress = started
+        print(
+            f"[Optimizer] Align window {physical_start_date} to {end_date}: "
+            f"{total} symbols"
+        )
+        for index, symbol in enumerate(symbols, 1):
             used_preloaded = False
             raw_df = self.raw_datas.get(symbol)
             if raw_df is not None and not raw_df.empty:
@@ -2060,33 +2196,51 @@ class OptimizationJob:
                         if not sliced_df.empty:
                             datas[symbol] = sliced_df
                             used_preloaded = True
+                            reused += 1
                             if raw_end < e and preloaded_request_covers_window:
-                                print(
-                                    f"[Optimizer] Reusing preloaded data for {symbol} through "
-                                    f"{pd.to_datetime(raw_end).strftime('%Y%m%d')}; "
-                                    f"requested end is {end_date}."
-                                )
-                except Exception:
-                    pass
+                                short_tail += 1
+                except Exception as exc:
+                    print(f"[Optimizer] Failed to reuse preloaded data for {symbol}: {exc}")
 
-            if used_preloaded:
-                continue
+            if not used_preloaded:
+                print(
+                    f"[Optimizer] Window data miss for {symbol}; fetching "
+                    f"{physical_start_date} to {end_date}..."
+                )
+                df = self.data_manager.get_data(
+                    symbol,
+                    start_date=physical_start_date,
+                    end_date=end_date,
+                    specified_sources=self.args.data_source,
+                    timeframe=self.args.timeframe,
+                    compression=self.args.compression,
+                    refresh=self.args.refresh
+                )
+                if df is not None and not df.empty:
+                    datas[symbol] = df
+                    fetched += 1
+                else:
+                    skipped += 1
+                    print(f"[Optimizer] Warning: No evaluation data for {symbol}, skipping.")
 
-            df = self.data_manager.get_data(
-                symbol,
-                start_date=physical_start_date,
-                end_date=end_date,
-                specified_sources=self.args.data_source,
-                timeframe=self.args.timeframe,
-                compression=self.args.compression,
-                refresh=self.args.refresh
-            )
-            if df is not None and not df.empty:
-                datas[symbol] = df
-            else:
-                print(f"[Optimizer] Warning: No evaluation data for {symbol}, skipping.")
+            now = time.monotonic()
+            if index == 1 or index == total or now - last_progress >= 30:
+                print(
+                    f"[Optimizer] Window {index}/{total} {symbol} "
+                    f"reuse={reused} fetch={fetched} skip={skipped} "
+                    f"elapsed={now - started:.0f}s"
+                )
+                last_progress = now
 
+        print(
+            f"[Optimizer] Window {physical_start_date} to {end_date} ready: "
+            f"reuse={reused} fetch={fetched} skip={skipped} "
+            f"short_tail={short_tail} elapsed={time.monotonic() - started:.0f}s"
+        )
         self._window_data_cache[cache_key] = datas
+        close_after_fetch = getattr(self.data_manager, "close_after_fetch", None)
+        if callable(close_after_fetch):
+            close_after_fetch()
         return datas
 
     def _run_main_eval_backtest(self, final_params):
@@ -2174,11 +2328,21 @@ class OptimizationJob:
         print("-" * 60)
 
         reports = []
-        for start_date, end_date in windows:
+        total = len(windows)
+        started = time.monotonic()
+        for index, (start_date, end_date) in enumerate(windows, 1):
             window_key = (self._normalize_date_tag(start_date), self._normalize_date_tag(end_date))
             if all(test_key) and window_key == test_key:
+                print(
+                    f"[Optimizer] Yearly {index}/{total} {start_date} to {end_date} "
+                    "skip=test-window"
+                )
                 continue
 
+            print(
+                f"[Optimizer] Yearly {index}/{total} {start_date} to {end_date} "
+                f"elapsed={time.monotonic() - started:.0f}s"
+            )
             datas = self.slice_datas(start_date, end_date)
             if not datas:
                 print(f"[Optimizer] Warning: Yearly validation skipped (no data): {start_date} to {end_date}")
@@ -2194,12 +2358,21 @@ class OptimizationJob:
                 )
                 if metrics:
                     reports.append(metrics)
+                    print(
+                        f"[Optimizer] Yearly {start_date} to {end_date} ok "
+                        f"elapsed={time.monotonic() - started:.0f}s"
+                    )
             except Exception as e:
                 print(f"[Optimizer] Warning: Yearly validation failed {start_date} to {end_date}: {e}")
 
+        print(
+            f"[Optimizer] Yearly validation done: {len(reports)}/{total} "
+            f"elapsed={time.monotonic() - started:.0f}s"
+        )
         return reports
 
     def run(self):
+        # 初始行情、历史期权链和切分已在构造阶段完成；训练阶段只使用内存数据。
         # 1. 配置存储 (支持多核)
         storage = None
         n_jobs = getattr(self.args, 'n_jobs', 1)
@@ -2271,12 +2444,27 @@ class OptimizationJob:
             if n_trials <= 0:
                 raise ValueError(f"n_trials must be a positive integer, got: {n_trials}")
 
-        # 使用 TPESampler(constant_liar=True)
-        # 这会防止多个 Worker 同时采样到同一个点（并发踩踏）
-        sampler = TPESampler(
-            constant_liar=True,
-            n_ei_candidates=self.TPE_DEFAULT_N_EI_CANDIDATES,
+        # 期权策略的有限空间需要去重网格；股票/普通标的继续保留原有 TPE
+        # 采样行为，避免改变既有股票训练的参数分布与复现结果。
+        grid_search_space = (
+            self._build_grid_search_space()
+            if getattr(getattr(self, "strategy_class", None), "option_universe", None)
+            else None
         )
+        if grid_search_space:
+            grid_size = math.prod(len(values) for values in grid_search_space.values())
+            n_trials = min(int(n_trials), grid_size)
+            print(
+                f"[Optimizer] Finite grid detected: {grid_size} unique combinations; "
+                f"duplicate sampling disabled, trials={n_trials}."
+            )
+            sampler = GridSampler(grid_search_space)
+        else:
+            # 连续空间使用并行 TPE。
+            sampler = TPESampler(
+                constant_liar=True,
+                n_ei_candidates=self.TPE_DEFAULT_N_EI_CANDIDATES,
+            )
 
         # 2. 创建 Study (包裹 try-except 以捕获 Windows 权限错误)
         try:
@@ -2351,6 +2539,7 @@ class OptimizationJob:
                     n_trials=n_trials,
                     log_file=log_file,
                     prefer_fork_cow=(not auto_launch_dashboard),
+                    grid_search_space=grid_search_space,
                 )
             else:
                 # 单核/单并行场景回退为单进程线程模式（与历史版本一致）
@@ -2454,6 +2643,7 @@ def _optimize_worker_entry(
     worker_idx,
     sampler_seed,
     tpe_n_ei_candidates=None,
+    grid_search_space=None,
 ):
     """
     多进程子进程入口：每个 worker 连接同一个 Study，执行固定 trial 配额。
@@ -2485,13 +2675,16 @@ def _optimize_worker_entry(
             worker_payload["train_datas"] = restored_train_datas
 
         storage = JournalStorage(JournalFileBackendCls(log_file))
-        if tpe_n_ei_candidates is None:
-            tpe_n_ei_candidates = OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
-        sampler = TPESampler(
-            constant_liar=True,
-            seed=sampler_seed,
-            n_ei_candidates=tpe_n_ei_candidates,
-        )
+        if grid_search_space:
+            sampler = GridSampler(grid_search_space)
+        else:
+            if tpe_n_ei_candidates is None:
+                tpe_n_ei_candidates = OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
+            sampler = TPESampler(
+                constant_liar=True,
+                seed=sampler_seed,
+                n_ei_candidates=tpe_n_ei_candidates,
+            )
 
         study = optuna.create_study(
             direction='maximize',

@@ -1,15 +1,16 @@
 import argparse
 import ast
-import datetime
 import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas
-import pandas as pd
 
 import config
 from backtest.backtester import Backtester
 import optimizer
+from optimizer.runtime import infer_omitted_backtest_window
 from common.loader import get_class_from_name, pascal_to_snake
 from common.live_process_supervisor import (
     LiveWorkerOperatorStop,
@@ -104,6 +105,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
             start_date=start_date,
             end_date=end_date,
             live=False,
+            refresh=refresh,
         )
     except ValueError as exc:
         print(f"\nFatal: {exc}")
@@ -114,8 +116,15 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     print(f"  Requesting data from: {start_date or 'origin'} to {end_date or 'latest'}")
 
     datas = {}
-    for symbol in symbols:
-        print(f"  Fetching data for: {symbol}")
+    skipped = []
+    symbols = list(symbols or [])
+    total = len(symbols)
+    started = time.monotonic()
+    last_progress = started
+    completed = 0
+    fetch_workers = max(1, min(4, total)) if total else 1
+
+    def fetch_symbol(symbol):
         df = data_manager.get_data(
             symbol,
             start_date=start_date,
@@ -125,10 +134,51 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
             compression=compression,
             refresh=refresh
         )
+        return symbol, df
+
+    def consume_symbol(symbol, df):
+        nonlocal completed, last_progress
+        completed += 1
         if df is not None and not df.empty:
             datas[symbol] = df
+            status = "ok"
         else:
+            skipped.append(symbol)
             print(f"  Warning: Failed to fetch data for {symbol}. It will be excluded from the backtest.")
+            status = "skip"
+        now = time.monotonic()
+        if completed == 1 or completed == total or now - last_progress >= 30:
+            print(
+                f"[Auto-Fetch] {completed}/{total} {symbol} {status} "
+                f"elapsed={now - started:.0f}s"
+            )
+            last_progress = now
+
+    if total == 1:
+        symbol, df = fetch_symbol(symbols[0])
+        consume_symbol(symbol, df)
+    elif total > 1:
+        with ThreadPoolExecutor(max_workers=fetch_workers) as pool:
+            futures = [pool.submit(fetch_symbol, symbol) for symbol in symbols]
+            for future in as_completed(futures):
+                symbol, df = future.result()
+                consume_symbol(symbol, df)
+
+    if skipped:
+        print(f"[Auto-Fetch] retry {len(skipped)} skipped symbols")
+        still_missing = []
+        retry_workers = max(1, min(4, len(skipped)))
+        if len(skipped) == 1:
+            retry_pairs = [fetch_symbol(skipped[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=retry_workers) as pool:
+                retry_pairs = list(pool.map(lambda symbol: fetch_symbol(symbol), skipped))
+        for symbol, df in retry_pairs:
+            if df is not None and not df.empty:
+                datas[symbol] = df
+                print(f"[Auto-Fetch] retry {symbol} ok")
+            else:
+                print(f"  Warning: Failed to fetch data for {symbol}. It will be excluded from the backtest.")
 
     if not datas:
         print("\nFatal: Could not fetch data for any of the specified symbols. Aborting.")
@@ -220,11 +270,21 @@ def _run_main():
             "full 不能与其他范围混用。"
         ),
     )
-    parser.add_argument('--refresh', action='store_true', help="强制刷新CACHE_DATA数据")
+    parser.add_argument(
+        '--refresh',
+        action='store_true',
+        help="忽略完整行情缓存和期权池断点，重新在线拉取并合并回写；不会删除整个缓存目录",
+    )
     parser.add_argument('--config', type=str, default='{}',
                         help="覆盖config.py配置 (JSON字符串, 例如: \"{'GM_TOKEN':'xxx','LOG':False}\")")
     # Optimizer 专用参数
     parser.add_argument('--opt_params', type=str, default=None, help="[优化模式] 优化参数空间定义 JSON")
+    parser.add_argument(
+        '--opt_schedule',
+        type=str,
+        default=None,
+        help="[优化模式] 启动调度：HH:MM[:SS] 单次触发，或 Nd/Nw/Nm/Nh[:HH:MM[:SS]] 周期触发",
+    )
     parser.add_argument('--n_trials', type=int, default=None, help="[优化模式] 尝试次数 (默认: 自动推断)")
     parser.add_argument(
         '--n_jobs',
@@ -277,27 +337,14 @@ def _run_main():
     # 3. 解析参数
     args = parser.parse_args()
 
+    if args.opt_schedule and not args.opt_params:
+        raise ValueError("--opt_schedule 仅可与 --opt_params 一起使用")
+    if args.opt_schedule and args.connect:
+        raise ValueError("--opt_schedule 用于训练启动等待；实盘请使用连接环境中的 schedule")
+
     # 非 worker 实盘进程由轻量父进程监督；worker 直接进入 launcher。
     if args.connect and not is_live_worker_process():
         sys.exit(supervise_live_process())
-
-    # ==========================================
-    # 全局时间自动推断逻辑 (Auto-Inference)
-    # 作用：支持缺省 start_date/end_date 的自动化回测
-    # ==========================================
-    # 1. 自动补全 end_date (默认为当前系统时间)
-    if not args.end_date:
-        args.end_date = datetime.datetime.now().strftime('%Y%m%d')
-
-    # 2. 自动补全 start_date
-    # 注意：如果是实盘模式(--connect)，引擎有自己的 1 年预热逻辑，无需在此强行干预
-    if not args.start_date and not args.connect:
-        # 默认最大公约数回溯周期：3年
-        # 使用 pd.DateOffset 可以完美处理闰年(Leap Year)的天数差异
-        end_dt = pd.to_datetime(args.end_date)
-        start_dt = end_dt - pandas.DateOffset(years=3)
-        args.start_date = start_dt.strftime('%Y%m%d')
-        print(f"\n[System] start_date omitted. Auto-inferred to: {args.start_date} (3 years lookback).")
 
     # 覆盖config.py
     if args.config:
@@ -336,6 +383,10 @@ def _run_main():
         if 'BROKER_ENVIRONMENTS' not in overridden_keys and overridden_keys & environment_keys:
             from configs.manager import refresh_broker_environments
             config.BROKER_ENVIRONMENTS = refresh_broker_environments()
+
+    # 全局时间自动推断。--opt_schedule 必须等槽位到达后再推断，避免跨日用等待前的窗口。
+    if not args.opt_schedule:
+        infer_omitted_backtest_window(args)
 
     # 将逗号分隔的字符串转换为列表
     symbol_list = [s.strip() for s in args.symbols.split(',')]
