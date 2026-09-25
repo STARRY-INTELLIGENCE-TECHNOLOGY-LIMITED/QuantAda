@@ -127,11 +127,96 @@ def _normalize_option_types(option_types):
     }
 
 
+def _option_quote_days(data):
+    """返回离线行情中可能存在有效当前报价的交易日键。"""
+    dataframe = getattr(getattr(data, "p", None), "dataname", None)
+    if not isinstance(dataframe, pd.DataFrame) or dataframe.empty:
+        return ()
+    attrs = getattr(dataframe, "attrs", {})
+    cached = attrs.get("_quantada_option_quote_days")
+    if cached is not None:
+        return cached
+    index = pd.to_datetime(dataframe.index, errors="coerce")
+    if getattr(index, "tz", None) is not None:
+        index = index.tz_localize(None)
+
+    def numeric_column(*names):
+        for name in names:
+            if name in dataframe.columns:
+                return pd.to_numeric(dataframe[name], errors="coerce").fillna(0.0)
+        return pd.Series(0.0, index=dataframe.index)
+
+    close = numeric_column("close")
+    bid = numeric_column("bid", "bid_price")
+    ask = numeric_column("ask", "ask_price")
+    valid = (close > 0) | ((bid > 0) & (ask >= bid))
+    valid &= ~index.isna()
+    days = index.normalize()[valid.to_numpy(dtype=bool)]
+    keys = tuple(dict.fromkeys(pd.Timestamp(day).value for day in days))
+    attrs["_quantada_option_quote_days"] = keys
+    return keys
+
+
+def _looks_like_option_data(data):
+    """判断行情 feed 是否可能是期权；未知代码用期权元数据列兜底。"""
+    if parse_option_symbol(getattr(data, "_name", "")).get("option_type"):
+        return True
+    dataframe = getattr(getattr(data, "p", None), "dataname", None)
+    if not isinstance(dataframe, pd.DataFrame):
+        return False
+    return bool(
+        set(dataframe.columns).intersection(
+            {"option_type", "right", "cp", "put_call", "strike", "expiry"}
+        )
+    )
+
+
+def _option_snapshot_datas(broker, current_dt):
+    """按当前交易日返回有报价的期权 feed；实盘不启用离线索引。"""
+    if getattr(broker, "is_live", False) or current_dt is None:
+        return getattr(broker, "datas", []) or []
+    datas = list(getattr(broker, "datas", []) or [])
+    signature = tuple(id(data) for data in datas)
+    if getattr(broker, "_option_snapshot_datas_signature", None) != signature:
+        by_day = {}
+        for data in datas:
+            if not _looks_like_option_data(data):
+                continue
+            for day_key in _option_quote_days(data):
+                by_day.setdefault(day_key, []).append(data)
+        broker._option_snapshot_datas_signature = signature
+        broker._option_snapshot_datas_by_day = by_day
+    timestamp = pd.Timestamp(current_dt)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_localize(None)
+    by_day = getattr(broker, "_option_snapshot_datas_by_day", {})
+    return by_day.get(timestamp.normalize().value, ())
+
+
 def iter_option_rows(broker, current_dt, option_types=None):
     """遍历当前可见的期权行情行。"""
     allowed = _normalize_option_types(option_types)
-    for data in getattr(broker, "datas", []) or []:
-        row = visible_row(data, current_dt, require_current_quote=True)
+    offline_cache = None
+    cache_key = None
+    if not getattr(broker, "is_live", False):
+        timestamp = pd.Timestamp(current_dt)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_localize(None)
+        if getattr(broker, "_option_rows_cache_dt", None) != timestamp:
+            broker._option_rows_cache_dt = timestamp
+            broker._option_rows_cache = {}
+        offline_cache = getattr(broker, "_option_rows_cache", None)
+        if isinstance(offline_cache, dict):
+            normalized_allowed = None if allowed is None else tuple(sorted(allowed))
+            cache_key = normalized_allowed
+            cached = offline_cache.get(cache_key)
+            if cached is not None:
+                yield from cached
+                return
+    rows = []
+    snapshot_datas = _option_snapshot_datas(broker, current_dt)
+    for data in snapshot_datas:
+        row = visible_row(data, current_dt, require_current_quote=True, cache_owner=broker)
         if row is None:
             continue
         meta = option_contract(data, row)
@@ -139,7 +224,10 @@ def iter_option_rows(broker, current_dt, option_types=None):
             continue
         if allowed is not None and meta["option_type"] not in allowed:
             continue
-        yield data, row, meta, quote_snapshot(row)
+        rows.append((data, row, meta, quote_snapshot(row)))
+    if offline_cache is not None:
+        offline_cache[cache_key] = rows
+    yield from rows
 
 
 def _metadata_row(data):
@@ -201,7 +289,7 @@ def held_protective_put(broker, short_meta, current_dt):
             continue
         if meta.get("expiry") != short_expiry or meta.get("strike", 0) >= short_strike:
             continue
-        row = visible_row(data, current_dt, require_current_quote=True)
+        row = visible_row(data, current_dt, require_current_quote=True, cache_owner=broker)
         candidates.append({
             "data": data,
             "meta": meta,

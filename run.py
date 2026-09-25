@@ -229,7 +229,7 @@ def _run_main():
     )
 
     # 2. 添加命令行参数
-    parser.add_argument('strategy', type=str,
+    parser.add_argument('strategy', type=str, nargs='?',
                         help="要运行的策略文件名 (例如: sample_macd_cross_strategy.py 或 sample_macd_cross_strategy 或 my_pkg.my_strategy.MyStrategyClass)")
     parser.add_argument('--params', type=str, default='{}',
                         help="策略参数 (JSON字符串, 例如: \"{\'selectTopK\': 2, \'target_buffer\': 0.95}\")")
@@ -278,6 +278,7 @@ def _run_main():
     parser.add_argument('--config', type=str, default='{}',
                         help="覆盖config.py配置 (JSON字符串, 例如: \"{'GM_TOKEN':'xxx','LOG':False}\")")
     # Optimizer 专用参数
+    parser.add_argument('--train_resume', action='store_true', help="List historical training tasks by most recent update and resume one interactively")
     parser.add_argument('--opt_params', type=str, default=None, help="[优化模式] 优化参数空间定义 JSON")
     parser.add_argument(
         '--opt_schedule',
@@ -285,7 +286,19 @@ def _run_main():
         default=None,
         help="[优化模式] 启动调度：HH:MM[:SS] 单次触发，或 Nd/Nw/Nm/Nh[:HH:MM[:SS]] 周期触发",
     )
-    parser.add_argument('--n_trials', type=int, default=None, help="[优化模式] 尝试次数 (默认: 自动推断)")
+    parser.add_argument('--n_trials', type=int, default=None, help="[优化模式] 累计有效试验预算，失败重试不占用完成额度 (默认: 自动推断)")
+    parser.add_argument(
+        '--study_name',
+        type=str,
+        default=None,
+        help="[优化模式] 指定 Optuna Study 名称；省略时按训练配置自动匹配并续传",
+    )
+    parser.add_argument(
+        '--study_journal',
+        type=str,
+        default=None,
+        help="[优化模式] 指定 Optuna Journal 文件；省略时自动查找匹配任务",
+    )
     parser.add_argument(
         '--n_jobs',
         type=int,
@@ -337,6 +350,30 @@ def _run_main():
     # 3. 解析参数
     args = parser.parse_args()
 
+    if args.train_resume:
+        from optimizer.training_tasks import build_resume_arguments, choose_training_task, list_training_tasks
+
+        if args.strategy or args.connect:
+            parser.error("--train_resume restores a saved strategy and does not accept a strategy argument or --connect")
+        overrides = ast.literal_eval(args.config)
+        if not isinstance(overrides, dict):
+            parser.error("--config must be a Python dictionary")
+        data_path = overrides.get("DATA_PATH", config.DATA_PATH)
+        print("Loading historical training tasks...")
+        extra_arguments = [item for item in raw_cli_args if item != "--train_resume"]
+        task = choose_training_task(list_training_tasks(os.path.join(os.getcwd(), data_path, "optuna")), extra_arguments)
+        if task is None:
+            return 0
+        restored = build_resume_arguments(task, extra_arguments)
+        # 提权重启必须继续选中的任务，不能在新窗口再次弹出选择菜单。
+        sys.argv[1:] = restored
+        args = parser.parse_args(restored)
+        os.environ.pop("QUANTADA_STUDY_NAME", None)
+        os.environ.pop("QUANTADA_STUDY_JOURNAL", None)
+        print(f"\nResuming: {task['strategy']} | {', '.join(task['metrics'])}")
+    if not args.strategy:
+        parser.error("Specify a strategy, or use --train_resume to choose a historical training task")
+
     if args.opt_schedule and not args.opt_params:
         raise ValueError("--opt_schedule 仅可与 --opt_params 一起使用")
     if args.opt_schedule and args.connect:
@@ -384,8 +421,9 @@ def _run_main():
             from configs.manager import refresh_broker_environments
             config.BROKER_ENVIRONMENTS = refresh_broker_environments()
 
-    # 全局时间自动推断。--opt_schedule 必须等槽位到达后再推断，避免跨日用等待前的窗口。
-    if not args.opt_schedule:
+    # 优化器需要区分显式日期和缺省日期，以便继承续传窗口；其它模式保持入口推断。
+    # --opt_schedule 必须等槽位到达后再推断，避免跨日用等待前的窗口。
+    if not args.opt_schedule and (not args.opt_params or args.connect):
         infer_omitted_backtest_window(args)
 
     # 将逗号分隔的字符串转换为列表

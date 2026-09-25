@@ -1164,6 +1164,7 @@ def test_optimizer_run_passes_gc_after_trial_to_single_process_optimize(monkeypa
         state = "complete"
 
     class DummyStudy:
+        user_attrs = {"_optimizer_worker_config_version": 1}
         trials = [DummyTrial()]
         best_params = {"lookback": 20}
         best_value = 1.23
@@ -1210,7 +1211,7 @@ def test_optimizer_run_passes_gc_after_trial_to_single_process_optimize(monkeypa
 
     assert result["best_params"] == {"lookback": 20}
     assert captured["gc_after_trial"] is True
-    assert captured["n_trials"] == 3
+    assert captured["n_trials"] == 2
     assert captured["n_jobs"] == 1
 
 
@@ -1224,6 +1225,7 @@ def test_optimizer_run_uses_default_tpe_candidates_for_short_runs(monkeypatch):
         state = "complete"
 
     class DummyStudy:
+        user_attrs = {"_optimizer_worker_config_version": 1}
         trials = [DummyTrial()]
         best_params = {"lookback": 20}
         best_value = 1.23
@@ -1313,6 +1315,7 @@ def test_tpe_candidates_drop_only_for_spawn_payload_copy_long_runs():
 
 def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, capsys):
     class DummyStudy:
+        user_attrs = {"_optimizer_worker_config_version": 1}
         def optimize(self, *args, **kwargs):
             raise MemoryError("simulated sampler pressure")
 
@@ -1328,7 +1331,7 @@ def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, cap
 
     monkeypatch.setattr(optimizer, "HAS_JOURNAL", True)
     monkeypatch.setattr(optimizer, "JournalStorage", lambda backend: object())
-    monkeypatch.setattr(optimizer, "JournalFileBackendCls", lambda log_file: object())
+    monkeypatch.setattr(optimizer, "JournalFileBackendCls", lambda log_file, **kwargs: object())
     monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
     monkeypatch.setattr(optimizer, "TPESampler", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
     monkeypatch.setattr(optimizer.OptimizationJob, "from_worker_payload", lambda payload: DummyJob())
@@ -1337,7 +1340,7 @@ def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, cap
     payload = {
         "args": _build_args(strategy="dummy.strategy", risk=None),
         "train_datas": {},
-        "log_enabled": False,
+        "runtime_config": {},
     }
 
     result = optimizer._optimize_worker_entry(
@@ -1533,6 +1536,111 @@ def test_finite_grid_search_space_is_materialized_without_duplicate_values():
         "profit_take_fraction": [0.4, 0.5, 0.6],
         "mode": ["a", "b"],
     }
+
+
+def test_explicit_study_name_is_not_replaced_by_timestamp():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.args = SimpleNamespace(study_name="csp-resume-20260922")
+
+    job._auto_refine_study_name()
+
+    assert job.args.study_name == "csp-resume-20260922"
+
+
+def test_remaining_trial_budget_does_not_count_failed_trials():
+    class Trial:
+        def __init__(self, state):
+            self.state = state
+
+    class Study:
+        trials = [
+            Trial(optimizer.optuna.trial.TrialState.COMPLETE),
+            Trial(optimizer.optuna.trial.TrialState.FAIL),
+            Trial(optimizer.optuna.trial.TrialState.RUNNING),
+        ]
+
+    assert optimizer.OptimizationJob._remaining_trial_budget(Study(), 10) == 9
+    assert optimizer.OptimizationJob._remaining_trial_budget(Study(), 2) == 1
+
+
+def test_spawn_payload_supports_string_metadata_without_strategy_specific_gate():
+    class StockStrategy:
+        pass
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.strategy_class = StockStrategy
+    frame = pd.DataFrame(
+        {
+            "close": [1.0, 1.1],
+            "option_type": ["PUT", "PUT"],
+            "expiry": ["2026-10-16", "2026-10-16"],
+        },
+        index=pd.Index(["2026-09-01", "2026-09-02"], name="datetime"),
+    )
+    frame.attrs["source"] = "stock-cache"
+    payload, handles = job._build_spawn_shared_payload(
+        {"train_datas": {"US.SPY_OPTION": frame}}
+    )
+    try:
+        restored, attached = optimizer.OptimizationJob._restore_train_datas_from_shared(
+            payload["train_datas_shared"]
+        )
+        try:
+            records_meta = payload["train_datas_shared"]["symbols"]["US.SPY_OPTION"]["records"]
+            records_arr, probe = optimizer.OptimizationJob._attach_shared_array(records_meta)
+            assert restored["US.SPY_OPTION"]["option_type"].tolist() == ["PUT", "PUT"]
+            assert restored["US.SPY_OPTION"]["expiry"].tolist() == [
+                "2026-10-16", "2026-10-16",
+            ]
+            assert restored["US.SPY_OPTION"].attrs["source"] == "stock-cache"
+            restored_values = restored["US.SPY_OPTION"]["close"].to_numpy(copy=False)
+            assert not restored_values.flags.owndata
+            base = restored_values
+            mmap_base = False
+            while base is not None:
+                if type(base).__module__ == "mmap" and type(base).__name__ == "mmap":
+                    mmap_base = True
+                    break
+                base = getattr(base, "base", None)
+            assert mmap_base
+            probe.close()
+        finally:
+            optimizer.OptimizationJob._cleanup_shared_segments(attached, unlink=False)
+    finally:
+        optimizer.OptimizationJob._cleanup_shared_segments(handles, unlink=True)
+
+
+def test_spawn_payload_falls_back_for_unsupported_object_values():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    frame = pd.DataFrame({"close": [1.0], "metadata": [{"nested": True}]})
+    worker_payload = {"train_datas": {"AAA": frame}}
+
+    payload, handles = job._build_spawn_shared_payload(worker_payload)
+
+    assert payload is worker_payload
+    assert handles == []
+
+
+def test_spawn_payload_falls_back_for_extension_dtypes():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    frame = pd.DataFrame({"close": [1.0], "sector": pd.Categorical(["ETF"])})
+    worker_payload = {"train_datas": {"AAA": frame}}
+
+    payload, handles = job._build_spawn_shared_payload(worker_payload)
+
+    assert payload is worker_payload
+    assert handles == []
+
+
+def test_spawn_payload_falls_back_for_missing_string_values():
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    frame = pd.DataFrame({"close": [1.0], "sector": pd.Series([None], dtype=object)})
+    worker_payload = {"train_datas": {"AAA": frame}}
+
+    payload, handles = job._build_spawn_shared_payload(worker_payload)
+
+    assert payload is worker_payload
+    assert handles == []
 
 
 def test_optimizer_infers_omitted_window_after_schedule_wait(monkeypatch):

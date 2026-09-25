@@ -3,6 +3,8 @@ import pandas as pd
 from backtest.backtester import Backtester
 from strategies.base_strategy import BaseStrategy
 from common.data_view import visible_row
+import strategies.options.support as option_support
+from strategies.options.support import iter_option_rows
 
 
 class _CountNextStrategy(BaseStrategy):
@@ -123,6 +125,93 @@ def test_visible_row_strict_quote_rejects_stale_last_trade():
     assert visible_row(data, pd.Timestamp("2024-01-03"), require_current_quote=True) is None
 
 
+def test_visible_row_cache_keeps_intraday_rows_distinct():
+    index = pd.to_datetime(["2024-01-03 10:00", "2024-01-03 11:00"])
+    frame = _option_frame(index)
+    frame.loc[index[0], "close"] = 1.0
+    frame.loc[index[1], "close"] = 2.0
+    data = type("Feed", (), {})()
+    data.p = type("Params", (), {"dataname": frame})()
+    owner = type("Broker", (), {"is_live": False})()
+
+    first = visible_row(data, pd.Timestamp("2024-01-03 10:30"), cache_owner=owner)
+    second = visible_row(data, pd.Timestamp("2024-01-03 11:30"), cache_owner=owner)
+
+    assert float(first["close"]) == 1.0
+    assert float(second["close"]) == 2.0
+
+
+def test_option_row_cache_reuses_only_the_same_offline_bar():
+    index = pd.to_datetime(["2024-01-03", "2024-01-04"])
+    frame = _option_frame(index)
+    data = type("Feed", (), {"_name": "US.SPY240119P00400000"})()
+    data.p = type("Params", (), {"dataname": frame})()
+    broker = type("Broker", (), {"is_live": False, "datas": [data]})()
+
+    first = list(iter_option_rows(broker, index[0], {"PUT"}))
+    second = list(iter_option_rows(broker, index[0], {"PUT"}))
+    later = list(iter_option_rows(broker, index[1], {"PUT"}))
+
+    assert len(first) == len(second) == len(later) == 1
+    assert first[0][2] == second[0][2]
+    assert first[0][1] is second[0][1]
+
+
+def test_live_option_rows_refresh_quotes_at_the_same_timestamp():
+    index = pd.to_datetime(["2024-01-03"])
+    frame = _option_frame(index)
+    data = type("Feed", (), {"_name": "US.SPY240119P00400000"})()
+    data.p = type("Params", (), {"dataname": frame})()
+    broker = type("Broker", (), {"is_live": True, "datas": [data]})()
+
+    first = list(iter_option_rows(broker, index[0], {"PUT"}))
+    replacement = frame.copy()
+    replacement.loc[index[0], ["close", "bid", "ask"]] = [3.0, 3.0, 3.1]
+    data.p.dataname = replacement
+    second = list(iter_option_rows(broker, index[0], {"PUT"}))
+
+    assert float(first[0][1]["close"]) == 2.0
+    assert float(second[0][1]["close"]) == 3.0
+    assert not hasattr(broker, "_visible_row_cache")
+    assert not hasattr(broker, "_option_rows_cache")
+    assert not hasattr(broker, "_option_snapshot_datas_by_day")
+
+
+def test_option_snapshot_index_skips_feeds_without_a_valid_quote(monkeypatch):
+    index = pd.to_datetime(["2024-01-03", "2024-01-04"])
+    active = _option_frame(index)
+    inactive = active.copy()
+    inactive["close"] = 0.0
+    inactive["bid"] = 0.0
+    inactive["ask"] = 0.0
+
+    def feed(symbol, frame):
+        data = type("Feed", (), {"_name": symbol})()
+        data.p = type("Params", (), {"dataname": frame})()
+        return data
+
+    active_data = feed("US.SPY240119P00400000", active)
+    inactive_data = feed("US.SPY240119P00410000", inactive)
+    broker = type(
+        "Broker",
+        (),
+        {"is_live": False, "datas": [active_data, inactive_data]},
+    )()
+    calls = {"count": 0}
+    original = option_support.visible_row
+
+    def counted(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(option_support, "visible_row", counted)
+    rows = list(option_support.iter_option_rows(broker, index[0], {"PUT"}))
+
+    assert len(rows) == 1
+    assert rows[0][0] is active_data
+    assert calls["count"] == 1
+
+
 def test_underlying_history_before_start_remains_on_dataname():
     history = pd.bdate_range("2023-12-01", "2024-01-10")
     option = _option_frame(pd.bdate_range("2024-01-08", "2024-01-10"))
@@ -160,4 +249,38 @@ def test_missing_option_bars_stay_zero_until_expiry_then_zero():
     data = type("Feed", (), {})()
     data.p = type("Params", (), {"dataname": frame})()
     assert visible_row(data, hole, require_current_quote=True) is None
+
+
+def test_option_feed_alignment_is_reused_when_clock_signature_matches():
+    clock = pd.bdate_range("2024-01-02", "2024-01-10")
+    datas = {
+        "US.SPY": _ohlcv(clock),
+        "US.SPY240119P00400000": _option_frame(clock[[0, 2, 4]]),
+    }
+    first = _run(datas)
+    prepared = first._prepared_datas
+    assert prepared is not None
+    option = prepared["US.SPY240119P00400000"]
+    assert option.index.equals(clock)
+    assert "_quantada_aligned_clock" in option.attrs
+
+    second = _run(prepared)
+    second_option = next(
+        data for data in second.cerebro.datas
+        if getattr(data, "_name", "") == "US.SPY240119P00400000"
+    )
+    assert second_option.p.dataname.equals(option)
+
+
+def test_stock_feed_preparation_reuse_keeps_the_same_clock_and_rows():
+    clock = pd.bdate_range("2024-01-02", "2024-01-10")
+    datas = {"US.SPY": _ohlcv(clock), "US.QQQ": _ohlcv(clock, close=200.0)}
+
+    first = _run(datas)
+    second = _run(first._prepared_datas)
+
+    assert first.results[0].strategy.n == second.results[0].strategy.n == len(clock)
+    assert second.cerebro.datas[0].p.dataname.equals(
+        first._prepared_datas["US.SPY"]
+    )
 

@@ -35,8 +35,10 @@
    - 账户中未加载进 `self.broker.datas` 的持仓默认不属于本策略管理范围；不要把标的池外对象加入 `target_symbols`。
    - 若目标仅与池内标的已知 IBKR venue 后缀不同，框架会保留兼容映射、推送 WARNING 级 IM 并继续执行当前计划；这是有意的离席运行容错，不应改为静默中止整轮。`HK.*` / `SHSE.*` 等市场前缀代码必须精确匹配。
    - 传入 `execute_rebalance` 的目标多于 `top_k` 时，框架按顺序截断到槽位数并告警，不要依赖“多传目标、少设 top_k”来放大仓位。
-- 期权滚动合约不要手写静态期权代码当标的池。需要展开时在策略类声明 `option_universe = ("PUT",)` 或 `True`，并提供 `min_dte`/`max_dte`；运行时会把正股池展开为历史/当前链候选。`next()` 必须遍历当前 `self.broker.datas`，不要冻结 init 时的合约列表。实盘无 K 线的滚动候选会被丢弃；账户已持仓或在途的旧合约会被增补进 datas，这些合约刷新失败仍会跳过整轮。零填充或缺 K 的已有持仓/在途合约仍占用底层名额，不能当成空仓再开；保护腿缺报价时不得单独买平空头。公开样例在 `strategies/options/`：`SampleLongPutStrategy` / `SampleLongCallStrategy` / `SampleCashSecuredPutStrategy` / `SampleCoveredCallStrategy` / `SamplePutCreditSpreadStrategy`；各文件顶部有可复制的 `run.py` 命令。
-- PCS 若声明 `protective_put_delta`，历史链展开必须同时保留 Short Put 中心 Delta 和保护腿 Delta 的候选；不得只依赖短腿中心附近的少量合约。
+   - 期权滚动合约不要手写静态期权代码当标的池。需要展开时在策略类声明 `option_universe = ("PUT",)` 或 `True`，并提供 `min_dte`/`max_dte`；运行时会把正股池展开为历史/当前链候选。持仓、保护腿和完整历史逻辑必须基于当前 `self.broker.datas`，不要冻结 init 时的合约列表。实盘无 K 线的滚动候选会被丢弃；账户已持仓或在途的旧合约会被增补进 datas，这些合约刷新失败仍会跳过整轮。零填充或缺 K 的已有持仓/在途合约仍占用底层名额，不能当成空仓再开；保护腿缺报价时不得单独买平空头。公开样例在 `strategies/options/`：`SampleLongPutStrategy` / `SampleLongCallStrategy` / `SampleCashSecuredPutStrategy` / `SampleCoveredCallStrategy` / `SamplePutCreditSpreadStrategy`；各文件顶部有可复制的 `run.py` 命令。
+   - 期权当前候选不要再次全量扫描 `self.broker.datas`；使用 `from strategies.options.support import iter_option_rows`，按 `for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"}):` 读取当前有效报价。该入口在离线回测/优化中使用交易日快照索引，实盘自动保持实时遍历语义。`meta`/`quote` 只提供标准化数据，DTE、Delta、IVP、持仓和风险过滤仍由策略决定。
+   - 单个期权当前报价使用 `common.data_view.visible_row(..., require_current_quote=True, cache_owner=self.broker)`；已持仓和保护腿优先使用 `iter_held_options`、`held_protective_put` 等公共视图。历史指标、估值带和底层趋势仍直接读取完整 `data.p.dataname`，不能把当前候选索引当成历史数据。
+   - PCS 若声明 `protective_put_delta`，历史链展开必须同时保留 Short Put 中心 Delta 和保护腿 Delta 的候选；不得只依赖短腿中心附近的少量合约。
 
 
 ---

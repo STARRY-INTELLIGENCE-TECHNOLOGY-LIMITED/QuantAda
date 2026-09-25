@@ -1,8 +1,13 @@
+import gc
+import sys
+import weakref
+
 import backtrader as backtrader
 import pandas as pd
 import pytest
 
 import backtest.plotting as plotting
+import config
 from backtest.backtester import Backtester
 from backtest.plotting import _PlotWithBottomMargin
 from strategies.base_strategy import BaseStrategy
@@ -210,6 +215,86 @@ def test_full_plot_scope_cannot_be_combined():
             strategy_class=_NoopStrategy,
             plot_scope="full,portfolio_equity",
         )
+
+
+@pytest.mark.parametrize("plot_scope", sorted(plotting.VALID_PLOT_SCOPES) + ["portfolio_equity,portfolio_drawdown"])
+def test_no_plot_backtests_keep_analyzers_without_observers(monkeypatch, plot_scope):
+    monkeypatch.setattr(config, "PRINT_PLAN", False)
+    engine = Backtester(
+        datas={"AAA": _make_df(), "BBB": _make_df()},
+        strategy_class=_NoopStrategy,
+        enable_plot=False,
+        verbose=False,
+        plot_scope=plot_scope,
+    )
+
+    engine.run()
+
+    assert engine.cerebro.p.stdstats is False
+    assert engine.results[0].getobservers() == []
+    assert set(engine.results[0].analyzers.getnames()) == {
+        "sharpe", "returns", "drawdown", "tradeanalyzer", "timereturn_monthly",
+    }
+
+
+def test_repeated_no_plot_backtests_do_not_retain_dynamic_classes_or_engines(monkeypatch):
+    monkeypatch.setattr(config, "PRINT_PLAN", False)
+    # 直接检查全局强引用与引擎存活，避免用受分配器高水位影响的 RSS 作断言。
+    modules = [sys.modules["backtrader.lineseries"], sys.modules["backtrader.metabase"]]
+    before = [set(vars(module)) for module in modules]
+    engine_refs = []
+    for _ in range(6):
+        engine = Backtester(
+            datas={"AAA": _make_df(), "BBB": _make_df()},
+            strategy_class=_NoopStrategy,
+            enable_plot=False,
+            verbose=False,
+        )
+        engine.run()
+        engine_refs.append(weakref.ref(engine.cerebro))
+        del engine
+        gc.collect()
+
+    assert all(ref() is None for ref in engine_refs)
+    assert [set(vars(module)) for module in modules] == before
+
+
+def test_no_plot_preserves_completed_trades_and_performance(monkeypatch):
+    monkeypatch.setattr(config, "PRINT_PLAN", False)
+    monkeypatch.setattr(config, "LOG", False)
+
+    class RoundTripStrategy(BaseStrategy):
+        def init(self):
+            self.fills = []
+
+        def next(self):
+            bar = len(self.broker.datas[0])
+            if bar in (1, 2):
+                for data in self.broker.datas:
+                    self.broker.order_target_value(data=data, target=1000.0 if bar == 1 else 0.0)
+
+        def notify_order(self, order):
+            if order.is_completed():
+                self.fills.append((order.data._name, order.executed.size, order.executed.price))
+
+    results = []
+    for enable_plot in (True, False):
+        engine = Backtester(
+            datas={"AAA": _make_df(), "BBB": _make_df()},
+            strategy_class=RoundTripStrategy,
+            enable_plot=enable_plot,
+            verbose=False,
+            commission=0.001,
+            slippage=0.0,
+        )
+        # verbose=False 保留绘图配置但不打开窗口，用作历史行为对照。
+        engine.run()
+        fills = engine.results[0].strategy.fills
+        assert len(fills) == 4
+        assert len(engine.get_closed_trades()) == 2
+        results.append((fills, engine.get_closed_trades(), engine.get_performance_metrics()))
+
+    assert results[0] == results[1]
 
 
 def test_force_bottom_xaxis_visible_restores_hidden_bottom_labels():

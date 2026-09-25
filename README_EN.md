@@ -117,6 +117,18 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'fast_period': {'type': 'int', 'low': 5, 'high': 30}}" --train_period 20210101-20221231 --test_period 20230101-20231231 --n_trials 50
 ```
 
+Choose a previous training task interactively and resume its saved configuration:
+
+```bash
+python run.py --train_resume
+```
+
+Tasks are listed by most recent update, ten per page. Use `n` / `p` to browse or `g 3` to jump to page 3. Select a task to inspect its original command, then enter `y` to confirm, `b` to return, or `q` to exit. The web workspace provides the same pagination and command details; click **Resume selected task** to confirm.
+The list also shows training status from the display section at the end of the matching terminal log. The journal filename must match; a window or snapshot written on the log must match the task too. A log with neither discriminator is not applied to every task that shares one journal file. Markers do not finish a task when the suffix is an empty crash summary, such as no metric result or both metrics and trials completed being zero; those logs are skipped. A missing end marker means incomplete. Incomplete tasks can still be resumed.
+After selecting a task, enter `l` to page through that task's matching terminal log. It does not open another task's log, and it opens at the end. Use `n` / `p` to move, `h` / `e` / `m` to jump to the first, last, or middle page, `s` for the analysis section, `g 3` for page 3, and `b` to return. The web workspace **View log** button provides the same paging.
+Resume prefers the saved data, selection, option universe, and train/test snapshot across dates. A study without a snapshot is still loaded so completed trials count. A snapshot already saved beside the same journal is actually loaded and skips another fetch; old scores count, but are not treated as results of that snapshot. If that snapshot cannot be loaded, or the study's own snapshot is damaged, data is prepared again and a new snapshot is bound. A damaged own snapshot is not replaced by another study's snapshot, and no empty study is opened. The details also provide a copyable fresh-data command that removes study bindings and adds `--refresh` to rerun selection, fetch data, and train independently. Omitted dates are inferred at launch; explicit dates can be edited manually.
+Tasks without the current worker configuration version are loaded by their original study name. Completed trials count toward the budget, and only unfinished combinations run. Console Trial numbers match that study's journal trial_id and continue from the study instead of starting at 0. If the same batch contains a study with more completed trials, resume loads that study so explored parameters are not discarded.
+
 ### 7. Connect to Live Trading or Simulation
 
 Configure `BROKER_ENVIRONMENTS` through the `config.py` entry point (broker defaults live in `configs/gm.py`, `configs/ibkr.py`, and `configs/futu.py`), then launch with `--connect=broker:env`:

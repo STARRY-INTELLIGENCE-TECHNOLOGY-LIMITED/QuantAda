@@ -80,3 +80,18 @@
 6. 实盘每个 schedule slot 用当前链增补合约；账户已有持仓或在途的旧合约必须保留，即使它们还不在当前 datas。pending 快照不可信，或持仓查询异常时，不得把现有期权 feed 当作空仓丢弃。
 7. 策略仍只交易 `self.broker.datas` 中的对象，并在 `next()` 按当前 DTE/Delta 再过滤；不要缓存 init 时的合约列表。已有持仓或在途期权即使当前 K 线被零填充、没有可交易报价，也必须占用底层名额；保护腿缺报价时不得把它当成已移除后单独买平空头。
 8. 框架内置期权样例位于 `strategies/options/`，覆盖买开 Put/Call、现金担保短 Put、Covered Call 和原子 Put Credit Spread。运行使用全限定类名；各样例文件顶部有可复制的 `run.py` 命令。裸卖、Call 价差和未实现多腿组合必须失败关闭，不要在样例里顺序拆腿。
+
+## 11. 期权当前行情读取
+1. 期权策略按当前交易日筛选候选时，使用 `strategies.options.support.iter_option_rows()`：
+```python
+from strategies.options.support import iter_option_rows
+
+for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"}):
+    # meta/quote 只提供标准化行情；DTE、Delta、IVP、持仓和风控仍由策略决定。
+    ...
+```
+2. `iter_option_rows()` 会在离线回测/优化中使用按交易日建立的有效报价索引，实盘自动回退为实时数据遍历；策略不应自行复制一套全量 `broker.datas` 扫描。
+3. `meta` 包含标准期权类型、执行价、到期日、底层代码和合约代码；`quote` 包含 bid/ask/last、Delta、IVP、历史波动率、持仓量和价差。候选过滤仍属于策略语义，不由该入口替代。
+4. 需要读取单个合约当前行时，使用 `common.data_view.visible_row(data, current_dt, require_current_quote=True, cache_owner=self.broker)`；持仓和保护腿优先使用 `iter_held_options()`、`held_protective_put()` 等专用视图。
+5. 历史指标、估值带和底层趋势需要完整 DataFrame 时，继续读取 `data.p.dataname` 并使用向量化计算；不得把当前报价索引当作历史数据集。
+6. 自定义期权 feed 至少应满足：代码可由 `parse_option_symbol()` 解析，或提供 `option_type/right/cp/put_call` 与 `strike/expiry` 等标准元数据列。否则候选索引会失败关闭，不能静默交易。

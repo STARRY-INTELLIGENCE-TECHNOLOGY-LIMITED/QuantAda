@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
+import config
+from optimizer.training_tasks import list_training_tasks, read_terminal_log_page, task_terminal_log, training_task_commands
+
 from .catalog import CommandPreset, EnvRef, default_catalog
 from .executor import CommandExecutor
 from common.terminal_log import (
@@ -27,10 +30,9 @@ from common.terminal_log import (
 )
 from .generator import (
     build_command,
+    build_resume_command,
+    command_response,
     detect_platform,
-    render_portable_linux_display_command,
-    render_shell_command,
-    render_variables,
 )
 from .profiles import CommandProfileStore
 from .web_static import get_index_html
@@ -439,6 +441,34 @@ class CommandCenterService:
             return tuple(self._resolve_env_refs(item) for item in value)
         return value
 
+    def training_tasks(self) -> list[dict[str, Any]]:
+        """返回与 CLI 共用的训练任务列表；列表展示不暴露整份参数快照。"""
+        tasks = list_training_tasks(self.project_root / config.DATA_PATH / "optuna")
+        return [{key: value for key, value in task.items() if key != "recorded"} for task in tasks]
+
+    def training_task_log(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """按页返回选中任务的最新终端日志，默认末尾；不接受客户端日志路径。"""
+        task_id = str(payload.get("train_resume") or "")
+        tasks = list_training_tasks(self.project_root / config.DATA_PATH / "optuna")
+        task = next((item for item in tasks if item["task_id"] == task_id), None)
+        if task is None:
+            raise ValueError("Task not found. Refresh the list and select again.")
+        path = task_terminal_log(task, tasks)
+        if path is None:
+            raise ValueError("No terminal log found for this task.")
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(self.project_root.resolve())
+        except ValueError:
+            raise ValueError("Training log must stay inside the QuantAda project directory.") from None
+        where = str(payload.get("where") or "").strip().lower()
+        page = payload.get("page")
+        if where in {"start", "middle", "end", "display"}:
+            return read_terminal_log_page(resolved, where=where)
+        if page not in (None, ""):
+            return read_terminal_log_page(resolved, page=int(page))
+        return read_terminal_log_page(resolved, where="end")
+
     def training_results(self) -> list[dict[str, Any]]:
         """合并日志和独立快照，日志删除后仍可恢复训练结果。"""
 
@@ -487,7 +517,7 @@ class CommandCenterService:
         try:
             path.relative_to(self.project_root)
         except ValueError:
-            raise ValueError("训练日志必须位于 QuantAda 项目目录内") from None
+            raise ValueError("Training log must stay inside the QuantAda project directory.") from None
         if not path.is_file():
             raise ValueError("训练日志不存在")
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -705,6 +735,28 @@ class CommandCenterService:
     ) -> dict[str, Any]:
         """生成命令和可复制文本。"""
 
+        if "train_resume" in payload:
+            task_id = str(payload.get("train_resume") or "")
+            tasks = list_training_tasks(self.project_root / config.DATA_PATH / "optuna")
+            task = next((item for item in tasks if item["task_id"] == task_id), None)
+            if task is None:
+                raise ValueError("Task not found. Refresh the list and select again.")
+            if not task["resumable"]:
+                raise ValueError(task["reason"])
+            variables = dict(self.variables)
+            if isinstance(payload.get("variables"), Mapping):
+                variables.update(payload["variables"])
+            generated = build_resume_command(
+                task, variables, self.project_root, self._resolve_source_root(payload.get("source_root")),
+            )
+            shell = str(payload.get("shell") or self.platform["shell"])
+            response = command_response(
+                generated, shell,
+                str(payload.get("platform") or self.platform["system"]),
+            )
+            response.update(training_task_commands(task, shell))
+            return _jsonable(response)
+
         preset = self._preset_from_payload(payload)
         source_value = payload.get('source_root')
         if not source_value:
@@ -780,21 +832,7 @@ class CommandCenterService:
                     if preset.origin == "私有命令集":
                         raise ValueError(message)
                     warnings.append(message)
-        public_variables = {str(key): str(value) for key, value in generated.variables.items()}
-        result = {
-            "argv": list(generated.argv),
-            "variables": _jsonable(public_variables),
-            "params": _jsonable(dict(generated.params)),
-            "config": _jsonable(dict(generated.config)),
-            "options": _jsonable(dict(generated.options)),
-            "warnings": warnings,
-            "command": render_shell_command(generated.argv, shell, platform_name),
-            "display_command": render_portable_linux_display_command(generated.argv),
-            "variables_text": render_variables(public_variables, shell),
-            "shell": shell,
-            "platform": platform_name,
-        }
-        return result
+        return _jsonable(command_response(replace(generated, warnings=tuple(warnings)), shell, platform_name))
 
     def save_profile(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """保存当前命令方案，环境变量只存在于当前请求，不写入方案。"""
@@ -912,6 +950,7 @@ class CommandCenterService:
             "running": True,
             "argv": generated["argv"],
             "command": generated["command"],
+            "display_command": generated["display_command"],
         }
 
     def run_snapshot(self, run_id: str, offset: int = 0) -> dict[str, Any]:
@@ -1019,6 +1058,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
                     self._send(profile)
             elif path in {"/api/training", "/api/training/results", "/api/training/scan"}:
                 self._send({"results": self.service.training_results()})
+            elif path == "/api/training/tasks":
+                self._send({"tasks": self.service.training_tasks()})
             elif path.startswith("/api/runs/"):
                 run_id = path.rsplit("/", 1)[-1]
                 query = parse_qs(parsed.query)
@@ -1046,6 +1087,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 self._send(self.service.analyze_training(payload))
             elif path == "/api/training/log":
                 self._send(self.service.training_log(payload))
+            elif path == "/api/training/task-log":
+                self._send(self.service.training_task_log(payload))
             elif path == "/api/strategy/params":
                 self._send(self.service.strategy_params(payload))
             elif path == "/api/training/select":

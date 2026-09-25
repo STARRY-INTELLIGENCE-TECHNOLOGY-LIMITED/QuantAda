@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import platform
 import re
 import shlex
@@ -10,6 +11,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+from optimizer.journal_metadata import parse_recorded_value
+from optimizer.training_tasks import RESUME_OPTIONS, build_resume_arguments
 
 from .catalog import (
     CommandCatalog,
@@ -41,6 +45,43 @@ class GeneratedCommand:
     params: Mapping[str, Any]
     options: Mapping[str, Any]
     warnings: tuple[str, ...] = ()
+
+
+def build_resume_command(task, variables, project_root, source_root=None):
+    """恢复选中的历史训练，不用当前表单参数或档案默认值改写原评分配置。"""
+    arguments = build_resume_arguments(task)
+    environ = {str(key): str(value) for key, value in variables.items()}
+    if source_root:
+        pythonpath = environ.get("PYTHONPATH") or os.environ.get("PYTHONPATH", "")
+        environ["PYTHONPATH"] = os.pathsep.join(item for item in (str(source_root), pythonpath) if item)
+    # 续传使用普通文件锁；保留在工作台管理的子进程中，以便输出跟随和停止。
+    environ.update(QUANTADA_DISABLE_AUTO_ELEVATE="1", QUANTADA_STUDY_NAME="", QUANTADA_STUDY_JOURNAL="")
+    attrs = task["recorded"]
+    options = {key: parse_recorded_value(attrs[key]) for key in RESUME_OPTIONS if key in attrs}
+    options.update(
+        metric=",".join(task["metrics"]), study_journal=task["journal"], n_trials=task["n_trials"],
+        opt_params=parse_recorded_value(attrs["opt_params"]), risk_params=parse_recorded_value(attrs["risk_params"]),
+        no_plot=bool(parse_recorded_value(attrs.get("no_plot", "True"))),
+    )
+    if "--study_name" in arguments:
+        options["study_name"] = arguments[arguments.index("--study_name") + 1]
+    return GeneratedCommand(
+        tuple([environ.get("PYTHON_EXECUTABLE") or sys.executable, "-u", str(Path(project_root) / "run.py"), *arguments]),
+        environ, parse_recorded_value(attrs["config"]), parse_recorded_value(attrs["params"]), options,
+        warnings=(task["notice"],) if task.get("notice") else (),
+    )
+
+
+def command_response(generated, shell, platform_name):
+    """把普通命令和续传命令统一转换为工作台预览及执行所需的数据。"""
+    variables = {str(key): str(value) for key, value in generated.variables.items()}
+    return {
+        "argv": list(generated.argv), "variables": variables,
+        "params": dict(generated.params), "config": dict(generated.config), "options": dict(generated.options),
+        "warnings": list(generated.warnings), "command": render_shell_command(generated.argv, shell, platform_name),
+        "display_command": render_portable_linux_display_command(generated.argv),
+        "variables_text": render_variables(variables, shell), "shell": shell, "platform": platform_name,
+    }
 
 
 _OPTION_ORDER = (

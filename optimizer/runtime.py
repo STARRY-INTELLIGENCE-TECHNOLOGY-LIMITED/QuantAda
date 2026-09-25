@@ -42,13 +42,13 @@ import traceback
 import webbrowser
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
+from contextlib import ExitStack
 from multiprocessing import shared_memory
 
 import numpy as np
 import optuna
-import optuna.visualization as vis
 import pandas as pd
-from optuna.samplers import GridSampler, TPESampler
+from optuna.samplers import TPESampler
 
 import config
 from backtest.backtester import Backtester
@@ -64,6 +64,29 @@ from common.terminal_log import (
     set_optimizer_terminal_log_path,
 )
 from data_providers.manager import DataManager
+from optimizer.study_resume import (
+    RetryAwareGridSampler,
+    ensure_study_config_version,
+    legacy_owner_running,
+    prepare_trial_resume,
+    resolve_study_plan,
+    study_run_lock,
+)
+from optimizer.journal_metadata import isolate_study_journal
+from optimizer.dashboard_view import (
+    begin_dashboard_log_scope,
+    build_dashboard_storage,
+    end_dashboard_log_scope,
+    launch_multi_metric_dashboard,
+)
+from optimizer.data_snapshot import load_training_snapshot, save_training_snapshot
+from optimizer.training_tasks import announce_training_scope, training_task_commands
+from optimizer.trial_progress import (
+    SharedFinishCounter,
+    TrialFinishCounter,
+    installed_trial_progress,
+    make_trial_progress,
+)
 from optimizer.reporting import (
     collect_dashboard_logs,
     normalize_metric_date,
@@ -76,12 +99,12 @@ try:
     from optuna.storages import JournalStorage
     try:
         # Optuna 4.0+ 新版路径
-        from optuna.storages.journal import JournalFileBackend
+        from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
         # 给它起个通用的别名
         JournalFileBackendCls = JournalFileBackend
     except ImportError:
         # 旧版路径 (兼容老环境)
-        from optuna.storages import JournalFileStorage
+        from optuna.storages import JournalFileStorage, JournalFileOpenLock
         JournalFileBackendCls = JournalFileStorage
     HAS_JOURNAL = True
 except ImportError:
@@ -217,12 +240,14 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
 
     terminal_tee = install_optimizer_terminal_log(terminal_log_path)
     try:
-        return _run_optimizer_mode_impl(
-            args=args,
-            fixed_params=fixed_params,
-            risk_params=risk_params,
-            symbol_list=symbol_list,
-        )
+        with ExitStack() as run_scope:
+            return _run_optimizer_mode_impl(
+                args=args,
+                fixed_params=fixed_params,
+                risk_params=risk_params,
+                symbol_list=symbol_list,
+                run_scope=run_scope,
+            )
     except Exception:
         print("\n[Optimizer] Fatal exception captured in optimizer mode:")
         traceback.print_exc()
@@ -246,7 +271,7 @@ def infer_omitted_backtest_window(args):
 
 
 
-def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
+def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list, run_scope):
     """
     运行优化模式主流程（从 run.py 下沉的编排逻辑）。
 
@@ -255,6 +280,7 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
         fixed_params: 策略固定参数（由 --params 解析）。
         risk_params: 风控参数（由 --risk_params 解析）。
         symbol_list: CLI symbols 列表（用于共享上下文兜底）。
+        run_scope: 当前命令的退出栈，确保 Journal 运行锁在返回或异常时释放。
 
     Returns:
         int: 进程退出码（0=成功；1=输入/初始化错误）。
@@ -263,7 +289,7 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
 
     # 1. 解析传入的 metric (支持单个或逗号分隔的多个)
     # 自动过滤空字符串，避免出现如 "sharpe,,calmar," 的脏输入
-    metrics_list = [m.strip() for m in args.metric.split(',') if m.strip()]
+    metrics_list = list(dict.fromkeys(m.strip() for m in args.metric.split(',') if m.strip()))
     if not metrics_list:
         print("Error: --metric contains no valid metric after filtering empty entries.")
         return 1
@@ -280,6 +306,7 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
             print(f"[Optimizer] Invalid --opt_schedule: {exc}")
             return 1
 
+    requested_window = (getattr(args, "start_date", None), getattr(args, "end_date", None))
     infer_omitted_backtest_window(args)
 
     config.LOG = False
@@ -290,6 +317,31 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
     except Exception as e:
         print(f"Error parsing opt_params JSON: {e}")
         return 1
+
+    if not HAS_JOURNAL:
+        print("Error: automatic training resume requires Optuna JournalStorage.")
+        return 1
+    log_dir = os.path.join(os.getcwd(), config.DATA_PATH, "optuna")
+    plan = resolve_study_plan(args, fixed_params, opt_p_def, risk_params, metrics_list, log_dir, requested_window)
+    for study_info in plan["source_studies"]:
+        owner = study_info["attrs"].get("_optimizer_owner")
+        if legacy_owner_running(owner or study_info["name"], workers_only=bool(owner)):
+            print(f"[Optimizer] Study is already running: {study_info['name']}; duplicate launch skipped.")
+            return 0
+    if not run_scope.enter_context(study_run_lock(plan["journal"])):
+        print(f"[Optimizer] Training is already running for {plan['journal']}; duplicate launch skipped.")
+        return 0
+    print(f"[Optimizer] Training Journal: {plan['journal']}")
+    if plan["incompatible"]:
+        print("[Optimizer] Historical task recorded an incompatible worker configuration. That part uses a separate study; old scores are kept and do not count toward the new budget.")
+    if plan.get("reused_pre_config"):
+        print("[Optimizer] Loaded the original study with load_if_exists. Completed trials count toward the budget; only unfinished combinations run. Console Trial numbers match Journal trial_id.")
+    if plan.get("switched_to_richer"):
+        print("[Optimizer] Another study in the same journal has more completed trials. Loading that study to reuse explored parameters.")
+    if plan["matched"]:
+        print(f"[Optimizer] Reusing training window: {args.start_date} to {args.end_date}")
+        for study_info in plan["matched"]:
+            print(f"[Optimizer] Auto-resume {study_info['attrs']['metric']}: {study_info['name']}")
 
     final_reports = []
     total_metrics = len(metrics_list)
@@ -305,8 +357,7 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
     shared_context = None
     bootstrap_job = None
     dashboard_launcher_job = None
-    shared_dashboard_log_file = None
-    log_dir = None
+    shared_dashboard_log_file = plan["journal"]
     test_set_requested = bool(getattr(args, "test_period", None) or getattr(args, "test_roll_period", None))
 
     def print_run_summary():
@@ -319,96 +370,113 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
             baseline_yearly_reports=baseline_yearly_reports,
         )
 
-    if is_multi_metric:
-        log_dir = os.path.join(os.getcwd(), config.DATA_PATH, 'optuna')
-        os.makedirs(log_dir, exist_ok=True)
+    source_attrs = (plan["matched"] or plan["source_studies"] or [{"attrs": {}}])[0]["attrs"]
+    original_argv = source_attrs.get("_optimizer_original_argv") or list(sys.argv[1:])
+    original_exact = source_attrs.get("_optimizer_original_exact", bool(original_argv))
+    snapshot_reference = source_attrs.get("_optimizer_data_snapshot") if plan["matched"] else None
+    snapshot_unreadable = False
+    if plan["source_studies"] and getattr(args, "strategy", None):
+        command_task = {"recorded": source_attrs, "metrics": metrics_list,
+                        "n_trials": source_attrs.get("_optimizer_target_trials") or args.n_trials, "journal": plan["journal"]}
+        commands = training_task_commands(command_task)
+        print("\nOriginal launch command" + (":" if commands["original_exact"] else " (reconstructed from saved settings):"))
+        print(commands["original_command"])
+        print("Manually train with fresh market data:\n" + commands["fresh_command"])
+        original_argv = commands["original_argv"]
+        original_exact = commands["original_exact"]
+    def use_snapshot(reference, *, sibling=False):
+        """校验并套用快照。失败时清空引用，由后续流程重新准备数据。"""
+        nonlocal shared_context, original_argv, original_exact, snapshot_reference, snapshot_unreadable
+        try:
+            shared_context, manifest = load_training_snapshot(plan["journal"], reference)
+        except (OSError, ValueError, EOFError, TypeError, ImportError) as exc:
+            shared_context = None
+            snapshot_reference = None
+            if sibling:
+                print(f"[Optimizer] The sibling snapshot could not be loaded. Preparing data again and binding a new snapshot: {exc}")
+                print("[Optimizer] Old scores are kept and count toward the budget. They are not treated as results of the new snapshot.")
+                return False
+            print(f"[Optimizer] Training snapshot is unreadable. Preparing data again and still loading the original study: {exc}")
+            print("[Optimizer] Old scores are kept and count toward the budget. The new snapshot is bound to the original study, but old scores are not treated as results of the new snapshot.")
+            snapshot_unreadable = True
+            return False
+        vars(config).update(shared_context.pop("runtime_config"))
+        original_argv = manifest["original_argv"]
+        original_exact = manifest.get("original_exact", True)
+        # 快照恢复训练当时的环境；本轮入口已合并的 --config 必须盖回，不能被快照撤销。
+        raw_overrides = getattr(args, "config", None)
+        if isinstance(raw_overrides, str):
+            raw_overrides = ast.literal_eval(raw_overrides)
+        if isinstance(raw_overrides, dict):
+            for key, value in raw_overrides.items():
+                if isinstance(key, str) and key.isupper() and hasattr(config, key):
+                    setattr(config, key, value)
+        snapshot_reference = reference
+        if sibling:
+            print(f"[Optimizer] The original study has no data snapshot. Loaded sibling snapshot {reference['id']}; skipping symbol selection and market fetch.")
+            print("[Optimizer] Old scores are kept and count toward the budget, but are not treated as results of this snapshot.")
+        else:
+            print(f"[Optimizer] Using validated data snapshot {reference['id']}; skipping symbol selection and market fetch.")
+        return True
 
-    def build_shared_optuna_log_file(train_range, test_range, symbols):
-        if not log_dir:
-            return None
+    if snapshot_reference:
+        use_snapshot(snapshot_reference)
+    elif plan["matched"]:
+        fallback = plan.get("fallback_snapshot")
+        if fallback:
+            use_snapshot(fallback, sibling=True)
+        else:
+            print("[Optimizer] The original study has no data snapshot. Still loading the original study; completed trials count toward the budget. Data prepared this run will be bound to that study.")
 
-        name_tag = OptimizationJob.build_optuna_name_tag(
-            metric=args.metric,
-            train_period=args.train_roll_period,
-            test_period=args.test_roll_period,
-            train_range=train_range,
-            test_range=test_range,
-            data_source=args.data_source,
-            symbols=symbols,
-            selection=args.selection,
-            run_dt=datetime.datetime.now(),
-            run_pid=os.getpid(),
+    # 快照或初次取数都只准备一次；失败时终止，不能逐指标偷偷改用不同的数据宇宙。
+    bootstrap_args = copy.deepcopy(args)
+    bootstrap_args.metric = metrics_list[0]
+    bootstrap_args.study_name = plan["studies"][metrics_list[0]]
+    bootstrap_args.auto_launch_dashboard = not is_multi_metric
+    bootstrap_kwargs = dict(args=bootstrap_args, fixed_params=fixed_params, opt_params_def=opt_p_def, risk_params=risk_params)
+    if shared_context is not None:
+        bootstrap_kwargs["shared_context"] = shared_context
+    bootstrap_job = OptimizationJob(**bootstrap_kwargs)
+    shared_context = bootstrap_job.export_shared_context()
+    if not snapshot_reference:
+        snapshot_reference = save_training_snapshot(
+            plan["journal"], shared_context, args, original_argv,
+            {key: value for key, value in vars(config).items() if key.isupper()},
+            original_exact=original_exact,
         )
-        return os.path.join(log_dir, f"optuna_{name_tag}.log")
-
-    # 先构建一次共享上下文，确保基准与多指标训练处于同一数据宇宙（同一选股与同一数据切分）
-    try:
-        bootstrap_args = copy.deepcopy(args)
-        bootstrap_args.metric = metrics_list[0]
-        bootstrap_args.auto_launch_dashboard = not is_multi_metric
-        bootstrap_job = OptimizationJob(
-            args=bootstrap_args,
-            fixed_params=fixed_params,
-            opt_params_def=opt_p_def,
-            risk_params=risk_params
-        )
-        shared_context = bootstrap_job.export_shared_context()
-        dashboard_launcher_job = bootstrap_job
-        if is_multi_metric:
-            shared_dashboard_log_file = build_shared_optuna_log_file(
-                train_range=bootstrap_job.train_range,
-                test_range=bootstrap_job.test_range,
-                symbols=bootstrap_job.target_symbols,
-            )
-    except Exception as e:
-        print(f"[警告] 共享上下文构建失败，将降级为逐metric独立初始化: {e}")
-        if is_multi_metric and not shared_dashboard_log_file:
-            fallback_train_range = (args.start_date, args.end_date)
-            fallback_test_range = (args.end_date, args.end_date) if args.test_roll_period else (None, None)
-            shared_dashboard_log_file = build_shared_optuna_log_file(
-                train_range=fallback_train_range,
-                test_range=fallback_test_range,
-                symbols=symbol_list,
-            )
+        print(f"[Optimizer] Training data snapshot saved: {snapshot_reference['id']}")
+    if isinstance(snapshot_reference, dict):
+        announce_training_scope(plan["journal"], (args.start_date, args.end_date), snapshot_reference.get("id"))
+    existing_names = {study["name"] for study in plan["matched"]}
+    for metric, name in plan["studies"].items():
+        if name not in existing_names:
+            plan["studies"][metric] = re.sub(r"__D[0-9a-f]{32}$", "", name) + "__D" + snapshot_reference["id"]
+    bootstrap_job._snapshot_frozen = True
+    shared_context["snapshot_frozen"] = True
+    dashboard_launcher_job = bootstrap_job
 
     if explicit_params_passed:
         print("\n--- Running Baseline Backtest from --params (MainEval) ---")
         baseline_start = time.time()
         try:
-            if bootstrap_job is not None:
-                if test_set_requested:
-                    baseline_test_report = bootstrap_job._run_test_set_backtest(copy.deepcopy(fixed_params), verbose=False)
-                baseline_report = bootstrap_job._run_main_eval_backtest(copy.deepcopy(fixed_params))
-                baseline_yearly_reports = bootstrap_job._run_yearly_validation_backtests(copy.deepcopy(fixed_params))
-            else:
-                baseline_args = copy.deepcopy(args)
-                baseline_args.metric = metrics_list[0]
-                baseline_args.auto_launch_dashboard = not is_multi_metric
-                if shared_dashboard_log_file:
-                    baseline_args.shared_journal_log_file = shared_dashboard_log_file
-                baseline_job = OptimizationJob(
-                    args=baseline_args,
-                    fixed_params=fixed_params,
-                    opt_params_def=opt_p_def,
-                    risk_params=risk_params
-                )
-                if test_set_requested:
-                    baseline_test_report = baseline_job._run_test_set_backtest(copy.deepcopy(fixed_params), verbose=False)
-                baseline_report = baseline_job._run_main_eval_backtest(copy.deepcopy(fixed_params))
-                baseline_yearly_reports = baseline_job._run_yearly_validation_backtests(copy.deepcopy(fixed_params))
+            if test_set_requested:
+                baseline_test_report = bootstrap_job._run_test_set_backtest(copy.deepcopy(fixed_params), verbose=False)
+            baseline_report = bootstrap_job._run_main_eval_backtest(copy.deepcopy(fixed_params))
+            baseline_yearly_reports = bootstrap_job._run_yearly_validation_backtests(copy.deepcopy(fixed_params))
         except Exception as e:
-            print(f"[警告] 当前基准回测失败: {e}")
+            print(f"[Warning] Baseline backtest failed: {e}")
         finally:
             baseline_elapsed_hours = (time.time() - baseline_start) / 3600.0
 
     for idx, current_metric in enumerate(metrics_list, 1):
         print(f"\n\n{'=' * 65}")
-        print(f"[指标 {idx}/{total_metrics} 正在训练]: {current_metric}")
+        print(f"[Metric {idx}/{total_metrics} training]: {current_metric}")
         print(f"{'=' * 65}")
 
         # 深拷贝 args，确保物理隔离
         current_args = copy.deepcopy(args)
         current_args.metric = current_metric
+        current_args.study_name = plan["studies"][current_metric]
         current_args.auto_launch_dashboard = not is_multi_metric
         if shared_dashboard_log_file:
             current_args.shared_journal_log_file = shared_dashboard_log_file
@@ -426,6 +494,13 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
                 job_kwargs["shared_context"] = shared_context
 
             job = OptimizationJob(**job_kwargs)
+            # 此 Job 位于本轮 Journal 进程锁内，允许回收上次中断的试验状态。
+            job._resume_exclusive = True
+            job._requested_metrics = metrics_list
+            job._data_snapshot = snapshot_reference
+            job._rebind_unreadable_snapshot = snapshot_unreadable
+            job._original_argv = original_argv
+            job._original_argv_exact = original_exact
             if dashboard_launcher_job is None:
                 dashboard_launcher_job = job
 
@@ -440,9 +515,9 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
                 final_reports.append(result_dict)
 
         except Exception as e:
-            print(f"\n[致命错误] 指标 '{current_metric}' 训练崩溃: {e}")
+            print(f"\n[Fatal] Metric '{current_metric}' crashed: {e}")
             traceback.print_exc()
-            print(">>> 引擎防宕机保护触发，强行切入下一个指标...")
+            print(">>> Fail-safe triggered. Continuing with the next metric...")
             continue
 
     if final_reports or explicit_params_passed:
@@ -488,49 +563,41 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list):
                 test_title = f"{period_text} 测试集回测结果 (Out-of-Sample Test Set)"
             test_section_title = test_title
 
-        print_optimizer_ai_summary(
-            final_reports=final_reports,
-            explicit_params_passed=explicit_params_passed,
-            fixed_params=fixed_params,
-            baseline_report=baseline_report,
-            baseline_test_report=baseline_test_report,
-            baseline_yearly_reports=baseline_yearly_reports,
-            baseline_elapsed_hours=baseline_elapsed_hours,
-            test_set_requested=test_set_requested,
-            test_section_title=test_section_title,
-        )
-
+        # 展示段标记表示训练完毕。全部指标失败时只保留警告，不能把崩溃日志标成已完成。
         if final_reports:
-            print("请在 Dashboard 中回放并排查孤点: ")
+            print_optimizer_ai_summary(
+                final_reports=final_reports,
+                explicit_params_passed=explicit_params_passed,
+                fixed_params=fixed_params,
+                baseline_report=baseline_report,
+                baseline_test_report=baseline_test_report,
+                baseline_yearly_reports=baseline_yearly_reports,
+                baseline_elapsed_hours=baseline_elapsed_hours,
+                test_set_requested=test_set_requested,
+                test_section_title=test_section_title,
+            )
+            print("Replay outliers in the dashboard: ")
             dashboard_logs = collect_dashboard_logs(final_reports)
             for log_file in dashboard_logs:
                 print(f"optuna-dashboard {log_file}")
+            if is_multi_metric and len(dashboard_logs) > 1:
+                print("[Info] The opened dashboard aggregates these journals. Each command above opens one study file.")
 
             print_run_summary()
 
-            # 多 metric 场景只在末尾弹一次 Dashboard（共享 Journal 可聚合全部 metric）
+            # 每个 Study 有独立 Journal。结束时聚合成只读视图，不合并训练文件。
             if is_multi_metric and dashboard_launcher_job and dashboard_logs:
-                final_log = shared_dashboard_log_file or dashboard_logs[0]
-                if os.path.exists(final_log):
-                    base_port = getattr(config, 'OPTUNA_DASHBOARD_PORT', 8090)
-                    target_port = base_port
-                    for _ in range(100):
-                        if not is_port_in_use(target_port):
-                            break
-                        target_port += 1
-                    else:
-                        print(f"[Warning] Could not find an available port starting from {base_port}.")
-                        target_port = base_port
-                    print(f"[Info] Multi-metric training completed. Launching aggregated dashboard: {final_log}")
-                    print("[Info] Dashboard will run in foreground. Analyze results, then press Ctrl-C to exit.")
-                    dashboard_launcher_job._launch_dashboard(final_log, port=target_port, background=False)
-                else:
-                    print(f"[Warning] Aggregated dashboard log file not found: {final_log}")
+                launch_multi_metric_dashboard(
+                    dashboard_launcher_job,
+                    dashboard_logs,
+                    port=getattr(config, 'OPTUNA_DASHBOARD_PORT', 8090),
+                    port_in_use=is_port_in_use,
+                )
         else:
-            print("[警告] 当前仅有基准回测结果，训练指标未返回结果。")
+            print("[Warning] Only the baseline backtest returned. Training metrics returned no results.")
             print_run_summary()
     else:
-        print("\n[警告] 所有指标均未返回结果")
+        print("\n[Warning] All metrics returned no results")
         print_run_summary()
     return 0
 
@@ -554,11 +621,19 @@ class OptimizationJob:
         self._indicator_cache = BoundedIndicatorCache(self.OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES)
         self.warmup_days = self.DEFAULT_WARMUP_DAYS
 
+        if shared_context is None or "strategy_class" not in shared_context:
+            self.strategy_class = get_class_from_name(args.strategy, ['strategies'])
+            self.risk_control_classes = [
+                get_class_from_name(name.strip(), ['risk_controls', 'strategies'])
+                for name in (args.risk or "").split(',') if name.strip()
+            ]
+
         # 共享上下文模式：复用选股、数据抓取与切分结果，确保多指标/基准对比在同一数据宇宙下进行
         if shared_context is not None:
-            self.strategy_class = shared_context["strategy_class"]
-            self.risk_control_classes = shared_context["risk_control_classes"]
-            self.data_manager = shared_context["data_manager"]
+            if "strategy_class" in shared_context:
+                self.strategy_class = shared_context["strategy_class"]
+                self.risk_control_classes = shared_context["risk_control_classes"]
+            self.data_manager = shared_context.get("data_manager")
             self.target_symbols = shared_context["target_symbols"]
             self._source_symbols = list(shared_context.get("source_symbols", self.target_symbols) or [])
             self.raw_datas = shared_context["raw_datas"]
@@ -572,21 +647,11 @@ class OptimizationJob:
             if not isinstance(self._indicator_cache, BoundedIndicatorCache):
                 self._indicator_cache = BoundedIndicatorCache(self.OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES)
             self._raw_data_fetch_range = shared_context.get("raw_data_fetch_range", (None, None))
+            self._snapshot_frozen = bool(shared_context.get("snapshot_frozen"))
 
             # 在复用数据上下文的前提下，仅重建本次 metric 对应的 study_name
             self._auto_refine_study_name()
             return
-
-        self.strategy_class = get_class_from_name(args.strategy, ['strategies'])
-        self.risk_control_classes = []
-        if args.risk:
-            # 支持逗号分隔
-            risk_names = args.risk.split(',')
-            for r_name in risk_names:
-                r_name = r_name.strip()
-                if r_name:
-                    cls = get_class_from_name(r_name, ['risk_controls', 'strategies'])
-                    self.risk_control_classes.append(cls)
 
         self.data_manager = DataManager()
 
@@ -647,6 +712,7 @@ class OptimizationJob:
             "window_data_cache": self._window_data_cache,
             "indicator_cache": self._indicator_cache,
             "raw_data_fetch_range": self._raw_data_fetch_range,
+            "snapshot_frozen": bool(getattr(self, "_snapshot_frozen", False)),
         }
 
     def _reset_trial_dedupe_cache(self):
@@ -733,8 +799,8 @@ class OptimizationJob:
             "train_range": self.train_range,
             "warmup_days": self.warmup_days,
             "terminal_log_path": get_optimizer_terminal_log_path(),
-            # spawn 子进程不会继承主进程运行期改写的 config，显式透传日志开关。
-            "log_enabled": bool(getattr(config, "LOG", False)),
+            # 传入父进程最终配置，包含 CLI 覆盖和聚合配置；不在 worker 中重新解析原始参数。
+            "runtime_config": copy.deepcopy({key: value for key, value in vars(config).items() if key.isupper()}),
         }
 
     @staticmethod
@@ -760,6 +826,39 @@ class OptimizationJob:
             meta["dtype"] = arr.dtype.str
 
         return meta, shm
+
+    @staticmethod
+    def _prepare_shared_values(values, source_dtype=None):
+        """将可安全序列化的 object 列编码为固定宽度 Unicode 数组。"""
+        arr = np.ascontiguousarray(values)
+        if arr.dtype != object:
+            return arr
+        if (
+            source_dtype is not None
+            and not pd.api.types.is_object_dtype(source_dtype)
+            and not pd.api.types.is_string_dtype(source_dtype)
+        ):
+            raise TypeError("extension dtype is not supported in shared memory mode")
+        scalar_values = []
+        for value in arr:
+            if value is None:
+                raise TypeError("missing object values are not supported in shared memory mode")
+            if isinstance(value, str):
+                scalar_values.append(value)
+                continue
+            try:
+                if bool(pd.isna(value)):
+                    raise TypeError("missing object values are not supported in shared memory mode")
+            except (TypeError, ValueError):
+                if isinstance(value, (float, np.floating)) and not math.isfinite(float(value)):
+                    raise TypeError("missing object values are not supported in shared memory mode")
+            raise TypeError(
+                "object dtype contains unsupported values; "
+                "shared memory conversion would lose its type"
+            )
+        text_values = np.asarray(scalar_values, dtype=str)
+        width = max((len(value) for value in text_values), default=1)
+        return np.asarray(text_values, dtype=f"<U{max(1, width)}")
 
     @staticmethod
     def _attach_shared_array(meta):
@@ -793,6 +892,8 @@ class OptimizationJob:
         if executor is None:
             return
 
+        # shutdown 会清空执行器的进程表，必须先保留句柄才能终止仍在运行的 worker。
+        processes = list((getattr(executor, "_processes", None) or {}).values())
         for fut in futures or []:
             try:
                 fut.cancel()
@@ -804,30 +905,36 @@ class OptimizationJob:
         except Exception:
             pass
 
-        # 访问私有字段做兜底清理，避免 spawn 子进程在中断后继续占用 CPU。
-        processes = getattr(executor, "_processes", None)
         if not processes:
             return
 
-        for proc in list(processes.values()):
+        for proc in processes:
             try:
                 if proc.is_alive():
                     proc.terminate()
             except Exception:
                 pass
 
-        deadline = time.time() + 2.0
-        for proc in list(processes.values()):
+        deadline = time.monotonic() + 2.0
+        for proc in processes:
             try:
-                remain = max(0.0, deadline - time.time())
+                remain = max(0.0, deadline - time.monotonic())
                 proc.join(timeout=remain)
             except Exception:
                 pass
 
-        for proc in list(processes.values()):
+        for proc in processes:
             try:
                 if proc.is_alive() and hasattr(proc, "kill"):
                     proc.kill()
+            except Exception:
+                pass
+
+        # kill 异步完成；回收句柄后才允许调用方释放共享行情和 Journal 运行锁。
+        deadline = time.monotonic() + 2.0
+        for proc in processes:
+            try:
+                proc.join(timeout=max(0.0, deadline - time.monotonic()))
             except Exception:
                 pass
 
@@ -841,10 +948,10 @@ class OptimizationJob:
 
         shm_handles = []
         shared_meta = {"symbols": {}}
-
         try:
             for symbol, df in train_datas.items():
-                idx_meta, idx_shm = self._create_shared_array(df.index.to_numpy(copy=False))
+                index_values = self._prepare_shared_values(df.index.to_numpy(copy=False))
+                idx_meta, idx_shm = self._create_shared_array(index_values)
                 shm_handles.append(idx_shm)
 
                 # 将所有列压成一个 structured array，只占用一个共享内存段
@@ -852,15 +959,17 @@ class OptimizationJob:
                 structured_fields = []
                 col_arrays = []
                 for i, col in enumerate(df.columns):
-                    arr = np.ascontiguousarray(df[col].to_numpy(copy=False))
-                    if arr.dtype == object:
-                        raise TypeError("object dtype is not supported in shared memory mode")
+                    series = df[col]
+                    arr = self._prepare_shared_values(
+                        series.to_numpy(copy=False), source_dtype=series.dtype
+                    )
                     field_name = f"f{i}"
                     structured_fields.append((field_name, arr.dtype))
                     col_arrays.append((field_name, arr))
                     columns_meta.append({
                         "name": col,
                         "field": field_name,
+                        "source_dtype": str(series.dtype),
                     })
 
                 records = np.empty(len(df), dtype=structured_fields)
@@ -872,7 +981,9 @@ class OptimizationJob:
                 symbol_meta = {
                     "index": idx_meta,
                     "index_name": df.index.name,
+                    "index_dtype": str(df.index.dtype),
                     "columns": columns_meta,
+                    "attrs": copy.deepcopy(getattr(df, "attrs", {}) or {}),
                     "records": records_meta,
                 }
 
@@ -884,6 +995,7 @@ class OptimizationJob:
             return shared_payload, shm_handles
         except Exception:
             self._cleanup_shared_segments(shm_handles, unlink=True)
+            self._shared_payload_last_error = traceback.format_exc().splitlines()[-1]
             return worker_payload, []
 
     @staticmethod
@@ -894,16 +1006,40 @@ class OptimizationJob:
         for symbol, symbol_meta in (shared_meta or {}).get("symbols", {}).items():
             idx_arr, idx_shm = OptimizationJob._attach_shared_array(symbol_meta["index"])
             shm_handles.append(idx_shm)
-            index_obj = pd.Index(idx_arr, name=symbol_meta.get("index_name"))
+            try:
+                index_obj = pd.Index(
+                    idx_arr,
+                    name=symbol_meta.get("index_name"),
+                    dtype=symbol_meta.get("index_dtype"),
+                )
+            except (TypeError, ValueError):
+                index_obj = pd.Index(idx_arr, name=symbol_meta.get("index_name"))
 
             records_arr, records_shm = OptimizationJob._attach_shared_array(symbol_meta["records"])
             shm_handles.append(records_shm)
 
             data_dict = {}
             for col_spec in symbol_meta.get("columns", []):
-                data_dict[col_spec["name"]] = records_arr[col_spec["field"]]
+                values = records_arr[col_spec["field"]]
+                source_dtype = col_spec.get("source_dtype")
+                if (
+                    source_dtype == "object"
+                    or str(source_dtype).startswith("string")
+                    or source_dtype == "str"
+                ):
+                    try:
+                        values = pd.Series(
+                            values,
+                            index=index_obj,
+                            dtype=source_dtype,
+                        )
+                    except (TypeError, ValueError):
+                        values = pd.Series(values, index=index_obj)
+                data_dict[col_spec["name"]] = values
 
-            train_datas[symbol] = pd.DataFrame(data_dict, index=index_obj, copy=False)
+            frame = pd.DataFrame(data_dict, index=index_obj, copy=False)
+            frame.attrs.update(symbol_meta.get("attrs", {}) or {})
+            train_datas[symbol] = frame
 
         return train_datas, shm_handles
 
@@ -948,6 +1084,22 @@ class OptimizationJob:
     def _params_to_key(self, params_dict):
         return tuple(sorted((k, self._normalize_param_value(v)) for k, v in params_dict.items()))
 
+    @staticmethod
+    def _remaining_trial_budget(study, target_trials):
+        """正常完成或主动剪枝计入预算；失败尝试留待续传重试，不占有效完成额度。"""
+        try:
+            target_trials = max(0, int(target_trials))
+        except (TypeError, ValueError):
+            return 0
+        trial_state = optuna.trial.TrialState
+        finished_states = {
+            getattr(trial_state, name, None)
+            for name in ("COMPLETE", "PRUNED")
+        }
+        finished_states.discard(None)
+        finished = sum(1 for trial in getattr(study, "trials", []) if trial.state in finished_states)
+        return max(0, target_trials - finished)
+
     def _get_cached_trial_value(self, params_key):
         return self._completed_trial_cache.get(params_key)
 
@@ -969,6 +1121,9 @@ class OptimizationJob:
         log_file,
         prefer_fork_cow=False,
         grid_search_space=None,
+        progress_target=None,
+        progress_finished_before=0,
+        trial_progress=None,
     ):
         if not log_file:
             raise RuntimeError("Multi-process mode requires a shared JournalStorage log file.")
@@ -984,6 +1139,9 @@ class OptimizationJob:
         worker_trials = [x for x in worker_trials if x > 0]
         if not worker_trials:
             return
+
+        # 回收前置验证回测的循环引用，避免父进程等待 worker 时继续占用这些对象。
+        gc.collect()
 
         start_method = "spawn"
         if prefer_fork_cow and sys.platform.startswith("linux"):
@@ -1017,6 +1175,9 @@ class OptimizationJob:
                     "[Optimizer] Spawn mode: shared_memory unavailable; "
                     "falling back to payload copy so training can continue."
                 )
+                reason = getattr(self, "_shared_payload_last_error", None)
+                if reason:
+                    print(f"[Optimizer] Shared-memory fallback reason: {reason}")
 
         spawn_shared_memory_enabled = start_method != "spawn" or bool(shared_parent_handles)
         tpe_n_ei_candidates = self._resolve_spawn_tpe_n_ei_candidates(
@@ -1033,22 +1194,45 @@ class OptimizationJob:
         executor = None
         interrupted = False
         stopped_early = False
+        shared_counter = None
         try:
-            executor = ProcessPoolExecutor(max_workers=len(worker_trials), mp_context=ctx)
-            for worker_idx, local_trials in enumerate(worker_trials, start=1):
-                futures.append(
-                    executor.submit(
-                        _optimize_worker_entry,
-                        payload_arg,
-                        self.args.study_name,
-                        log_file,
-                        local_trials,
-                        worker_idx,
-                        seed_base + worker_idx,
-                        tpe_n_ei_candidates,
-                        grid_search_space=grid_search_space,
+            # spawn 在进入 worker 函数前已导入 NumPy，必须在创建进程时传入 BLAS 默认值。
+            # 尊重用户显式环境配置；所有任务提交后立即恢复父进程环境。
+            default_worker_blas = start_method == "spawn" and "OPENBLAS_NUM_THREADS" not in os.environ
+            try:
+                if default_worker_blas:
+                    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+                # 已有进度计数时沿用，避免重试阶段和新组合阶段各记一份速度。
+                if trial_progress is None and progress_target:
+                    try:
+                        shared_counter = SharedFinishCounter.create()
+                        trial_progress = make_trial_progress(
+                            progress_target,
+                            progress_finished_before,
+                            shared_counter,
+                        )
+                    except Exception as exc:
+                        print(f"[Optimizer] Trial progress counter unavailable; continuing without ETA: {exc}")
+                        trial_progress = None
+                executor = ProcessPoolExecutor(max_workers=len(worker_trials), mp_context=ctx)
+                for worker_idx, local_trials in enumerate(worker_trials, start=1):
+                    futures.append(
+                        executor.submit(
+                            _optimize_worker_entry,
+                            payload_arg,
+                            self.args.study_name,
+                            log_file,
+                            local_trials,
+                            worker_idx,
+                            seed_base + worker_idx,
+                            tpe_n_ei_candidates,
+                            grid_search_space=grid_search_space,
+                            trial_progress=trial_progress,
+                        )
                     )
-                )
+            finally:
+                if default_worker_blas:
+                    os.environ.pop("OPENBLAS_NUM_THREADS", None)
 
             for fut in as_completed(futures):
                 result = fut.result()
@@ -1085,6 +1269,8 @@ class OptimizationJob:
             if start_method == "fork":
                 _FORK_SHARED_WORKER_PAYLOAD = None
             self._cleanup_shared_segments(shared_parent_handles, unlink=True)
+            if shared_counter is not None:
+                shared_counter.close(unlink=True)
 
     def _fetch_all_data(self):
         print("\n--- Fetching Data for Optimization ---")
@@ -1477,9 +1663,18 @@ class OptimizationJob:
 
     def _auto_refine_study_name(self):
         """
-        基于时间维度的自动化命名逻辑（始终自动生成）
-        格式：[训练周期]_[测试周期]_[指标]_[市场]_[训练集范围]_[测试集范围]_[运行时间]
+        优先保留已解析的续传名称；独立构造且未指定名称的 Job 使用日期默认名。
+        日期格式：[训练周期]_[测试周期]_[指标]_[市场]_[训练集范围]_[测试集范围]_[运行时间]
         """
+        explicit_name = (
+            str(getattr(self.args, "study_name", None) or os.environ.get("QUANTADA_STUDY_NAME", "")).strip()
+            or None
+        )
+        if explicit_name:
+            self.args.study_name = explicit_name
+            print(f"[Optimizer] Using explicit study_name: {explicit_name}")
+            return
+
         new_name = self.build_optuna_name_tag(
             metric=self.args.metric,
             train_period=self.args.train_roll_period,
@@ -1496,17 +1691,21 @@ class OptimizationJob:
         print(f"[Optimizer] Auto-refining study_name (Date-Based): {new_name}")
         self.args.study_name = new_name
 
-    def _launch_dashboard(self, log_file, port=8080, background=True):
+    def _launch_dashboard(self, log_file, port=8080, background=True, log_files=None):
         """
         直接在代码中运行 Optuna Dashboard。
         - background=True: 后台线程模式（默认）
         - background=False: 前台阻塞模式（按 Ctrl-C 退出）
+        多份 Journal 先复制到只读内存视图，不写回训练文件。
         """
+        files = [str(path) for path in (log_files if log_files is not None else [log_file]) if path]
+        if not files:
+            print("[Warning] No dashboard journal is available.")
+            return
         if not HAS_DASHBOARD:
             print("[Warning] 'optuna-dashboard' not installed. Skipping.")
             return
 
-        import logging
         import http.server
         import wsgiref.simple_server
 
@@ -1524,25 +1723,24 @@ class OptimizationJob:
         print(f">>> STARTING DASHBOARD ({mode_str}) <<<")
         print("=" * 60)
 
-        def build_storage_and_run():
-            # 静默日志
-            loggers_to_silence = [
-                "optuna",
-                "optuna_dashboard",
-                "sqlalchemy",
-                "bottle",
-                "waitress",
-                "werkzeug"
-            ]
-            for name in loggers_to_silence:
-                logging.getLogger(name).setLevel(logging.ERROR)
+        def prepare_storage():
+            # 单文件直接打开原 Journal，训练中的写入仍能显示。
+            # 多文件复制到内存视图；缺失文件不会被后端创建成空 Journal。
+            view = build_dashboard_storage(files)
+            for message in view.warnings:
+                print(f"[Warning] {message}")
+            if view.storage is None:
+                raise RuntimeError("No dashboard journal could be opened.")
+            if view.aggregated:
+                print(
+                    f"[Info] Dashboard view includes {len(view.study_names)} studies. "
+                    "This is a read-only snapshot; notes are not written back to training journals."
+                )
+            elif len(files) > 1:
+                print(f"[Info] Dashboard opened the remaining journal with {len(view.study_names)} studies.")
 
-            # 1. 在线程内部初始化存储对象
-            # 这样可以确保它读取的是最新的文件
-            storage = JournalStorage(JournalFileBackendCls(log_file))
-
-            # 2. 启动服务 (这是一个阻塞操作，会一直运行)
-            run_server(storage, host="127.0.0.1", port=port)
+            # 启动服务 (这是一个阻塞操作，会一直运行)
+            return view.storage
 
         def open_browser_later(url):
             try:
@@ -1556,15 +1754,20 @@ class OptimizationJob:
 
         if background:
             def start_server():
+                # 只过滤本线程的 Optuna 日志，不能改共享 logger 级别。
+                saved_level = begin_dashboard_log_scope()
                 try:
-                    build_storage_and_run()
-                except OSError as e:
-                    if "Address already in use" in str(e) or (hasattr(e, 'winerror') and e.winerror == 10048):
-                        print(f"\n[Error] Port {port} was seized by another process just now! Dashboard failed.")
-                    else:
-                        print(f"\n[Error] Dashboard thread failed: {e}")
-                except Exception as e:
-                    print(f"\n[Error] Dashboard crashed: {e}")
+                    try:
+                        run_server(prepare_storage(), host="127.0.0.1", port=port)
+                    except OSError as e:
+                        if "Address already in use" in str(e) or (hasattr(e, 'winerror') and e.winerror == 10048):
+                            print(f"\n[Error] Port {port} was seized by another process just now! Dashboard failed.")
+                        else:
+                            print(f"\n[Error] Dashboard thread failed: {e}")
+                    except Exception as e:
+                        print(f"\n[Error] Dashboard crashed: {e}")
+                finally:
+                    end_dashboard_log_scope(saved_level)
 
             # 3. 创建并启动守护线程
             t = threading.Thread(target=start_server, daemon=True)
@@ -1580,18 +1783,25 @@ class OptimizationJob:
         # 前台模式：主线程阻塞，允许用户人工排查后 Ctrl-C 退出
         print("[INFO] Dashboard running in foreground. Press Ctrl-C to stop.")
         print("=" * 60 + "\n")
-        threading.Thread(target=open_browser_later, args=(dashboard_url,), daemon=True).start()
+        # 前台 Dashboard 占用当前线程；退出后必须卸下过滤并保持原 logger 级别。
+        saved_level = begin_dashboard_log_scope()
         try:
-            build_storage_and_run()
-        except KeyboardInterrupt:
-            print("\n[INFO] Dashboard stopped by user (Ctrl-C).")
-        except OSError as e:
-            if "Address already in use" in str(e) or (hasattr(e, 'winerror') and e.winerror == 10048):
-                print(f"\n[Error] Port {port} was seized by another process just now! Dashboard failed.")
-            else:
-                print(f"\n[Error] Dashboard failed: {e}")
-        except Exception as e:
-            print(f"\n[Error] Dashboard crashed: {e}")
+            try:
+                # 先完成多 Journal 复制，再打开浏览器，避免页面早于服务启动。
+                ready_storage = prepare_storage()
+                threading.Thread(target=open_browser_later, args=(dashboard_url,), daemon=True).start()
+                run_server(ready_storage, host="127.0.0.1", port=port)
+            except KeyboardInterrupt:
+                print("\n[INFO] Dashboard stopped by user (Ctrl-C).")
+            except OSError as e:
+                if "Address already in use" in str(e) or (hasattr(e, 'winerror') and e.winerror == 10048):
+                    print(f"\n[Error] Port {port} was seized by another process just now! Dashboard failed.")
+                else:
+                    print(f"\n[Error] Dashboard failed: {e}")
+            except Exception as e:
+                print(f"\n[Error] Dashboard crashed: {e}")
+        finally:
+            end_dashboard_log_scope(saved_level)
 
     def _estimate_n_trials(self):
         """
@@ -1777,6 +1987,17 @@ class OptimizationJob:
             )
 
             bt_instance.run()
+
+            # 同一 worker 的后续 trial 复用首次运行生成的离线行情准备结果。
+            # 期权的时钟对齐仍由 Backtester 的期权分支负责，股票不会走期权归零语义。
+            if (
+                getattr(getattr(self, "strategy_class", None), "option_universe", None)
+                and not getattr(self, "_train_datas_prepared", False)
+            ):
+                prepared_datas = getattr(bt_instance, "_prepared_datas", None)
+                if isinstance(prepared_datas, dict) and prepared_datas:
+                    self.train_datas = prepared_datas
+                    self._train_datas_prepared = True
 
             # 检查回测是否成功生成结果，防止烂参数导致引擎空转
             if not getattr(bt_instance, 'results', None) or len(bt_instance.results) == 0:
@@ -2185,7 +2406,7 @@ class OptimizationJob:
                 prepared_df = self.prepare_data_index(raw_df)
                 try:
                     raw_end = prepared_df.index.max()
-                    has_window = (
+                    has_window = bool(getattr(self, "_snapshot_frozen", False)) or (
                         len(prepared_df) > 0
                         and (prepared_df.index.min() <= s or preloaded_request_covers_window)
                         and (raw_end >= e or preloaded_request_covers_window)
@@ -2202,6 +2423,9 @@ class OptimizationJob:
                 except Exception as exc:
                     print(f"[Optimizer] Failed to reuse preloaded data for {symbol}: {exc}")
 
+            if not used_preloaded and getattr(self, "_snapshot_frozen", False):
+                skipped += 1
+                continue
             if not used_preloaded:
                 print(
                     f"[Optimizer] Window data miss for {symbol}; fetching "
@@ -2388,19 +2612,24 @@ class OptimizationJob:
                 log_dir = os.path.join(os.getcwd(), config.DATA_PATH, 'optuna')
                 os.makedirs(log_dir, exist_ok=True)
 
-                # 支持多指标共享同一个 Journal 文件，以便最终只弹出一个聚合 Dashboard
+                # 批次 Journal 只作为锚点。每个 Study 独占文件，避免 trial_id 与控制台编号岔开。
                 if shared_journal_log_file:
                     shared_dir = os.path.dirname(shared_journal_log_file)
                     if shared_dir:
                         os.makedirs(shared_dir, exist_ok=True)
                     log_file = shared_journal_log_file
                 else:
-                    # 为每个 study 创建独立的日志文件，彻底消除跨任务的锁争抢
                     log_file = os.path.join(log_dir, f"optuna_{self.args.study_name}.log")
+                batch_journal = os.path.abspath(shared_journal_log_file or log_file)
+                aligned, separated = isolate_study_journal(log_file, self.args.study_name, batch_journal)
+                if os.path.abspath(aligned) != os.path.abspath(log_file) or separated:
+                    print(f"[Optimizer] Journal aligned to the study. Console Trial numbers match trial_id: {aligned}")
+                log_file = aligned
+                self._batch_journal = batch_journal
 
                 try:
                     # 尝试创建文件存储
-                    storage = JournalStorage(JournalFileBackendCls(log_file))
+                    storage = JournalStorage(JournalFileBackendCls(log_file, lock_obj=JournalFileOpenLock(log_file)))
                     if resolved_requested_workers != 1:
                         print(
                             f"\n[Optimizer] Multi-core mode enabled "
@@ -2409,6 +2638,12 @@ class OptimizationJob:
                     else:
                         print(f"\n[Optimizer] JournalStorage enabled for dashboard/log persistence (n_jobs=1).")
                     print(f"[Optimizer] Using JournalStorage: {log_file}")
+                    reference = getattr(self, "_data_snapshot", None)
+                    announce_training_scope(
+                        log_file,
+                        (getattr(self.args, "start_date", None), getattr(self.args, "end_date", None)),
+                        reference.get("id") if isinstance(reference, dict) else None,
+                    )
                 except OSError as e:
                     # 专门捕获 Windows 权限错误 (WinError 1314)
                     if hasattr(e, 'winerror') and e.winerror == 1314:
@@ -2458,7 +2693,7 @@ class OptimizationJob:
                 f"[Optimizer] Finite grid detected: {grid_size} unique combinations; "
                 f"duplicate sampling disabled, trials={n_trials}."
             )
-            sampler = GridSampler(grid_search_space)
+            sampler = RetryAwareGridSampler(grid_search_space)
         else:
             # 连续空间使用并行 TPE。
             sampler = TPESampler(
@@ -2476,24 +2711,49 @@ class OptimizationJob:
                 sampler=sampler,
             )
 
+            ensure_study_config_version(study)
+            snapshot_reference = getattr(self, "_data_snapshot", None)
+            if snapshot_reference:
+                existing_snapshot = study.user_attrs.get("_optimizer_data_snapshot")
+                snapshot_changed = existing_snapshot not in (None, snapshot_reference)
+                if study.get_trials(deepcopy=False) and snapshot_changed:
+                    if not getattr(self, "_rebind_unreadable_snapshot", False):
+                        raise ValueError("Study data snapshot differs; existing trial scores cannot be reused.")
+                    study.set_user_attr("_optimizer_rebound_snapshot", True)
+                if existing_snapshot is None and study.get_trials(deepcopy=False):
+                    study.set_user_attr("_optimizer_reused_pre_snapshot", True)
+                study.set_user_attr("_optimizer_data_snapshot", snapshot_reference)
+                study.set_user_attr("_optimizer_original_argv", list(self._original_argv))
+                study.set_user_attr("_optimizer_original_exact", self._original_argv_exact)
+
             # 将命令行参数记录到 Study User Attributes
             # vars(args) 可以将 Namespace 转换为字典，方便遍历
             for key, value in vars(self.args).items():
                 # 为了防止日志干扰或 token 泄露，可以根据需要做简单过滤
                 # 这里将所有参数转为字符串存储，方便在 Dashboard 右下角直接查阅
                 study.set_user_attr(key, str(value))
+            # 保留当前调度进程身份，便于新命令识别 Windows 主进程退出后仍运行的 worker。
+            study.set_user_attr("_optimizer_owner", f"optimizer_RUN{datetime.datetime.now():%Y%m%d-%H%M%S}_{os.getpid()}")
+            requested_metrics = list(getattr(self, "_requested_metrics", [self.args.metric]))
+            previous_metrics = study.user_attrs.get("_optimizer_metrics", [])
+            if isinstance(previous_metrics, list):
+                requested_metrics = list(dict.fromkeys(previous_metrics + requested_metrics))
+            study.set_user_attr("_optimizer_metrics", requested_metrics)
+            study.set_user_attr("_optimizer_target_trials", n_trials)
+            batch_journal = getattr(self, "_batch_journal", None)
+            if batch_journal:
+                study.set_user_attr("_optimizer_batch_journal", os.path.abspath(batch_journal))
 
         except OSError as e:
             # 捕获 WinError 1314 (Symlink 权限不足)
             if hasattr(e, 'winerror') and e.winerror == 1314:
+                if shared_journal_log_file:
+                    raise RuntimeError(f"Cannot persist resumable Study in {log_file}") from e
                 print("\n" + "!" * 60)
                 print("[WARNING] Windows Permission Error (WinError 1314).")
                 print(
                     "          Multi-core optimization requires Administrator privileges to create lock files.")
-                print(
-                    "          请使用管理员权限运行终端后执行，以进行多核优化")
                 print("          >> AUTOMATICALLY FALLING BACK TO SINGLE-CORE MODE. <<")
-                print("          >> 自动降级为单核优化模式. <<")
                 print("!" * 60 + "\n")
 
                 # 降级：重置为单核 + 内存存储
@@ -2511,8 +2771,33 @@ class OptimizationJob:
                 # 其他错误照常抛出
                 raise e
 
+        trial_state = optuna.trial.TrialState
+        if getattr(self, "_resume_exclusive", False) and storage is not None:
+            running_count, failed_count = prepare_trial_resume(study, storage)
+            if running_count or failed_count:
+                print(f"[Optimizer] Resume trials: requeued_running={running_count}, queued_failed_retries={failed_count}.")
+        finished_states = {
+            getattr(trial_state, name, None)
+            for name in ("COMPLETE", "PRUNED")
+        }
+        finished_states.discard(None)
+        target_trials = int(n_trials)
+        finished_trials = sum(
+            1
+            for trial in getattr(study, "trials", [])
+            if trial.state in finished_states
+        )
+        finished_before = int(finished_trials)
+        if finished_trials:
+            original_budget = n_trials
+            print(
+                f"[Optimizer] Resuming existing study: finished={finished_trials}, "
+                f"remaining={self._remaining_trial_budget(study, original_budget)}, target={original_budget}."
+            )
+        # FAIL 不占有效完成额度。这里先收成差额，后面的重试不能再从这里扣。
+        n_trials = self._remaining_trial_budget(study, target_trials)
+
         resolved_workers = self._resolve_worker_count(n_jobs)
-        effective_parallel_jobs = min(resolved_workers, max(1, int(n_trials)))
 
         if auto_launch_dashboard and log_file and os.path.exists(log_file):
             # 端口检测与递增逻辑
@@ -2529,36 +2814,113 @@ class OptimizationJob:
 
             self._launch_dashboard(log_file, port=target_port)
 
-        print(f"\n--- Starting Optimization ({n_trials} trials, {effective_parallel_jobs} parallel jobs) ---")
+        # 已登记 WAITING 先在父进程各跑一次。失败不占完成差额，成功才减少后续新组合。
+        waiting_state = getattr(trial_state, "WAITING", None)
+        queued_resume_trials = 0
+        if waiting_state is not None and n_trials > 0:
+            queued_resume_trials = sum(
+                1
+                for trial in getattr(study, "trials", [])
+                if getattr(trial, "state", None) == waiting_state
+            )
+
+        shared_counter = None
+        progress = None
+        if n_trials > 0:
+            counter = None
+            if resolved_workers > 1 and n_trials > 1:
+                try:
+                    shared_counter = SharedFinishCounter.create()
+                    counter = shared_counter
+                except Exception as exc:
+                    print(f"[Optimizer] Trial progress counter unavailable; continuing without ETA: {exc}")
+            if counter is None:
+                counter = TrialFinishCounter()
+            # finished_before 固定为本轮开始前的完成数，两个阶段共用同一速度计数。
+            progress = make_trial_progress(target_trials, finished_before, counter)
+
+        def run_queued_resume_trials(count):
+            """把本轮已登记的 WAITING 各执行一次。普通失败不中断补额，也不再次排队。"""
+
+            class QueuedResumeFailure(Exception):
+                pass
+
+            def objective(trial):
+                try:
+                    return self.objective(trial)
+                except (KeyboardInterrupt, MemoryError):
+                    raise
+                except Exception as exc:
+                    raise QueuedResumeFailure(f"{type(exc).__name__}: {exc}") from exc
+
+            study.optimize(
+                objective,
+                n_trials=count,
+                n_jobs=1,
+                gc_after_trial=True,
+                catch=(QueuedResumeFailure,),
+            )
 
         # 3. 执行优化
         try:
-            if effective_parallel_jobs > 1:
-                self._run_multiprocess_optimization(
-                    n_jobs=n_jobs,
-                    n_trials=n_trials,
-                    log_file=log_file,
-                    prefer_fork_cow=(not auto_launch_dashboard),
-                    grid_search_space=grid_search_space,
+            with installed_trial_progress(progress):
+                if queued_resume_trials:
+                    print(
+                        "[Optimizer] Running queued resume trials without consuming the completion gap: "
+                        f"waiting={queued_resume_trials}."
+                    )
+                    run_queued_resume_trials(queued_resume_trials)
+                    if waiting_state is not None:
+                        leftover = sum(
+                            1
+                            for trial in getattr(study, "trials", [])
+                            if getattr(trial, "state", None) == waiting_state
+                        )
+                        # 采样器提前 stop 时，剩余 WAITING 仍属本轮快照，继续在父进程排空。
+                        if leftover:
+                            run_queued_resume_trials(leftover)
+                    n_trials = self._remaining_trial_budget(study, target_trials)
+                effective_parallel_jobs = min(resolved_workers, max(1, int(n_trials)))
+                print(
+                    f"\n--- Starting Optimization ({n_trials} trials, {effective_parallel_jobs} parallel jobs) ---"
                 )
-            else:
-                # 单核/单并行场景回退为单进程线程模式（与历史版本一致）
-                # 这里保留 Optuna 的 n_jobs 参数入口，避免强制写死为 1。
-                thread_jobs = max(1, min(int(n_trials), self._resolve_worker_count(n_jobs)))
-                if thread_jobs != 1:
-                    print(f"[Optimizer] Fallback to single-process threaded mode (n_jobs={thread_jobs}).")
-                study.optimize(
-                    self.objective,
-                    n_trials=n_trials,
-                    n_jobs=thread_jobs,
-                    gc_after_trial=True,
-                )
+                if n_trials <= 0:
+                    print("[Optimizer] Study already reached its requested trial budget; skipping optimization.")
+                elif effective_parallel_jobs > 1:
+                    # 父进程已排空 WAITING，worker 只拆分新组合，避免抢走重试并挤占差额。
+                    self._run_multiprocess_optimization(
+                        n_jobs=n_jobs,
+                        n_trials=n_trials,
+                        log_file=log_file,
+                        prefer_fork_cow=(not auto_launch_dashboard),
+                        grid_search_space=grid_search_space,
+                        progress_target=None if shared_counter is not None else target_trials,
+                        progress_finished_before=finished_before,
+                        trial_progress=progress if shared_counter is not None else None,
+                    )
+                else:
+                    # 单核/单并行场景回退为单进程线程模式（与历史版本一致）
+                    # 这里保留 Optuna 的 n_jobs 参数入口，避免强制写死为 1。
+                    thread_jobs = max(1, min(int(n_trials), self._resolve_worker_count(n_jobs)))
+                    if thread_jobs != 1:
+                        print(f"[Optimizer] Fallback to single-process threaded mode (n_jobs={thread_jobs}).")
+                    study.optimize(
+                        self.objective,
+                        n_trials=n_trials,
+                        n_jobs=thread_jobs,
+                        gc_after_trial=True,
+                    )
         except KeyboardInterrupt:
-            print("\n[Optimizer] Optimization stopped by user.")
+            print("\n[Optimizer] Optimization stopped by user. Saved trials can be resumed on the next run.")
+            # 用户中断终止整个训练批次，不能继续验证回测或启动下一个 metric。
+            raise
         except MemoryError as exc:
             self._release_memory_pressure()
             print(f"\n[Optimizer] Optimization stopped early due to memory pressure: {exc}")
             print("[Optimizer] Completed trials will be used for the final report if available.")
+        finally:
+            if shared_counter is not None:
+                shared_counter.close(unlink=True)
 
         completed_trials = [
             trial for trial in study.trials
@@ -2626,7 +2988,7 @@ class OptimizationJob:
         return {
             "best_score": best_val_display,
             "best_params": best_params,
-            "trials_completed": len(study.trials),
+            "trials_completed": len(completed_trials),
             "log_file": log_file,
             "main_eval_backtest": main_eval_metrics,
             "recent_backtest": main_eval_metrics,
@@ -2644,6 +3006,7 @@ def _optimize_worker_entry(
     sampler_seed,
     tpe_n_ei_candidates=None,
     grid_search_space=None,
+    trial_progress=None,
 ):
     """
     多进程子进程入口：每个 worker 连接同一个 Study，执行固定 trial 配额。
@@ -2657,8 +3020,11 @@ def _optimize_worker_entry(
     if worker_payload is None:
         raise RuntimeError("Worker payload is missing.")
 
-    # 在 worker 内同步主进程日志开关；缺省按训练静音处理。
-    config.LOG = bool(worker_payload.get("log_enabled", False))
+    runtime_config = worker_payload.get("runtime_config")
+    if not isinstance(runtime_config, dict):
+        raise ValueError("Worker runtime configuration snapshot is missing.")
+    # 必须先恢复配置，再加载策略、风控与评分插件，包括它们在导入时读取的常量。
+    vars(config).update(copy.deepcopy(runtime_config))
     worker_tee = None
     terminal_log_path = worker_payload.get("terminal_log_path") or get_optimizer_terminal_log_path()
     if terminal_log_path:
@@ -2674,9 +3040,9 @@ def _optimize_worker_entry(
             worker_payload = dict(worker_payload)
             worker_payload["train_datas"] = restored_train_datas
 
-        storage = JournalStorage(JournalFileBackendCls(log_file))
+        storage = JournalStorage(JournalFileBackendCls(log_file, lock_obj=JournalFileOpenLock(log_file)))
         if grid_search_space:
-            sampler = GridSampler(grid_search_space)
+            sampler = RetryAwareGridSampler(grid_search_space)
         else:
             if tpe_n_ei_candidates is None:
                 tpe_n_ei_candidates = OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
@@ -2693,15 +3059,17 @@ def _optimize_worker_entry(
             load_if_exists=True,
             sampler=sampler,
         )
+        ensure_study_config_version(study)
 
         job = OptimizationJob.from_worker_payload(worker_payload)
         try:
-            study.optimize(
-                job.objective,
-                n_trials=n_trials,
-                n_jobs=1,
-                gc_after_trial=True,
-            )
+            with installed_trial_progress(trial_progress):
+                study.optimize(
+                    job.objective,
+                    n_trials=n_trials,
+                    n_jobs=1,
+                    gc_after_trial=True,
+                )
         except MemoryError as exc:
             job._release_memory_pressure()
             print(

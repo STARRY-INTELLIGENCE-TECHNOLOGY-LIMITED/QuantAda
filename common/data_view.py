@@ -31,37 +31,92 @@ def bar_datetime(data, broker=None):
     return timestamp
 
 
-def visible_row(data, current_dt, require_current_quote=False):
+def visible_row(data, current_dt, require_current_quote=False, cache_owner=None):
     """返回不超过当前时间的最后一行有效行情。"""
     dataframe = getattr(getattr(data, "p", None), "dataname", None)
     if not isinstance(dataframe, pd.DataFrame) or dataframe.empty or current_dt is None:
         return None
-    index = pd.to_datetime(dataframe.index, errors="coerce")
-    if getattr(index, "tz", None) is not None:
-        index = index.tz_localize(None)
+    cache = None
+    cache_key = None
+    if cache_owner is not None and not getattr(cache_owner, "is_live", False):
+        normalized_dt = pd.Timestamp(current_dt)
+        if getattr(normalized_dt, "tzinfo", None) is not None:
+            normalized_dt = normalized_dt.tz_localize(None)
+        if getattr(cache_owner, "_visible_row_cache_dt", None) != normalized_dt:
+            cache_owner._visible_row_cache_dt = normalized_dt
+            cache_owner._visible_row_cache = {}
+        cache = getattr(cache_owner, "_visible_row_cache", None)
+        if isinstance(cache, dict):
+            cache_key = (id(data), bool(require_current_quote))
+            if cache_key in cache:
+                return cache[cache_key]
+    index = None
+    if cache_owner is not None and not getattr(cache_owner, "is_live", False):
+        index_cache = getattr(cache_owner, "_visible_index_cache", None)
+        if not isinstance(index_cache, dict):
+            index_cache = {}
+            cache_owner._visible_index_cache = index_cache
+        cached_index = index_cache.get(id(dataframe))
+        if cached_index is not None and cached_index[0] is dataframe:
+            index = cached_index[1]
+        else:
+            index = pd.to_datetime(dataframe.index, errors="coerce")
+            if getattr(index, "tz", None) is not None:
+                index = index.tz_localize(None)
+            index_cache[id(dataframe)] = (dataframe, index)
+    if index is None:
+        index = pd.to_datetime(dataframe.index, errors="coerce")
+        if getattr(index, "tz", None) is not None:
+            index = index.tz_localize(None)
     current_timestamp = pd.Timestamp(current_dt)
     if current_timestamp.tzinfo is not None:
         current_timestamp = current_timestamp.tz_localize(None)
-    visible_mask = index <= current_timestamp
-    visible = dataframe.loc[visible_mask]
-    if visible.empty:
-        return None
     if require_current_quote:
-        latest = visible.iloc[-1]
-        latest_dt = pd.Timestamp(index[visible_mask][-1]).normalize()
+        latest = None
+        latest_dt = None
+        if index.is_monotonic_increasing and not index.hasnans:
+            position = int(index.searchsorted(current_timestamp, side="right")) - 1
+            if position >= 0:
+                latest = dataframe.iloc[position]
+                latest_dt = pd.Timestamp(index[position]).normalize()
+        else:
+            visible_mask = index <= current_timestamp
+            visible = dataframe.loc[visible_mask]
+            if not visible.empty:
+                latest = visible.iloc[-1]
+                latest_dt = pd.Timestamp(index[visible_mask][-1]).normalize()
+        if latest is None:
+            if cache is not None:
+                cache[cache_key] = None
+            return None
         current_day = current_timestamp.normalize()
         bid = _safe_number(latest.get("bid", latest.get("bid_price")), 0.0)
         ask = _safe_number(latest.get("ask", latest.get("ask_price")), 0.0)
         close = _safe_number(latest.get("close"), 0.0)
         if latest_dt != current_day:
+            if cache is not None:
+                cache[cache_key] = None
             return None
         if close <= 0 and not (bid > 0 and ask >= bid):
+            if cache is not None:
+                cache[cache_key] = None
             return None
+        if cache is not None:
+            cache[cache_key] = latest
         return latest
+    visible_mask = index <= current_timestamp
+    visible = dataframe.loc[visible_mask]
+    if visible.empty:
+        if cache is not None:
+            cache[cache_key] = None
+        return None
     if "close" in visible.columns:
         closes = pd.to_numeric(visible["close"], errors="coerce")
         visible = visible.loc[closes.notna() & (closes > 0)]
-    return visible.iloc[-1] if not visible.empty else None
+    result = visible.iloc[-1] if not visible.empty else None
+    if cache is not None:
+        cache[cache_key] = result
+    return result
 
 
 def _safe_number(value, default=0.0):

@@ -1198,7 +1198,7 @@ class Backtester:
                  recorder = None, enable_plot = True, verbose=True, indicator_cache=None,
                  plot_scope: str = 'full'):
         self.plot_scope = parse_plot_scopes(plot_scope)
-        self.cerebro = create_cerebro(self.plot_scope)
+        self.cerebro = create_cerebro(self.plot_scope, enable_plot=enable_plot)
         self.cerebro.broker = SignalLoggingBroker()
         self.datas = datas
         self.strategy_class = strategy_class
@@ -1218,10 +1218,13 @@ class Backtester:
         self.enable_plot = enable_plot
         self.verbose = verbose
         self.indicator_cache = indicator_cache if isinstance(indicator_cache, dict) else {}
+        # 优化器可在同一进程内复用首次运行后生成的对齐行情；签名不匹配时自动重建。
+        self._prepared_datas = None
         self.timeframe = self._get_bt_timeframe(timeframe)
 
         self._init_analyzers()
-        configure_plot_observers(self.cerebro, self.plot_scope)
+        if self.enable_plot:
+            configure_plot_observers(self.cerebro, self.plot_scope)
 
     def _get_bt_timeframe(self, timeframe_str: str) -> int:
         """将字符串时间维度映射到backtrader的TimeFrame枚举值"""
@@ -1267,6 +1270,7 @@ class Backtester:
         end = pd.to_datetime(self.end_date) if self.end_date else None
         underlyings = {}
         options = {}
+        parsed_symbols = {}
         skipped_empty = 0
 
         def _naive_frame(df):
@@ -1296,7 +1300,9 @@ class Backtester:
             if visible.empty:
                 skipped_empty += 1
                 continue
-            if parse_option_symbol(symbol).get("option_type"):
+            parsed = parse_option_symbol(symbol)
+            parsed_symbols[symbol] = parsed
+            if parsed.get("option_type"):
                 options[symbol] = frame
             else:
                 underlyings[symbol] = frame
@@ -1308,6 +1314,19 @@ class Backtester:
             clock = visible.index if clock is None else clock.union(visible.index)
         if clock is not None:
             clock = clock.sort_values()
+        clock_signature = None
+        if clock is not None:
+            try:
+                clock_signature = (len(clock), clock.asi8.tobytes())
+            except Exception:
+                clock_signature = (len(clock), tuple(clock))
+        clock_days = None
+        if clock is not None:
+            clock_days = pd.DatetimeIndex(pd.to_datetime(clock, errors="coerce"))
+            if clock_days.tz is not None:
+                clock_days = clock_days.tz_localize(None)
+            clock_days = clock_days.normalize()
+        alive_masks = {}
         prepared = {}
         for symbol in self.datas:
             if symbol in underlyings:
@@ -1315,27 +1334,43 @@ class Backtester:
             elif symbol in options:
                 frame = options[symbol]
                 if clock is not None:
-                    aligned = frame.reindex(clock)
-                    expiry = parse_option_symbol(symbol).get("expiry")
+                    cached_signature = getattr(frame, "attrs", {}).get(
+                        "_quantada_aligned_clock"
+                    )
+                    already_aligned = (
+                        cached_signature == clock_signature
+                        and isinstance(frame.index, pd.DatetimeIndex)
+                        and frame.index.equals(clock)
+                    )
+                    aligned = frame if already_aligned else frame.reindex(clock)
+                    expiry = parsed_symbols.get(symbol, {}).get("expiry")
                     expiry_day = None if expiry is None else pd.Timestamp(expiry)
                     if expiry_day is not None and not pd.isna(expiry_day):
                         expiry_day = expiry_day.tz_localize(None) if expiry_day.tzinfo is not None else expiry_day
                         expiry_day = expiry_day.normalize()
-                    clock_days = pd.DatetimeIndex(pd.to_datetime(aligned.index, errors="coerce")).tz_localize(None) if getattr(aligned.index, "tz", None) is not None else pd.DatetimeIndex(pd.to_datetime(aligned.index, errors="coerce"))
-                    clock_days = clock_days.normalize()
-                    alive = pd.Series(True, index=aligned.index)
                     if expiry_day is not None:
-                        alive = pd.Series(clock_days <= expiry_day, index=aligned.index)
-                    for column in ("open", "high", "low", "close", "bid", "ask", "bid_price", "ask_price", "last"):
-                        if column not in aligned.columns:
-                            continue
-                        series = pd.to_numeric(aligned[column], errors="coerce")
-                        series = series.where(alive, 0.0).fillna(0.0)
-                        aligned[column] = series
-                    if "volume" in aligned.columns:
-                        aligned["volume"] = pd.to_numeric(aligned["volume"], errors="coerce").fillna(0.0)
+                        mask_key = expiry_day.value
+                        alive_mask = alive_masks.get(mask_key)
+                        if alive_mask is None:
+                            alive_mask = clock_days <= expiry_day
+                            alive_masks[mask_key] = alive_mask
+                    else:
+                        alive_mask = None
+                    if not already_aligned:
+                        for column in ("open", "high", "low", "close", "bid", "ask", "bid_price", "ask_price", "last"):
+                            if column not in aligned.columns:
+                                continue
+                            series = pd.to_numeric(aligned[column], errors="coerce")
+                            if alive_mask is not None:
+                                series = series.where(alive_mask, 0.0)
+                            series = series.fillna(0.0)
+                            aligned[column] = series
+                        if "volume" in aligned.columns:
+                            aligned["volume"] = pd.to_numeric(aligned["volume"], errors="coerce").fillna(0.0)
+                        aligned.attrs["_quantada_aligned_clock"] = clock_signature
                     frame = aligned
                 prepared[symbol] = frame
+        self._prepared_datas = prepared
         for symbol, df in prepared.items():
             feed = bt.feeds.PandasData(
                 dataname=df,

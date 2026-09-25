@@ -83,8 +83,9 @@ def _uses_portfolio_plotting(plot_scope) -> bool:
     return any(scope in PORTFOLIO_PLOT_SCOPES for scope in scopes)
 
 
-def create_cerebro(plot_scope: str):
-    return bt.Cerebro(stdstats=not _uses_portfolio_plotting(plot_scope))
+def create_cerebro(plot_scope: str, enable_plot: bool = True):
+    # 无绘图回测不创建默认观察器，避免 DataTrades 动态类在模块全局逐轮累积。
+    return bt.Cerebro(stdstats=bool(enable_plot) and not _uses_portfolio_plotting(plot_scope))
 
 
 def configure_plot_observers(cerebro, plot_scope: str) -> None:

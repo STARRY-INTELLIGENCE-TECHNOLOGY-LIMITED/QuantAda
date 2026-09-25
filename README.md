@@ -126,6 +126,18 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'fast_period': {'type': 'int', 'low': 5, 'high': 30}}" --train_period 20210101-20221231 --test_period 20230101-20231231 --n_trials 50
 ```
 
+从历史任务交互选择并续传，无需重新填写策略和参数：
+
+```bash
+python run.py --train_resume
+```
+
+任务按最近更新时间倒序，每页 10 个；`n` / `p` 翻页，`g 3` 跳到第 3 页。输入序号后先查看原始命令，再输入 `y` 确认恢复，`b` 返回列表，`q` 退出。菜单和日志为英文：`1 / y: confirm resume`、`l: view log`。Web 工作台提供相同分页及命令详情，点击 `Resume selected task` 确认。
+列表会标明训练状态 `Finished` 或 `Incomplete`。只看与该任务匹配的终端日志末尾展示段：Journal 文件名必须一致；日志若写了窗口或快照，也必须一致。同一 Journal 里有多个任务、而日志没有窗口和快照时，不把该日志判给每一个任务。分析开始标记之后出现结束标记，且结束标记后不是空摘要，才算 `Finished`；空摘要会跳过。否则为 `Incomplete`。`Incomplete` 仍可续传。
+选中任务后可输入 `l` 查看该任务匹配的最新终端日志，不会打开另一个任务的日志，默认停在末尾。`n` / `p` 翻页，`h` / `e` / `m` 跳到首页、末尾和中间，`s` 跳到分析展示段，`g 3` 跳到第 3 页，`b` 返回详情。Web 工作台的 `View log` 提供相同翻页。Trial 进度在同一行显示 `Trial 369/2160 ETA 6h12m`。
+跨日恢复优先使用固定的数据、选股结果和期权池快照。旧任务没有快照时仍加载原 Study 并复用已完成试验；同一批次已有快照会实际加载并跳过取数，旧评分计入预算但不算该快照的结果。本任务快照损坏时重新准备数据并绑定新快照，不改用其它 Study 的快照，也不另开空 Study。详情页同时提供可复制的“使用最新行情手动重新训练”命令：移除旧 Study 绑定并追加 `--refresh`，重新选股、取数和训练；未显式指定的日期按启动时推断，显式日期可手动调整。
+未记录当前 worker 配置口径的旧任务会按原 Study 名称加载，已完成试验计入预算，只跑未完成组合。控制台 Trial 编号与 Journal trial_id 一致，从原 Study 继续，不是从 0 开始。同一批次里完成更多的 Study 优先，避免薄的隔离 Study 丢掉已探索参数。列表和预览会写明这一口径。
+
 ### 7) 连接实盘/仿真
 
 在 `config.py` 统一入口（Broker 默认连接值位于 `configs/gm.py`、`configs/ibkr.py`、`configs/futu.py`）配置 `BROKER_ENVIRONMENTS`，再通过 `--connect=broker:env` 启动：
