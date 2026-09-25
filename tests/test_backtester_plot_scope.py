@@ -242,8 +242,9 @@ def test_repeated_no_plot_backtests_do_not_retain_dynamic_classes_or_engines(mon
     # 直接检查全局强引用与引擎存活，避免用受分配器高水位影响的 RSS 作断言。
     modules = [sys.modules["backtrader.lineseries"], sys.modules["backtrader.metabase"]]
     before = [set(vars(module)) for module in modules]
-    engine_refs = []
-    for _ in range(6):
+
+    def _run_once():
+        # Backtrader 会读取调用栈 f_locals。Python 3.10 缓存该快照，同函数 del 后仍可能留住引擎。
         engine = Backtester(
             datas={"AAA": _make_df(), "BBB": _make_df()},
             strategy_class=_NoopStrategy,
@@ -251,9 +252,12 @@ def test_repeated_no_plot_backtests_do_not_retain_dynamic_classes_or_engines(mon
             verbose=False,
         )
         engine.run()
-        engine_refs.append(weakref.ref(engine.cerebro))
+        ref = weakref.ref(engine.cerebro)
         del engine
-        gc.collect()
+        return ref
+
+    engine_refs = [_run_once() for _ in range(6)]
+    gc.collect()
 
     assert all(ref() is None for ref in engine_refs)
     assert [set(vars(module)) for module in modules] == before

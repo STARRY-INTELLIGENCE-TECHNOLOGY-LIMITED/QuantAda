@@ -154,10 +154,16 @@ def test_pool_start_reclaims_finished_backtest_cycles(monkeypatch):
             {name: [100.0] * 3 for name in ("open", "high", "low", "close", "volume")},
             index=pd.date_range("2024-01-01", periods=3),
         )
-        engine = Backtester(datas={"AAA": frame}, strategy_class=NoopStrategy, enable_plot=False, verbose=False)
-        engine.run()
-        engine_ref = weakref.ref(engine.cerebro)
-        del engine
+
+        def _finished_backtest():
+            # 独立作用域结束后才检查回收，避免 Python 3.10 的 f_locals 快照把引擎留在当前测试帧。
+            engine = Backtester(datas={"AAA": frame}, strategy_class=NoopStrategy, enable_plot=False, verbose=False)
+            engine.run()
+            ref = weakref.ref(engine.cerebro)
+            del engine
+            return ref
+
+        engine_ref = _finished_backtest()
         assert engine_ref() is not None
 
         with pytest.raises(RuntimeError, match="stop before spawning"):

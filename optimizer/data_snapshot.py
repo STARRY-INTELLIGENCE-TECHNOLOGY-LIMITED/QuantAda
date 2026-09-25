@@ -18,6 +18,17 @@ DATA_FIELDS = (
 )
 
 
+def _sha256_stream(stream):
+    """流式计算 SHA-256，兼容 CI 使用的 Python 3.10。"""
+    digest = hashlib.sha256()
+    while True:
+        chunk = stream.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def save_training_snapshot(journal, context, args, original_argv, runtime_config, original_exact=True):
     """持锁调用；流式写入后提交清单，同一批次的所有指标共用一次快照。"""
     directory = Path(str(journal) + ".snapshots").resolve()
@@ -35,7 +46,7 @@ def save_training_snapshot(journal, context, args, original_argv, runtime_config
             stream.flush()
             os.fsync(stream.fileno())
         with data_file.open("rb") as stream:
-            data_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            data_digest = _sha256_stream(stream)
         frames = context.get("raw_datas") or {}
         coverage = {}
         for symbol, frame in frames.items():
@@ -96,7 +107,7 @@ def load_training_snapshot(journal, reference):
     if manifest.get("version") != SNAPSHOT_VERSION:
         raise ValueError("训练数据快照版本不兼容")
     with (snapshot / "data.pkl").open("rb") as stream:
-        if hashlib.file_digest(stream, "sha256").hexdigest() != manifest.get("data_sha256"):
+        if _sha256_stream(stream) != manifest.get("data_sha256"):
             raise ValueError("训练数据快照行情校验失败")
         stream.seek(0)
         try:
