@@ -43,6 +43,9 @@
 14. 修复 worker 配置一致性时，透传父进程最终生效的完整大写配置快照，并在策略/风控/评分插件导入前恢复；不能仅传 LOG 或重新解释原始 args.config。用真实 spawn 验证导入期常量、嵌套字典和单进程/多进程评分一致性。历史配置口径不明的 Study 按原名加载并复用已完成试验，不把旧评分改标成当前口径；验证重复执行仍幂等，且 UI 说明已完成试验计入预算。
 15. 跨日续传须测试行情和选股结果改变后仍使用原快照，报告阶段也不能补拉。快照恢复后本轮显式 `--config` 仍生效；显式 `--study_name` 只能锚定同快照指标，不能把旧 Study 名称复用给另一个指标。覆盖缺失/损坏快照隔离、同 Journal 快照必须实际加载、损坏的本 Study 快照不得改用其它 Study 快照、同日 --refresh、快照写入失败及多指标共用数据。CLI 覆盖每页 10 条、跳页、详情确认/返回/取消；原始命令与最新行情命令须可复制且不触发 Shell 展开。
 16. 长时间多指标训练跨越交易日时，必须确认日期推断只执行一次；bootstrap、每个 metric Job、spawn worker 的 `start_date/end_date` 必须完全一致。用模拟时钟推进日期验证，不能只检查单个 Study。
+17. Optuna 为避免 trial_id 冲突而拆分的专属 Journal 仍属于同一个 `_optimizer_batch_journal` 批次。任务列表须合并其 COMPLETE/FAIL/RUNNING/WAITING 计数和指标；恢复命令指向批次主 Journal 并锚定 Study，不能把 Ctrl-C 后的拆分文件显示成第二个训练任务。验证原任务和拆分 Journal 的回放。
+18. `--n_jobs -1` 的恢复不能把 WAITING retry 固定为父进程 `n_jobs=1`。有可用 JournalStorage 和 worker 时，恢复队列应并行领取固定参数 trial；验证同一批次失败链、原网格槽位和未完成预算不被新采样污染。
+19. 训练身份必须有稳定参数 hash。参数不同即使命中旧批次 Journal 或锁文件，也要派生独立 Journal；相同 hash 才幂等跳过重复启动。测试固定参数、搜索空间、风险参数和配置覆盖的变化，以及已有无 hash 旧 Study 的兼容恢复。
 
 ## 输出格式
 1. `根因`

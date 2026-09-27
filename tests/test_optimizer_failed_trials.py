@@ -286,7 +286,7 @@ def test_failed_retries_do_not_consume_completion_gap(tmp_path):
 def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypatch, tmp_path):
     path, study_name, failed, storage = _seed_completion_gap(tmp_path)
     seen = []
-    captured = {}
+    captured = {"calls": []}
 
     def objective(trial):
         value = trial.suggest_int("x", 0, 5)
@@ -297,17 +297,21 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
 
     def fake_parallel(self, n_jobs, n_trials, log_file, **kwargs):
         current = optuna.load_study(study_name=study_name, storage=storage)
-        captured["n_trials"] = n_trials
-        captured["waiting"] = sum(trial.state == optuna.trial.TrialState.WAITING for trial in current.trials)
-        captured["retries"] = sum("failed_trial" in trial.system_attrs for trial in current.trials)
+        call = {"n_trials": n_trials}
+        call["waiting"] = sum(trial.state == optuna.trial.TrialState.WAITING for trial in current.trials)
+        call["retries"] = sum("failed_trial" in trial.system_attrs for trial in current.trials)
         progress = kwargs.get("trial_progress")
-        captured["finished_before"] = (
+        call["finished_before"] = (
             progress["finished_before"] if progress is not None else kwargs.get("progress_finished_before")
         )
+        call["progress"] = progress
+        call["counter"] = progress["counter"] if progress is not None else None
+        call["started_at"] = progress["started_at"] if progress is not None else None
+        captured["calls"].append(call)
         resumed = optuna.load_study(
             study_name=study_name, storage=storage, sampler=RetryAwareGridSampler({"x": list(range(6))}),
         )
-        resumed.optimize(objective, n_trials=n_trials)
+        resumed.optimize(objective, n_trials=n_trials, catch=(RuntimeError,))
 
     monkeypatch.setattr(
         OptimizationJob, "_resolve_worker_count", classmethod(lambda cls, requested: max(1, int(requested))),
@@ -315,11 +319,49 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
     monkeypatch.setattr(OptimizationJob, "_run_multiprocess_optimization", fake_parallel)
     result = _resume_job(path, study_name, objective, n_jobs=2).run()
     loaded = optuna.load_study(study_name=study_name, storage=storage)
-    assert captured["waiting"] == 0
-    assert captured["retries"] == 3
-    assert captured["n_trials"] == 2
-    assert captured["finished_before"] == 1
+    assert captured["calls"][0]["waiting"] == 3
+    assert captured["calls"][0]["n_trials"] == 3
+    assert captured["calls"][0]["retries"] == 3
+    assert captured["calls"][1]["waiting"] == 0
+    assert captured["calls"][1]["n_trials"] == 2
+    assert captured["calls"][1]["finished_before"] == 1
+    assert captured["calls"][1]["progress"]["parallel_workers"] == 2
+    assert captured["calls"][0]["progress"] is captured["calls"][1]["progress"]
+    assert captured["calls"][0]["counter"] is not captured["calls"][1]["counter"]
+    assert captured["calls"][1]["started_at"] >= captured["calls"][0]["started_at"]
     assert result["trials_completed"] == 3
     assert sum(value in failed for value in seen) == 3
     assert sum(trial.state == optuna.trial.TrialState.COMPLETE for trial in loaded.trials) == 3
     assert OptimizationJob._remaining_trial_budget(loaded, 3) == 0
+
+
+def test_leftover_waiting_is_drained_by_parent_before_new_trials(monkeypatch, tmp_path):
+    path, study_name, failed, storage = _seed_completion_gap(tmp_path)
+    calls = []
+
+    def objective(trial):
+        value = trial.suggest_int("x", 0, 5)
+        if value in failed:
+            raise RuntimeError("deterministic failure")
+        return float(value)
+
+    def fake_parallel(self, n_jobs, n_trials, log_file, **kwargs):
+        current = optuna.load_study(study_name=study_name, storage=storage)
+        calls.append({
+            "n_trials": n_trials,
+            "waiting": sum(trial.state == optuna.trial.TrialState.WAITING for trial in current.trials),
+        })
+
+    monkeypatch.setattr(
+        OptimizationJob, "_resolve_worker_count", classmethod(lambda cls, requested: max(1, int(requested))),
+    )
+    monkeypatch.setattr(OptimizationJob, "_run_multiprocess_optimization", fake_parallel)
+    _resume_job(path, study_name, objective, n_jobs=2).run()
+    loaded = optuna.load_study(study_name=study_name, storage=storage)
+    assert calls[0] == {"n_trials": 3, "waiting": 3}
+    assert calls[1] == {"n_trials": 2, "waiting": 0}
+    assert len(calls) == 2
+    assert not any(trial.state == optuna.trial.TrialState.WAITING for trial in loaded.trials)
+    retries = [trial for trial in loaded.trials if "failed_trial" in trial.system_attrs]
+    assert len(retries) == 3
+    assert all(trial.state == optuna.trial.TrialState.FAIL for trial in retries)

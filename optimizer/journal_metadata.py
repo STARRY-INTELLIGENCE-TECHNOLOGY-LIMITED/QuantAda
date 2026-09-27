@@ -54,6 +54,14 @@ def study_identity(values):
     return result
 
 
+def training_identity_hash(values):
+    """只哈希训练身份；连接、界面和续传入口不参与，避免同配置被拆成两份。"""
+    raw_values = dict(values) if hasattr(values, "items") else vars(values)
+    identity = study_identity(raw_values)
+    encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:20]
+
+
 def read_study_metadata(path, *, with_trial_counts=False):
     """保留 Study 元数据；需要进度时每个 trial 仅保存 Study ID 和一个状态字节。"""
     studies = {}
@@ -136,7 +144,20 @@ def related_journal_paths(path):
     """同一批次的 Journal。只跟随批次标记，不按训练身份合并两次运行。"""
     path = Path(path).resolve()
     if not path.is_file():
-        return [path]
+        # 锚点被删后，专属 Journal 仍用批次标记指向它；必须反查，不能当成空批次。
+        if not path.parent.is_dir():
+            return [path]
+        target = str(path)
+        found = []
+        for candidate in sorted(path.parent.glob("optuna_*.log")):
+            resolved = candidate.resolve()
+            try:
+                studies = read_study_metadata(resolved)
+            except (OSError, ValueError, KeyError, TypeError, IndexError):
+                continue
+            if target in _batch_values(studies):
+                found.append(resolved)
+        return found or [path]
     anchor = batch_journal_path(path)
     keys = {str(anchor), str(path)}
     found = []

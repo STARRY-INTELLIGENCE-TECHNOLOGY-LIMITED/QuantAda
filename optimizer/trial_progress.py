@@ -178,7 +178,7 @@ def format_remaining_duration(seconds):
     return f"{days}d{hours}h" if hours else f"{days}d"
 
 
-def remaining_label(target_trials, finished_before, counted, started_at, now):
+def remaining_label(target_trials, finished_before, counted, started_at, now, parallel_workers=1):
     """按本次运行墙钟速度估计剩余时间；失败不计入速度。"""
     remaining = int(target_trials) - int(finished_before) - int(counted)
     if remaining <= 0:
@@ -186,18 +186,22 @@ def remaining_label(target_trials, finished_before, counted, started_at, now):
     elapsed = float(now) - float(started_at)
     if int(counted) <= 0 or elapsed < 1.0:
         return "ETA unavailable"
+    parallel_workers = max(1, int(parallel_workers or 1))
+    if parallel_workers > 1 and int(counted) < parallel_workers:
+        return f"ETA warming up ({int(counted)}/{parallel_workers} workers)"
     eta = remaining * elapsed / int(counted)
     if int(round(eta)) <= 0:
         return "finishing"
     return f"ETA {format_remaining_duration(eta)}"
 
 
-def make_trial_progress(target_trials, finished_before, counter, started_at=None):
+def make_trial_progress(target_trials, finished_before, counter, started_at=None, parallel_workers=1):
     """组装可传入 worker 的进度状态。分母是指标目标预算，不是本轮剩余额度。"""
     return {
         "target_trials": int(target_trials),
         "finished_before": max(0, int(finished_before)),
         "started_at": time.time() if started_at is None else float(started_at),
+        "parallel_workers": max(1, int(parallel_workers or 1)),
         "counter": counter,
     }
 
@@ -240,6 +244,7 @@ class TrialProgressFilter(logging.Filter):
             counted,
             self.progress["started_at"],
             time.time(),
+            self.progress.get("parallel_workers", 1),
         )
         rest = message[match.end(1):]
         record.msg = f"Trial {match.group(1)}/{int(self.progress['target_trials'])} {label}{rest}"

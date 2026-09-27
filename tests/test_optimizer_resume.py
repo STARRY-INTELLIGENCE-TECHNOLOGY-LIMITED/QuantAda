@@ -19,7 +19,7 @@ import pytest
 import config
 import optimizer.runtime as runtime
 from optimizer.study_resume import ensure_study_config_version, legacy_owner_running, resolve_study_plan, study_run_lock
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION, isolate_study_journal, read_study_metadata
+from optimizer.journal_metadata import WORKER_CONFIG_VERSION, isolate_study_journal, read_study_metadata, related_journal_paths, training_identity_hash
 
 
 def _args(**overrides):
@@ -197,6 +197,30 @@ def test_explicit_snapshot_anchor_restores_all_metrics_of_selected_data(tmp_path
     assert selected["studies"] == {"return": "old_return", "sharpe": "old_sharpe"}
     latest = _plan(_args(), tmp_path)
     assert latest["studies"] == {"return": "new_return", "sharpe": "new_sharpe"}
+
+
+def test_training_identity_hash_separates_parameter_variants_and_journals(tmp_path):
+    base = _args()
+    changed = _args(params="{'contracts': 2}")
+    assert training_identity_hash(base) != training_identity_hash(changed)
+    journal = tmp_path / "optuna_batch.log"
+    study = _write_study(journal, "existing", base)
+    study.set_user_attr("_optimizer_identity_hash", training_identity_hash(base))
+    plan = _plan(changed, tmp_path)
+    assert plan["matched"] == []
+    assert plan["identity_hash"] == training_identity_hash(changed)
+    assert Path(plan["journal"]).resolve() != journal.resolve()
+
+
+def test_explicit_journal_with_different_parameter_hash_gets_independent_path(tmp_path):
+    base = _args()
+    journal = tmp_path / "optuna_batch.log"
+    study = _write_study(journal, "existing", base)
+    study.set_user_attr("_optimizer_identity_hash", training_identity_hash(base))
+    changed = _args(params="{'contracts': 9}", study_journal=str(journal))
+    plan = _plan(changed, tmp_path)
+    assert plan["matched"] == []
+    assert Path(plan["journal"]).resolve() != journal.resolve()
 
 
 def test_stable_names_separate_metrics_with_same_sanitized_prefix(tmp_path):
@@ -790,3 +814,55 @@ def test_isolate_renumbers_interleaved_trials_and_resume_finds_sibling(tmp_path)
     assert plan["studies"]["return"] == "return-study"
     assert plan["studies"]["sharpe"] == "sharpe-study"
     assert Path(plan["journal"]).resolve() == path.resolve()
+
+
+def test_training_identity_hash_ignores_non_training_flags():
+    base = _args()
+    flagged = _args(connect="ibkr:paper", ui=True, train_resume=True, ui_port=8080)
+    assert training_identity_hash(base) == training_identity_hash(flagged)
+    assert training_identity_hash(base) != training_identity_hash(_args(params="{'contracts': 2}"))
+
+
+def test_matching_metadata_is_not_rejected_by_stale_identity_hash(tmp_path):
+    journal = tmp_path / "optuna_batch.log"
+    study = _write_study(journal, "existing", _args())
+    study.set_user_attr("_optimizer_identity_hash", "stale-hash-with-ui-flags")
+    plan = _plan(_args(study_journal=str(journal), connect="ibkr:paper", ui=True, train_resume=True), tmp_path)
+    assert plan["studies"]["return"] == "existing"
+    assert plan["matched"]
+
+
+def test_new_explicit_journal_path_is_preserved(tmp_path):
+    path = tmp_path / "custom_new.log"
+    plan = _plan(_args(study_journal=str(path)), tmp_path)
+    assert Path(plan["journal"]).resolve() == path.resolve()
+    assert plan["matched"] == []
+
+
+def test_refresh_keeps_explicit_journal_and_does_not_match_old_study(tmp_path):
+    journal = tmp_path / "optuna_batch.log"
+    _write_study(journal, "existing", _args())
+    plan = _plan(_args(study_journal=str(journal), refresh=True), tmp_path)
+    assert Path(plan["journal"]).resolve() == journal.resolve()
+    assert plan["matched"] == []
+    assert "existing" not in plan["studies"].values()
+
+
+def test_missing_batch_anchor_still_loads_dedicated_study(tmp_path):
+    anchor = tmp_path / "optuna_batch.log"
+    dedicated = tmp_path / "optuna_return_split.log"
+    study = _write_study(dedicated, "return-study", _args(metric="return"), "return")
+    study.set_user_attr("_optimizer_batch_journal", str(anchor.resolve()))
+    study.add_trial(optuna.trial.create_trial(value=4.0))
+
+    assert related_journal_paths(anchor) == [dedicated.resolve()]
+    found, moved = isolate_study_journal(anchor, "return-study", anchor)
+    assert Path(found).resolve() == dedicated.resolve()
+    assert moved == ()
+    plan = _plan(_args(metric="return", study_journal=str(anchor), study_name="return-study"), tmp_path)
+    assert plan["studies"]["return"] == "return-study"
+    assert plan["matched"]
+    assert Path(plan["journal"]).resolve() == anchor.resolve()
+    unnamed = _plan(_args(metric="return", study_journal=str(anchor)), tmp_path)
+    assert unnamed["studies"]["return"] == "return-study"
+    assert Path(unnamed["journal"]).resolve() == anchor.resolve()

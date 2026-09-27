@@ -131,3 +131,9 @@ When user asks for rapid code generation or new module scaffolding, agents must 
 ## 7) Decision Ownership
 - AI can propose and rank with high weight.
 - Final GO/HOLD/KILL decisions remain human-owned.
+
+## 8) Training Command Defaults
+- When generating `run.py` optimize or training commands, always include `--n_jobs -1` unless the user explicitly requests another value.
+- Do not emit `--n_jobs 1` as a cautious default. `run.py` already defaults `--n_jobs` to `-1`; generated commands must still write `--n_jobs -1` explicitly so the command is self-contained.
+- `--n_jobs -1` is the framework full-speed setting: workers = cores - max(2, ceil(0.15 * cores)). It is not permission to occupy every logical core.
+- Use `--n_jobs 1` only when the user asks for single-process, or after that same run has already failed with Windows `WinError 1314` and Developer Mode is still unavailable.

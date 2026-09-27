@@ -13,7 +13,7 @@ import pandas as pd
 import optuna
 from optuna.samplers import GridSampler
 
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION, batch_journal_path, finished_trial_count, read_study_metadata, related_journal_paths, study_identity
+from optimizer.journal_metadata import WORKER_CONFIG_VERSION, batch_journal_path, finished_trial_count, read_study_metadata, related_journal_paths, study_identity, training_identity_hash
 
 
 def ensure_study_config_version(study):
@@ -162,13 +162,18 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
     """优先匹配现有批次；未指定日期时沿用匹配窗口，否则使用本轮推断窗口。"""
     values = dict(vars(args), params=fixed_params, opt_params=opt_params_def, risk_params=risk_params)
     identity = study_identity(values)
+    identity_hash = training_identity_hash(values)
     identity_json = json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str)
     requested_name = str(getattr(args, "study_name", None) or os.environ.get("QUANTADA_STUDY_NAME", "")).strip()
     requested_journal = str(getattr(args, "study_journal", None) or os.environ.get("QUANTADA_STUDY_JOURNAL", "")).strip()
     directory = Path(log_dir).resolve()
-    selected_path = Path(requested_journal).resolve() if requested_journal else None
+    requested_path = Path(requested_journal).resolve() if requested_journal else None
+    selected_path = requested_path
+    identity_conflict = False
     if selected_path:
-        paths = [selected_path] if selected_path.exists() else []
+        paths = [selected_path] if selected_path.exists() else [
+            item for item in related_journal_paths(selected_path) if item.is_file()
+        ]
     elif requested_name:
         selected_path = directory / f"optuna_{requested_name}.log"
         paths = [selected_path] if selected_path.exists() else sorted(
@@ -176,8 +181,9 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
         )
     else:
         paths = sorted(directory.glob("optuna_*.log"), key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
-    # 刷新表示用新行情创建独立实验，不沿用旧日期和试验；运行锁仍保护所选 Journal。
-    if getattr(args, "refresh", False):
+    # 刷新不复用旧试验，但保留用户指定的 Journal；运行锁仍保护所选路径。
+    refreshing = bool(getattr(args, "refresh", False))
+    if refreshing:
         paths = []
     if not identity["strategy"]:
         paths = []
@@ -197,6 +203,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
             print(f"[Optimizer] Warning: skipping unreadable Journal {path.name}: {exc}")
             continue
         candidates = []
+        inspecting_requested = requested_path is not None and path.resolve() == requested_path
         anchor = next((study for study in studies if study["name"] == requested_name), None) if requested_name else None
         if anchor is not None:
             named_study = anchor
@@ -204,6 +211,14 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
         for study in reversed(studies):
             attrs = study["attrs"]
             metric = attrs.get("metric")
+            if inspecting_requested:
+                required_identity = set(identity) - ({"symbols"} if identity["selection"] else set())
+                if required_identity.issubset(attrs):
+                    recorded_identity = json.dumps(
+                        study_identity(attrs), sort_keys=True, ensure_ascii=False, default=str,
+                    )
+                    if recorded_identity != identity_json:
+                        identity_conflict = True
             if requested_name and study["name"] == requested_name and metric not in metrics and not anchored_snapshot:
                 raise ValueError(f"Study {study['name']} belongs to a different metric")
             # 快照锚点只负责定位同批指标；指标不符不能进入候选，否则会把旧名称复用给新指标。
@@ -247,7 +262,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
                 study["_recency"] = index
             break
 
-    if selected_path is not None and selected_path.exists():
+    if selected_path is not None and selected_path.exists() and not refreshing:
         anchor = batch_journal_path(selected_path)
         seen = {study["name"] for study in matched}
         for related in related_journal_paths(anchor if anchor.exists() else selected_path):
@@ -300,12 +315,29 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
             if study["name"] in counted:
                 study["trial_counts"] = counted[study["name"]]
 
+    if requested_path is not None and not requested_path.exists() and matched:
+        referenced = False
+        for study in matched:
+            batch = study["attrs"].get("_optimizer_batch_journal")
+            if not batch:
+                continue
+            try:
+                referenced = Path(str(batch)).resolve() == requested_path
+            except OSError:
+                referenced = False
+            if referenced:
+                selected_path = requested_path
+                break
     source_studies = matched
     matched, incompatible, switched, fallback_snapshot = select_resume_studies(source_studies, metrics, requested_name)
+    # 只有已有 Journal 且训练身份冲突时才派生独立文件；新路径和刷新都保留用户指定路径。
+    if not matched and requested_journal and not requested_name and not refreshing and identity_conflict:
+        strategy_tag = re.sub(r"[^A-Za-z0-9_]+", "_", str(identity["strategy"] or "optimizer").split(".")[-1])[:40]
+        selected_path = directory / f"optuna_{strategy_tag}_{identity_hash}.log"
     if selected_window:
         args.start_date, args.end_date = selected_window
     digest = hashlib.sha256(json.dumps(
-        {"identity": identity, "window": [str(pd.Timestamp(args.start_date)), str(pd.Timestamp(args.end_date))],
+        {"identity": identity, "identity_hash": identity_hash, "window": [str(pd.Timestamp(args.start_date)), str(pd.Timestamp(args.end_date))],
          "worker_config_version": WORKER_CONFIG_VERSION},
         sort_keys=True, ensure_ascii=False, default=str,
     ).encode("utf-8")).hexdigest()[:20]
@@ -329,7 +361,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
             study_names[metric] = f"{base_name}__{suffix}_{metric_hash}"
     return {
         "journal": str(selected_path), "studies": study_names, "matched": matched, "source_studies": source_studies,
-        "incompatible": incompatible, "reused_pre_config": any(
+        "incompatible": incompatible, "identity_hash": identity_hash, "reused_pre_config": any(
             study["attrs"].get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION for study in matched
         ),
         "switched_to_richer": switched, "fallback_snapshot": fallback_snapshot,

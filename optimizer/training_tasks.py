@@ -325,6 +325,83 @@ def _recorded_metrics(value):
     return list(dict.fromkeys(str(item).strip() for item in parsed if str(item).strip()))
 
 
+def _batch_task_key(task):
+    """同一批次的专属 Journal 使用相同锚点，任务列表必须合并它们。"""
+    attrs = task.get("recorded") or {}
+    batch = parse_recorded_value(attrs.get("_optimizer_batch_journal"))
+    if not batch:
+        snapshot = parse_recorded_value(attrs.get("_optimizer_data_snapshot"))
+        if isinstance(snapshot, dict):
+            batch = snapshot.get("journal")
+    try:
+        batch = str(Path(str(batch or task["journal"])).resolve())
+    except (OSError, TypeError, ValueError):
+        batch = str(batch or task["journal"])
+    identity = study_identity(attrs)
+    window = [task.get("start_date"), task.get("end_date")]
+    return json.dumps({
+        "batch": batch, "identity": identity, "window": window,
+        "worker_config_version": task.get("worker_config_version"),
+        "snapshot": _task_snapshot_id(task),
+    }, sort_keys=True, default=str), batch
+
+
+def _merge_batch_tasks(tasks):
+    """合并同一批次跨文件的 Study；保留各指标名称和所有状态计数。"""
+    groups = {}
+    for task in tasks:
+        key, batch = _batch_task_key(task)
+        groups.setdefault((key, batch), []).append(task)
+    merged = []
+    for (key, batch), group in groups.items():
+        canonical = max(group, key=lambda item: (finished_trial_count(item["trial_counts"]), item["updated_ns"]))
+        task = dict(canonical)
+        task["journal"] = batch
+        task["updated_ns"] = max(item["updated_ns"] for item in group)
+        task["updated_at"] = datetime.fromtimestamp(task["updated_ns"] / 1_000_000_000).isoformat(timespec="seconds")
+        available = list(dict.fromkeys(metric for item in group for metric in item["metrics"]))
+        if len(canonical.get("metrics", ())) > 1:
+            task["metrics"] = list(dict.fromkeys(list(canonical["metrics"]) + available))
+        else:
+            task["metrics"] = sorted(available)
+        # 同指标保留完成更多的 Study，避免先扫到的薄记录盖过已探索参数。
+        by_metric = {}
+        for item in group:
+            names = item.get("study_metric_names") or {}
+            counts_by_metric = item.get("study_metric_counts") or {}
+            for metric, name in names.items():
+                if not metric:
+                    continue
+                counts = counts_by_metric.get(metric) or item.get("trial_counts") or {}
+                finished = finished_trial_count(counts)
+                current = by_metric.get(metric)
+                if current is not None and (
+                    finished < current[0] or (finished == current[0] and item["updated_ns"] <= current[1])
+                ):
+                    continue
+                by_metric[metric] = (finished, item["updated_ns"], name, counts)
+        task["study_names"] = [by_metric[metric][2] for metric in task["metrics"] if metric in by_metric]
+        if by_metric:
+            task["trial_counts"] = {
+                state: sum(int(by_metric[metric][3].get(state, 0)) for metric in task["metrics"] if metric in by_metric)
+                for state in TRIAL_STATES
+            }
+        else:
+            task["trial_counts"] = {
+                state: sum(item["trial_counts"].get(state, 0) for item in group)
+                for state in TRIAL_STATES
+            }
+        task.pop("study_metric_counts", None)
+        task["n_trials"] = max((item["n_trials"] for item in group if isinstance(item["n_trials"], int)), default=task["n_trials"])
+        task["resumable"] = all(item["resumable"] for item in group)
+        notices = list(dict.fromkeys(item["notice"] for item in group if item.get("notice")))
+        task["notice"] = " ".join(notices)
+        task["task_id"] = hashlib.sha256((batch + "\n" + key).encode("utf-8")).hexdigest()[:24]
+        task["source_journals"] = sorted({item["journal"] for item in group})
+        merged.append(task)
+    return merged
+
+
 def list_training_tasks(journal_dir):
     """按最近更新时间倒序列出任务；同 Journal 的配置和窗口不同则分开。"""
     directory = Path(journal_dir).resolve()
@@ -389,6 +466,11 @@ def list_training_tasks(journal_dir):
                 "updated_ns": stat.st_mtime_ns, "strategy": attrs.get("strategy") or latest[-1]["name"],
                 "metrics": metrics, "start_date": attrs.get("start_date"), "end_date": attrs.get("end_date"),
                 "trial_counts": counts, "n_trials": budget, "study_names": [study["name"] for study in latest],
+                "study_metric_names": {str(study["attrs"].get("metric") or ""): study["name"] for study in latest},
+                "study_metric_counts": {
+                    str(study["attrs"].get("metric") or ""): dict(study.get("trial_counts") or {})
+                    for study in latest
+                },
                 "recorded": attrs, "resumable": True, "reason": "",
                 "worker_config_version": attrs.get("_optimizer_worker_config_version"),
                 "training_status": _STATUS_UNFINISHED,
@@ -404,6 +486,7 @@ def list_training_tasks(journal_dir):
             except (ValueError, TypeError) as exc:
                 task.update(resumable=False, reason=str(exc))
             tasks.append(task)
+    tasks = _merge_batch_tasks(tasks)
     _apply_training_status(tasks, directory)
     _prefer_richer_resume_target(tasks)
     return sorted(tasks, key=lambda task: (

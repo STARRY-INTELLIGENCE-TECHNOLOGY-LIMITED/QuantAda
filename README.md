@@ -132,6 +132,8 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 python run.py --train_resume
 ```
 
+优化任务会按完整训练参数生成稳定身份 hash；相同训练重复执行会安全续传或提示已有任务，不同参数会使用独立 Journal，不会因为旧任务仍在运行而误判重复。
+
 任务按最近更新时间倒序，每页 10 个；`n` / `p` 翻页，`g 3` 跳到第 3 页。输入序号后先查看原始命令，再输入 `y` 确认恢复，`b` 返回列表，`q` 退出。菜单和日志为英文：`1 / y: confirm resume`、`l: view log`。Web 工作台提供相同分页及命令详情，点击 `Resume selected task` 确认。
 列表会标明训练状态 `Finished` 或 `Incomplete`。只看与该任务匹配的终端日志末尾展示段：Journal 文件名必须一致；日志若写了窗口或快照，也必须一致。同一 Journal 里有多个任务、而日志没有窗口和快照时，不把该日志判给每一个任务。分析开始标记之后出现结束标记，且结束标记后不是空摘要，才算 `Finished`；空摘要会跳过。否则为 `Incomplete`。`Incomplete` 仍可续传。
 选中任务后可输入 `l` 查看该任务匹配的最新终端日志，不会打开另一个任务的日志，默认停在末尾。`n` / `p` 翻页，`h` / `e` / `m` 跳到首页、末尾和中间，`s` 跳到分析展示段，`g 3` 跳到第 3 页，`b` 返回详情。Web 工作台的 `View log` 提供相同翻页。Trial 进度在同一行显示 `Trial 369/2160 ETA 6h12m`。

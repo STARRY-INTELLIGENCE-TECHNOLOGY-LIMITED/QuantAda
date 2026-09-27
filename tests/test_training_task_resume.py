@@ -81,6 +81,25 @@ def test_task_list_is_newest_first_with_saved_metric_set_and_progress(tmp_path):
     assert tasks[0]["resumable"] is True
 
 
+def test_same_batch_studies_in_dedicated_journals_are_one_resume_task(tmp_path):
+    batch = tmp_path / "optuna_batch.log"
+    first = _recorded(metric="mix_score_defender", _optimizer_batch_journal=str(batch))
+    second = _recorded(metric="us_robust", _optimizer_batch_journal=str(batch))
+    left = _write_task(tmp_path / "optuna_split_a.log", attributes=first, metrics=("mix_score_defender",), timestamp=1000, name="mix")
+    right = _write_task(tmp_path / "optuna_split_b.log", attributes=second, metrics=("us_robust",), timestamp=2000, name="robust")
+    tasks = list_training_tasks(tmp_path)
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert Path(task["journal"]).resolve() == batch.resolve()
+    assert task["metrics"] == ["mix_score_defender", "us_robust"]
+    assert task["study_names"] == ["mix", "robust"]
+    assert task["trial_counts"]["COMPLETE"] == 2
+    assert task["trial_counts"]["FAIL"] == 2
+    assert set(task["source_journals"]) == {str(left), str(right)}
+    argv = build_resume_arguments(task)
+    assert argv[argv.index("--study_journal") + 1] == str(batch)
+
+
 def test_task_versions_have_separate_progress_and_show_isolation_notice(tmp_path, monkeypatch, capsys):
     from command_center.generator import build_resume_command
 
@@ -666,3 +685,22 @@ def test_newer_window_log_does_not_finish_or_open_for_another_task(tmp_path, mon
     opened = service.training_task_log({"train_resume": by_end["20220101"]["task_id"], "path": str(ambiguous)})
     assert opened["name"] == other.name
     assert "secret" not in opened["text"]
+
+
+def test_batch_merge_keeps_richer_study_name_for_the_same_metric(tmp_path):
+    batch = tmp_path / "optuna_batch.log"
+    attrs = _recorded(metric="return", _optimizer_batch_journal=str(batch))
+    _write_task(tmp_path / "optuna_z_thin.log", attributes=attrs, metrics=("return",), timestamp=3000, name="thin")
+    rich = _write_task(tmp_path / "optuna_a_rich.log", attributes=dict(attrs), metrics=("return",), timestamp=1000, name="rich")
+    extra = []
+    for trial_id in (2, 3):
+        extra.append({"op_code": 4, "study_id": 0, "datetime_start": "2026-09-23T09:00:02"})
+        extra.append({"op_code": 6, "trial_id": trial_id, "state": 1, "values": [1.0]})
+    with rich.open("a", encoding="utf-8") as stream:
+        stream.writelines(json.dumps(event) + "\n" for event in extra)
+    tasks = list_training_tasks(tmp_path)
+    assert len(tasks) == 1
+    assert tasks[0]["study_names"] == ["rich"]
+    assert tasks[0]["trial_counts"]["COMPLETE"] == 3
+    argv = build_resume_arguments(tasks[0])
+    assert argv[argv.index("--study_name") + 1] == "rich"

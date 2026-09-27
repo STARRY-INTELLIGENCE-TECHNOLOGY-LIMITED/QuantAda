@@ -33,6 +33,46 @@ def format_metric_label(report):
     return f"{metric_name} ({score_str})" if score_str != "N/A" else metric_name
 
 
+def training_elapsed_hours(trials):
+    """返回试验墙钟小时数；并行重叠只计一次，没有试验的空档不计。"""
+    intervals = []
+    for trial in trials or ():
+        start = _naive_timestamp(getattr(trial, "datetime_start", None))
+        end = _naive_timestamp(getattr(trial, "datetime_complete", None))
+        if start is None or end is None or end < start:
+            continue
+        intervals.append((start, end))
+    if not intervals:
+        return None
+    intervals.sort(key=lambda item: (item[0], item[1]))
+    merged_start, merged_end = intervals[0]
+    total = pd.Timedelta(0)
+    for start, end in intervals[1:]:
+        if start <= merged_end:
+            if end > merged_end:
+                merged_end = end
+            continue
+        total += merged_end - merged_start
+        merged_start, merged_end = start, end
+    total += merged_end - merged_start
+    return total.total_seconds() / 3600.0
+
+
+def _naive_timestamp(value):
+    """把试验时间转成可相减的 naive 时间；无效值返回 None。"""
+    if value is None:
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(stamp):
+        return None
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("UTC").tz_localize(None)
+    return stamp
+
+
 def print_metric_row(metric_label, metrics_payload, elapsed_hours, params_payload, log_payload):
     fmt = format_recent_backtest_metrics(metrics_payload or {})
     m_str = str(metric_label)[:30]

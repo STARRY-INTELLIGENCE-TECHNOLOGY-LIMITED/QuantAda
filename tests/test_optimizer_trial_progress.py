@@ -48,6 +48,7 @@ def test_eta_uses_this_run_rate_and_skips_failures(monkeypatch):
     assert remaining_label(2160, 1033, 1, started, started + 0.2) == "ETA unavailable"
     assert remaining_label(2160, 1033, 10, started, started + 600) == "ETA 18h37m"
     assert remaining_label(2160, 1033, 1127, started, started + 600) == "finishing"
+    assert remaining_label(1200, 13, 1, started, started + 180, parallel_workers=13) == "ETA warming up (1/13 workers)"
 
 
 def test_child_logger_line_is_rewritten_once_and_keeps_best_trial(monkeypatch):
@@ -217,3 +218,17 @@ def test_multiprocess_submit_shares_target_budget_without_shifting_worker_args(m
     assert int(first_progress["counter"].value) == 0
     assert len(submitted[0][0]) == 8
     assert "trial_progress" not in submitted[0][0][-1].__class__.__name__.lower()
+
+
+def test_trial_log_shows_warming_up_until_each_worker_reports(monkeypatch):
+    started = 1_000_000.0
+    monkeypatch.setattr("optimizer.trial_progress.time.time", lambda: started + 180)
+    counter = TrialFinishCounter()
+    progress = make_trial_progress(1200, 13, counter, started_at=started, parallel_workers=13)
+    progress_filter = TrialProgressFilter(progress)
+    record = logging.LogRecord(
+        "optuna.study.study", logging.INFO, __file__, 1,
+        "Trial 14 finished with value: 1.0 and parameters: {}.", (), None,
+    )
+    assert progress_filter.filter(record) is True
+    assert "ETA warming up (1/13 workers)" in record.msg

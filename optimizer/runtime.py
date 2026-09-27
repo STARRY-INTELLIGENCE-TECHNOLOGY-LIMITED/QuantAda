@@ -72,7 +72,7 @@ from optimizer.study_resume import (
     resolve_study_plan,
     study_run_lock,
 )
-from optimizer.journal_metadata import isolate_study_journal
+from optimizer.journal_metadata import isolate_study_journal, training_identity_hash
 from optimizer.dashboard_view import (
     begin_dashboard_log_scope,
     build_dashboard_storage,
@@ -92,6 +92,7 @@ from optimizer.reporting import (
     normalize_metric_date,
     print_optimizer_ai_summary,
     print_run_summary as print_optimizer_run_summary,
+    training_elapsed_hours,
 )
 
 
@@ -510,7 +511,9 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list, run_s
 
             if result_dict and isinstance(result_dict, dict):
                 result_dict['metric_name'] = current_args.metric
-                result_dict['elapsed_hours'] = elapsed_hours
+                # 预算已满的续跑只重跑验证；有试验时间戳时保留真实训练耗时。
+                if result_dict.get('elapsed_hours') is None:
+                    result_dict['elapsed_hours'] = elapsed_hours
                 result_dict['study_db'] = getattr(current_args, 'study_name', 'N/A')
                 final_reports.append(result_dict)
 
@@ -1210,6 +1213,7 @@ class OptimizationJob:
                             progress_target,
                             progress_finished_before,
                             shared_counter,
+                            parallel_workers=worker_count,
                         )
                     except Exception as exc:
                         print(f"[Optimizer] Trial progress counter unavailable; continuing without ETA: {exc}")
@@ -2732,6 +2736,11 @@ class OptimizationJob:
                 # 为了防止日志干扰或 token 泄露，可以根据需要做简单过滤
                 # 这里将所有参数转为字符串存储，方便在 Dashboard 右下角直接查阅
                 study.set_user_attr(key, str(value))
+            identity_values = dict(
+                vars(self.args), params=self.fixed_params, opt_params=self.opt_params_def,
+                risk_params=getattr(self, "risk_params", {}),
+            )
+            study.set_user_attr("_optimizer_identity_hash", training_identity_hash(identity_values))
             # 保留当前调度进程身份，便于新命令识别 Windows 主进程退出后仍运行的 worker。
             study.set_user_attr("_optimizer_owner", f"optimizer_RUN{datetime.datetime.now():%Y%m%d-%H%M%S}_{os.getpid()}")
             requested_metrics = list(getattr(self, "_requested_metrics", [self.args.metric]))
@@ -2837,7 +2846,9 @@ class OptimizationJob:
             if counter is None:
                 counter = TrialFinishCounter()
             # finished_before 固定为本轮开始前的完成数，两个阶段共用同一速度计数。
-            progress = make_trial_progress(target_trials, finished_before, counter)
+            progress = make_trial_progress(
+                target_trials, finished_before, counter, parallel_workers=resolved_workers,
+            )
 
         def run_queued_resume_trials(count):
             """把本轮已登记的 WAITING 各执行一次。普通失败不中断补额，也不再次排队。"""
@@ -2861,25 +2872,69 @@ class OptimizationJob:
                 catch=(QueuedResumeFailure,),
             )
 
+        def run_parallel_queued_resume_trials(count):
+            """并行执行固定参数的 WAITING trial；每个 worker 只领取一个已有重试。"""
+            if count <= 0:
+                return
+            worker_count = min(resolved_workers, int(count))
+            if worker_count <= 1 or not log_file:
+                run_queued_resume_trials(count)
+                return
+            print(
+                "[Optimizer] Running queued resume trials in parallel: "
+                f"waiting={count}, workers={worker_count}."
+            )
+            self._run_multiprocess_optimization(
+                n_jobs=worker_count,
+                n_trials=count,
+                log_file=log_file,
+                prefer_fork_cow=(not auto_launch_dashboard),
+                grid_search_space=grid_search_space,
+                progress_target=None,
+                progress_finished_before=finished_before,
+                trial_progress=progress,
+            )
+
         # 3. 执行优化
         try:
             with installed_trial_progress(progress):
                 if queued_resume_trials:
-                    print(
-                        "[Optimizer] Running queued resume trials without consuming the completion gap: "
-                        f"waiting={queued_resume_trials}."
-                    )
-                    run_queued_resume_trials(queued_resume_trials)
+                    run_parallel_queued_resume_trials(queued_resume_trials)
                     if waiting_state is not None:
                         leftover = sum(
                             1
                             for trial in getattr(study, "trials", [])
                             if getattr(trial, "state", None) == waiting_state
                         )
-                        # 采样器提前 stop 时，剩余 WAITING 仍属本轮快照，继续在父进程排空。
+                        # 采样器提前 stop 时，剩余 WAITING 仍属本轮快照，由父进程排空后再开新组合。
                         if leftover:
                             run_queued_resume_trials(leftover)
                     n_trials = self._remaining_trial_budget(study, target_trials)
+                    # 恢复耗时不能外推到新组合。原地更新已安装进度，过滤器才能看到新起点。
+                    if n_trials > 0:
+                        if shared_counter is not None:
+                            shared_counter.close(unlink=True)
+                            shared_counter = SharedFinishCounter.create()
+                            progress_counter = shared_counter
+                        else:
+                            progress_counter = TrialFinishCounter()
+                        finished_after_resume = sum(
+                            1
+                            for trial in getattr(study, "trials", [])
+                            if trial.state in finished_states
+                        )
+                        updated_progress = make_trial_progress(
+                            target_trials,
+                            finished_after_resume,
+                            progress_counter,
+                            parallel_workers=resolved_workers,
+                        )
+                        if progress is None:
+                            progress = updated_progress
+                        else:
+                            progress.clear()
+                            progress.update(updated_progress)
+                        finished_before = finished_after_resume
                 effective_parallel_jobs = min(resolved_workers, max(1, int(n_trials)))
                 print(
                     f"\n--- Starting Optimization ({n_trials} trials, {effective_parallel_jobs} parallel jobs) ---"
@@ -2985,7 +3040,7 @@ class OptimizationJob:
             print(f" YearlyWindows: {len(yearly_metrics)}")
         print("=" * 60 + "\n")
 
-        return {
+        result = {
             "best_score": best_val_display,
             "best_params": best_params,
             "trials_completed": len(completed_trials),
@@ -2995,6 +3050,10 @@ class OptimizationJob:
             "test_backtest": test_metrics,
             "yearly_backtests": yearly_metrics,
         }
+        trained_hours = training_elapsed_hours(study.trials)
+        if trained_hours is not None:
+            result['elapsed_hours'] = trained_hours
+        return result
 
 
 def _optimize_worker_entry(
