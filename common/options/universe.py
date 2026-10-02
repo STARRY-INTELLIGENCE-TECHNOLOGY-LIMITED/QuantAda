@@ -115,6 +115,18 @@ def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
         number = _finite_param(overrides if name in overrides else merged, name)
         if number is not None:
             delta_values.append(number)
+    directional = {}
+    for right in sorted(normalised_types):
+        names = (f"{right.lower()}_min_delta", f"{right.lower()}_max_delta")
+        if any(name in merged for name in names):
+            bounds = tuple(_finite_param(merged, name) for name in names)
+            lower, upper = bounds
+            valid = lower is not None and upper is not None and lower <= upper
+            valid = valid and (-1 <= lower <= upper < 0 if right == "PUT" else 0 < lower <= upper <= 1)
+            if not valid:
+                raise ValueError(f"invalid {right} option universe Delta window")
+            directional[right] = bounds
+            delta_values.extend(bounds)
     min_delta = min(delta_values) if delta_values else None
     max_delta = max(delta_values) if delta_values else None
     protective_delta = _finite_param(merged, "protective_put_delta")
@@ -124,6 +136,9 @@ def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
             (float(min_delta) + float(max_delta)) / 2.0,
             float(protective_delta),
         )
+    if directional:
+        # 两个方向分别保留中心锚点，不能让低行权价 Put 挤掉整个 Call 池。
+        delta_targets = tuple((low + high) / 2 for low, high in directional.values())
     min_open_interest = _finite_param(
         overrides if "min_open_interest" in overrides else merged,
         "min_open_interest",
@@ -139,6 +154,7 @@ def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
         "min_delta": min_delta,
         "max_delta": max_delta,
         "delta_targets": delta_targets,
+        "delta_bounds_by_type": directional,
         "min_open_interest": float(min_open_interest),
     }
 
@@ -159,6 +175,12 @@ def widen_universe_bounds(spec: dict, *, live: bool, step_days: int = DEFAULT_AS
             result["max_delta"] = min(0.0, result["max_delta"])
         if "CALL" in spec["option_types"] and "PUT" not in spec["option_types"]:
             result["min_delta"] = max(0.0, result.get("min_delta") or 0.0)
+    if spec.get("delta_bounds_by_type"):
+        result["delta_bounds_by_type"] = {
+            right: (max(-1.0, low - DEFAULT_DELTA_BUFFER), min(0.0, high + DEFAULT_DELTA_BUFFER))
+            if right == "PUT" else (max(0.0, low - DEFAULT_DELTA_BUFFER), min(1.0, high + DEFAULT_DELTA_BUFFER))
+            for right, (low, high) in spec["delta_bounds_by_type"].items()
+        }
     return result
 
 
@@ -245,6 +267,9 @@ def select_chain_candidates(chain, *, as_of, spec: dict, limit: int = MAX_CANDID
         if dte < min_dte or dte > max_dte:
             continue
         delta = safe_number(row.get("delta"))
+        bounds = (spec.get("delta_bounds_by_type") or {}).get(option_type)
+        if bounds and (delta != delta or not bounds[0] <= delta <= bounds[1]):
+            continue
         if min_delta is not None or max_delta is not None:
             if delta != delta:
                 continue

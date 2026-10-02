@@ -19,7 +19,7 @@ from optimizer.journal_metadata import (
 
 RESUME_OPTIONS = (
     "selection", "data_source", "symbols", "cash", "commission", "slippage", "start_date", "end_date",
-    "risk", "timeframe", "compression", "desc", "plot_scope", "n_jobs", "train_roll_period",
+    "risk", "timeframe", "compression", "execution_price", "desc", "plot_scope", "n_jobs", "train_roll_period",
     "test_roll_period", "train_ratio", "train_period", "test_period",
 )
 _STATUS_FINISHED = "Finished"

@@ -113,7 +113,7 @@
 18. GM 已知维护型连接故障采用 schedule 驱动的两档恢复，但不得硬编码交易日历或完全停掉探测：有效 `1d` schedule 在正式 slot 前 30 分钟（与 `ALIVE` 相同边界）切回积极恢复，若 `LIVE_SCHEDULE_PREWARM_LEAD` 更早则取更早边界，并保持到正式 slot 后本轮 live execution budget 结束；边界外 `gmi_init` 至少每 10 分钟真实探测一次，最后一次等待必须截断到恢复边界。固定间隔 schedule 的恢复提前量至少覆盖“调度间隔减去本轮 execution budget”的尾部，因此当天首个 anchor 后的连续高频 slot 之间不得出现恢复盲区，首个 anchor 前的安静等待也不得跨过该恢复边界；无有效 schedule 时保持积极恢复。GM `gmi_poll=-1`、1200/1201 行情连接维护回调及 1100 交易连接维护回调在安静期继续参与探测和结构化健康上报，但不得周期性写 warning/error 日志或驱动每分钟 worker 重建；heartbeat 必须在恢复边界到期以强制干净重建。进入积极窗口后恢复有限日志，连接恢复必须立即记录并汇总安静期抑制数量。该策略只属于 GM live Phoenix 路径，不得进入回测、优化或训练。
 
 ## 8. 实盘与本地回测的语义差异
-1. 本地回测使用 Backtrader，并开启 Cheat-On-Close：T 日信号按 T 日收盘价成交，同 bar 可用虚拟现金先卖后买。这不等于实盘盘口/保护价，也不等于等待柜台成交。
+1. 本地回测默认 `execution_price=close`，开启 Cheat-On-Close：T 日信号按 T 日收盘价成交，同 bar 可用虚拟现金先卖后买。`next_open` 仅限日线股票/ETF，关闭 Cheat-On-Close，按下一根开盘成交；分钟、周线、月线和期权必须失败关闭。实盘 `next_open` 将取数终点前移一个自然日，schedule 必须放在下一交易日开盘。两者都不等于实盘盘口/保护价，也不等于等待柜台成交。
 2. 实盘卖出使用券商可卖量；T+1 市场当天买入不可卖时跳过。本地回测不模拟 T+1。
 3. 实盘数量保留券商返回的正整数或正小数精度；本地回测在 `LOT_SIZE==1` 时仍按整数股截断。
 4. 券商平台回测（`LiveTrader` 且 `is_live=False`）只用于验证适配器通路，不作为收益对标。

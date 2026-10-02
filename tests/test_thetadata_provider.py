@@ -398,7 +398,7 @@ def test_bulk_requests_use_longer_timeout():
     assert ThetaDataProvider._is_bulk_kwargs({"strike": "*"}) is True
     assert ThetaDataProvider._is_bulk_kwargs({"expiration": "*"}) is True
     assert ThetaDataProvider._is_bulk_kwargs({"strike": "150"}) is False
-    assert ThetaDataProvider._timeout_seconds(bulk=True) == 120.0
+    assert ThetaDataProvider._timeout_seconds(bulk=True) == 300.0
     assert ThetaDataProvider._timeout_seconds() == 60.0
 
 
@@ -850,4 +850,3 @@ def test_thread_local_empty_counts_do_not_steal_across_workers():
         thread.join(timeout=5)
     assert counts == [1, 1, 1]
     assert provider.take_empty_result_count() == 0
-

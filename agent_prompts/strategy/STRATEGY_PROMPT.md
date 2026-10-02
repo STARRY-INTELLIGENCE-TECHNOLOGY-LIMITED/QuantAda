@@ -162,3 +162,5 @@ class YourCustomStrategy(BaseStrategy):
 ## 期权卖方补充契约
 
 期权卖方策略不得把本地现金、持仓或订单意图当作事实。`SELL_TO_OPEN_PUT` 若要求灾难保护，必须同时构造包含两个 `OptionRiskLeg` 的定义风险 Put Credit Spread，并调用券商原子组合入口；入口不存在或券商不支持时直接阻断，不得顺序提交裸 Put。实盘风险 Watchdog 和清算对账只接受券商快照，未知快照必须停止新开仓；回测仍使用同步内存路径。
+CSP 轮动独立于 PCS：Put 按执行价乘乘数全额担保，Call 读取足额正股覆盖，已有股票也属于管理范围时必须明确说明。阶段由 Broker 持仓推导，不缓存指派或补仓意图；平仓不受开仓条件限制，缺报价持仓和同底层在途仍占名额。
+双向池使用 `option_universe = ("PUT", "CALL")` 与分方向 `put_min_delta/put_max_delta/call_min_delta/call_max_delta`，框架分别保留 Delta 锚点。日线轮动可声明 `option_settlement = "physical"`，交割记账由回测柜台负责，禁止在策略内修改现金或仓位。不得沿用 PCS 提前平仓规则冒充接货轮动。该回测仅模拟到期日交割，不代表真实美式提前指派或含分红总回报。

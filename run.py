@@ -60,7 +60,7 @@ def _normalize_timeframe(value: str) -> str:
 
 def run_backtest(selection_filename, strategy_filename, symbols, cash, commission, slippage, data_source, start_date, end_date,
                  risk_filename, risk_params, params, timeframe, compression, recorder=None, enable_plot=True, refresh=False,
-                 plot_scope='full'):
+                 plot_scope='full', execution_price='close'):
     """执行回测"""
     # --- 1. 自动发现并加载所有数据提供者 ---
     data_manager = DataManager()
@@ -90,6 +90,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     print(f"  Risk Control: {risk_filename or 'None'}")
     print(f"  Symbols: {symbols}")
     print(f"  Backtest Period: {start_date} to {end_date}")
+    print(f"  Execution Price: {execution_price}")
     print(f"  Initial Cash: {cash:,.2f}")
     print(f"  Commission: {commission:.4f}")
 
@@ -212,6 +213,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
         risk_control_params=risk_params,
         timeframe=timeframe,
         compression=compression,
+        execution_price=execution_price,
         recorder=recorder,
         enable_plot=enable_plot,
         plot_scope=plot_scope,
@@ -250,6 +252,10 @@ def _run_main():
                         help=f"K线时间维度 (默认: Days). 支持: {', '.join(bt_timeframes)}")
     parser.add_argument('--compression', type=int, default=1,
                         help="K线时间周期 (默认: 1). 结合 timeframe, 例如 30 Minutes")
+    parser.add_argument(
+        '--execution_price', choices=('close', 'next_open'), default='close',
+        help='成交时点：close=本根收盘，next_open=下一根 K 线开盘；默认 close。',
+    )
     parser.add_argument('--desc', type=str, default=None,
                         help="本次回测的描述信息 (默认为不带 .py 的策略文件名)")
 
@@ -462,6 +468,7 @@ def _run_main():
             'slippage': args.slippage,
             'timeframe': args.timeframe,
             'compression': args.compression,
+            'execution_price': args.execution_price,
             'data_source': args.data_source,
             # 实盘风控配置透传
             'risk': args.risk,
@@ -522,6 +529,7 @@ def _run_main():
         params=s_params,
         timeframe=args.timeframe,
         compression=args.compression,
+        execution_price=args.execution_price,
         recorder=recorder_manager,
         enable_plot=not args.no_plot,
         refresh=args.refresh,

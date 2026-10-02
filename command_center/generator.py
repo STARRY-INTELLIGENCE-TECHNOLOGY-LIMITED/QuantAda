@@ -97,6 +97,7 @@ _OPTION_ORDER = (
     "risk_params",
     "timeframe",
     "compression",
+    "execution_price",
     "desc",
     "plot_scope",
     "refresh",

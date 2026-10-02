@@ -76,6 +76,7 @@
 3. 未声明时，运行时不得自动把正股代码展开成期权链，避免股票策略误拉全链。
 4. 展开过滤读取策略 `params` 的 `min_dte`/`max_dte`，以及 `min_delta`/`max_delta`/`protective_put_delta` 的并集；缺少 DTE 窗口时失败关闭。
 5. 回测/优化在取数前按 as_of 抽样历史链并求并集，必须使用 ThetaData 或 `theta+futu` 的历史链，禁止用 Futu 当前链回放。并集应按时间均匀封顶，不得只收下窗口开头的合约，否则 Optuna 训练集/测试集会没有可交易期权。展开和合约历史拉取应周期性打印进度（当前 as_of、成功数、空结果数、失败数、合约数、已用时间）。Theta 的 No data found 不逐条打印、不重试；超时与瞬时错误有界重试 5 次，失败 as_of 与漏拉合约在本轮扫完后补偿一轮。`CACHE_DATA=True` 时按 as_of 断点续拉；`--refresh` 忽略断点并全量重拉。实盘不写该断点。
+   若策略声明 `option_universe_exclude_underlyings`，或声明 `option_universe_exclude_param` 指向一个参数（如反向 ETF Beta 对冲标的），这些正股保留在股票池但不展开期权链，避免对冲标的被轮动逻辑当成卖 Put/Call 的底层。
 历史链候选若声明 `protective_put_delta`，每个 as_of 必须同时覆盖 Short Put 的中心 Delta 和保护腿 Delta；断点缓存身份必须包含 Delta 锚点，不能复用只围绕短腿中心生成的旧缓存。
 6. 实盘每个 schedule slot 用当前链增补合约；账户已有持仓或在途的旧合约必须保留，即使它们还不在当前 datas。pending 快照不可信，或持仓查询异常时，不得把现有期权 feed 当作空仓丢弃。
 7. 策略仍只交易 `self.broker.datas` 中的对象，并在 `next()` 按当前 DTE/Delta 再过滤；不要缓存 init 时的合约列表。已有持仓或在途期权即使当前 K 线被零填充、没有可交易报价，也必须占用底层名额；保护腿缺报价时不得把它当成已移除后单独买平空头。
@@ -95,3 +96,12 @@ for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"})
 4. 需要读取单个合约当前行时，使用 `common.data_view.visible_row(data, current_dt, require_current_quote=True, cache_owner=self.broker)`；持仓和保护腿优先使用 `iter_held_options()`、`held_protective_put()` 等专用视图。
 5. 历史指标、估值带和底层趋势需要完整 DataFrame 时，继续读取 `data.p.dataname` 并使用向量化计算；不得把当前报价索引当作历史数据集。
 6. 自定义期权 feed 至少应满足：代码可由 `parse_option_symbol()` 解析，或提供 `option_type/right/cp/put_call` 与 `strike/expiry` 等标准元数据列。否则候选索引会失败关闭，不能静默交易。
+
+## 12. 双向期权池与显式物理交割回测
+1. 双向轮动声明 `option_universe = ("PUT", "CALL")`，参数使用 `put_min_delta/put_max_delta/call_min_delta/call_max_delta`。方向参数必须完整且符号合法；发现时两侧各保留中心 Delta 锚点，边界和锚点进入缓存身份。当前优化器仅按固定参数展开池，不能假定搜索自动加载固定边界以外的合约。
+2. 策略声明 `option_settlement = "physical"` 才启用日线物理交割。已有股票和 PCS 策略不改变行为；实盘不执行历史交割模拟。
+3. 机械记账集中在 `backtest/option_settlement.py`，策略不保存现金、虚拟仓位或等待指派队列。
+4. 仅支持 Days/compression=1；到期日正股收盘价决定价内价外，按执行价转移现金和股票，期权归零。缺到期日价格、标的或足额担保时明确失败，不用次日价格代替。
+5. 交割通过引擎原生成交通知更新持仓、归因和净值，避免重复入账，回测结束日在到期日时也结算。交割转移不加交易佣金/滑点；普通订单仍走原有成本路径。
+6. 该模型不模拟提前指派、放弃行权、盘后价格、分红现金流、行权费用或拆股调整合约；不能当成完整美式期权结算模型。
+7. 轮动按券商股票/期权持仓重新判阶段，不能推断股票来源；所有在途与缺报价持仓占用底层名额，已有股票卖 Call 不占第二个名额。卖 Call 必须足额股票覆盖，退出不受开仓 Delta/IVP/OI 过滤。

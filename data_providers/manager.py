@@ -318,7 +318,8 @@ class DataManager:
         return discovered_providers
 
     def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
-                 specified_sources: str = None, timeframe: str = 'Days', compression: int = 1, refresh: bool = False) -> pd.DataFrame:
+                 specified_sources: str = None, timeframe: str = 'Days', compression: int = 1,
+                 refresh: bool = False) -> pd.DataFrame:
         """
         智能获取数据。
         - 如果指定了 specified_sources，则按指定顺序尝试。
@@ -374,7 +375,6 @@ class DataManager:
 
         # 【最终切片】确保返回的数据在请求的日期范围内
         if final_df is not None and not final_df.empty:
-
             # 辅助函数：将输入的日期字符串对齐到 df 索引的时区，防止比较报错
             def align_date(dt_input, index):
                 dt = pd.to_datetime(dt_input)

@@ -55,7 +55,7 @@
 
 ## 6. 自动续传与重复执行
 1. 匹配依据包括策略、选股器或有序标的列表、数据源、固定参数、搜索空间、风险控制及参数、现金、佣金、滑点、K 线周期、训练/测试切分和完整显式配置覆盖。字典格式和键顺序不影响匹配；并行度、trial 总预算、metric 顺序和顶层展示参数不参与训练身份。
-   每个训练身份生成稳定 `_optimizer_identity_hash`，只哈希训练身份，不纳入 connect、ui、train_resume 等非训练字段，并写入 Study 元数据。复用以完整训练元数据为准；已写入的旧 hash 与当前算法不一致时，只要元数据仍匹配就继续该 Study，并在继续时补写当前 hash。参数、搜索空间、风险参数或配置覆盖变化会派生独立 Journal，不因旧批次锁存在而报重复。显式 `--study_journal` 指向尚不存在的新文件时保留该路径。只有请求的 Journal 已存在、训练身份不同、且不是 `--refresh`、也没有 `--study_name` 时，才派生独立文件。`--refresh` 不复用旧试验，但保留用户指定的 Journal 路径。
+   每个训练身份生成稳定 `_optimizer_identity_hash`，只哈希训练身份，不纳入 connect、ui、train_resume 等非训练字段，并写入 Study 元数据。训练身份必须包含完整执行口径（包括 `execution_price`）；缺少该字段的旧 Study 不自动续传。参数、搜索空间、风险参数或配置覆盖变化会派生独立 Journal，不因旧批次锁存在而报重复。显式 `--study_journal` 指向尚不存在的新文件时保留该路径。只有请求的 Journal 已存在、训练身份不同、且不是 `--refresh`、也没有 `--study_name` 时，才派生独立文件。`--refresh` 不复用旧试验，但保留用户指定的 Journal 路径。
 2. 自动发现从 `.data/optuna/optuna_*.log` 中优先选择最近更新的匹配批次；按 Study 元数据匹配，不从文件名猜测实际 Study 名称。只扫描 Study 元数据；同一文件有多份匹配 Study 时用现有轻量计数比较完成数，不把历史 trial 重放成内存对象。旧记录缺少必要元数据时不自动复用。
 3. 未显式指定日期且命中已有任务时，沿用其原始窗口，跨天重跑也不漂移。开始新窗口应显式指定 `--end_date`；非滚动模式还比较 `--start_date`。滚动窗口由结束日期和训练/测试周期决定。`--opt_schedule` 等待结束后按当前槽位推断窗口，不冻结到旧槽位。
    一次命令请求的多指标/多组训练只在批次入口推断一次 `start_date/end_date`；所有 bootstrap、metric Job 和 worker 必须使用同一窗口。批次运行跨越多个交易日时，不得按每组开始时间重新推断。
@@ -67,7 +67,7 @@
 6. 单 worker 的 CLI 优化也必须使用 Journal 持久化。Journal 追加采用 `JournalFileOpenLock`，不要求单 worker 为创建符号链接提权；Journal 不可用时应明确失败，不能把自动续传静默降级成易失的内存 Study。
 7. 显式 `--study_journal` 可单独约束扫描文件；显式 `--study_name` 优先约束任务名称。已有显式名称对应不同 metric、配置或窗口时必须拒绝复用，避免覆盖其元数据后混入不同含义的评分。快照锚点只用于定位同一快照中的其它指标，不得把该 Study 名称分配给未匹配的另一个指标。
 8. 自动恢复校验并使用原始数据快照，不重新获取远端修订行情；策略源码版本仍由操作者保证。优化模式的 `--refresh` 表示使用最新行情创建独立实验：不继承旧任务的缺省日期、不读取旧快照、不复用旧评分，原记录保留。同日刷新也必须使用独立 Study；不传刷新时仍按当前任务幂等续传。
-9. 完整配置透传仍用内部 `_optimizer_worker_config_version` 标记新 Study。没有该标记的历史 Study 按原名交给 `create_study(..., load_if_exists=True)`，COMPLETE 和 PRUNED 计入预算，只跑未完成组合；不把旧评分改标成当前口径，只记录复用事实。已记录且不等于当前版本的口径仍然隔离。同一批次、同一训练身份和窗口中，同指标选择已完成更多的 Study；误隔离出来的薄 Study 不能盖过已探索更多的原 Study。显式 `--refresh` 仍新建实验。控制台 Trial 编号与该 Study 的 Journal trial_id 一致，从被加载的 Study 继续，不是从 0 开始。
+9. 完整配置透传仍用内部 `_optimizer_worker_config_version` 标记新 Study。历史 Study 只有在完整训练元数据仍可验证时才允许续传；缺少 `execution_price` 等必要字段的旧记录保留供查阅，但不生成续传命令，也不计入新训练预算。已记录且不等于当前版本的口径仍然隔离。同一批次、同一训练身份和窗口中，同指标选择已完成更多的 Study；误隔离出来的薄 Study 不能盖过已探索更多的原 Study。显式 `--refresh` 仍新建实验。控制台 Trial 编号与该 Study 的 Journal trial_id 一致，从被加载的 Study 继续，不是从 0 开始。
 
 ## 7. 交互选择历史训练
 1. `python run.py --train_resume` 无需策略位置参数，按 Journal 最近更新时间倒序，每页显示 10 个任务。页底显示总数、当前页和总页数；`n` / `p` 翻页，`g 页码` 跳页，任务使用全局序号。列表中 `q`、`0`、空输入、EOF 或 Ctrl-C 取消；取消不取行情、不启动训练。

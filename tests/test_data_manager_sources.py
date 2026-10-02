@@ -14,6 +14,8 @@ def _market_cache_csv(tmp_path, filename):
 def test_platform_default_data_source_is_owned_by_data_providers():
     assert resolve_platform_default_source("ib") == "ibkr"
     assert resolve_platform_default_source("ib_broker") == "ibkr"
+    assert resolve_platform_default_source("futu") == "futu"
+    assert resolve_platform_default_source("futu_broker") == "futu"
     assert resolve_platform_default_source("gm") == "gm"
     assert resolve_platform_default_source("unknown") == ""
 

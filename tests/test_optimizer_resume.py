@@ -26,7 +26,7 @@ def _args(**overrides):
     values = dict(
         strategy="test_strategy.Strategy", selection="test_selector.Selector", symbols="AAA",
         data_source="csv", cash=100000.0, commission=0.0005, slippage=0.0001,
-        timeframe="Days", compression=1, risk=None, risk_params="{}", config="{'LOT_SIZE': 1}",
+        timeframe="Days", compression=1, execution_price="close", risk=None, risk_params="{}", config="{'LOT_SIZE': 1}",
         params="{'contracts': 1}", opt_params="{'x': {'type': 'int', 'low': 0, 'high': 5}}",
         train_roll_period="2y", test_roll_period="12m", train_ratio=None, train_period=None, test_period=None,
         start_date="20230923", end_date="20260923", metric="return,sharpe", n_jobs=1, n_trials=2,
@@ -152,7 +152,7 @@ def test_implicit_dates_keep_existing_window_across_days(tmp_path):
     {"strategy": "another.Strategy"}, {"selection": "another.Selector"}, {"data_source": "theta+futu"},
     {"params": "{'contracts': 2}"}, {"opt_params": "{'x': {'type': 'int', 'low': 0, 'high': 8}}"},
     {"risk": "risk_control"}, {"risk_params": "{'limit': 0.1}"}, {"config": "{'LOT_SIZE': 100}"},
-    {"timeframe": "Minutes"}, {"compression": 5}, {"test_roll_period": "6m"},
+    {"timeframe": "Minutes"}, {"compression": 5}, {"execution_price": "next_open"}, {"test_roll_period": "6m"},
 ])
 def test_changed_training_identity_is_not_mixed_with_existing_scores(tmp_path, overrides):
     path = tmp_path / "optuna_legacy.log"
@@ -311,6 +311,39 @@ def test_incomplete_study_metadata_is_not_used_for_automatic_resume(tmp_path):
     study = optuna.create_study(storage=_storage(path), study_name="incomplete", direction="maximize")
     study.set_user_attr("metric", "return")
     assert _plan(_args(), tmp_path)["matched"] == []
+
+
+@pytest.mark.parametrize("execution_price", ["close", "next_open"])
+def test_missing_execution_price_is_not_resumed(tmp_path, execution_price):
+    """缺少成交口径的旧记录不得再被默认为 close 后续传。"""
+    path = tmp_path / "optuna_missing_execution.log"
+    recorded = _args()
+    del recorded.execution_price
+    _write_study(path, "missing_execution", recorded)
+    before = path.read_bytes()
+
+    plan = _plan(_args(execution_price=execution_price), tmp_path)
+
+    assert plan["matched"] == []
+    assert plan["source_studies"] == []
+    assert plan["journal"] != str(path)
+    with pytest.raises(ValueError, match="different training configuration"):
+        _plan(_args(execution_price=execution_price, study_name="missing_execution", study_journal=str(path)), tmp_path)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("execution_price", ["close", "next_open"])
+def test_recorded_execution_price_resumes_same_mode_only(tmp_path, execution_price):
+    """新记录可按原口径续传，另一成交口径保持独立。"""
+    path = tmp_path / "optuna_execution.log"
+    _write_study(path, "recorded_execution", _args(execution_price=execution_price))
+
+    plan = _plan(_args(execution_price=execution_price), tmp_path)
+
+    assert plan["studies"]["return"] == "recorded_execution"
+    assert plan["journal"] == str(path)
+    other = "next_open" if execution_price == "close" else "close"
+    assert _plan(_args(execution_price=other), tmp_path)["matched"] == []
 
 
 def test_journal_lock_reports_only_contention_and_raises_other_io_errors(tmp_path, monkeypatch):

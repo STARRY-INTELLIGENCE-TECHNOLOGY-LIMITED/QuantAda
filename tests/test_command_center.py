@@ -357,6 +357,28 @@ def test_build_command_normalizes_symbol_list_literal(tmp_path: Path) -> None:
     assert generated.argv[symbols_index + 1] == "SHSE.600000,US.AAPL"
 
 
+def test_command_center_exposes_execution_price_with_close_default(tmp_path: Path) -> None:
+    html = (Path(__file__).parents[1] / "command_center" / "static" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    assert 'id="execution-price-select"' in html
+    assert '<option value="close">收盘成交</option>' in html
+    assert '<option value="next_open">下一根开盘成交</option>' in html
+
+    catalog = default_catalog(tmp_path)
+    preset = CommandPreset(
+        "next-open",
+        "next-open",
+        "全球",
+        "backtest",
+        "strategies.example",
+        options={"symbols": "US.SPY", "execution_price": "next_open"},
+    )
+    generated = build_command(catalog, preset, catalog.variable_values({}), tmp_path)
+    assert generated.options["execution_price"] == "next_open"
+    assert generated.argv[generated.argv.index("--execution_price") + 1] == "next_open"
+
+
 def test_build_command_exposes_hybrid_provider_credentials(tmp_path: Path) -> None:
     catalog = default_catalog()
     preset = CommandPreset(

@@ -2830,12 +2830,16 @@ class IBBrokerAdapter(BaseLiveBroker):
 
     @staticmethod
     def _augment_live_data_source(data_source: str) -> str:
+        """规范化显式数据源，不向用户指定的链路追加 IBKR。
+
+        ``--data_source`` 是策略行情的显式合同。用户指定 ``futu`` 时，
+        实盘策略必须只使用 Futu；指定 ``theta+futu`` 时，必须保留该混合
+        Provider。未指定数据源时，IBKR 仍由本适配器的默认价格路径负责。
+        """
         source_names = DataManager._split_source_names(data_source)
         if not source_names:
             return data_source
-        if 'ibkr' in source_names:
-            return ",".join(source_names)
-        return ",".join(source_names + ['ibkr'])
+        return ",".join(source_names)
 
     # 4. 发单
     def _submit_order(self, data, volume, side, price):
@@ -3143,14 +3147,14 @@ class IBBrokerAdapter(BaseLiveBroker):
             engine_config['timeframe'] = kwargs.get('timeframe')
         if kwargs.get('compression') is not None:
             engine_config['compression'] = kwargs.get('compression')
+        if kwargs.get('execution_price') is not None:
+            engine_config['execution_price'] = kwargs.get('execution_price')
         if kwargs.get('data_source'):
             raw_data_source = kwargs.get('data_source')
-            source_names = [s for s in re.split(r"[,\s]+", str(raw_data_source or '').strip().lower()) if s]
-            had_ib_source = any(s in {'ib', 'ibkr'} for s in source_names)
             data_source = cls._augment_live_data_source(raw_data_source)
-            if data_source != raw_data_source and not had_ib_source:
+            if data_source != raw_data_source:
                 _runtime_print(
-                    f"[IBBroker] Live data source fallback enabled: "
+                    f"[IBBroker] Live data source normalized: "
                     f"{raw_data_source} -> {data_source}"
                 )
             engine_config['data_source'] = data_source

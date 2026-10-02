@@ -1399,6 +1399,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 if kwargs.get('slippage') is not None: engine_config['slippage'] = slippage
                 if timeframe is not None: engine_config['timeframe'] = timeframe
                 if compression is not None: engine_config['compression'] = compression
+                if kwargs.get('execution_price') is not None: engine_config['execution_price'] = kwargs.get('execution_price')
                 if kwargs.get('data_source'): engine_config['data_source'] = kwargs.get('data_source')
 
                 # 注入选股器或标的

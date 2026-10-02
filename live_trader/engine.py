@@ -231,9 +231,15 @@ class LiveTrader:
         self._bind_shared_ib_to_data_manager(self._data_manager)
 
         if data_source and not isinstance(self._data_manager, _DataManagerProxy):
-            self._data_manager = _DataManagerProxy(self._data_manager, specified_sources=data_source)
+            self._data_manager = _DataManagerProxy(
+                self._data_manager,
+                specified_sources=data_source,
+            )
 
-        self.data_provider = _DataManagerProvider(self._data_manager, specified_sources=data_source)
+        self.data_provider = _DataManagerProvider(
+            self._data_manager,
+            specified_sources=data_source,
+        )
         if data_source:
             print(f"[Engine] Live data source selected by engine: {data_source}")
         else:
@@ -277,7 +283,6 @@ class LiveTrader:
         # 合并配置：平台配置为默认，用户配置有更高优先级
         self.config = {**platform_config, **self.user_config}
         self._runtime_context = context
-
         # Provider 由引擎按 data_source/平台默认值选择，不再要求 adapter 提供 bridge。
         self._maybe_override_live_data_provider()
         if self._data_manager is not None:
@@ -330,6 +335,19 @@ class LiveTrader:
 
         # 3. 使用最终配置实例化所有组件
         self.strategy_class = get_class_from_name(self.config['strategy_name'], ['strategies'])
+        execution_price = self.config.get('execution_price', 'close')
+        timeframe = self.config.get('timeframe', 'Days')
+        compression = self.config.get('compression', 1)
+        if execution_price == 'next_open' and (timeframe != 'Days' or int(compression or 1) != 1):
+            raise ValueError("execution_price=next_open currently requires daily bars with compression=1")
+        if execution_price == 'next_open' and (
+            getattr(self.strategy_class, 'option_universe', None) is not None
+            or getattr(self.strategy_class, 'option_settlement', None)
+        ):
+            raise ValueError(
+                "execution_price=next_open is currently unsupported for option strategies; "
+                "use close execution or a dedicated option settlement protocol"
+            )
         if self.config.get('selection_name'):
             self.selector_class = get_class_from_name(self.config['selection_name'], ['stock_selectors'])
 
@@ -365,9 +383,14 @@ class LiveTrader:
             else:
                 raise
 
+        if execution_price == 'next_open':
+            from common.options.analytics import parse_option_symbol
+            if any(parse_option_symbol(str(symbol)).get('option_type') for symbol in symbols):
+                raise ValueError(
+                    "execution_price=next_open is currently unsupported for option contracts"
+                )
+
         # 获取 timeframe 和 compression
-        timeframe = self.config.get('timeframe', 'Days')
-        compression = self.config.get('compression', 1)
         print(f"[Engine] Using timeframe: {compression} {timeframe}")
 
         # 4. 传入 is_live 标志来获取数据
@@ -1315,6 +1338,8 @@ class LiveTrader:
         if is_live:
             # 实盘模式: 仅获取最近的预热数据，用于计算指标
             now_timestamp = pd.Timestamp(context.now)
+            if self.config.get('execution_price', 'close') == 'next_open':
+                now_timestamp = now_timestamp.normalize() - pd.Timedelta(days=1)
             if is_intraday:
                 end_date = now_timestamp.strftime('%Y-%m-%d %H:%M:%S')
             else:
@@ -1409,6 +1434,8 @@ class LiveTrader:
 
         # 重新计算时间窗口 (Warmup ~ Now)
         now_ts = pd.Timestamp(context.now)
+        if self.config.get('execution_price', 'close') == 'next_open':
+            now_ts = now_ts.normalize() - pd.Timedelta(days=1)
         end_date = now_ts.strftime('%Y-%m-%d %H:%M:%S') if is_intraday else now_ts.strftime('%Y-%m-%d')
         today_key = now_ts.strftime('%Y-%m-%d')
 
@@ -1485,8 +1512,13 @@ class LiveTrader:
                     force_window_rebase = True
 
             start_date = _build_window_start() if force_window_rebase else _build_incremental_start(old_df)
-            new_df = self.data_provider.get_history(symbol, start_date, end_date,
-                                                    timeframe=timeframe, compression=compression)
+            new_df = self.data_provider.get_history(
+                symbol,
+                start_date,
+                end_date,
+                timeframe=timeframe,
+                compression=compression,
+            )
             # 部分实时行情只提供 OHLC；成交量缺失不能把整条可靠价格快照判为无效。
             new_df = sanitize_market_dataframe(new_df, require_ohlcv=False)
             if live_run_budget_expired(self.broker):

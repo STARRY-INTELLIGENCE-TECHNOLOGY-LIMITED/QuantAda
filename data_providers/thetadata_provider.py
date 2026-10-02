@@ -29,7 +29,8 @@ THETADATA_API_KEY = os.getenv("THETADATA_API_KEY", "").strip()
 _OPTION_CONTRACT_MULTIPLIER = 100.0
 _ENRICH_OPTIONS = True
 _REQUEST_TIMEOUT_SECONDS = 60.0
-_BULK_REQUEST_TIMEOUT_SECONDS = 120.0
+_MAX_REQUEST_TIMEOUT_SECONDS = 300.0
+_BULK_REQUEST_TIMEOUT_SECONDS = _MAX_REQUEST_TIMEOUT_SECONDS
 _MAX_AUTO_CHAIN_EXPIRATIONS = 16
 _AUTO_CHAIN_STRIKE_RANGE = 40
 _DEFAULT_AUTO_MAX_DTE = 90
@@ -356,12 +357,12 @@ class ThetaDataProvider(BaseDataProvider):
     def _timeout_seconds(bulk=False):
         """读取并限制 Provider 内置的单次 ThetaData 操作超时。"""
         source = _BULK_REQUEST_TIMEOUT_SECONDS if bulk else _REQUEST_TIMEOUT_SECONDS
-        fallback = 120.0 if bulk else 60.0
+        fallback = _MAX_REQUEST_TIMEOUT_SECONDS if bulk else 60.0
         try:
             timeout = float(source)
         except (TypeError, ValueError, OverflowError):
             timeout = fallback
-        return max(0.1, min(timeout, 300.0))
+        return max(0.1, min(timeout, _MAX_REQUEST_TIMEOUT_SECONDS))
 
     def _reset_owned_client_locked(self):
         """在已持有客户端锁时关闭自建 session，避免并发认证换出新的 session id。"""

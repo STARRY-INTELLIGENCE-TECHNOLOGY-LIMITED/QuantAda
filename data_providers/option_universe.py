@@ -32,6 +32,7 @@ from common.options.universe import (
     split_symbol_pool,
     widen_universe_bounds,
 )
+from common.options.analytics import underlying_key
 
 _PROGRESS_INTERVAL_SECONDS = 30.0
 _FETCH_WORKERS = 4  # 与 Theta 单 session 并发上限对齐，禁止并发新认证。
@@ -335,6 +336,11 @@ def _checkpoint_parts(underlying, spec, snapshot_limit):
         if pd.notna(number):
             token = f"{number:.4f}".rstrip("0").rstrip(".")
             delta_parts.append(token.replace("-", "m").replace(".", "p"))
+    for right, bounds in sorted((spec.get("delta_bounds_by_type") or {}).items()):
+        delta_parts.append(right.lower())
+        for value in bounds:
+            token = f"{float(value):.4f}".rstrip("0").rstrip(".")
+            delta_parts.append(token.replace("-", "m").replace(".", "p"))
     try:
         oi_value = float(spec.get("min_open_interest", 0.0) or 0.0)
     except (TypeError, ValueError, OverflowError):
@@ -458,6 +464,19 @@ def expand_option_universe(
     if spec is None:
         return source
     underlyings, explicit_options = split_symbol_pool(source)
+    excluded_underlyings = {
+        underlying_key(item)
+        for item in (getattr(strategy_class, "option_universe_exclude_underlyings", ()) or ())
+        if str(item).strip()
+    }
+    exclude_param = getattr(strategy_class, "option_universe_exclude_param", None)
+    if isinstance(params, dict) and exclude_param:
+        excluded_value = params.get(exclude_param)
+        if excluded_value:
+            excluded_underlyings.add(underlying_key(excluded_value))
+    option_underlyings = [
+        item for item in underlyings if underlying_key(item) not in excluded_underlyings
+    ]
     if not underlyings:
         return source
     if data_manager is None:
@@ -497,7 +516,7 @@ def expand_option_universe(
 
     discovered = []
     failed_underlyings = []
-    for underlying in underlyings:
+    for underlying in option_underlyings:
         union = []
         seen = set()
         success = 0

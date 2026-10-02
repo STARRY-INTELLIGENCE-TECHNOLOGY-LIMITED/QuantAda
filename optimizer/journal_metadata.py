@@ -36,7 +36,7 @@ def study_identity(values):
     defaults = {
         "strategy": None, "selection": None, "symbols": "SHSE.510300", "data_source": None,
         "cash": 100000.0, "commission": 0.0, "slippage": 0.001,
-        "timeframe": "Days", "compression": 1, "risk": None,
+        "timeframe": "Days", "compression": 1, "execution_price": "close", "risk": None,
         "params": {}, "opt_params": {}, "risk_params": {}, "config": {},
         "train_roll_period": None, "test_roll_period": None, "train_ratio": None,
         "train_period": None, "test_period": None,

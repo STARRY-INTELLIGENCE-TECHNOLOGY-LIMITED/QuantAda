@@ -3857,7 +3857,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
             'symbols': symbols,
             '_suppress_start_alarm': bool(kwargs.get('_suppress_start_alarm', False)),
         })
-        for name in ('timeframe', 'compression', 'data_source', 'selection', 'risk', 'risk_params'):
+        for name in ('timeframe', 'compression', 'execution_price', 'data_source', 'selection', 'risk', 'risk_params'):
             if kwargs.get(name) is not None:
                 key = 'selection_name' if name == 'selection' else name
                 engine_config[key] = kwargs.get(name)

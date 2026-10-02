@@ -29,7 +29,7 @@ def test_training_resume_ui_async_consistency():
 def _recorded(**changes):
     values = dict(
         strategy="examples.Strategy", selection=None, symbols="AAA", data_source="csv", cash=100000.0,
-        commission=0.0005, slippage=0.0001, timeframe="Days", compression=1, risk=None, params={"size": 1},
+        commission=0.0005, slippage=0.0001, timeframe="Days", compression=1, execution_price="close", risk=None, params={"size": 1},
         opt_params={"x": {"type": "int", "low": 1, "high": 4}}, risk_params={}, config={"LOT_SIZE": 1},
         train_roll_period="2y", test_roll_period="12m", train_ratio=None, train_period=None, test_period=None,
         start_date="20230923", end_date="20260923", metric="return", n_trials=None, n_jobs=-1,
@@ -196,11 +196,13 @@ def test_legacy_task_recovers_unstarted_metrics_from_its_terminal_header(tmp_pat
     assert task["n_trials"] == 2160
 
 
-def test_resume_arguments_restore_training_context_and_skip_startup_schedule(tmp_path):
-    path = _write_task(tmp_path / "optuna_task.log")
+@pytest.mark.parametrize("execution_price", ["close", "next_open"])
+def test_resume_arguments_restore_training_context_and_skip_startup_schedule(tmp_path, execution_price):
+    path = _write_task(tmp_path / "optuna_task.log", attributes=_recorded(execution_price=execution_price))
     task = list_training_tasks(tmp_path)[0]
     argv = build_resume_arguments(task)
     assert argv[0] == "examples.Strategy"
+    assert argv[argv.index("--execution_price") + 1] == execution_price
     for key, value in {"start_date": "20230923", "end_date": "20260923", "metric": "return,sharpe", "n_trials": "4", "n_jobs": "-1", "study_journal": str(path)}.items():
         assert argv[argv.index("--" + key) + 1] == value
     assert ast.literal_eval(argv[argv.index("--params") + 1]) == {"size": 1}
@@ -209,6 +211,22 @@ def test_resume_arguments_restore_training_context_and_skip_startup_schedule(tmp
     assert "--opt_schedule" not in argv
     assert "--refresh" not in argv
     assert argv[argv.index("--study_name") + 1] == "saved"
+
+
+def test_missing_execution_price_disables_task_resume(tmp_path):
+    """旧任务保留在列表中供查阅，但缺少成交口径时不得生成续传命令。"""
+    attrs = _recorded()
+    del attrs["execution_price"]
+    path = _write_task(tmp_path / "optuna_missing_execution.log", attributes=attrs)
+    before = path.read_bytes()
+
+    task = list_training_tasks(tmp_path)[0]
+
+    assert task["resumable"] is False
+    assert "incomplete" in task["reason"]
+    with pytest.raises(ValueError, match="incomplete"):
+        build_resume_arguments(task)
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("changes", [{"connect": "gm_broker:real"}, {"start_date": None}, {"opt_params": {}}, {"params": "__import__('os').getcwd()"}])

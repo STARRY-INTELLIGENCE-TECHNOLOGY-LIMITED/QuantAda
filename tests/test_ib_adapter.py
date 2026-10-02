@@ -1323,12 +1323,15 @@ def test_ib_get_current_price_uses_refreshed_ticker_after_delayed_switch():
     assert price == pytest.approx(66.6)
 
 
-def test_ib_augment_live_data_source_appends_ibkr_fallback():
+def test_ib_explicit_live_data_source_is_authoritative():
     """
     IB 启动配置回归:
-    非 ib 单源应在 adapter 层自动补齐 ibkr 末位兜底。
+    显式数据源必须由 DataManager 严格按调用方选择，不能因交易 Broker 是
+    IBKR 而隐式追加 ibkr。
     """
-    assert IBBrokerAdapter._augment_live_data_source("tiingo") == "tiingo,ibkr"
+    assert IBBrokerAdapter._augment_live_data_source("tiingo") == "tiingo"
+    assert IBBrokerAdapter._augment_live_data_source("futu") == "futu"
+    assert IBBrokerAdapter._augment_live_data_source("theta+futu") == "hybrid"
     assert IBBrokerAdapter._augment_live_data_source("tiingo, ibkr") == "tiingo,ibkr"
     assert IBBrokerAdapter._augment_live_data_source("ibkr") == "ibkr"
     assert IBBrokerAdapter._augment_live_data_source("ib") == "ibkr"

@@ -404,7 +404,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         ))
 
     def submit_option_order(self, data, volume, order_effect, price=None, **kwargs):
-        """回测中提供显式期权效果入口；生命周期事件仍需单独建模。"""
+        """回测显式期权效果入口；到期交割由声明 option_settlement 的策略启用。"""
         from common.options.contracts import (
             InvalidOptionOrderEffect,
             normalize_option_order_effect,
@@ -1169,6 +1169,13 @@ class SignalLoggingBroker(bt.brokers.BackBroker):
     继承自 Backtrader 原生 Broker，仅用于在回测时拦截下单信号并打印日志。
     """
 
+    def next(self):
+        """撮合后、策略前执行显式启用的离线到期交割。"""
+        super().next()
+        if getattr(self, "physical_option_settlement", False):
+            from backtest.option_settlement import settle_physical_options
+            settle_physical_options(self)
+
     def buy(self, owner, data, size, price=None, **kwargs):
         # 训练/优化场景下 owner.verbose=False，直接静音避免刷屏。
         if size > 0 and getattr(owner, 'verbose', True):
@@ -1196,7 +1203,7 @@ class Backtester:
                  risk_control_classes=None, risk_control_params=None,
                  timeframe: str = 'Days', compression: int = 1,
                  recorder = None, enable_plot = True, verbose=True, indicator_cache=None,
-                 plot_scope: str = 'full'):
+                 plot_scope: str = 'full', execution_price: str = 'close'):
         self.plot_scope = parse_plot_scopes(plot_scope)
         self.cerebro = create_cerebro(self.plot_scope, enable_plot=enable_plot)
         self.cerebro.broker = SignalLoggingBroker()
@@ -1214,6 +1221,24 @@ class Backtester:
         self.risk_control_params = risk_control_params
         self.timeframe_str = timeframe
         self.compression = compression
+        if execution_price not in {'close', 'next_open'}:
+            raise ValueError("execution_price must be close or next_open")
+        if execution_price == 'next_open' and (timeframe != 'Days' or int(compression or 1) != 1):
+            raise ValueError("execution_price=next_open currently requires daily bars with compression=1")
+        if execution_price == 'next_open':
+            from common.options.analytics import parse_option_symbol
+
+            has_option_data = any(
+                parse_option_symbol(str(symbol)).get('option_type')
+                for symbol in (datas or {})
+            )
+            if has_option_data or getattr(strategy_class, 'option_universe', None) is not None \
+                    or getattr(strategy_class, 'option_settlement', None):
+                raise ValueError(
+                    "execution_price=next_open is currently unsupported for option strategies; "
+                    "use close execution or a dedicated option settlement protocol"
+                )
+        self.execution_price = execution_price
         self.recorder = recorder
         self.enable_plot = enable_plot
         self.verbose = verbose
@@ -1398,6 +1423,12 @@ class Backtester:
         )
 
     def _init_broker(self):
+        settlement = getattr(self.strategy_class, "option_settlement", None)
+        if settlement is not None:
+            if settlement != "physical" or self.timeframe != bt.TimeFrame.Days or self.compression != 1:
+                raise ValueError("Physical option settlement requires daily bars with compression=1")
+            self.cerebro.broker.physical_option_settlement = True
+            self.cerebro.broker.option_settlement_events = []
         self.cerebro.broker.setcash(self.cash)
         self.cerebro.broker.setcommission(commission=self.commission)
 
@@ -1429,10 +1460,8 @@ class Backtester:
                 name=data._name,
             )
 
-        # 开启 "Cheat-On-Close" (收盘作弊模式)
-        # 作用：让 T 日发出的市价单，以 T 日的 Close 价成交。
-        # 目的：模拟实盘在 14:45 (接近收盘) 的买入动作，消除 "次日低开红利" 的回测虚高。
-        self.cerebro.broker.set_coc(True)
+        # close 模式模拟收盘附近成交；next_open 使用 Backtrader 市价单的下一根 K 线开盘成交语义。
+        self.cerebro.broker.set_coc(self.execution_price == 'close')
 
         # 关闭下单时的资金检查
         # 允许 "先卖后买" 的订单在资金未回笼时先提交进入队列

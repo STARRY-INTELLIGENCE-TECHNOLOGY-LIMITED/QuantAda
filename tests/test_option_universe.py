@@ -135,6 +135,80 @@ def test_select_chain_candidates_keeps_protective_delta_anchor():
     ]
 
 
+class WheelUniverseStrategy:
+    option_universe = ("PUT", "CALL")
+    params = {"min_dte": 30, "max_dte": 45,
+              "put_min_delta": -0.25, "put_max_delta": -0.10,
+              "call_min_delta": 0.10, "call_max_delta": 0.30}
+
+
+def test_wheel_universe_keeps_both_directional_delta_anchors():
+    spec = resolve_option_universe_spec(WheelUniverseStrategy)
+    assert spec["min_delta"] == -0.25
+    assert spec["max_delta"] == 0.30
+    assert set(spec["delta_targets"]) == {-0.175, 0.20}
+    chain = _chain(
+        _chain_row("US.SPY261016P00470000", "PUT", 470, "2026-10-16", -0.175),
+        _chain_row("US.SPY261016P00465000", "PUT", 465, "2026-10-16", -0.174),
+        _chain_row("US.SPY261016C00530000", "CALL", 530, "2026-10-16", 0.22),
+        _chain_row("US.SPY261016C00600000", "CALL", 600, "2026-10-16", 0.02),
+    )
+    selected = select_chain_candidates(chain, as_of="2026-09-04", spec=spec, limit=2)
+    assert set(selected) == {"US.SPY261016P00470000", "US.SPY261016C00530000"}
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_wheel_expansion_uses_both_sides_and_distinct_checkpoint(live):
+    from common.options.universe import widen_universe_bounds
+    from data_providers.option_universe import _checkpoint_parts
+    spec = resolve_option_universe_spec(WheelUniverseStrategy)
+    expanded = widen_universe_bounds(spec, live=live)
+    assert spec["delta_bounds_by_type"]["PUT"] == (-0.25, -0.10)
+    assert expanded["delta_bounds_by_type"]["CALL"][1] == pytest.approx(0.30 if live else 0.35)
+    legacy = dict(expanded, delta_bounds_by_type={})
+    assert _checkpoint_parts("US.SPY", expanded, 4)[-1] != _checkpoint_parts("US.SPY", legacy, 4)[-1]
+    chain = _chain(
+        _chain_row("US.SPY261016P00470000", "PUT", 470, "2026-10-16", -0.18),
+        _chain_row("US.SPY261016C00530000", "CALL", 530, "2026-10-16", 0.20),
+    )
+    manager = DummyManager({("US.SPY", None if live else "2026-09-04"): chain})
+    result = expand_option_universe(["US.SPY"], strategy_class=WheelUniverseStrategy,
+                                    data_manager=manager, specified_sources="theta", live=live,
+                                    as_of="2026-09-04", start_date="20260904", end_date="20260904",
+                                    refresh=True, log=None)
+    assert set(result) == {"US.SPY", "US.SPY261016P00470000", "US.SPY261016C00530000"}
+    assert manager.calls[0][3]["right"] == "both"
+
+
+def test_wheel_directional_delta_input_must_be_complete():
+    with pytest.raises(ValueError):
+        resolve_option_universe_spec(WheelUniverseStrategy, {"call_min_delta": -0.1})
+
+
+class ExcludedUnderlyingStrategy:
+    option_universe = ("PUT", "CALL")
+    option_universe_exclude_param = "beta_hedge_symbol"
+    params = {"min_dte": 30, "max_dte": 45, "min_delta": -0.25, "max_delta": 0.30,
+              "beta_hedge_symbol": "US.SH"}
+
+
+def test_option_universe_excludes_beta_hedge_stock_from_option_chain(monkeypatch):
+    manager = DummyManager({
+        ("US.SPY", "2026-09-04"): _chain(
+            _chain_row("US.SPY261016P00470000", "PUT", 470, "2026-10-16", -0.15),
+        ),
+    })
+    monkeypatch.setattr("data_providers.option_universe._incomplete_vendor_day", lambda: pd.Timestamp("2026-09-30").date())
+    result = expand_option_universe(
+        ["US.SPY", "US.SH"], strategy_class=ExcludedUnderlyingStrategy,
+        params={"beta_hedge_symbol": "US.SH"}, data_manager=manager,
+        specified_sources="theta", start_date="2026-09-04", end_date="2026-09-04",
+        live=False, log=None,
+    )
+    assert result == ["US.SPY", "US.SH", "US.SPY261016P00470000"]
+    assert all(call[0] == "US.SPY" for call in manager.calls)
+
+
 def test_expand_clamps_end_to_previous_calendar_day(monkeypatch):
     monkeypatch.setattr(
         "data_providers.option_universe._incomplete_vendor_day",

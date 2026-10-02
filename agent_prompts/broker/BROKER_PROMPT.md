@@ -15,6 +15,7 @@
 
 1. **继承基类**: 你的主类必须命名为 `[BrokerName]Broker`，并且严格继承自 `live_trader.adapters.base_broker.BaseLiveBroker`。
 2. **模块装载契约**: `live_trader.engine.LiveTrader` 只在 adapter 模块中反射并加载 Broker。历史行情 Provider 由 `data_providers` 包中的 `DataManager` 根据 `data_source` 或平台默认值独立选择；adapter 文件不得定义或复制 Provider 逻辑。
+   用户显式指定的 `data_source` 是唯一数据源合同；adapter 不得因交易 Broker 平台自动追加其他 Provider。实盘未指定时由 `LiveTrader` 按交易平台选择原生实时 Provider；回测/优化不得因此触发实时请求。
 3. **绝对无状态 (Stateless)**: QuantAda 已移除 `deferred/buffered` 买单队列。适配器内部**严禁**维护任何类似 `self.local_cash` 或 `self.local_positions` 的缓存变量，也**严禁**自行实现跨回调重试队列。所有状态查询必须实时通过 API 向物理柜台发起。若 SDK/TCP 已连接但账户摘要或持仓订阅尚未同步，必须暴露当前会话的短生命周期健康失败并让实盘当轮有界重试后失败关闭；禁止把空快照静默解释为真实的零现金/空仓。该健康状态不得进入回测/优化路径或保存交易意图。
 4. **数据对象解包**: 框架传入的 `data` 参数是一个代理对象（DataFeedProxy）。获取标的代码时，必须使用 `data._name`，并在与券商 API 交互前，根据需要进行格式化（例如截取基础代码 `data._name.split('.')[0].upper()`）。
 5. **卖出可用仓位约束**: 对存在 T+1 或可卖冻结语义的市场，必须提供准确可卖仓位（建议实现/覆盖 `get_sellable_position`），不要仅用总仓位代替可卖仓位。
