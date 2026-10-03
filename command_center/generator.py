@@ -103,7 +103,6 @@ _OPTION_ORDER = (
     "refresh",
     "no_plot",
     "opt_params",
-    "opt_schedule",
     "n_trials",
     "n_jobs",
     "metric",

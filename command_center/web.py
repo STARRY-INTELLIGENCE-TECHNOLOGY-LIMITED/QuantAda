@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import argparse
 import os
+import re
 import threading
 import uuid
 import webbrowser
@@ -188,6 +189,19 @@ class CommandCenterService:
     @staticmethod
     def _external_module_reference(value: str, root: Path | None) -> str:
         """把外部 .py 路径转换为可由 run.py 导入的模块名。"""
+        raw_value = str(value or "")
+        if root and any(delimiter in raw_value for delimiter in ("+", ",")):
+            parts = re.split(r"([+,])", raw_value)
+            if any(
+                part.strip().lower().endswith(".py")
+                for part in parts
+                if part not in {"+", ","}
+            ):
+                return "".join(
+                    part if part in {"+", ","}
+                    else CommandCenterService._external_module_reference(part.strip(), root)
+                    for part in parts
+                )
         if not root or not value.strip().lower().endswith('.py'):
             return value
         path = Path(value).expanduser()
@@ -784,6 +798,10 @@ class CommandCenterService:
             raise ValueError("优化模式必须先设置优化参数范围（--opt_params）")
         if preset.mode in {"backtest", "live"} and preset.options.get("opt_params"):
             raise ValueError("当前模式包含优化参数；请切换为优化/训练模式")
+        if preset.mode != "optimize" and "," in str(preset.strategy or ""):
+            raise ValueError("策略逗号组合仅支持优化/训练模式")
+        if preset.mode != "optimize" and "," in str(preset.selection or ""):
+            raise ValueError("选股器逗号组合仅支持优化/训练模式；回测和实盘请使用 '+'")
         variables = dict(self.variables)
         incoming = payload.get("variables")
         if isinstance(incoming, Mapping):
@@ -817,16 +835,22 @@ class CommandCenterService:
         # 校验私有策略包的实际可解析性，避免把导入失败留到执行阶段。
         validation_root = source_root or self.project_root
         for reference, label in ((preset.strategy, '策略'), (preset.selection, '选股器')):
-            if reference and '.' in str(reference):
-                package = str(reference).split('.')[0]
+            references = (
+                [part.strip() for part in re.split(r"[+,]", str(reference)) if part.strip()]
+                if reference else [reference]
+            )
+            for module_reference in references:
+                if not module_reference or '.' not in str(module_reference):
+                    continue
+                package = str(module_reference).split('.')[0]
                 if not (validation_root / package).exists():
-                    if self._module_resolves_from_pythonpath(str(reference), variables):
+                    if self._module_resolves_from_pythonpath(str(module_reference), variables):
                         continue
                     if source_root:
-                        message = f"{label}模块 {reference} 不在 source_root={source_root} 内"
+                        message = f"{label}模块 {module_reference} 不在 source_root={source_root} 内"
                     else:
                         message = (
-                            f"{label}模块 {reference} 不在当前项目或 PYTHONPATH 中；"
+                            f"{label}模块 {module_reference} 不在当前项目或 PYTHONPATH 中；"
                             "请配置 source_root 或 PYTHONPATH 外部源码根目录"
                         )
                     if preset.origin == "私有命令集":

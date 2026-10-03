@@ -285,11 +285,11 @@ def test_explicit_study_rejects_incompatible_configuration(tmp_path, overrides):
         _plan(_args(study_name="manual", **overrides), tmp_path)
 
 
-def test_schedule_uses_new_slot_window_instead_of_freezing_old_dates(tmp_path):
+def test_removed_schedule_flag_does_not_change_resume_window_matching(tmp_path):
     path = tmp_path / "optuna_legacy.log"
     _write_study(path, "existing", _args())
     args = _args(start_date="20230924", end_date="20260924", opt_schedule="1d:02:00")
-    assert _plan(args, tmp_path, (None, None))["matched"] == []
+    assert _plan(args, tmp_path, (None, None))["matched"]
 
 
 def test_reader_handles_duplicate_creates_deletions_and_partial_tail(tmp_path):
@@ -664,7 +664,7 @@ def test_keyboard_interrupt_stops_remaining_metrics_and_preserves_trials(monkeyp
 
 
 def test_failed_metrics_do_not_emit_finished_markers(monkeypatch, capsys):
-    from common.terminal_log import OPTIMIZER_AI_ANALYSIS_START_MARKER
+    from common.terminal_log import OPTIMIZER_AI_ANALYSIS_END_MARKER, OPTIMIZER_AI_ANALYSIS_START_MARKER
 
     context = {
         "strategy_class": SimpleNamespace(option_universe=("PUT",)), "risk_control_classes": [],
@@ -688,6 +688,8 @@ def test_failed_metrics_do_not_emit_finished_markers(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "Training metrics returned no results" in output
     assert OPTIMIZER_AI_ANALYSIS_START_MARKER not in output
+    assert OPTIMIZER_AI_ANALYSIS_END_MARKER not in output
+    assert ">>> 运行概要 (RUN SUMMARY) <<<" in output
 
 
 def test_live_cli_keeps_date_inference_when_unused_optimizer_flags_are_present(monkeypatch):

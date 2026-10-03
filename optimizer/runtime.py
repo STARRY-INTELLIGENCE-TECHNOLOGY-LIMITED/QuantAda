@@ -1,27 +1,8 @@
-"""
-QuantAda 启发式并行贝叶斯优化器
--------------------------------------------------------------------
-Copyright (c) 2026 Starry Intelligence Technology Limited. All rights reserved.
+"""QuantAda 参数优化运行时。
 
-本模块实现 IEEE Access 研究中描述的基于熵的计算预算和 Mix-Score 评估机制。
-
-作者：Xingchen Lin (ceo@starryint.hk)
-项目：SIT-2026-Q1
--------------------------------------------------------------------
-QuantAda 启发式并行贝叶斯优化器
-===============================
-
-基于 TPE (Tree-structured Parzen Estimator) 算法的高性能参数寻优框架，
-专为解决非凸、高维的金融时间序列参数优化问题而设计。
-
-核心特性：
-1. **贝叶斯内核**：利用 TPE 算法建模目标函数的后验概率分布，高效定位高潜参数区域。
-2. **启发式算力评估**：基于参数空间复杂度（熵）与硬件算力（CPU核数），
-   通过非线性公式动态估算最佳尝试次数 ($N_{trials}$)，拒绝盲目穷举。
-3. **随机并发探索**：引入 `Constant-Liar` 采样策略与哈希去重机制，
-   解决多核环境下的"并发踩踏"问题，模拟退火特性以有效跳出局部最优陷阱。
-4. **工程鲁棒性**：内置跨平台文件锁管理、异常自动降级及全自动环境清理机制。
-5. **动态滚动训练**：支持基于时间周期的自动滚动切分 (Walk-Forward)，自动推断训练/测试窗口。
+本模块负责 Optuna Study 生命周期、训练任务恢复、数据快照、并行 worker、
+参数评估和训练后验证报告。每个训练批次进入运行时前已确定策略、选股器、
+时间窗口和生效配置；运行期只按该固定上下文执行并记录结果。
 """
 
 import ast
@@ -29,6 +10,7 @@ import copy
 import datetime
 import gc
 import importlib
+import io
 import logging
 import math
 import multiprocessing as mp
@@ -42,7 +24,7 @@ import traceback
 import webbrowser
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -56,7 +38,6 @@ from common.formatters import format_float, format_recent_backtest_metrics
 from common.indicator_cache import BoundedIndicatorCache
 from common.loader import get_class_from_name, parse_period_string
 from common import process_elevation
-from common.schedule_planner import SchedulePlanner
 from common.terminal_log import (
     build_optimizer_terminal_log_path,
     get_optimizer_terminal_log_path,
@@ -64,6 +45,7 @@ from common.terminal_log import (
     set_optimizer_terminal_log_path,
 )
 from data_providers.manager import DataManager
+from stock_selectors.runtime import run_selectors
 from optimizer.study_resume import (
     RetryAwareGridSampler,
     ensure_study_config_version,
@@ -94,6 +76,12 @@ from optimizer.reporting import (
     print_run_summary as print_optimizer_run_summary,
     training_elapsed_hours,
 )
+from optimizer.result_file import (
+    append_optimizer_result,
+    build_optimizer_result_file_path,
+    open_optimizer_result_file,
+)
+from optimizer.training_matrix import expand_training_matrix
 
 
 try:
@@ -233,6 +221,33 @@ def _build_optimizer_terminal_log_path_for_args(args, symbol_list, run_dt=None, 
     return build_optimizer_terminal_log_path(name_tag)
 
 
+def _build_combination_argv(strategy_name, selection_name, original_strategy=None):
+    """将当前 CLI argv 收窄到单个策略/选股器组合，供 Journal 续传保存。"""
+    argv = list(sys.argv[1:])
+    positional = next(
+        (index for index, item in enumerate(argv) if original_strategy is not None and item == original_strategy),
+        None,
+    )
+    if positional is None:
+        positional = next((index for index, item in enumerate(argv) if not str(item).startswith("-")), None)
+    if positional is not None:
+        argv[positional] = str(strategy_name)
+    for index, item in enumerate(list(argv)):
+        if item == "--selection":
+            if selection_name is None:
+                del argv[index:index + 2]
+            else:
+                argv[index + 1] = str(selection_name)
+            break
+        if str(item).startswith("--selection="):
+            if selection_name is None:
+                del argv[index]
+            else:
+                argv[index] = "--selection=" + str(selection_name)
+            break
+    return argv
+
+
 def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
     terminal_log_path = get_optimizer_terminal_log_path()
     if not terminal_log_path:
@@ -241,14 +256,73 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
 
     terminal_tee = install_optimizer_terminal_log(terminal_log_path)
     try:
-        with ExitStack() as run_scope:
-            return _run_optimizer_mode_impl(
-                args=args,
-                fixed_params=fixed_params,
-                risk_params=risk_params,
-                symbol_list=symbol_list,
-                run_scope=run_scope,
+        resolve_worker_count = getattr(
+            OptimizationJob, "_resolve_worker_count", lambda _requested_jobs: 1,
+        )
+        if process_elevation.request_optimizer_elevation_if_needed(args, resolve_worker_count):
+            return 0
+        combinations = expand_training_matrix(
+            getattr(args, "strategy", None), getattr(args, "selection", None),
+        )
+        result_file = build_optimizer_result_file_path() if len(combinations) > 0 else None
+        if result_file:
+            append_optimizer_result(
+                result_file,
+                "QuantAda optimizer AI analysis results\n"
+                f"Original command combinations: {len(combinations)}",
             )
+        statuses = []
+        for index, (strategy_name, selection_name) in enumerate(combinations, 1):
+            child_args = args if len(combinations) == 1 else copy.deepcopy(args)
+            if strategy_name is not None:
+                child_args.strategy = strategy_name
+            child_args.selection = selection_name
+            if len(combinations) > 1:
+                base_study_name = str(
+                    getattr(args, "study_name", None)
+                    or os.environ.get("QUANTADA_STUDY_NAME", "")
+                ).strip()
+                if base_study_name:
+                    child_args.study_name = f"{base_study_name}__combo_{index}"
+                print(
+                    f"\n\n===== Training combination {index}/{len(combinations)}: "
+                    f"strategy={strategy_name}; selection={selection_name or 'None'} ====="
+                )
+            if result_file:
+                print(f"[Optimizer] AI analysis result file: {result_file}")
+            combination_argv = (
+                _build_combination_argv(
+                    strategy_name, selection_name, getattr(args, "strategy", None),
+                )
+                if len(combinations) > 1 else None
+            )
+            try:
+                with ExitStack() as run_scope:
+                    status = _run_optimizer_mode_impl(
+                        args=child_args,
+                        fixed_params=fixed_params,
+                        risk_params=risk_params,
+                        symbol_list=symbol_list,
+                        run_scope=run_scope,
+                        result_file=result_file,
+                        result_label=(
+                            f"Combination {index}/{len(combinations)} | "
+                            f"strategy={strategy_name} | selection={selection_name or 'None'}"
+                        ),
+                        original_argv_override=combination_argv,
+                    )
+                statuses.append(status)
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                print(f"\n[Optimizer] Combination {index} failed; continuing with the next combination.")
+                traceback.print_exc()
+                statuses.append(1)
+        if len(combinations) > 1 and result_file:
+            print(f"[Optimizer] Opening combined AI analysis result file: {result_file}")
+            if not open_optimizer_result_file(result_file):
+                print(f"[Optimizer] Could not open the result file automatically: {result_file}")
+        return 0 if statuses and all(status == 0 for status in statuses) else 1
     except Exception:
         print("\n[Optimizer] Fatal exception captured in optimizer mode:")
         traceback.print_exc()
@@ -258,7 +332,7 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
 
 
 def infer_omitted_backtest_window(args):
-    """缺省 start/end 按调用时刻补全。调度等待必须先完成，再调用本函数。"""
+    """缺省 start/end 按本次训练启动时刻补全。"""
     if not getattr(args, "end_date", None):
         args.end_date = datetime.datetime.now().strftime("%Y%m%d")
     if not getattr(args, "start_date", None) and not getattr(args, "connect", None):
@@ -272,7 +346,10 @@ def infer_omitted_backtest_window(args):
 
 
 
-def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list, run_scope):
+def _run_optimizer_mode_impl(
+    args, fixed_params, risk_params, symbol_list, run_scope,
+    result_file=None, result_label=None, original_argv_override=None,
+):
     """
     运行优化模式主流程（从 run.py 下沉的编排逻辑）。
 
@@ -294,18 +371,6 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list, run_s
     if not metrics_list:
         print("Error: --metric contains no valid metric after filtering empty entries.")
         return 1
-
-    resolve_worker_count = getattr(OptimizationJob, "_resolve_worker_count", lambda _requested_jobs: 1)
-    if process_elevation.request_optimizer_elevation_if_needed(args, resolve_worker_count):
-        return 0
-
-    opt_schedule = getattr(args, "opt_schedule", None)
-    if opt_schedule:
-        try:
-            SchedulePlanner.wait_until_schedule(opt_schedule, log_func=print)
-        except ValueError as exc:
-            print(f"[Optimizer] Invalid --opt_schedule: {exc}")
-            return 1
 
     requested_window = (getattr(args, "start_date", None), getattr(args, "end_date", None))
     infer_omitted_backtest_window(args)
@@ -373,6 +438,8 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list, run_s
 
     source_attrs = (plan["matched"] or plan["source_studies"] or [{"attrs": {}}])[0]["attrs"]
     original_argv = source_attrs.get("_optimizer_original_argv") or list(sys.argv[1:])
+    if original_argv_override is not None and not plan["source_studies"]:
+        original_argv = list(original_argv_override)
     original_exact = source_attrs.get("_optimizer_original_exact", bool(original_argv))
     snapshot_reference = source_attrs.get("_optimizer_data_snapshot") if plan["matched"] else None
     snapshot_unreadable = False
@@ -568,25 +635,35 @@ def _run_optimizer_mode_impl(args, fixed_params, risk_params, symbol_list, run_s
 
         # 展示段标记表示训练完毕。全部指标失败时只保留警告，不能把崩溃日志标成已完成。
         if final_reports:
-            print_optimizer_ai_summary(
-                final_reports=final_reports,
-                explicit_params_passed=explicit_params_passed,
-                fixed_params=fixed_params,
-                baseline_report=baseline_report,
-                baseline_test_report=baseline_test_report,
-                baseline_yearly_reports=baseline_yearly_reports,
-                baseline_elapsed_hours=baseline_elapsed_hours,
-                test_set_requested=test_set_requested,
-                test_section_title=test_section_title,
-            )
+            summary_buffer = io.StringIO()
+            with redirect_stdout(summary_buffer):
+                print_optimizer_ai_summary(
+                    final_reports=final_reports,
+                    total_metrics=total_metrics,
+                    original_argv=original_argv,
+                    original_exact=original_exact,
+                    explicit_params_passed=explicit_params_passed,
+                    fixed_params=fixed_params,
+                    baseline_report=baseline_report,
+                    baseline_test_report=baseline_test_report,
+                    baseline_yearly_reports=baseline_yearly_reports,
+                    baseline_elapsed_hours=baseline_elapsed_hours,
+                    test_set_requested=test_set_requested,
+                    test_section_title=test_section_title,
+                )
+            summary_text = summary_buffer.getvalue()
+            print(summary_text, end="")
+            if result_file:
+                append_optimizer_result(
+                    result_file,
+                    (result_label or "Training result") + "\n" + summary_text,
+                )
             print("Replay outliers in the dashboard: ")
             dashboard_logs = collect_dashboard_logs(final_reports)
             for log_file in dashboard_logs:
                 print(f"optuna-dashboard {log_file}")
             if is_multi_metric and len(dashboard_logs) > 1:
                 print("[Info] The opened dashboard aggregates these journals. Each command above opens one study file.")
-
-            print_run_summary()
 
             # 每个 Study 有独立 Journal。结束时聚合成只读视图，不合并训练文件。
             if is_multi_metric and dashboard_launcher_job and dashboard_logs:
@@ -663,13 +740,10 @@ class OptimizationJob:
         if self.args.selection:
             print(f"\n--- Running Selection Phase: {self.args.selection} ---")
             try:
-                selector_class = get_class_from_name(self.args.selection, ['stock_selectors', 'stock_selectors_custom'])
-                selector_instance = selector_class(data_manager=self.data_manager)
-                selection_result = selector_instance.run_selection()
-                if isinstance(selection_result, list):
-                    self.target_symbols = selection_result
-                elif isinstance(selection_result, pd.DataFrame):
-                    self.target_symbols = selection_result.index.tolist()
+                self.target_symbols = run_selectors(
+                    self.args.selection, self.data_manager, ['stock_selectors', 'stock_selectors_custom'],
+                    class_resolver=get_class_from_name,
+                )
                 print(f"  Selector returned {len(self.target_symbols)} symbols: {self.target_symbols}")
             except Exception as e:
                 print(f"Error during selection execution: {e}")

@@ -10,6 +10,8 @@ import pytest
 
 from optimizer.data_snapshot import load_training_snapshot, save_training_snapshot
 from optimizer.runtime import OptimizationJob
+from common.runtime_command import format_cli_command
+from common.terminal_log import OPTIMIZER_AI_ANALYSIS_START_MARKER
 
 
 class SnapshotStrategy:
@@ -167,7 +169,13 @@ def test_cross_day_resume_freezes_selection_options_and_scores_then_isolates_new
     SnapshotSelector.symbols = ["BBB"]
 
     second = args(n_trials=2, start_date=None, end_date=None)
+    capsys.readouterr()
+    monkeypatch.setattr(runtime.sys, "argv", ["run.py", "--train_resume", "--n_jobs", "-1"])
     assert runtime.run_optimizer_mode(second, ast.literal_eval(second.params), {}, []) == 0
+    resumed_output = capsys.readouterr().out
+    command_header = resumed_output.split(OPTIMIZER_AI_ANALYSIS_START_MARKER, 1)[1].split(">>> 多臂赌博机训练结果汇总", 1)[0]
+    assert command_header == "\nOriginal launch command:\n" + format_cli_command(["python", "run.py", *original]) + "\n\n"
+    monkeypatch.setattr(runtime.sys, "argv", ["run.py", *original])
     assert second.end_date == "20260923"
     assert len(fetched) == 2 and len(expanded) == SnapshotSelector.calls == 1
     assert len(scores) == 4

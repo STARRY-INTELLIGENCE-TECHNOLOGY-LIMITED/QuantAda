@@ -3,6 +3,7 @@ import re
 import pandas as pd
 
 from common.formatters import format_float, format_recent_backtest_metrics
+from common.runtime_command import format_cli_command
 from common.terminal_log import (
     OPTIMIZER_AI_ANALYSIS_END_MARKER,
     OPTIMIZER_AI_ANALYSIS_START_MARKER,
@@ -232,6 +233,9 @@ def print_trade_attribution_sections(
 
 def print_optimizer_ai_summary(
     final_reports,
+    total_metrics,
+    original_argv,
+    original_exact=True,
     explicit_params_passed=False,
     fixed_params=None,
     baseline_report=None,
@@ -242,6 +246,9 @@ def print_optimizer_ai_summary(
     test_section_title=None,
 ):
     print(OPTIMIZER_AI_ANALYSIS_START_MARKER)
+    print("Original launch command" + (":" if original_exact else " (reconstructed from saved settings):"))
+    print(format_cli_command(["python", "run.py", *original_argv]))
+    print()
     print(">>> 多臂赌博机训练结果汇总(MULTI-METRIC BANDIT SUMMARY)  <<<")
 
     header = (
@@ -311,5 +318,13 @@ def print_optimizer_ai_summary(
         test_set_requested=test_set_requested,
         baseline_report=baseline_report,
         baseline_test_report=baseline_test_report,
+    )
+    print_run_summary(
+        final_reports=final_reports,
+        total_metrics=total_metrics,
+        explicit_params_passed=explicit_params_passed,
+        baseline_report=baseline_report,
+        baseline_test_report=baseline_test_report,
+        baseline_yearly_reports=baseline_yearly_reports,
     )
     print(OPTIMIZER_AI_ANALYSIS_END_MARKER)

@@ -6,6 +6,7 @@ import pandas as pd
 import optimizer.runtime as optimizer
 import common.process_elevation as process_elevation
 import common.terminal_log as terminal_log
+from common.runtime_command import format_cli_command
 from common.terminal_log import configure_text_stream_error_handling
 
 
@@ -144,7 +145,18 @@ def test_run_optimizer_mode_prints_test_backtest_section(monkeypatch, capsys):
     assert "年度固定窗口回测结果" in out
     assert "TRADE MICRO ATTRIBUTION" in out
     assert "Trade Attribution by Symbol" in out
-    assert out.index("TRADE MICRO ATTRIBUTION") < out.index("=== 请将上文提供给AI辅助分析 ===")
+    analysis_start = out.index(terminal_log.OPTIMIZER_AI_ANALYSIS_START_MARKER)
+    analysis_end = out.index(terminal_log.OPTIMIZER_AI_ANALYSIS_END_MARKER)
+    command_header = out[analysis_start:out.index(">>> 多臂赌博机训练结果汇总")]
+    assert command_header == (
+        terminal_log.OPTIMIZER_AI_ANALYSIS_START_MARKER + "\nOriginal launch command:\n"
+        + format_cli_command(["python", *optimizer.sys.argv]) + "\n\n"
+    )
+    summary_start = out.index(">>> 运行概要 (RUN SUMMARY) <<<")
+    assert analysis_start < out.index("TRADE MICRO ATTRIBUTION") < summary_start < analysis_end
+    assert "Optuna log files:   1\n  - dummy.log" in out[summary_start:analysis_end]
+    assert out.count(">>> 运行概要 (RUN SUMMARY) <<<") == 1
+    assert analysis_end < out.index("Replay outliers in the dashboard:")
     assert "20240101->20241231" in out
     assert "20250101 -> 20250331" in out
     assert "当前基准" in out
@@ -158,20 +170,95 @@ def test_run_optimizer_mode_prints_test_backtest_section(monkeypatch, capsys):
     assert "Optuna log files:   1" in out
 
 
-def test_run_optimizer_mode_waits_after_elevation_for_opt_schedule(monkeypatch):
+def test_optimizer_ai_summary_marks_reconstructed_command(capsys):
+    original = ["examples.Strategy", "--mode", "optimize", "--params", "{'text': '$HOME `literal`'}", "--n_jobs", "-1"]
+    optimizer.print_optimizer_ai_summary(
+        final_reports=[{"metric_name": "sharpe"}], total_metrics=1, original_argv=original, original_exact=False,
+    )
+    output = capsys.readouterr().out
+    header = output.split(">>> 多臂赌博机训练结果汇总", 1)[0]
+    assert header == (
+        terminal_log.OPTIMIZER_AI_ANALYSIS_START_MARKER
+        + "\nOriginal launch command (reconstructed from saved settings):\n"
+        + format_cli_command(["python", "run.py", *original]) + "\n\n"
+    )
+
+
+def test_run_optimizer_mode_executes_strategy_selection_matrix(monkeypatch, tmp_path):
+    calls = []
+    opened = []
+
+    def fake_impl(**kwargs):
+        calls.append((
+            kwargs["args"].strategy,
+            kwargs["args"].selection,
+            kwargs["result_label"],
+            kwargs["original_argv_override"],
+        ))
+        return 0
+
+    monkeypatch.setattr(optimizer, "_run_optimizer_mode_impl", fake_impl)
+    monkeypatch.setattr(optimizer, "open_optimizer_result_file", lambda path: opened.append(path))
+    monkeypatch.setattr(optimizer.config, "DATA_PATH", str(tmp_path / "data"))
+    monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
+    monkeypatch.setattr(
+        optimizer.sys,
+        "argv",
+        [
+            "run.py", "strategy_a,strategy_b", "--selection",
+            "selector_a,selector_b+selector_c", "--opt_params", "{}",
+        ],
+    )
+
+    args = _build_args(
+        strategy="strategy_a,strategy_b",
+        selection="selector_a,selector_b+selector_c",
+    )
+    assert optimizer.run_optimizer_mode(args, {}, {}, []) == 0
+    assert [(strategy, selection) for strategy, selection, _, _ in calls] == [
+        ("strategy_a", "selector_a"),
+        ("strategy_a", "selector_b+selector_c"),
+        ("strategy_b", "selector_a"),
+        ("strategy_b", "selector_b+selector_c"),
+    ]
+    assert calls[0][3] == ["strategy_a", "--selection", "selector_a", "--opt_params", "{}"]
+    assert calls[3][3] == [
+        "strategy_b", "--selection", "selector_b+selector_c", "--opt_params", "{}",
+    ]
+    assert len(opened) == 1
+
+
+def test_run_optimizer_mode_elevates_once_before_training_matrix(monkeypatch, tmp_path):
+    elevation_calls = []
+    combination_calls = []
+
+    monkeypatch.setattr(
+        optimizer.process_elevation,
+        "request_optimizer_elevation_if_needed",
+        lambda *args: elevation_calls.append(args[0]) or True,
+    )
+    monkeypatch.setattr(
+        optimizer, "_run_optimizer_mode_impl",
+        lambda **kwargs: combination_calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(optimizer.config, "DATA_PATH", str(tmp_path / "data"))
+    monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
+
+    args = _build_args(
+        strategy="strategy_a,strategy_b",
+        selection="selector_a,selector_b",
+        n_jobs=2,
+    )
+    assert optimizer.run_optimizer_mode(args, {}, {}, []) == 0
+    assert len(elevation_calls) == 1
+    assert combination_calls == []
+def test_run_optimizer_mode_does_not_wait_for_removed_opt_schedule(monkeypatch):
     monkeypatch.setattr(optimizer, "OptimizationJob", _DummyOptimizationJob)
     monkeypatch.setattr(
         optimizer.process_elevation,
         "request_optimizer_elevation_if_needed",
         lambda *_args: False,
     )
-    waited = []
-    monkeypatch.setattr(
-        optimizer.SchedulePlanner,
-        "wait_until_schedule",
-        lambda schedule, **_kwargs: waited.append(schedule),
-    )
-
     args = _build_args(opt_schedule="2d:02:00")
     code = optimizer.run_optimizer_mode(
         args=args,
@@ -181,7 +268,6 @@ def test_run_optimizer_mode_waits_after_elevation_for_opt_schedule(monkeypatch):
     )
 
     assert code == 0
-    assert waited == ["2d:02:00"]
 
 
 def test_run_optimizer_mode_skips_test_backtest_section_without_test_config(monkeypatch, capsys):
@@ -200,6 +286,7 @@ def test_run_optimizer_mode_skips_test_backtest_section_without_test_config(monk
     out = capsys.readouterr().out
     assert code == 0
     assert "测试集回测结果" not in out
+    assert out.index(">>> 运行概要 (RUN SUMMARY) <<<") < out.index(terminal_log.OPTIMIZER_AI_ANALYSIS_END_MARKER)
 
 
 def test_run_test_set_backtest_returns_structured_metrics(monkeypatch):
@@ -1643,12 +1730,8 @@ def test_spawn_payload_falls_back_for_missing_string_values():
     assert handles == []
 
 
-def test_optimizer_infers_omitted_window_after_schedule_wait(monkeypatch):
+def test_optimizer_infers_omitted_window_without_removed_schedule(monkeypatch):
     events = []
-
-    def wait(schedule, **_kwargs):
-        events.append(("wait", schedule))
-        return None
 
     def infer(args):
         events.append(("infer", args.start_date, args.end_date))
@@ -1661,7 +1744,6 @@ def test_optimizer_infers_omitted_window_after_schedule_wait(monkeypatch):
         "request_optimizer_elevation_if_needed",
         lambda *_args: False,
     )
-    monkeypatch.setattr(optimizer.SchedulePlanner, "wait_until_schedule", wait)
     monkeypatch.setattr(optimizer, "infer_omitted_backtest_window", infer)
 
     args = _build_args(opt_schedule="02:00", start_date=None, end_date=None)
@@ -1673,8 +1755,6 @@ def test_optimizer_infers_omitted_window_after_schedule_wait(monkeypatch):
     )
 
     assert code == 0
-    assert events[0] == ("wait", "02:00")
-    assert events[1][0] == "infer"
-    assert events[1][1:] == (None, None)
+    assert events == [("infer", None, None)]
     assert args.start_date == "20230922"
     assert args.end_date == "20260922"

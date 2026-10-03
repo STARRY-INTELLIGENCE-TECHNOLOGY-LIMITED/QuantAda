@@ -337,7 +337,7 @@ def test_cli_resume_restores_selection_before_elevation_and_allows_worker_overri
     assert args.metric == "return,sharpe"
     assert args.n_jobs == 2
     assert args.n_trials == 4
-    assert args.opt_schedule is None
+    assert not hasattr(args, "opt_schedule")
     assert args.refresh is False
     assert args.start_date == "20230923"
     assert "--train_resume" not in run.sys.argv

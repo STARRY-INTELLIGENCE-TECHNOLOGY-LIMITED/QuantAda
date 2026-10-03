@@ -32,6 +32,7 @@ from live_trader.option_fill_payoff import collect_option_fill_payoff_summary
 from live_trader.data_bridge.data_warm import SchedulePlanner
 from live_trader.data_bridge.provider_bridge import _DataManagerProvider, _DataManagerProxy
 from run import get_class_from_name
+from stock_selectors.runtime import run_selectors
 
 
 _INTRADAY_WARMUP_BARS = 1000
@@ -348,9 +349,6 @@ class LiveTrader:
                 "execution_price=next_open is currently unsupported for option strategies; "
                 "use close execution or a dedicated option settlement protocol"
             )
-        if self.config.get('selection_name'):
-            self.selector_class = get_class_from_name(self.config['selection_name'], ['stock_selectors'])
-
         # 保持原有初始化顺序，并在 Broker 已建立后再次绑定可能由 Broker 持有的共享会话。
         self.broker = self.BrokerClass(context, cash_override=self.config.get('cash'),
                                        commission_override=self.config.get('commission'),
@@ -1282,22 +1280,15 @@ class LiveTrader:
             return list(self._resolved_symbols)
 
         symbols = []
-        if self.selector_class:
+        selection_name = self.config.get('selection_name')
+        if selection_name:
             if self._data_manager is None:
                 self._data_manager = DataManager()
             self._bind_shared_ib_to_data_manager(self._data_manager)
 
-            selector_instance = self.selector_class(data_manager=self._data_manager)
-            raw_symbols = selector_instance.run_selection()
-
-            if isinstance(raw_symbols, pd.DataFrame):
-                symbols = [str(s) for s in raw_symbols.index.tolist()]
-            elif isinstance(raw_symbols, (pd.Index, list, tuple, set)):
-                symbols = [str(s) for s in raw_symbols]
-            else:
-                raise ValueError(
-                    f"Selector '{self.selector_class.__name__}' returned unsupported type: {type(raw_symbols).__name__}"
-                )
+            symbols = run_selectors(
+                selection_name, self._data_manager, class_resolver=get_class_from_name,
+            )
             print(f"Selector selected symbols: {symbols}")
         else:
             configured_symbols = self.config.get('symbols', [])

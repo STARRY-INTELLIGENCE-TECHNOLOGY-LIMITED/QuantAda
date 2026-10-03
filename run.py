@@ -5,8 +5,6 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas
-
 import config
 from backtest.backtester import Backtester
 import optimizer
@@ -25,6 +23,7 @@ from data_providers.manager import DataManager
 from recorders.db_recorder import DBRecorder
 from recorders.http_recorder import HttpRecorder
 from recorders.manager import RecorderManager
+from stock_selectors.runtime import run_selectors
 
 configure_text_stream_error_handling()
 
@@ -68,13 +67,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     # --- 2. 执行选股 ---
     if selection_filename:
         print("--- Running Selection Phase ---")
-        selector_class = get_class_from_name(selection_filename, ['stock_selectors'])
-        selector_instance = selector_class(data_manager=data_manager)
-        selection_result = selector_instance.run_selection()
-        if isinstance(selection_result, list):
-            symbols = selection_result
-        if isinstance(selection_result, pandas.DataFrame):
-            symbols = selection_result.index.tolist()
+        symbols = run_selectors(selection_filename, data_manager, class_resolver=get_class_from_name)
 
         if not symbols:
             print("\nFatal: The selector did not return any symbols. Aborting.")
@@ -232,10 +225,10 @@ def _run_main():
 
     # 2. 添加命令行参数
     parser.add_argument('strategy', type=str, nargs='?',
-                        help="要运行的策略文件名 (例如: sample_macd_cross_strategy.py 或 sample_macd_cross_strategy 或 my_pkg.my_strategy.MyStrategyClass)")
+                        help="策略文件名或全限定类名；优化/训练支持逗号分隔的策略组合")
     parser.add_argument('--params', type=str, default='{}',
                         help="策略参数 (JSON字符串, 例如: \"{\'selectTopK\': 2, \'target_buffer\': 0.95}\")")
-    parser.add_argument('--selection', type=str, default=None, help="选股器文件名 (位于selectors目录 或 自定义包路径)")
+    parser.add_argument('--selection', type=str, default=None, help="选股器路径；支持 A+B 并集，优化/训练还支持逗号分组")
     parser.add_argument('--data_source', type=str, default=None,
                         help="指定数据源 (例如: csv akshare tushare sxsc_tushare tiingo futu gm)")
     parser.add_argument('--symbols', type=str, default='SHSE.510300', help="以,分割的回测标的代码 (默认: SHSE.510300)")
@@ -286,12 +279,6 @@ def _run_main():
     # Optimizer 专用参数
     parser.add_argument('--train_resume', action='store_true', help="List historical training tasks by most recent update and resume one interactively")
     parser.add_argument('--opt_params', type=str, default=None, help="[优化模式] 优化参数空间定义 JSON")
-    parser.add_argument(
-        '--opt_schedule',
-        type=str,
-        default=None,
-        help="[优化模式] 启动调度：HH:MM[:SS] 单次触发，或 Nd/Nw/Nm/Nh[:HH:MM[:SS]] 周期触发",
-    )
     parser.add_argument('--n_trials', type=int, default=None, help="[优化模式] 累计有效试验预算，失败重试不占用完成额度 (默认: 自动推断)")
     parser.add_argument(
         '--study_name',
@@ -380,10 +367,13 @@ def _run_main():
     if not args.strategy:
         parser.error("Specify a strategy, or use --train_resume to choose a historical training task")
 
-    if args.opt_schedule and not args.opt_params:
-        raise ValueError("--opt_schedule 仅可与 --opt_params 一起使用")
-    if args.opt_schedule and args.connect:
-        raise ValueError("--opt_schedule 用于训练启动等待；实盘请使用连接环境中的 schedule")
+    if not args.opt_params and (
+        "," in str(args.strategy or "") or "," in str(args.selection or "")
+    ):
+        raise ValueError(
+            "策略/选股器的逗号组合仅支持优化/训练模式；回测和实盘请只提供一个策略，"
+            "选股器组合请使用 '+'。"
+        )
 
     # 非 worker 实盘进程由轻量父进程监督；worker 直接进入 launcher。
     if args.connect and not is_live_worker_process():
@@ -428,8 +418,7 @@ def _run_main():
             config.BROKER_ENVIRONMENTS = refresh_broker_environments()
 
     # 优化器需要区分显式日期和缺省日期，以便继承续传窗口；其它模式保持入口推断。
-    # --opt_schedule 必须等槽位到达后再推断，避免跨日用等待前的窗口。
-    if not args.opt_schedule and (not args.opt_params or args.connect):
+    if not args.opt_params or args.connect:
         infer_omitted_backtest_window(args)
 
     # 将逗号分隔的字符串转换为列表

@@ -24,6 +24,8 @@ def test_web_html_is_external_static_resource():
     assert 'id="strategy-input"' in html
     assert 'id="strategy-toggle"' in html
     assert 'id="strategy-options"' in html
+    assert '<select id="selection-input" multiple' in html
+    assert 'id="selection-custom-input"' in html
     assert 'list="strategy-list"' not in html
     assert 'id="strategy-picker"' not in html
     assert 'id="risk-params-input"' in html
@@ -142,6 +144,34 @@ def test_web_service_generates_custom_command(tmp_path):
     assert "--no_plot" in result["argv"]
     assert "period" in result["params"]
     assert result["display_command"].startswith("python run.py")
+
+
+def test_web_service_preserves_multiple_selection_modules_in_command(tmp_path):
+    service = CommandCenterService(tmp_path)
+    result = service.generate({
+        "strategy": "strategies.example",
+        "selection": "stock_selectors.first+stock_selectors.second",
+    })
+
+    argv = result["argv"]
+    assert argv[argv.index("--selection") + 1] == "stock_selectors.first+stock_selectors.second"
+
+
+def test_web_service_rejects_training_combinations_outside_optimize_mode(tmp_path):
+    service = CommandCenterService(tmp_path)
+    with pytest.raises(ValueError, match="策略逗号组合"):
+        service.generate({
+            "strategy": "strategies.first,strategies.second",
+            "mode": "backtest",
+        })
+    with pytest.raises(ValueError, match="选股器逗号组合"):
+        service.generate({
+            "strategy": "strategies.first",
+            "selection": "selectors.first,selectors.second",
+            "mode": "live",
+            "connect": "gm_broker:sim",
+            "variables": {"GM_TOKEN": "token", "GM_HOST": "127.0.0.1", "GM_PORT": "7001"},
+        })
 
 
 def test_custom_tiingo_command_has_explicit_symbol_options_only(tmp_path):
@@ -375,6 +405,22 @@ def test_web_service_analyzes_strategy_source(tmp_path):
     result = service.analyze_training({"source_path": "strategies/demo.py"})
     assert result["strategy"] == "strategies.demo"
     assert result["opt_params"]["period"]["type"] == "int"
+
+
+def test_external_selection_paths_are_converted_individually(tmp_path):
+    source_root = tmp_path / "private"
+    (source_root / "selectors").mkdir(parents=True)
+    (source_root / "selectors" / "one.py").write_text("class One: pass\n", encoding="utf-8")
+    (source_root / "selectors" / "two.py").write_text("class Two: pass\n", encoding="utf-8")
+
+    service = CommandCenterService(tmp_path / "project")
+
+    assert service._external_module_reference(
+        "selectors/one.py+selectors/two.py", source_root,
+    ) == "selectors.one+selectors.two"
+    assert service._external_module_reference(
+        "strategies/one.py,strategies/two.py", source_root,
+    ) == "strategies.one,strategies.two"
 
 
 def test_web_service_reads_strategy_params_by_module_path(tmp_path):

@@ -189,8 +189,6 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
         paths = []
 
     start_filter, end_filter = requested_window
-    if getattr(args, "opt_schedule", None):
-        start_filter, end_filter = args.start_date, args.end_date
     matched = []
     selected_window = None
     named_study = None

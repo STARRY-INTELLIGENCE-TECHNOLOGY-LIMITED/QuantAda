@@ -11,7 +11,8 @@
 4. 不在 selector 内部下单，不调用 broker 发单
 5. 可使用 `self.data_manager.get_data(...)`
 6. 实盘 `LiveTrader` 只在 init 与数据恢复时调用 `run_selection()`，结果是启动标的池，不是每根 K 重新选股。每日轮动应在策略 `next()` 中从 `self.broker.datas` 挑选子集。
-7. 期权合约展开不是重新选股。selector 仍只输出标的/静态代码；声明了 `option_universe` 的策略由运行时在取数前展开历史链，实盘每个 slot 用当前链增补。`get_option_chain` 的历史回放必须带 `as_of`。滚动候选没有 K 线时丢弃该合约并继续；正股/指数或仍有持仓、在途的期权刷新失败仍跳过整轮。
+7. `--selection` 支持使用 `+` 连接多个选股器（如 `selector_a+selector_b`）。运行时按书写顺序执行各选股器，将 list 或 DataFrame index 的结果合并为去重并集，并保留首次出现顺序；回测、训练和实盘使用同一语义。任一选股器失败或返回不支持的类型时，整次选股失败，不使用不完整结果。
+8. 期权合约展开不是重新选股。selector 仍只输出标的/静态代码；声明了 `option_universe` 的策略由运行时在取数前展开历史链，实盘每个 slot 用当前链增补。`get_option_chain` 的历史回放必须带 `as_of`。滚动候选没有 K 线时丢弃该合约并继续；正股/指数或仍有持仓、在途的期权刷新失败仍跳过整轮。
 
 
 ## 2. 风控模块
