@@ -120,6 +120,16 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'fast_period': {'type': 'int', 'low': 5, 'high': 30}}" --train_period 20210101-20221231 --test_period 20230101-20231231 --n_trials 50
 ```
 
+`--opt_params` supports both flat and strategy-keyed search spaces. Single- and multi-strategy runs automatically keep only parameters declared by the current strategy's class-level `params`, so unused parameters do not add search dimensions:
+
+```bash
+# Flat space: each strategy keeps its declared parameters
+python run.py StrategyA,StrategyB --opt_params "{'p1': {'type': 'int', 'low': 1, 'high': 5}, 'p3': {'type': 'float', 'low': 0.1, 'high': 0.9}, 'p5': {'type': 'int', 'low': 1, 'high': 10}}"
+
+# Strategy-keyed space: independent spaces by fully qualified name or class name
+python run.py StrategyA,StrategyB --opt_params "{'StrategyA': {'p1': {'type': 'int', 'low': 1, 'high': 5}}, 'StrategyB': {'p5': {'type': 'int', 'low': 1, 'high': 10}}}"
+```
+
 Choose a previous training task interactively and resume its saved configuration:
 
 ```bash

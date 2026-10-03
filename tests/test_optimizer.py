@@ -194,6 +194,7 @@ def test_run_optimizer_mode_executes_strategy_selection_matrix(monkeypatch, tmp_
             kwargs["args"].selection,
             kwargs["result_label"],
             kwargs["original_argv_override"],
+            kwargs["suppress_dashboard"],
         ))
         return 0
 
@@ -215,7 +216,7 @@ def test_run_optimizer_mode_executes_strategy_selection_matrix(monkeypatch, tmp_
         selection="selector_a,selector_b+selector_c",
     )
     assert optimizer.run_optimizer_mode(args, {}, {}, []) == 0
-    assert [(strategy, selection) for strategy, selection, _, _ in calls] == [
+    assert [(strategy, selection) for strategy, selection, _, _, _ in calls] == [
         ("strategy_a", "selector_a"),
         ("strategy_a", "selector_b+selector_c"),
         ("strategy_b", "selector_a"),
@@ -225,6 +226,7 @@ def test_run_optimizer_mode_executes_strategy_selection_matrix(monkeypatch, tmp_
     assert calls[3][3] == [
         "strategy_b", "--selection", "selector_b+selector_c", "--opt_params", "{}",
     ]
+    assert all(call[4] is True for call in calls)
     assert len(opened) == 1
 
 

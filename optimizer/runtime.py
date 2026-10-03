@@ -82,6 +82,7 @@ from optimizer.result_file import (
     open_optimizer_result_file,
 )
 from optimizer.training_matrix import expand_training_matrix
+from optimizer.opt_param_space import _looks_like_param_spec, resolve_opt_params
 
 
 try:
@@ -310,6 +311,7 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                             f"strategy={strategy_name} | selection={selection_name or 'None'}"
                         ),
                         original_argv_override=combination_argv,
+                        suppress_dashboard=(len(combinations) > 1),
                     )
                 statuses.append(status)
             except KeyboardInterrupt:
@@ -349,6 +351,7 @@ def infer_omitted_backtest_window(args):
 def _run_optimizer_mode_impl(
     args, fixed_params, risk_params, symbol_list, run_scope,
     result_file=None, result_label=None, original_argv_override=None,
+    suppress_dashboard=False,
 ):
     """
     运行优化模式主流程（从 run.py 下沉的编排逻辑）。
@@ -379,14 +382,33 @@ def _run_optimizer_mode_impl(
     logging.getLogger("optuna").setLevel(logging.INFO)
 
     try:
-        opt_p_def = ast.literal_eval(args.opt_params)
+        raw_opt_p_def = ast.literal_eval(args.opt_params)
     except Exception as e:
         print(f"Error parsing opt_params JSON: {e}")
         return 1
 
+    if not isinstance(raw_opt_p_def, dict):
+        print("Error parsing opt_params JSON: expected a dictionary")
+        return 1
     if not HAS_JOURNAL:
         print("Error: automatic training resume requires Optuna JournalStorage.")
         return 1
+    if getattr(args, "strategy", None):
+        try:
+            strategy_for_space = get_class_from_name(args.strategy, ["strategies"])
+        except ImportError:
+            # 让已有 Study/运行互斥检查先完成；真正的策略加载仍由 OptimizationJob 负责。
+            strategy_for_space = None
+        opt_p_def = resolve_opt_params(raw_opt_p_def, args.strategy, strategy_for_space)
+        ignored = set(raw_opt_p_def) - set(opt_p_def)
+        if ignored and all(_looks_like_param_spec(value) for value in raw_opt_p_def.values()):
+            print(
+                f"[Optimizer] Ignoring opt_params not declared by {args.strategy}: "
+                f"{sorted(str(name) for name in ignored)}"
+            )
+    else:
+        opt_p_def = raw_opt_p_def
+
     log_dir = os.path.join(os.getcwd(), config.DATA_PATH, "optuna")
     plan = resolve_study_plan(args, fixed_params, opt_p_def, risk_params, metrics_list, log_dir, requested_window)
     for study_info in plan["source_studies"]:
@@ -500,7 +522,7 @@ def _run_optimizer_mode_impl(
     bootstrap_args = copy.deepcopy(args)
     bootstrap_args.metric = metrics_list[0]
     bootstrap_args.study_name = plan["studies"][metrics_list[0]]
-    bootstrap_args.auto_launch_dashboard = not is_multi_metric
+    bootstrap_args.auto_launch_dashboard = not is_multi_metric and not suppress_dashboard
     bootstrap_kwargs = dict(args=bootstrap_args, fixed_params=fixed_params, opt_params_def=opt_p_def, risk_params=risk_params)
     if shared_context is not None:
         bootstrap_kwargs["shared_context"] = shared_context
@@ -545,7 +567,7 @@ def _run_optimizer_mode_impl(
         current_args = copy.deepcopy(args)
         current_args.metric = current_metric
         current_args.study_name = plan["studies"][current_metric]
-        current_args.auto_launch_dashboard = not is_multi_metric
+        current_args.auto_launch_dashboard = not is_multi_metric and not suppress_dashboard
         if shared_dashboard_log_file:
             current_args.shared_journal_log_file = shared_dashboard_log_file
 
@@ -666,7 +688,7 @@ def _run_optimizer_mode_impl(
                 print("[Info] The opened dashboard aggregates these journals. Each command above opens one study file.")
 
             # 每个 Study 有独立 Journal。结束时聚合成只读视图，不合并训练文件。
-            if is_multi_metric and dashboard_launcher_job and dashboard_logs:
+            if is_multi_metric and not suppress_dashboard and dashboard_launcher_job and dashboard_logs:
                 launch_multi_metric_dashboard(
                     dashboard_launcher_job,
                     dashboard_logs,

@@ -129,6 +129,16 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'fast_period': {'type': 'int', 'low': 5, 'high': 30}}" --train_period 20210101-20221231 --test_period 20230101-20231231 --n_trials 50
 ```
 
+`--opt_params` 支持扁平空间和策略分组空间。单策略或多策略训练都会按当前策略类的 `params` 自动筛选实际搜索参数，未声明参数不会增加搜索维度：
+
+```bash
+# 扁平空间：每个策略自动取自己声明的参数
+python run.py StrategyA,StrategyB --opt_params "{'p1': {'type': 'int', 'low': 1, 'high': 5}, 'p3': {'type': 'float', 'low': 0.1, 'high': 0.9}, 'p5': {'type': 'int', 'low': 1, 'high': 10}}"
+
+# 分组空间：按全限定策略名或类名提供独立空间
+python run.py StrategyA,StrategyB --opt_params "{'StrategyA': {'p1': {'type': 'int', 'low': 1, 'high': 5}}, 'StrategyB': {'p5': {'type': 'int', 'low': 1, 'high': 10}}}"
+```
+
 从历史任务交互选择并续传，无需重新填写策略和参数：
 
 ```bash
