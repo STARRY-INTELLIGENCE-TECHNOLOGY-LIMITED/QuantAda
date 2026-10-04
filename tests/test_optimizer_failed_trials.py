@@ -305,6 +305,8 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
             progress["finished_before"] if progress is not None else kwargs.get("progress_finished_before")
         )
         call["progress"] = progress
+        call["metric_label"] = progress["metric_label"] if progress is not None else None
+        call["future_remaining"] = progress["future_remaining"] if progress is not None else None
         call["counter"] = progress["counter"] if progress is not None else None
         call["started_at"] = progress["started_at"] if progress is not None else None
         captured["calls"].append(call)
@@ -317,7 +319,10 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
         OptimizationJob, "_resolve_worker_count", classmethod(lambda cls, requested: max(1, int(requested))),
     )
     monkeypatch.setattr(OptimizationJob, "_run_multiprocess_optimization", fake_parallel)
-    result = _resume_job(path, study_name, objective, n_jobs=2).run()
+    job = _resume_job(path, study_name, objective, n_jobs=2)
+    job._requested_metrics = ["sharpe", "return", "calmar"]
+    job._future_metric_finished_counts = (1,)
+    result = job.run()
     loaded = optuna.load_study(study_name=study_name, storage=storage)
     assert captured["calls"][0]["waiting"] == 3
     assert captured["calls"][0]["n_trials"] == 3
@@ -327,6 +332,8 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
     assert captured["calls"][1]["finished_before"] == 1
     assert captured["calls"][1]["progress"]["parallel_workers"] == 2
     assert captured["calls"][0]["progress"] is captured["calls"][1]["progress"]
+    assert [call["metric_label"] for call in captured["calls"]] == ["Metric 2/3 return"] * 2
+    assert [call["future_remaining"] for call in captured["calls"]] == [2, 2]
     assert captured["calls"][0]["counter"] is not captured["calls"][1]["counter"]
     assert captured["calls"][1]["started_at"] >= captured["calls"][0]["started_at"]
     assert result["trials_completed"] == 3

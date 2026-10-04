@@ -1,4 +1,9 @@
 from datetime import datetime
+import os
+
+# GM SDK 的旧版 protobuf 生成代码与新版 C++ 实现不兼容；历史行情仍可用纯 Python
+# 实现运行。该环境变量必须在导入 gm.api 前设置。
+os.environ.setdefault('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'python')
 
 import pandas as pd
 from common.live_runtime import dependency_install_hint
@@ -100,7 +105,12 @@ class GmDataProvider(BaseDataProvider):
                     df.index = df.index.tz_localize(None)
 
             # 3. 粘合实时数据 (仅限日线)
-            if freq == '1d':
+            # 历史结束日在今天之前时不请求 current，避免把未复权实时快照混入历史回测，
+            # 也避免旧版 GM SDK 的实时 protobuf 字段转换影响历史数据链路。
+            should_stitch_realtime = freq == '1d' and (
+                end_date is None or pd.Timestamp(end_date).normalize() >= pd.Timestamp.now().normalize()
+            )
+            if should_stitch_realtime:
                 try:
                     df = self._stitch_realtime_bar(symbol, df)
                 except Exception as e:

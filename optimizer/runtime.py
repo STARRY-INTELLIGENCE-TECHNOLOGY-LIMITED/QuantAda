@@ -54,7 +54,7 @@ from optimizer.study_resume import (
     resolve_study_plan,
     study_run_lock,
 )
-from optimizer.journal_metadata import isolate_study_journal, training_identity_hash
+from optimizer.journal_metadata import finished_trial_count, isolate_study_journal, training_identity_hash
 from optimizer.dashboard_view import (
     begin_dashboard_log_scope,
     build_dashboard_storage,
@@ -434,6 +434,11 @@ def _run_optimizer_mode_impl(
     final_reports = []
     total_metrics = len(metrics_list)
     is_multi_metric = total_metrics > 1
+    matched_finished = {
+        study["attrs"]["metric"]: finished_trial_count(study.get("trial_counts"))
+        for study in plan["matched"]
+    }
+    total_finished_before = sum(matched_finished.values())
     explicit_params_passed = any(
         (arg == '--params') or arg.startswith('--params=')
         for arg in sys.argv[1:]
@@ -587,6 +592,11 @@ def _run_optimizer_mode_impl(
             # 此 Job 位于本轮 Journal 进程锁内，允许回收上次中断的试验状态。
             job._resume_exclusive = True
             job._requested_metrics = metrics_list
+            job._future_metric_finished_counts = tuple(
+                matched_finished.get(metric, 0) for metric in metrics_list[idx:]
+            )
+            job._total_finished_before = total_finished_before
+            job._total_metric_count = total_metrics
             job._data_snapshot = snapshot_reference
             job._rebind_unreadable_snapshot = snapshot_unreadable
             job._original_argv = original_argv
@@ -605,6 +615,11 @@ def _run_optimizer_mode_impl(
                     result_dict['elapsed_hours'] = elapsed_hours
                 result_dict['study_db'] = getattr(current_args, 'study_name', 'N/A')
                 final_reports.append(result_dict)
+                total_finished_before += max(
+                    0,
+                    int(result_dict.get("trials_finished", result_dict.get("trials_completed", 0)))
+                    - matched_finished.get(current_metric, 0),
+                )
 
         except Exception as e:
             print(f"\n[Fatal] Metric '{current_metric}' crashed: {e}")
@@ -1310,6 +1325,11 @@ class OptimizationJob:
                             progress_finished_before,
                             shared_counter,
                             parallel_workers=worker_count,
+                            metric_name=self.args.metric,
+                            metrics=getattr(self, "_requested_metrics", None),
+                            future_finished_counts=getattr(self, "_future_metric_finished_counts", ()),
+                            total_target_trials=getattr(self, "_total_target_trials", None),
+                            total_finished_before=getattr(self, "_total_finished_before", 0),
                         )
                     except Exception as exc:
                         print(f"[Optimizer] Trial progress counter unavailable; continuing without ETA: {exc}")
@@ -2889,6 +2909,7 @@ class OptimizationJob:
         }
         finished_states.discard(None)
         target_trials = int(n_trials)
+        self._total_target_trials = target_trials * len(getattr(self, "_requested_metrics", [self.args.metric]))
         finished_trials = sum(
             1
             for trial in getattr(study, "trials", [])
@@ -2946,6 +2967,10 @@ class OptimizationJob:
             # finished_before 固定为本轮开始前的完成数，两个阶段共用同一速度计数。
             progress = make_trial_progress(
                 target_trials, finished_before, counter, parallel_workers=resolved_workers,
+                metric_name=self.args.metric, metrics=getattr(self, "_requested_metrics", None),
+                future_finished_counts=getattr(self, "_future_metric_finished_counts", ()),
+                total_target_trials=getattr(self, "_total_target_trials", None),
+                total_finished_before=getattr(self, "_total_finished_before", 0),
             )
 
         def run_queued_resume_trials(count):
@@ -3026,6 +3051,11 @@ class OptimizationJob:
                             finished_after_resume,
                             progress_counter,
                             parallel_workers=resolved_workers,
+                            metric_name=self.args.metric,
+                            metrics=getattr(self, "_requested_metrics", None),
+                            future_finished_counts=getattr(self, "_future_metric_finished_counts", ()),
+                            total_target_trials=getattr(self, "_total_target_trials", None),
+                            total_finished_before=getattr(self, "_total_finished_before", 0),
                         )
                         if progress is None:
                             progress = updated_progress
@@ -3142,6 +3172,9 @@ class OptimizationJob:
             "best_score": best_val_display,
             "best_params": best_params,
             "trials_completed": len(completed_trials),
+            "trials_finished": sum(
+                trial.state in finished_states for trial in getattr(study, "trials", [])
+            ),
             "log_file": log_file,
             "main_eval_backtest": main_eval_metrics,
             "recent_backtest": main_eval_metrics,

@@ -1,4 +1,4 @@
-"""Optuna Trial 日志应在原行显示预算和剩余时间。"""
+"""Optuna Trial 日志应在原行显示预算、剩余时间和指标进度。"""
 
 import logging
 import time
@@ -27,8 +27,11 @@ class _Capture(logging.Handler):
         self.messages.append(record.getMessage())
 
 
-def _progress(counter, started_at, target=2160, finished_before=0):
-    return make_trial_progress(target, finished_before, counter, started_at=started_at)
+def _progress(counter, started_at, target=2160, finished_before=0, metric_name="sharpe", metrics=None):
+    return make_trial_progress(
+        target, finished_before, counter, started_at=started_at,
+        metric_name=metric_name, metrics=metrics,
+    )
 
 
 def test_duration_uses_two_largest_units():
@@ -51,6 +54,37 @@ def test_eta_uses_this_run_rate_and_skips_failures(monkeypatch):
     assert remaining_label(1200, 13, 1, started, started + 180, parallel_workers=13) == "ETA warming up (1/13 workers)"
 
 
+def test_eta_includes_only_unfinished_trials_in_later_metrics():
+    started = 1_000_000.0
+    counter = TrialFinishCounter()
+    progress = make_trial_progress(
+        100, 20, counter, started_at=started,
+        metric_name="return", metrics=["return", "sharpe", "calmar"],
+        future_finished_counts=(100, 40),
+    )
+    assert progress["future_remaining"] == 60
+    assert remaining_label(100, 20, 10, started, started + 100, future_remaining=60) == "ETA 21m40s"
+    assert remaining_label(100, 100, 0, started, started + 100, future_remaining=60) == "ETA unavailable"
+    assert remaining_label(100, 100, 10, started, started + 100, future_remaining=60) == "ETA 10m"
+
+
+def test_trial_line_eta_covers_later_metric_budget(monkeypatch):
+    started = 1_000_000.0
+    monkeypatch.setattr("optimizer.trial_progress.time.time", lambda: started + 100)
+    progress = make_trial_progress(
+        10, 0, TrialFinishCounter(), started_at=started,
+        metric_name="return", metrics=["return", "sharpe"],
+        future_finished_counts=(0,),
+        total_target_trials=20,
+    )
+    record = logging.LogRecord(
+        "optuna.study.study", logging.INFO, __file__, 1,
+        "Trial 0 finished with value: 1.0 and parameters: {}.", (), None,
+    )
+    assert TrialProgressFilter(progress).filter(record) is True
+    assert record.msg.startswith("Metric 1/2 return | Trial 0/10 ETA 15m | Total Trial 1/20 ETA 31m40s | Finished with")
+
+
 def test_child_logger_line_is_rewritten_once_and_keeps_best_trial(monkeypatch):
     started = 1_000_000.0
     monkeypatch.setattr("optimizer.trial_progress.time.time", lambda: started + 600)
@@ -59,7 +93,11 @@ def test_child_logger_line_is_rewritten_once_and_keeps_best_trial(monkeypatch):
     root = logging.getLogger("optuna")
     root.addHandler(capture)
     try:
-        with installed_trial_progress(_progress(counter, started, finished_before=1033)):
+        with installed_trial_progress(_progress(
+            counter, started, finished_before=1033,
+            metric_name="mix_score_defender",
+            metrics=["mix_score_origin", "us_robust", "mix_score_defender", "mix_score_turbo"],
+        )):
             logging.getLogger("optuna.study.study").info(
                 "Trial 369 finished with value: -22.0 and parameters: {'min_dte': 35}. "
                 "Best is trial 10 with value: 10.87481044264505."
@@ -75,14 +113,18 @@ def test_child_logger_line_is_rewritten_once_and_keeps_best_trial(monkeypatch):
 
     assert counter.value == 2
     assert len(capture.messages) == 5
-    assert capture.messages[0].startswith("Trial 369/2160 ETA ")
+    assert capture.messages[0].startswith("Metric 3/4 mix_score_defender | Trial 369/2160 ETA ")
+    assert " | Total Trial 1/2160 ETA " in capture.messages[0]
+    assert " | Finished with" in capture.messages[0]
     assert "Best is trial 10 with value: 10.87481044264505." in capture.messages[0]
     assert capture.messages[0].endswith("10.87481044264505.")
-    assert capture.messages[1].startswith("Trial 370/2160 ETA ")
-    assert " pruned. " in capture.messages[1]
-    assert capture.messages[2].startswith("Trial 371/2160 ")
-    assert "failed with parameters" in capture.messages[2]
-    assert capture.messages[3].startswith("Trial 371/2160 ")
+    assert capture.messages[1].startswith("Metric 3/4 mix_score_defender | Trial 370/2160 ETA ")
+    assert " | Pruned. " in capture.messages[1]
+    assert capture.messages[2].startswith("Metric 3/4 mix_score_defender | Trial 371/2160 ETA ")
+    assert " | Failed with" in capture.messages[2]
+    assert "Failed with parameters" in capture.messages[2]
+    assert capture.messages[3].startswith("Metric 3/4 mix_score_defender | Trial 371/2160 ETA ")
+    assert " | Failed with" in capture.messages[3]
     assert capture.messages[4] == "A new study created in memory with name: demo"
     assert not any(handler.filters for handler in root.handlers if capture not in (handler,))
 
@@ -98,7 +140,7 @@ def test_same_record_and_rewritten_line_are_not_counted_twice():
     assert progress_filter.filter(record) is True
     assert progress_filter.filter(record) is True
     assert counter.value == 1
-    assert record.msg.startswith("Trial 3/10 ")
+    assert record.msg.startswith("Metric 1/1 sharpe | Trial 3/10 ")
     assert "/10/10" not in record.msg
 
     again = logging.LogRecord(
@@ -107,6 +149,12 @@ def test_same_record_and_rewritten_line_are_not_counted_twice():
     )
     assert progress_filter.filter(again) is True
     assert again.msg == "Trial 8/10 finished with value: 1.0."
+    prefixed = logging.LogRecord(
+        "optuna.study.study", logging.INFO, __file__, 1,
+        record.msg, (), None,
+    )
+    assert progress_filter.filter(prefixed) is True
+    assert prefixed.msg == record.msg
     assert counter.value == 1
 
 
@@ -170,7 +218,8 @@ def test_worker_entry_rewrites_trial_log_without_opening_real_journal(monkeypatc
 
     assert result["stopped_early"] is False
     assert counter.value == 1
-    assert capture.messages[0].startswith("Trial 12/2160 ")
+    assert capture.messages[0].startswith("Metric 1/1 sharpe | Trial 12/2160 ETA ")
+    assert " | Finished with" in capture.messages[0]
     assert "Best is trial 10 with value: 1.0." in capture.messages[0]
 
 
@@ -196,7 +245,10 @@ def test_multiprocess_submit_shares_target_budget_without_shifting_worker_args(m
 
     monkeypatch.setattr(optimizer, "ProcessPoolExecutor", DummyExecutor)
     job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
-    job.args = SimpleNamespace(study_name="dummy-study")
+    job.args = SimpleNamespace(study_name="dummy-study", metric="mix_score_defender")
+    job._requested_metrics = ["mix_score_origin", "mix_score_defender", "mix_score_turbo"]
+    job._future_metric_finished_counts = (200,)
+    job._total_target_trials = 6480
     job._resolve_worker_count = lambda requested: 2
     job._build_worker_payload = lambda: {"runtime_config": {}}
     job._build_spawn_shared_payload = lambda payload: (payload, [])
@@ -215,6 +267,8 @@ def test_multiprocess_submit_shares_target_budget_without_shifting_worker_args(m
     assert first_progress is second_progress
     assert first_progress["target_trials"] == 2160
     assert first_progress["finished_before"] == 1033
+    assert first_progress["metric_label"] == "Metric 2/3 mix_score_defender"
+    assert first_progress["future_remaining"] == 1960
     assert int(first_progress["counter"].value) == 0
     assert len(submitted[0][0]) == 8
     assert "trial_progress" not in submitted[0][0][-1].__class__.__name__.lower()
@@ -224,7 +278,10 @@ def test_trial_log_shows_warming_up_until_each_worker_reports(monkeypatch):
     started = 1_000_000.0
     monkeypatch.setattr("optimizer.trial_progress.time.time", lambda: started + 180)
     counter = TrialFinishCounter()
-    progress = make_trial_progress(1200, 13, counter, started_at=started, parallel_workers=13)
+    progress = make_trial_progress(
+        1200, 13, counter, started_at=started, parallel_workers=13,
+        metric_name="us_robust", metrics=["mix_score_origin", "us_robust"],
+    )
     progress_filter = TrialProgressFilter(progress)
     record = logging.LogRecord(
         "optuna.study.study", logging.INFO, __file__, 1,
@@ -232,3 +289,5 @@ def test_trial_log_shows_warming_up_until_each_worker_reports(monkeypatch):
     )
     assert progress_filter.filter(record) is True
     assert "ETA warming up (1/13 workers)" in record.msg
+    assert record.msg.startswith("Metric 2/2 us_robust | Trial 14/1200 ETA warming up")
+    assert " | Total Trial 1/1200 ETA warming up" in record.msg

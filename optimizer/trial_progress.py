@@ -1,4 +1,4 @@
-"""改写 Optuna 既有 Trial 日志，在同一行补上目标预算和剩余时间。
+"""改写 Optuna 既有 Trial 日志，在同一行补上目标预算、剩余时间和指标进度。
 
 不另起一行，不修改 Journal 的 trial_id，也不新增配置开关。
 """
@@ -15,7 +15,7 @@ from multiprocessing import shared_memory
 
 
 _TRIAL_LINE = re.compile(r"^Trial (\d+) (finished with|pruned\b|failed with)")
-_ALREADY_REWRITTEN = re.compile(r"^Trial \d+/\d+ ")
+_ALREADY_REWRITTEN = re.compile(r"^(?:Metric \d+/\d+ .+ \| )?Trial \d+/\d+ ")
 _APPLIED = "_quantada_trial_progress"
 
 
@@ -178,9 +178,8 @@ def format_remaining_duration(seconds):
     return f"{days}d{hours}h" if hours else f"{days}d"
 
 
-def remaining_label(target_trials, finished_before, counted, started_at, now, parallel_workers=1):
-    """按本次运行墙钟速度估计剩余时间；失败不计入速度。"""
-    remaining = int(target_trials) - int(finished_before) - int(counted)
+def _eta_label(remaining, counted, started_at, now, parallel_workers=1):
+    """按当前运行速度格式化给定剩余 trial 的 ETA。"""
     if remaining <= 0:
         return "finishing"
     elapsed = float(now) - float(started_at)
@@ -195,14 +194,43 @@ def remaining_label(target_trials, finished_before, counted, started_at, now, pa
     return f"ETA {format_remaining_duration(eta)}"
 
 
-def make_trial_progress(target_trials, finished_before, counter, started_at=None, parallel_workers=1):
-    """组装可传入 worker 的进度状态。分母是指标目标预算，不是本轮剩余额度。"""
+def remaining_label(target_trials, finished_before, counted, started_at, now, parallel_workers=1, future_remaining=0):
+    """按当前指标速度估计当前及后续指标的整批剩余时间。"""
+    remaining = max(0, int(target_trials) - int(finished_before) - int(counted))
+    remaining += int(future_remaining)
+    return _eta_label(remaining, counted, started_at, now, parallel_workers)
+
+
+def metric_remaining_label(target_trials, finished_before, counted, started_at, now, parallel_workers=1):
+    """按当前指标速度估计当前指标的剩余时间。"""
+    remaining = max(0, int(target_trials) - int(finished_before) - int(counted))
+    return _eta_label(remaining, counted, started_at, now, parallel_workers)
+
+
+def make_trial_progress(
+    target_trials, finished_before, counter, started_at=None, parallel_workers=1,
+    metric_name=None, metrics=None, future_finished_counts=(),
+    total_target_trials=None, total_finished_before=0,
+):
+    """组装当前指标和整批指标共用的进度状态。"""
+    metric_label = None
+    if metric_name is not None:
+        requested_metrics = list(metrics) if metrics else [metric_name]
+        if metric_name not in requested_metrics:
+            requested_metrics = [metric_name]
+        metric_label = f"Metric {requested_metrics.index(metric_name) + 1}/{len(requested_metrics)} {metric_name}"
     return {
         "target_trials": int(target_trials),
         "finished_before": max(0, int(finished_before)),
         "started_at": time.time() if started_at is None else float(started_at),
         "parallel_workers": max(1, int(parallel_workers or 1)),
         "counter": counter,
+        "metric_label": metric_label,
+        "future_remaining": sum(
+            max(0, int(target_trials) - int(finished)) for finished in future_finished_counts
+        ),
+        "total_target_trials": int(total_target_trials or target_trials),
+        "total_finished_before": max(0, int(total_finished_before)),
     }
 
 
@@ -238,16 +266,35 @@ class TrialProgressFilter(logging.Filter):
             counted = counter.read()
         else:
             counted = counter.add(1)
-        label = remaining_label(
+        now = time.time()
+        metric_eta = metric_remaining_label(
             self.progress["target_trials"],
             self.progress["finished_before"],
             counted,
             self.progress["started_at"],
-            time.time(),
+            now,
+            self.progress.get("parallel_workers", 1),
+        )
+        total_finished = self.progress.get("total_finished_before", self.progress["finished_before"]) + counted
+        total_target = self.progress.get("total_target_trials", self.progress["target_trials"])
+        total_eta = _eta_label(
+            max(0, int(total_target) - int(total_finished)),
+            counted,
+            self.progress["started_at"],
+            now,
             self.progress.get("parallel_workers", 1),
         )
         rest = message[match.end(1):]
-        record.msg = f"Trial {match.group(1)}/{int(self.progress['target_trials'])} {label}{rest}"
+        status_text = rest.lstrip()
+        if status_text:
+            status_text = status_text[0].upper() + status_text[1:]
+            rest = " " + status_text
+        metric_label = self.progress.get("metric_label")
+        metric_prefix = f"{metric_label} | " if metric_label else ""
+        record.msg = (
+            f"{metric_prefix}Trial {match.group(1)}/{int(self.progress['target_trials'])} {metric_eta}"
+            f" | Total Trial {int(total_finished)}/{int(total_target)} {total_eta} |{rest}"
+        )
         record.args = ()
         if "message" in record.__dict__:
             record.message = record.msg

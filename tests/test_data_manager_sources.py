@@ -498,6 +498,40 @@ def test_data_manager_applies_runtime_token_only_to_selected_provider():
     assert other_provider.is_external_mode is True
 
 
+def test_gm_historical_end_skips_realtime_stitch(monkeypatch):
+    import data_providers.gm_provider as gm_module
+
+    history = pd.DataFrame(
+        {
+            'open': [1.0], 'high': [1.1], 'low': [0.9],
+            'close': [1.0], 'volume': [100.0],
+            'eob': pd.to_datetime(['2024-01-02']),
+        }
+    )
+    calls = {'current': 0}
+
+    monkeypatch.setattr(gm_module, 'history', lambda **kwargs: history.copy())
+
+    def fail_current(**kwargs):
+        calls['current'] += 1
+        raise AssertionError('historical backtest must not query current()')
+
+    monkeypatch.setattr(gm_module, 'current', fail_current)
+    provider = gm_module.GmDataProvider(token='historical-token')
+
+    result = provider.get_data(
+        'SHSE.510300',
+        start_date='20240101',
+        end_date='20240131',
+        timeframe='Days',
+        compression=1,
+    )
+
+    assert result is not None
+    assert len(result) == 1
+    assert calls['current'] == 0
+
+
 def test_data_manager_close_does_not_call_dynamic_provider_attribute():
     class DynamicProvider:
         def __init__(self):

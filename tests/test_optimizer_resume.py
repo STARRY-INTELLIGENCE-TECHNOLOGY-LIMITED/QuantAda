@@ -470,6 +470,7 @@ def test_resumable_study_write_failure_does_not_fall_back_to_memory(monkeypatch,
 @pytest.mark.parametrize("legacy_scores", [False, True])
 def test_repeated_multi_metric_command_reuses_trials_and_tops_up_budget(monkeypatch, tmp_path, interruption_state, legacy_scores):
     evaluated = []
+    future_counts = []
     frame = pd.DataFrame({"close": [1.0, 1.1, 1.2]}, index=pd.date_range("2024-01-01", periods=3))
     context = {
         "strategy_class": SimpleNamespace(option_universe=("PUT",)), "risk_control_classes": [],
@@ -481,6 +482,10 @@ def test_repeated_multi_metric_command_reuses_trials_and_tops_up_budget(monkeypa
     class OfflineJob(runtime.OptimizationJob):
         def __init__(self, args, fixed_params, opt_params_def, risk_params, shared_context=None):
             super().__init__(args, fixed_params, opt_params_def, risk_params, shared_context=shared_context or context)
+
+        def run(self):
+            future_counts.append((self.args.metric, self._future_metric_finished_counts))
+            return super().run()
 
         def _evaluate_trial_params(self, params):
             evaluated.append((self.args.metric, params["x"]))
@@ -526,6 +531,12 @@ def test_repeated_multi_metric_command_reuses_trials_and_tops_up_budget(monkeypa
         assert "_optimizer_worker_config_version" not in legacy.user_attrs
         journals = [path for path in journals if path != legacy_path]
     assert len(journals) == 2
+    assert future_counts == [
+        ("return", (0,)), ("sharpe", ()),
+        ("return", (2,)), ("sharpe", ()),
+        ("return", (2,)), ("sharpe", ()),
+        ("return", (4,)), ("sharpe", ()),
+    ]
     studies = []
     for journal in journals:
         infos = read_study_metadata(journal)
