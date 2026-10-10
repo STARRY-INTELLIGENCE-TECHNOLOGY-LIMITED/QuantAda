@@ -47,7 +47,7 @@ def normalize_source_name(source: str) -> str:
 class DataManager:
     def __init__(self):
         self.providers = self.auto_discover_and_sort_providers()
-        self.data_path = config.DATA_PATH
+        self.data_path = getattr(config, "DATA_PATH", ".data") or ".data"
         # 创建一个从字符串名称到提供者实例的映射
         self.provider_map = OrderedDict(
             (p.__class__.__name__.replace('DataProvider', '').lower(), p)

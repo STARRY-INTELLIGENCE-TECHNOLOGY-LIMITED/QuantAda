@@ -17,7 +17,7 @@ class CsvDataProvider(BaseDataProvider):
         # 在实例化时解析 DATA_PATH，确保命令行配置覆盖值生效；该模块
         # 可能早于命令行参数解析完成导入。
         if data_path is None:
-            data_path = getattr(config, "DATA_PATH", ".data")
+            data_path = getattr(config, "DATA_PATH", ".data") or ".data"
         self.data_path = data_path
         self.ensure_cache_dir(self.data_path)
 

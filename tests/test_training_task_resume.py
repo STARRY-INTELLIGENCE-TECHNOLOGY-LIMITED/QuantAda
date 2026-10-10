@@ -364,6 +364,19 @@ def test_cli_resume_cancel_never_starts_training(monkeypatch, tmp_path, cancel):
     assert run._run_main() == 0
 
 
+def test_cli_resume_defaults_data_path_when_config_key_is_missing(monkeypatch, tmp_path):
+    import config
+    import run
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delattr(config, "DATA_PATH")
+    _write_task(tmp_path / ".data" / "optuna" / "optuna_task.log")
+    monkeypatch.setattr(run.sys, "argv", ["run.py", "--train_resume"])
+    monkeypatch.setattr("builtins.input", lambda _: "q")
+
+    assert run._run_main() == 0
+
+
 def test_web_resume_uses_saved_arguments_and_existing_execution_tracking(tmp_path, monkeypatch):
     import config
     from command_center.web import CommandCenterService
@@ -389,6 +402,16 @@ def test_web_resume_uses_saved_arguments_and_existing_execution_tracking(tmp_pat
     result = service.run_snapshot(run_id)
     assert result["return_code"] == 0
     assert "resume-ok" in "\n".join(result["output"])
+
+
+def test_web_training_tasks_defaults_data_path_when_config_key_is_missing(tmp_path, monkeypatch):
+    import config
+    from command_center.web import CommandCenterService
+
+    monkeypatch.delattr(config, "DATA_PATH")
+    _write_task(tmp_path / ".data" / "optuna" / "optuna_task.log")
+
+    assert len(CommandCenterService(tmp_path).training_tasks()) == 1
 
 
 def test_web_task_api_and_unknown_selection_validation(tmp_path, monkeypatch):

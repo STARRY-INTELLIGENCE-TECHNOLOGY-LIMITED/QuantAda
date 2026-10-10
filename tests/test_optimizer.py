@@ -1088,6 +1088,17 @@ def test_optimizer_terminal_log_path_uses_optuna_style_name(tmp_path, monkeypatc
     ) in got
 
 
+def test_optimizer_terminal_log_path_defaults_when_data_path_is_missing(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delattr(terminal_log.config, "DATA_PATH")
+
+    got = terminal_log.build_optimizer_terminal_log_path("legacy_config")
+
+    expected = tmp_path / ".data" / "optimizer" / "optimizer_terminal_legacy_config.log"
+    assert got == str(expected)
+    assert expected.parent.is_dir()
+
+
 def test_optimizer_terminal_log_tee_writes_console_and_file(tmp_path, capsys, monkeypatch):
     monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
     monkeypatch.setattr(terminal_log, "_TERMINAL_LOG_TEE", None)

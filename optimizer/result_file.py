@@ -10,7 +10,8 @@ import config
 
 def build_optimizer_result_file_path(run_dt=None, run_pid=None):
     """构造当前训练批次的 UTF-8 文本结果文件路径。"""
-    directory = os.path.join(os.getcwd(), config.DATA_PATH, "optimizer")
+    data_path = getattr(config, "DATA_PATH", ".data") or ".data"
+    directory = os.path.join(os.getcwd(), data_path, "optimizer")
     os.makedirs(directory, exist_ok=True)
     run_dt = run_dt or datetime.datetime.now()
     run_pid = os.getpid() if run_pid is None else run_pid

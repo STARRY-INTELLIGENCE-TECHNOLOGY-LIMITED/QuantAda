@@ -409,7 +409,8 @@ def _run_optimizer_mode_impl(
     else:
         opt_p_def = raw_opt_p_def
 
-    log_dir = os.path.join(os.getcwd(), config.DATA_PATH, "optuna")
+    data_path = getattr(config, "DATA_PATH", ".data") or ".data"
+    log_dir = os.path.join(os.getcwd(), data_path, "optuna")
     plan = resolve_study_plan(args, fixed_params, opt_p_def, risk_params, metrics_list, log_dir, requested_window)
     for study_info in plan["source_studies"]:
         owner = study_info["attrs"].get("_optimizer_owner")
@@ -2731,7 +2732,8 @@ class OptimizationJob:
 
         if use_journal_storage:
             if HAS_JOURNAL:
-                log_dir = os.path.join(os.getcwd(), config.DATA_PATH, 'optuna')
+                data_path = getattr(config, 'DATA_PATH', '.data') or '.data'
+                log_dir = os.path.join(os.getcwd(), data_path, 'optuna')
                 os.makedirs(log_dir, exist_ok=True)
 
                 # 批次 Journal 只作为锚点。每个 Study 独占文件，避免 trial_id 与控制台编号岔开。

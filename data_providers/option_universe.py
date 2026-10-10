@@ -357,7 +357,11 @@ def _checkpoint_parts(underlying, spec, snapshot_limit):
 
 def _checkpoint_dir(data_manager):
     """option_universe 目录；父目录不存在时一并创建。"""
-    data_path = getattr(data_manager, "data_path", None) or getattr(config, "DATA_PATH", ".data")
+    data_path = (
+        getattr(data_manager, "data_path", None)
+        or getattr(config, "DATA_PATH", ".data")
+        or ".data"
+    )
     folder = os.path.join(CsvDataProvider.ensure_cache_dir(data_path), "option_universe")
     os.makedirs(folder, exist_ok=True)
     return folder

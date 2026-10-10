@@ -48,7 +48,8 @@ def _safe_log_token(value, max_len=180):
 
 
 def build_optimizer_terminal_log_path(name_tag=None, run_dt=None, run_pid=None):
-    log_dir = os.path.join(os.getcwd(), config.DATA_PATH, "optimizer")
+    data_path = getattr(config, "DATA_PATH", ".data") or ".data"
+    log_dir = os.path.join(os.getcwd(), data_path, "optimizer")
     os.makedirs(log_dir, exist_ok=True)
 
     if name_tag:

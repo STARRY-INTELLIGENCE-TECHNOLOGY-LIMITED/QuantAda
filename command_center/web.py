@@ -457,13 +457,15 @@ class CommandCenterService:
 
     def training_tasks(self) -> list[dict[str, Any]]:
         """返回与 CLI 共用的训练任务列表；列表展示不暴露整份参数快照。"""
-        tasks = list_training_tasks(self.project_root / config.DATA_PATH / "optuna")
+        data_path = getattr(config, "DATA_PATH", ".data") or ".data"
+        tasks = list_training_tasks(self.project_root / data_path / "optuna")
         return [{key: value for key, value in task.items() if key != "recorded"} for task in tasks]
 
     def training_task_log(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """按页返回选中任务的最新终端日志，默认末尾；不接受客户端日志路径。"""
         task_id = str(payload.get("train_resume") or "")
-        tasks = list_training_tasks(self.project_root / config.DATA_PATH / "optuna")
+        data_path = getattr(config, "DATA_PATH", ".data") or ".data"
+        tasks = list_training_tasks(self.project_root / data_path / "optuna")
         task = next((item for item in tasks if item["task_id"] == task_id), None)
         if task is None:
             raise ValueError("Task not found. Refresh the list and select again.")
@@ -751,7 +753,8 @@ class CommandCenterService:
 
         if "train_resume" in payload:
             task_id = str(payload.get("train_resume") or "")
-            tasks = list_training_tasks(self.project_root / config.DATA_PATH / "optuna")
+            data_path = getattr(config, "DATA_PATH", ".data") or ".data"
+            tasks = list_training_tasks(self.project_root / data_path / "optuna")
             task = next((item for item in tasks if item["task_id"] == task_id), None)
             if task is None:
                 raise ValueError("Task not found. Refresh the list and select again.")

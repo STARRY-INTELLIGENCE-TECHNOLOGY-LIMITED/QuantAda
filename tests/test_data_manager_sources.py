@@ -20,6 +20,15 @@ def test_platform_default_data_source_is_owned_by_data_providers():
     assert resolve_platform_default_source("unknown") == ""
 
 
+def test_data_manager_defaults_data_path_when_config_key_is_missing(monkeypatch):
+    import config
+
+    monkeypatch.delattr(config, "DATA_PATH")
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [])
+
+    assert DataManager().data_path == ".data"
+
+
 def test_data_manager_normalizes_platform_source_aliases():
     assert DataManager._split_source_names("ib tiingo") == ["ibkr", "tiingo"]
     assert DataManager._split_source_names("gmi") == ["gmi"]

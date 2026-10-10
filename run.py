@@ -351,7 +351,7 @@ def _run_main():
         overrides = ast.literal_eval(args.config)
         if not isinstance(overrides, dict):
             parser.error("--config must be a Python dictionary")
-        data_path = overrides.get("DATA_PATH", config.DATA_PATH)
+        data_path = overrides.get("DATA_PATH", getattr(config, "DATA_PATH", ".data")) or ".data"
         print("Loading historical training tasks...")
         extra_arguments = [item for item in raw_cli_args if item != "--train_resume"]
         task = choose_training_task(list_training_tasks(os.path.join(os.getcwd(), data_path, "optuna")), extra_arguments)
