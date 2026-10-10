@@ -340,7 +340,7 @@ class CommandCenterService:
         presets = list(self.catalog.presets)
         known_data_sources = {
             "gm", "futu", "tiingo", "akshare", "tushare", "sxsc_tushare",
-            "csv", "theta", "thetadata", "ibkr", "hybrid", "theta+futu",
+            "csv", "theta", "thetadata", "cboe", "ibkr", "hybrid", "theta+futu",
         }
         profile_ids = {profile.profile_id for profile in self.catalog.profiles}
         return {

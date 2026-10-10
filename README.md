@@ -83,6 +83,8 @@ Futu 期权 Credit Spread 使用券商原子组合接口；若当前 OpenD 仿�
 
 Provider 组合在 `configs/providers.py` 的 `DATA_PROVIDER_COMPOSITIONS` 中声明。每项配置指定历史 Provider、实时 Provider 和 `package.module:factory`；新增组合只需实现自己的适配器工厂并注册配置，不需修改 DataManager 或工作台。
 
+CBOE 官方日频指数 CSV 由 `cboe` Provider 按代码读取，例如 `US.VIX`、`US.VIX3M`、`US.VVIX` 和 `US.SKEW`；完整代码、字段语义和 `close-only` 指数限制见 [`docs/specs/contracts/cboe_provider.md`](docs/specs/contracts/cboe_provider.md)。
+
 ### 4) 基础回测示例
 
 ```bash

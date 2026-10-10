@@ -8,6 +8,7 @@
 import math
 import re
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -292,7 +293,7 @@ def black_scholes_series(
 def iv_percentile(
     dataframe: pd.DataFrame,
     iv: pd.Series,
-    window: int | None = None,
+    window: Optional[int] = None,
     explicit: bool = True,
 ) -> pd.Series:
     """计算当前 IV 在历史窗口中的百分位，显式 IVP 优先。"""

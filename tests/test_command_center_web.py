@@ -547,6 +547,11 @@ def test_public_futu_generate_uses_futu_source(tmp_path):
     assert "futu_global" not in catalog["data_sources"]
 
 
+def test_catalog_exposes_cboe_data_source(tmp_path):
+    service = CommandCenterService(tmp_path)
+    assert "cboe" in service.catalog_snapshot()["data_sources"]
+
+
 def test_hybrid_catalog_profile_resolves_theta_and_futu_configuration(tmp_path):
     service = CommandCenterService(tmp_path)
     catalog = service.catalog_snapshot()

@@ -197,10 +197,16 @@ def historical_as_of_dates(start_date, end_date, step_days: int = DEFAULT_AS_OF_
     if end < start:
         raise ValueError("option universe end_date is before start_date")
     step = max(1, int(step_days or DEFAULT_AS_OF_STEP_DAYS))
-    dates = list(pd.date_range(start, end, freq=f"{step}D"))
-    if not dates or dates[0] != start:
+    # 周频步长通常为 7 天。若起点落在周末，直接以起点生成日期会让所有
+    # 采样日都落在同一个周末，过滤后只剩终点，导致历史期权池只展开最后
+    # 一个快照。将首个采样锚定到起点之后的下一个工作日，保留整个窗口。
+    first = start
+    while first.weekday() >= 5 and first <= end:
+        first = first + pd.Timedelta(days=1)
+    dates = list(pd.date_range(first, end, freq=f"{step}D")) if first <= end else []
+    if start.weekday() < 5 and (not dates or dates[0] != start):
         dates.insert(0, start)
-    if dates[-1] != end:
+    if not dates or dates[-1] != end:
         dates.append(end)
     unique = []
     seen = set()
@@ -214,7 +220,10 @@ def historical_as_of_dates(start_date, end_date, step_days: int = DEFAULT_AS_OF_
         seen.add(key)
         unique.append(day)
     if not unique:
-        unique = [start, end] if start != end else [start]
+        unique = []
+        for day in (start, end):
+            if day.weekday() < 5 and day not in unique:
+                unique.append(day)
     return unique
 
 

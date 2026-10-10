@@ -74,6 +74,8 @@ Futu option credit spreads use the broker's atomic combo-order API. If the curre
 
 Provider compositions are declared in `configs/providers.py` under `DATA_PROVIDER_COMPOSITIONS`. Each entry names a historical Provider, a realtime Provider, and a `package.module:factory`; adding another pair only requires a new adapter factory and configuration, not DataManager or Command Center changes.
 
+Cboe's official daily index CSVs are available through the `cboe` Provider by symbol, such as `US.VIX`, `US.VIX3M`, `US.VVIX`, and `US.SKEW`. The complete code list, field semantics, and `close-only` limitations are documented in [`docs/specs/contracts/cboe_provider.md`](docs/specs/contracts/cboe_provider.md).
+
 ### 4. Basic Backtest
 
 ```bash

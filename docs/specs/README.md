@@ -30,7 +30,7 @@
 1. 架构与行为基线: `architecture/core_principles.md`
 2. 实盘运行语义: `architecture/live_runtime_semantics.md`
 3. Broker / Strategy 契约: `contracts/live_adapter.md`, `contracts/strategy.md`
-4. 其他扩展点: `contracts/extensions.md`
+4. 其他扩展点: `contracts/extensions.md`；CBOE 日频指数代码: `contracts/cboe_provider.md`
 5. 代码生成流程: `workflows/agent_codegen.md`
 6. 优化器运行期日志: `workflows/optimizer_runtime.md`
 7. 专业研报生成: `workflows/professional_research_report.md`

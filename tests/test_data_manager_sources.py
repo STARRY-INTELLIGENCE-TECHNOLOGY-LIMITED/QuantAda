@@ -27,6 +27,7 @@ def test_data_manager_normalizes_platform_source_aliases():
     assert DataManager._split_source_names("thetadata") == ["theta"]
     assert DataManager._split_source_names("sxsc_tushare") == ["sxsctushare"]
     assert DataManager._split_source_names("theta + futu") == ["hybrid"]
+    assert DataManager._split_source_names("theta+futu,cboe") == ["hybrid", "cboe"]
 
 
 def test_cache_data_merges_segments_without_duplicate_timestamps(tmp_path, monkeypatch):

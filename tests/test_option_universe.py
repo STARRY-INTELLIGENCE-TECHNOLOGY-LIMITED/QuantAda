@@ -296,6 +296,16 @@ def test_historical_as_of_dates_include_bounds_and_skip_weekend():
     assert all(day.weekday() < 5 for day in dates)
 
 
+def test_historical_as_of_dates_weekend_start_keeps_weekly_snapshots():
+    dates = historical_as_of_dates("2026-09-05", "2026-09-30", step_days=7)
+
+    assert dates
+    assert dates[0] == pd.Timestamp("2026-09-07")
+    assert dates[-1] == pd.Timestamp("2026-09-30")
+    assert len(dates) > 2
+    assert all(day.weekday() < 5 for day in dates)
+
+
 def test_expand_historical_unions_contracts_and_keeps_underlyings():
     manager = DummyManager({
         ("US.SPY", "2026-09-04"): _chain(
