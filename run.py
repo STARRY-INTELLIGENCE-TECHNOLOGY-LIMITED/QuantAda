@@ -10,6 +10,8 @@ from backtest.backtester import Backtester
 import optimizer
 from optimizer.runtime import infer_omitted_backtest_window
 from common.loader import get_class_from_name, pascal_to_snake
+from common.detached_process import spawn_detached_python
+from common.process_tree import stop_optimizer_owners
 from common.live_process_supervisor import (
     LiveWorkerOperatorStop,
     install_live_worker_operator_stop_handler,
@@ -277,7 +279,8 @@ def _run_main():
     parser.add_argument('--config', type=str, default='{}',
                         help="覆盖config.py配置 (JSON字符串, 例如: \"{'GM_TOKEN':'xxx','LOG':False}\")")
     # Optimizer 专用参数
-    parser.add_argument('--train_resume', action='store_true', help="List historical training tasks by most recent update and resume one interactively")
+    parser.add_argument('--train_resume', action='store_true', help="List historical training tasks and launch the selected resume in a detached process")
+    parser.add_argument('--train_kill', action='store_true', help="List running training tasks and stop selected process trees")
     parser.add_argument('--opt_params', type=str, default=None, help="[优化模式] 优化参数空间定义 JSON")
     parser.add_argument('--n_trials', type=int, default=None, help="[优化模式] 累计有效试验预算，失败重试不占用完成额度 (默认: 自动推断)")
     parser.add_argument(
@@ -343,6 +346,46 @@ def _run_main():
     # 3. 解析参数
     args = parser.parse_args()
 
+    if args.train_resume and args.train_kill:
+        parser.error("--train_resume and --train_kill cannot be used together")
+
+    if args.train_kill:
+        from optimizer.training_tasks import choose_running_training_tasks, list_running_training_tasks
+
+        if args.strategy or args.connect:
+            parser.error("--train_kill does not accept a strategy argument or --connect")
+        overrides = ast.literal_eval(args.config)
+        if not isinstance(overrides, dict):
+            parser.error("--config must be a Python dictionary")
+        data_path = overrides.get("DATA_PATH", getattr(config, "DATA_PATH", ".data")) or ".data"
+        print("Loading running historical training tasks...")
+        running_tasks = list_running_training_tasks(os.path.join(os.getcwd(), data_path, "optuna"))
+        selected_tasks = choose_running_training_tasks(running_tasks)
+        if not selected_tasks:
+            return 0
+        owners = list(dict.fromkeys(
+            owner for task in selected_tasks for owner in task.get("running_owners", ()) if owner
+        ))
+        outcomes = stop_optimizer_owners(owners)
+        failed = []
+        for task in selected_tasks:
+            task_outcomes = [outcomes.get(owner) for owner in task.get("running_owners", ())]
+            if task_outcomes and all(item == "stopped" for item in task_outcomes):
+                status = "stopped"
+            elif task_outcomes and all(item in {"stopped", "already_stopped"} for item in task_outcomes):
+                status = "already_stopped"
+            elif not task_outcomes:
+                status = "already_stopped"
+            else:
+                status = "stop_incomplete"
+            if status == "stop_incomplete":
+                failed.append(task)
+            print(
+                f"[TrainKill] {status}: {task.get('strategy')} | "
+                f"{', '.join(task.get('metrics', ()))} | pids={','.join(str(pid) for pid in task.get('running_pids', ())) }"
+            )
+        return 1 if failed else 0
+
     if args.train_resume:
         from optimizer.training_tasks import build_resume_arguments, choose_training_task, list_training_tasks
 
@@ -358,12 +401,25 @@ def _run_main():
         if task is None:
             return 0
         restored = build_resume_arguments(task, extra_arguments)
-        # 提权重启必须继续选中的任务，不能在新窗口再次弹出选择菜单。
-        sys.argv[1:] = restored
-        args = parser.parse_args(restored)
-        os.environ.pop("QUANTADA_STUDY_NAME", None)
-        os.environ.pop("QUANTADA_STUDY_JOURNAL", None)
-        print(f"\nResuming: {task['strategy']} | {', '.join(task['metrics'])}")
+        # 菜单进程只负责选择；训练进程脱离当前终端后再接管保存的参数。
+        child_env = os.environ.copy()
+        child_env.pop("QUANTADA_STUDY_NAME", None)
+        child_env.pop("QUANTADA_STUDY_JOURNAL", None)
+        child_command = [sys.executable, "-u", os.path.abspath(sys.argv[0]), *restored]
+        try:
+            child_pid, bootstrap_log = spawn_detached_python(
+                child_command,
+                cwd=os.getcwd(),
+                env=child_env,
+                data_path=data_path,
+            )
+        except Exception as exc:
+            print(f"Failed to launch detached resume process: {exc}")
+            return 1
+        print(f"\nDetached resume started: pid={child_pid}")
+        print(f"Bootstrap log: {bootstrap_log}")
+        print(f"Resuming: {task['strategy']} | {', '.join(task['metrics'])}")
+        return 0
     if not args.strategy:
         parser.error("Specify a strategy, or use --train_resume to choose a historical training task")
 

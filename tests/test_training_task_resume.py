@@ -16,7 +16,16 @@ import pytest
 
 from optimizer.journal_metadata import WORKER_CONFIG_VERSION, read_study_metadata
 from common.terminal_log import OPTIMIZER_AI_ANALYSIS_END_MARKER, OPTIMIZER_AI_ANALYSIS_START_MARKER
-from optimizer.training_tasks import _DISPLAY_TAIL_BYTES, build_resume_arguments, choose_training_task, list_training_tasks, read_terminal_log_page, training_task_commands
+from optimizer.training_tasks import (
+    _DISPLAY_TAIL_BYTES,
+    build_resume_arguments,
+    choose_running_training_tasks,
+    choose_training_task,
+    list_running_training_tasks,
+    list_training_tasks,
+    read_terminal_log_page,
+    training_task_commands,
+)
 
 
 def test_training_resume_ui_async_consistency():
@@ -308,6 +317,74 @@ def test_resume_preview_merges_config_overrides_like_actual_cli(tmp_path):
     assert ast.literal_eval(argv[last_config + 1]) == {"LOT_SIZE": 1, "ANNUAL_FACTOR": 365}
 
 
+def test_running_training_tasks_keep_owner_pids_and_filter_stale_tasks(tmp_path, monkeypatch):
+    import optimizer.training_tasks as training_tasks
+
+    active = _recorded(
+        strategy="examples.Active",
+        _optimizer_owner="optimizer_RUN20261011-120000_1234",
+    )
+    stale = _recorded(
+        strategy="examples.Stale",
+        _optimizer_owner="optimizer_RUN20261011-120000_5678",
+    )
+    _write_task(tmp_path / "optuna_active.log", attributes=active, name="active")
+    _write_task(tmp_path / "optuna_stale.log", attributes=stale, name="stale")
+    monkeypatch.setattr(
+        training_tasks,
+        "optimizer_owner_process",
+        lambda owner: {"pid": 1234} if owner.endswith("_1234") else None,
+    )
+
+    tasks = list_running_training_tasks(tmp_path)
+
+    assert len(tasks) == 1
+    assert tasks[0]["strategy"] == "examples.Active"
+    assert tasks[0]["running_owners"] == ["optimizer_RUN20261011-120000_1234"]
+    assert tasks[0]["running_pids"] == [1234]
+
+
+def test_running_training_task_menu_supports_multi_select_and_confirmation(tmp_path, monkeypatch):
+    tasks = [
+        {"strategy": "examples.A", "metrics": ["return"], "running_pids": [101]},
+        {"strategy": "examples.B", "metrics": ["sharpe"], "running_pids": [202]},
+    ]
+    answers = iter(["1 2", "k", "KILL"])
+    monkeypatch.setattr("builtins.input", lambda _: next(answers))
+
+    selected = choose_running_training_tasks(tasks)
+
+    assert [task["strategy"] for task in selected] == ["examples.A", "examples.B"]
+
+
+def test_cli_train_kill_stops_selected_owner_trees(monkeypatch, tmp_path, capsys):
+    import config
+    import optimizer.training_tasks as training_tasks
+    import run
+
+    task = {
+        "strategy": "examples.Active",
+        "metrics": ["return"],
+        "running_owners": ["optimizer_RUN20261011-120000_4321"],
+        "running_pids": [4321],
+    }
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path / ".data"))
+    monkeypatch.setattr(run.sys, "argv", ["run.py", "--train_kill"])
+    monkeypatch.setattr(training_tasks, "list_running_training_tasks", lambda _directory: [task])
+    monkeypatch.setattr(training_tasks, "choose_running_training_tasks", lambda tasks: tasks)
+    calls = {}
+
+    def stop(owners):
+        calls["owners"] = owners
+        return {owners[0]: "stopped"}
+
+    monkeypatch.setattr(run, "stop_optimizer_owners", stop)
+
+    assert run._run_main() == 0
+    assert calls["owners"] == task["running_owners"]
+    assert "[TrainKill] stopped" in capsys.readouterr().out
+
+
 def test_cli_resume_restores_selection_before_elevation_and_allows_worker_override(monkeypatch, tmp_path):
     import config
     import run
@@ -323,26 +400,26 @@ def test_cli_resume_restores_selection_before_elevation_and_allows_worker_overri
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
     captured = {}
 
+    detached = {}
+
+    def spawn(command, **kwargs):
+        detached.update(command=command, kwargs=kwargs)
+        return 4321, str(tmp_path / "resume_launcher.log")
+
     def optimize(**kwargs):
         captured.update(kwargs)
         return 0
 
+    monkeypatch.setattr(run, "spawn_detached_python", spawn)
     monkeypatch.setattr(run.optimizer, "run_optimizer_mode", optimize)
-    with pytest.raises(SystemExit) as exit_result:
-        run._run_main()
-    assert exit_result.value.code == 0
-    args = captured["args"]
-    assert args.strategy == "examples.Old"
-    assert args.study_journal == str(old)
-    assert args.metric == "return,sharpe"
-    assert args.n_jobs == 2
-    assert args.n_trials == 4
-    assert not hasattr(args, "opt_schedule")
-    assert args.refresh is False
-    assert args.start_date == "20230923"
-    assert "--train_resume" not in run.sys.argv
-    assert os.environ.get("QUANTADA_STUDY_NAME") is None
-    assert captured["fixed_params"] == {"size": 1}
+    assert run._run_main() == 0
+    assert captured == {}
+    assert detached["command"][0] == run.sys.executable
+    assert detached["command"][1:3] == ["-u", os.path.abspath("run.py")]
+    assert detached["command"][detached["command"].index("--study_journal") + 1] == str(old)
+    assert detached["command"][-2:] == ["--n_jobs", "2"]
+    assert detached["kwargs"]["env"].get("QUANTADA_STUDY_NAME") is None
+    assert detached["kwargs"]["env"].get("QUANTADA_STUDY_JOURNAL") is None
 
 
 @pytest.mark.parametrize("cancel", ["q", EOFError(), KeyboardInterrupt()])

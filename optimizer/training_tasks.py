@@ -12,6 +12,7 @@ from common.runtime_command import format_cli_command
 from common.terminal_log import (
     OPTIMIZER_AI_ANALYSIS_END_MARKER, OPTIMIZER_AI_ANALYSIS_START_MARKER, get_optimizer_terminal_log_path,
 )
+from common.process_tree import optimizer_owner_process
 from optimizer.journal_metadata import (
     WORKER_CONFIG_VERSION, TRIAL_STATES, finished_trial_count, parse_recorded_value, read_study_metadata, study_identity,
 )
@@ -398,6 +399,9 @@ def _merge_batch_tasks(tasks):
         task["notice"] = " ".join(notices)
         task["task_id"] = hashlib.sha256((batch + "\n" + key).encode("utf-8")).hexdigest()[:24]
         task["source_journals"] = sorted({item["journal"] for item in group})
+        task["owners"] = list(dict.fromkeys(
+            owner for item in group for owner in item.get("owners", ()) if owner
+        ))
         merged.append(task)
     return merged
 
@@ -471,6 +475,10 @@ def list_training_tasks(journal_dir):
                     str(study["attrs"].get("metric") or ""): dict(study.get("trial_counts") or {})
                     for study in latest
                 },
+                "owners": list(dict.fromkeys(
+                    str(study["attrs"].get("_optimizer_owner") or "").strip()
+                    for study in latest if str(study["attrs"].get("_optimizer_owner") or "").strip()
+                )),
                 "recorded": attrs, "resumable": True, "reason": "",
                 "worker_config_version": attrs.get("_optimizer_worker_config_version"),
                 "training_status": _STATUS_UNFINISHED,
@@ -492,6 +500,110 @@ def list_training_tasks(journal_dir):
     return sorted(tasks, key=lambda task: (
         -task["updated_ns"], task["worker_config_version"] != WORKER_CONFIG_VERSION, task["task_id"],
     ))
+
+
+def list_running_training_tasks(journal_dir):
+    """只返回仍有可验证优化器主进程的任务。"""
+    running = []
+    for task in list_training_tasks(journal_dir):
+        verified = {
+            owner: record
+            for owner in task.get("owners", ())
+            if (record := optimizer_owner_process(owner)) is not None
+        }
+        if not verified:
+            continue
+        task["running_owners"] = list(verified)
+        task["running_pids"] = list(dict.fromkeys(record["pid"] for record in verified.values()))
+        running.append(task)
+    return running
+
+
+def choose_running_training_tasks(tasks):
+    """分页选择一个或多个运行中的训练任务，逐项复核后才允许停止。"""
+    if not tasks:
+        print("No running training tasks found.")
+        return None
+
+    page = 0
+    pages = (len(tasks) + 9) // 10
+    selected = set()
+    while True:
+        start = page * 10
+        visible = tasks[start:start + 10]
+        print("\nRunning training tasks")
+        for number, task in enumerate(visible, start=start + 1):
+            mark = "x" if number in selected else " "
+            pids = ",".join(str(pid) for pid in task.get("running_pids", ())) or "unknown"
+            print(
+                f"{number:>3}. [{mark}] pid={pids} {task.get('strategy')} | "
+                f"{', '.join(task.get('metrics', ()))} | {task.get('start_date')} -> {task.get('end_date')}"
+            )
+        print(f"Selected: {len(selected)} | Total {len(tasks)} tasks | page {page + 1}/{pages}")
+        print("Enter number(s) to toggle, a for all, n/p/g page, k to stop selected, q to cancel.")
+        try:
+            answer = input("Selection: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nStop cancelled.")
+            return None
+
+        if answer in {"q", "quit", "exit", "0"}:
+            print("Stop cancelled.")
+            return None
+        if answer == "n":
+            page = min(pages - 1, page + 1)
+            continue
+        if answer == "p":
+            page = max(0, page - 1)
+            continue
+        if answer.startswith("g") and answer[1:].strip().isdecimal():
+            target = int(answer[1:].strip())
+            if 1 <= target <= pages:
+                page = target - 1
+            else:
+                print(f"Page must be from 1 to {pages}.")
+            continue
+        if answer == "a":
+            page_numbers = set(range(start + 1, start + len(visible) + 1))
+            if page_numbers.issubset(selected):
+                selected.difference_update(page_numbers)
+            else:
+                selected.update(page_numbers)
+            continue
+        if answer in {"k", "stop"}:
+            if not selected:
+                print("Select at least one task first.")
+                continue
+            chosen = [tasks[number - 1] for number in sorted(selected)]
+            print("\nTasks to stop:")
+            for task in chosen:
+                pids = ", ".join(str(pid) for pid in task.get("running_pids", ()))
+                print(f"  pid={pids} {task.get('strategy')} | {', '.join(task.get('metrics', ()))}")
+            try:
+                confirmation = input("Type KILL to stop these process trees: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nStop cancelled.")
+                return None
+            if confirmation == "KILL":
+                return chosen
+            print("Stop cancelled; no processes were signalled.")
+            selected.clear()
+            continue
+
+        numbers = [part for part in re.split(r"[,\s]+", answer) if part]
+        if numbers and all(item.isdecimal() for item in numbers):
+            invalid = [int(item) for item in numbers if not 1 <= int(item) <= len(tasks)]
+            if invalid:
+                print(f"Task numbers must be from 1 to {len(tasks)}.")
+                continue
+            for number in dict.fromkeys(int(item) for item in numbers):
+                if number in selected:
+                    selected.remove(number)
+                else:
+                    selected.add(number)
+            page = (int(numbers[0]) - 1) // 10
+            continue
+        print("Enter task number(s), a, n, p, g page, k, or q.")
 
 
 def _prefer_richer_resume_target(tasks):
