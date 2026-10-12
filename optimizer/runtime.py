@@ -3002,6 +3002,11 @@ class OptimizationJob:
             if count <= 0:
                 return
             worker_count = min(resolved_workers, int(count))
+            print(
+                "[Optimizer] Resume queue phase: "
+                f"waiting={count}, requested_n_jobs={n_jobs}, resolved_workers={resolved_workers}, "
+                f"actual_workers={worker_count} (min(resolved_workers, waiting))."
+            )
             if worker_count <= 1 or not log_file:
                 run_queued_resume_trials(count)
                 return
@@ -3065,6 +3070,10 @@ class OptimizationJob:
                             progress.clear()
                             progress.update(updated_progress)
                         finished_before = finished_after_resume
+                    print(
+                        "[Optimizer] Resume queue phase finished; "
+                        f"new-trial phase worker budget={resolved_workers}."
+                    )
                 effective_parallel_jobs = min(resolved_workers, max(1, int(n_trials)))
                 print(
                     f"\n--- Starting Optimization ({n_trials} trials, {effective_parallel_jobs} parallel jobs) ---"

@@ -283,7 +283,7 @@ def test_failed_retries_do_not_consume_completion_gap(tmp_path):
     assert sum(trial.state == optuna.trial.TrialState.COMPLETE for trial in loaded.trials) == 3
 
 
-def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypatch, tmp_path):
+def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypatch, tmp_path, capsys):
     path, study_name, failed, storage = _seed_completion_gap(tmp_path)
     seen = []
     captured = {"calls": []}
@@ -340,6 +340,9 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
     assert sum(value in failed for value in seen) == 3
     assert sum(trial.state == optuna.trial.TrialState.COMPLETE for trial in loaded.trials) == 3
     assert OptimizationJob._remaining_trial_budget(loaded, 3) == 0
+    output = capsys.readouterr().out
+    assert "Resume queue phase: waiting=3, requested_n_jobs=2, resolved_workers=2, actual_workers=2" in output
+    assert "new-trial phase worker budget=2" in output
 
 
 def test_leftover_waiting_is_drained_by_parent_before_new_trials(monkeypatch, tmp_path):
