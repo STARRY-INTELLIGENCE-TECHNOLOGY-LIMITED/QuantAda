@@ -218,6 +218,8 @@ def test_full_day_engine_lifecycle(monkeypatch):
     engine = LiveTrader(cfg)
     context = MockContext(now=datetime(2026, 2, 17, 9, 30, 0))
     engine.init(context)
+    from alarms.manager import AlarmManager
+    assert AlarmManager()._live_broker is engine.broker
 
     # Step 1: 09:35 开盘建仓
     context.now = datetime(2026, 2, 17, 9, 35, 0)
@@ -723,6 +725,8 @@ def test_backtest_mode_auto_warmup_start_date(monkeypatch):
     engine = LiveTrader(cfg)
     context = MockContext(now=datetime(2026, 2, 17, 9, 30, 0))
     engine.init(context)
+    from alarms.manager import AlarmManager
+    assert AlarmManager()._live_broker is None
 
     calls = engine.data_provider.history_calls
     assert calls, "回测初始化阶段未触发历史数据拉取。"

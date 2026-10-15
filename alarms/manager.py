@@ -26,6 +26,7 @@ class AlarmManager:
     })
     _LIFECYCLE_STATUSES = frozenset({"STARTED", "ALIVE", "DEAD", "STOPPED"})
     _EXCEPTION_AGGREGATION_WINDOW_SECONDS = 60
+    _BROKER_STATUS_PROBE_TIMEOUT_SECONDS = 15.0
     _COOLDOWN_BASE_DELAY_SECONDS = 30
     _COOLDOWN_MAX_DELAY_SECONDS = 10 * 60
     _COOLDOWN_RESET_WINDOW_SECONDS = 15 * 60
@@ -84,6 +85,7 @@ class AlarmManager:
         self._exception_cooldown_state: Dict[Tuple[str, str], Dict[str, float]] = {}
         self._exception_cooldown_timer = None
         self._exception_cooldown_day = time.strftime("%Y-%m-%d", time.localtime())
+        self._live_broker = None
 
         self._register_dead_letter_handlers()
         self._initialized = True
@@ -119,6 +121,89 @@ class AlarmManager:
             except Exception as e:
                 print(f"[AlarmManager] Invalid schedule timezone '{tz_name}': {e}. Falling back to local time.")
         return datetime.datetime.now()
+
+    def bind_live_broker(self, broker):
+        """绑定当前 live broker，供系统状态读取账户；回测传 None 解除绑定。"""
+        self._live_broker = broker
+
+    @staticmethod
+    def _compact_probe_reason(reason) -> str:
+        text = " ".join(str(reason or "account snapshot unavailable").split())
+        if len(text) > 180:
+            return text[:177] + "..."
+        return text or "account snapshot unavailable"
+
+    def _read_broker_account_connection(self, broker):
+        """通过账户查询判断连接；成功不返回金额，失败返回短原因。"""
+        probe = getattr(broker, "is_account_snapshot_trusted", None)
+        if callable(probe):
+            if probe():
+                return True, "Broker: connected."
+            reason = getattr(broker, "_last_account_snapshot_fetch_error", None)
+            return False, f"Broker: disconnected ({self._compact_probe_reason(reason)})."
+
+        getter = getattr(broker, "get_cash", None)
+        if not callable(getter):
+            getter = getattr(broker, "getvalue", None)
+        if not callable(getter):
+            return False, "Broker: unavailable (broker has no account query)."
+        value = getter()
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return False, "Broker: disconnected (account query returned no numeric value)."
+        if not math.isfinite(numeric):
+            return False, "Broker: disconnected (account query returned a non-finite value)."
+        return True, "Broker: connected."
+
+    def _probe_live_broker_connection(self):
+        """在有界线程中读取账户，避免券商查询卡住下一次日频状态调度。"""
+        broker = getattr(self, "_live_broker", None)
+        if broker is None:
+            return False, "Broker: unavailable (live broker is not bound)."
+
+        holder = {}
+
+        def _run():
+            had_probe_flag = hasattr(broker, "_ib_connection_probe")
+            previous_probe = getattr(broker, "_ib_connection_probe", False)
+            if had_probe_flag:
+                broker._ib_connection_probe = True
+            try:
+                holder["result"] = self._read_broker_account_connection(broker)
+            except Exception as exc:
+                holder["result"] = (
+                    False,
+                    f"Broker: disconnected ({self._compact_probe_reason(exc)}).",
+                )
+            finally:
+                if had_probe_flag:
+                    broker._ib_connection_probe = previous_probe
+
+        worker = threading.Thread(
+            target=_run,
+            name="alarm-broker-account-probe",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(self._BROKER_STATUS_PROBE_TIMEOUT_SECONDS)
+        if worker.is_alive():
+            timeout = self._BROKER_STATUS_PROBE_TIMEOUT_SECONDS
+            return False, f"Broker: disconnected (account probe timed out after {timeout:g}s)."
+        return holder.get(
+            "result",
+            (False, "Broker: disconnected (account probe returned no result)."),
+        )
+
+    def _build_daily_health_status(self, slot_text: str):
+        connected, broker_detail = self._probe_live_broker_connection()
+        status = "ALIVE" if connected else "DISCONNECTED"
+        detail = (
+            f"Live worker is running. {broker_detail} "
+            f"Next daily schedule: {slot_text}."
+        )
+        print(f"[AlarmManager] Daily health status: {status}. {broker_detail}")
+        return status, detail
 
     def _schedule_daily_health_status(self):
         timer = self._daily_schedule_health_timer
@@ -157,11 +242,9 @@ class AlarmManager:
         def _push_health_status():
             self._daily_schedule_health_timer = None
             try:
-                self.push_status(
-                    "ALIVE",
-                    f"Live worker is running. Next daily schedule: {slot_text}.",
-                    alarm_tag=BaseAlarm.TAG_LIFECYCLE,
-                )
+                if self.alarms:
+                    status, detail = self._build_daily_health_status(slot_text)
+                    self.push_status(status, detail, alarm_tag=BaseAlarm.TAG_LIFECYCLE)
             finally:
                 self._schedule_daily_health_status()
 

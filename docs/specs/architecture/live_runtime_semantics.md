@@ -109,7 +109,7 @@
     - 子进程正常返回时必须显式标记 expected exit，父进程不得无条件重放；监督器不保存订单、持仓或交易意图。
     - 操作者向父子进程发送 `SIGINT` 时，父进程应转发安全退出信号，worker 推送一次 `STOPPED` 并标记 expected exit；内部探活回收继续使用 `SIGTERM` 且不推生命周期 IM。
     - 该监督链路只适用于 live connect；回测/优化不得创建监督进程、heartbeat 线程或等待循环。
-17. 配置 `1d` schedule 且启用 IM 时，每个自然日必须在正式 slot 前 30 分钟推送一次 `ALIVE` 状态；该通知只表示 worker 存活，不承诺券商连接可用，不新增配置开关，非日线 schedule 不发送。该调度不按星期筛选，默认覆盖 7x24 时段。
+17. 配置 `1d` schedule 且启用 IM 时，每个自然日必须在正式 slot 前 30 分钟推送一次系统状态。推送前读取已绑定 live broker 的账户信息判断连接：账户可读时状态为 `ALIVE` 并注明 Broker connected；broker 未绑定、账户查询失败或探针超时则为 `DISCONNECTED`，详情仍说明 worker 在运行及失败原因。不推送账户金额，不新增配置开关，非日线 schedule 不发送。该调度不按星期筛选，默认覆盖 7x24 时段。`STARTED` 仍在进入 SDK 前发送且不探测账户；`STOPPED` / `DEAD` 不得等待账户探针。回测/优化不得绑定 live broker 或执行该探针。
 18. GM 已知维护型连接故障采用 schedule 驱动的两档恢复，但不得硬编码交易日历或完全停掉探测：有效 `1d` schedule 在正式 slot 前 30 分钟（与 `ALIVE` 相同边界）切回积极恢复，若 `LIVE_SCHEDULE_PREWARM_LEAD` 更早则取更早边界，并保持到正式 slot 后本轮 live execution budget 结束；边界外 `gmi_init` 至少每 10 分钟真实探测一次，最后一次等待必须截断到恢复边界。固定间隔 schedule 的恢复提前量至少覆盖“调度间隔减去本轮 execution budget”的尾部，因此当天首个 anchor 后的连续高频 slot 之间不得出现恢复盲区，首个 anchor 前的安静等待也不得跨过该恢复边界；无有效 schedule 时保持积极恢复。GM `gmi_poll=-1`、1200/1201 行情连接维护回调及 1100 交易连接维护回调在安静期继续参与探测和结构化健康上报，但不得周期性写 warning/error 日志或驱动每分钟 worker 重建；heartbeat 必须在恢复边界到期以强制干净重建。进入积极窗口后恢复有限日志，连接恢复必须立即记录并汇总安静期抑制数量。该策略只属于 GM live Phoenix 路径，不得进入回测、优化或训练。
 
 ## 8. 实盘与本地回测的语义差异

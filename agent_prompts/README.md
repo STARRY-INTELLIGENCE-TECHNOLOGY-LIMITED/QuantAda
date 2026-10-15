@@ -43,7 +43,7 @@
 13. live data refresh 只对必需失败做有限次重试；重试仍失败才跳过并告警。
 14. GM/IB 的 schedule 运行支持 prewarm；相关生成/修复应保留 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 15. schedule 附近的 IM 报警支持时间窗；默认用 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可按连接覆盖。
-16. 初次 `STARTED` 必须在 worker 进入 broker SDK 前发送，并在同一 worker 进程内去重；定时 `ALIVE` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。受监督 worker 内部重启和终止不推 `STOPPED` / `DEAD`；只有操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。`1d` schedule 在每个自然日正式 slot 前 30 分钟固定推送一次仅表示 worker 存活的 `ALIVE`，非日线不发送；GM 维护期低频探测必须复用该恢复边界（更早 prewarm 优先），不得完全停探或让等待跨过下一 slot，且只允许存在于 live Phoenix 路径。
+16. 初次 `STARTED` 必须在 worker 进入 broker SDK 前发送，并在同一 worker 进程内去重；定时 `ALIVE` 生命周期消息与显式 `plan` 标签消息默认绕过时间窗；新增报警语义时优先复用 `BaseAlarm` 中的标签常量。受监督 worker 内部重启和终止不推 `STOPPED` / `DEAD`；只有操作者 `SIGINT` 安全退出才由 worker 推送一次 `STOPPED`。`1d` schedule 在每个自然日正式 slot 前 30 分钟固定推送一次系统状态：已绑定 live broker 的账户信息可读则为 `ALIVE`，未绑定、查询失败或探针超时则为 `DISCONNECTED`；不推送账户金额，不新增开关，非日线不发送。`STARTED` 仍在进入 SDK 前发送且不探测账户，`STOPPED` / `DEAD` 不得等待账户探针。回测/优化不得执行该探针；GM 维护期低频探测必须复用该恢复边界（更早 prewarm 优先），不得完全停探或让等待跨过下一 slot，且只允许存在于 live Phoenix 路径。
 17. 核心/基础层需要运行期通知时通过 `common.runtime_notifications`，不要在 rebalancer、executor、strategy/base broker 等模块里直接导入 `AlarmManager`。
 18. `PRINT_PLAN=True` 时，live 运行可即时推送每次计划和策略排名快照；backtest 运行必须只在回测结束时按快照 key 推送最后一条计划/排名，并附带本次执行命令、交易归因和最终绩效摘要，本地日志可继续打印每次计划，避免历史区间触发 IM 限流。
 19. `ALARMS_ENABLED=None` 为自动模式: 有任一 webhook 时启用报警通道，无 webhook 时不启用；显式 `False` 可强制禁用。`LOG` 只控制本地详细日志，不作为 IM 总开关。

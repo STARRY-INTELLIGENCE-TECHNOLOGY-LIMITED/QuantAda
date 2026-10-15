@@ -277,9 +277,131 @@ def test_daily_schedule_pushes_health_status_thirty_minutes_before_every_day(mon
     assert timers[1].delay == pytest.approx(24 * 60 * 60 - 1)
     assert _wait_until(lambda: len(fake.status_calls) == 1)
     status, detail = fake.status_calls[0]
-    assert status == "ALIVE [GM_BROKER:demo]"
+    assert status == "DISCONNECTED [GM_BROKER:demo]"
+    assert "Live worker is running." in detail
+    assert "Broker: unavailable (live broker is not bound)." in detail
     assert "Next daily schedule: 2026-07-18 14:45:00" in detail
 
+
+
+
+def _schedule_health_timer(monkeypatch):
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def is_alive(self):
+            return self.started and not self.cancelled
+
+    monkeypatch.setattr(manager_module.threading, "Timer", FakeTimer)
+    return timers
+
+
+def test_daily_health_status_reports_connected_broker_account(monkeypatch, fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+    now = {"value": datetime.datetime(2026, 10, 14, 8, 30, 0)}
+    timers = _schedule_health_timer(monkeypatch)
+    monkeypatch.setattr(mgr, "_current_schedule_alarm_time", lambda: now["value"])
+
+    class ConnectedBroker:
+        def is_account_snapshot_trusted(self):
+            return True
+
+    mgr.bind_live_broker(ConnectedBroker())
+    mgr.set_runtime_context(
+        broker="ib_broker",
+        conn_id="real",
+        strategy="my_strategy",
+        params={},
+        schedule_rule="1d:09:30:00",
+    )
+
+    timers[0].callback()
+    assert _wait_until(lambda: len(fake.status_calls) == 1)
+    status, detail = fake.status_calls[0]
+    assert status == "ALIVE [IB_BROKER:real]"
+    assert "Broker: connected." in detail
+    assert "Next daily schedule: 2026-10-14 09:30:00" in detail
+
+
+def test_daily_health_status_reports_disconnected_broker_account(fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+
+    class DisconnectedBroker:
+        def __init__(self):
+            self._last_account_snapshot_fetch_error = "ib not connected"
+
+        def is_account_snapshot_trusted(self):
+            return False
+
+    mgr.bind_live_broker(DisconnectedBroker())
+    status, detail = mgr._build_daily_health_status("2026-10-14 09:30:00")
+
+    assert status == "DISCONNECTED"
+    assert "Broker: disconnected (ib not connected)." in detail
+    assert "Live worker is running." in detail
+
+
+def test_daily_health_status_uses_cash_query_when_snapshot_probe_is_missing(fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+
+    class CashBroker:
+        def get_cash(self):
+            return 1000.0
+
+    mgr.bind_live_broker(CashBroker())
+    status, detail = mgr._build_daily_health_status("2026-10-14 09:30:00")
+    assert status == "ALIVE"
+    assert "Broker: connected." in detail
+    assert "1000" not in detail
+
+
+def test_daily_health_status_bounds_hung_account_probe(fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    mgr._BROKER_STATUS_PROBE_TIMEOUT_SECONDS = 0.05
+    mgr.bind_live_broker(object())
+
+    def _slow(_broker):
+        time.sleep(2)
+        return True, "Broker: connected."
+
+    mgr._read_broker_account_connection = _slow
+    started = time.monotonic()
+    status, detail = mgr._build_daily_health_status("2026-10-14 09:30:00")
+    elapsed = time.monotonic() - started
+
+    assert status == "DISCONNECTED"
+    assert "account probe timed out after 0.05s" in detail
+    assert elapsed < 1.0
+
+
+def test_started_status_does_not_probe_broker_account(fresh_alarm_manager):
+    mgr = fresh_alarm_manager
+    fake = FakeAlarmChannel()
+    mgr.alarms = [fake]
+
+    def _explode():
+        raise AssertionError("lifecycle status outside daily health must not probe broker")
+
+    mgr._probe_live_broker_connection = _explode
+    mgr.push_status("STARTED", "Booting", alarm_tag=manager_module.BaseAlarm.TAG_LIFECYCLE)
+    assert _wait_until(lambda: len(fake.status_calls) == 1)
+    assert fake.status_calls[0][0] == "STARTED"
 
 def test_interval_schedule_does_not_create_daily_health_timer(monkeypatch, fresh_alarm_manager):
     mgr = fresh_alarm_manager

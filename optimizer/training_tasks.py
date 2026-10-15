@@ -41,6 +41,27 @@ _SCOPE_WINDOW = re.compile(
 )
 
 
+def training_journal_dirs(data_path, *, working_directory=None, project_directory=None, home_directory=None):
+    """解析训练菜单应扫描的目录；相对数据目录兼容常见启动工作目录。"""
+    configured = Path(str(data_path or ".data")).expanduser()
+    if configured.is_absolute():
+        roots = [configured]
+    else:
+        roots = [
+            Path(working_directory or Path.cwd()) / configured,
+            Path(project_directory or Path(__file__).resolve().parents[1]) / configured,
+            Path(home_directory or Path.home()) / configured,
+        ]
+    directories = []
+    seen = set()
+    for root in roots:
+        directory = (root / "optuna").resolve()
+        if directory not in seen:
+            seen.add(directory)
+            directories.append(str(directory))
+    return directories
+
+
 @lru_cache(maxsize=128)
 def _journal_snapshot(path, modified_ns, size):
     """缓存有文件签名的派生摘要，不保留历史 trial 对象。"""

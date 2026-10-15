@@ -344,6 +344,19 @@ def test_running_training_tasks_keep_owner_pids_and_filter_stale_tasks(tmp_path,
     assert tasks[0]["running_pids"] == [1234]
 
 
+def test_training_journal_dirs_check_current_project_and_home_for_relative_data_path(tmp_path):
+    from optimizer.training_tasks import training_journal_dirs
+
+    roots = [tmp_path / "cwd", tmp_path / "project", tmp_path / "home"]
+    directories = training_journal_dirs(
+        ".data", working_directory=roots[0], project_directory=roots[1], home_directory=roots[2],
+    )
+
+    assert directories == [str((root / ".data" / "optuna").resolve()) for root in roots]
+    absolute = training_journal_dirs(roots[0] / "custom-data", working_directory=roots[1])
+    assert absolute == [str((roots[0] / "custom-data" / "optuna").resolve())]
+
+
 def test_running_training_task_menu_supports_multi_select_and_confirmation(tmp_path, monkeypatch):
     tasks = [
         {"strategy": "examples.A", "metrics": ["return"], "running_pids": [101]},
@@ -382,7 +395,37 @@ def test_cli_train_kill_stops_selected_owner_trees(monkeypatch, tmp_path, capsys
 
     assert run._run_main() == 0
     assert calls["owners"] == task["running_owners"]
-    assert "[TrainKill] stopped" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "[TrainKill] stopped" in output
+    assert f"[TrainKill] Scanning training journals: {tmp_path / '.data' / 'optuna'}" in output
+
+
+def test_cli_train_kill_loads_tasks_from_each_candidate_directory(monkeypatch, tmp_path):
+    import config
+    import optimizer.training_tasks as training_tasks
+    import run
+
+    task = {
+        "strategy": "examples.HomeTask",
+        "metrics": ["return"],
+        "running_owners": ["optimizer_RUN20261011-120000_4321"],
+        "running_pids": [4321],
+    }
+    directories = [str(tmp_path / "project" / "optuna"), str(tmp_path / "home" / "optuna")]
+    scanned = []
+    monkeypatch.setattr(config, "DATA_PATH", ".data")
+    monkeypatch.setattr(run.sys, "argv", ["run.py", "--train_kill"])
+    monkeypatch.setattr(training_tasks, "training_journal_dirs", lambda _data_path: directories)
+    monkeypatch.setattr(
+        training_tasks,
+        "list_running_training_tasks",
+        lambda directory: scanned.append(directory) or ([task] if directory == directories[1] else []),
+    )
+    monkeypatch.setattr(training_tasks, "choose_running_training_tasks", lambda tasks: tasks)
+    monkeypatch.setattr(run, "stop_optimizer_owners", lambda owners: {owners[0]: "stopped"})
+
+    assert run._run_main() == 0
+    assert scanned == directories
 
 
 def test_cli_resume_restores_selection_before_elevation_and_allows_worker_override(monkeypatch, tmp_path):

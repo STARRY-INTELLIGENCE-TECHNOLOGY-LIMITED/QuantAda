@@ -350,7 +350,9 @@ def _run_main():
         parser.error("--train_resume and --train_kill cannot be used together")
 
     if args.train_kill:
-        from optimizer.training_tasks import choose_running_training_tasks, list_running_training_tasks
+        from optimizer.training_tasks import (
+            choose_running_training_tasks, list_running_training_tasks, training_journal_dirs,
+        )
 
         if args.strategy or args.connect:
             parser.error("--train_kill does not accept a strategy argument or --connect")
@@ -358,8 +360,12 @@ def _run_main():
         if not isinstance(overrides, dict):
             parser.error("--config must be a Python dictionary")
         data_path = overrides.get("DATA_PATH", getattr(config, "DATA_PATH", ".data")) or ".data"
+        journal_dirs = training_journal_dirs(data_path)
         print("Loading running historical training tasks...")
-        running_tasks = list_running_training_tasks(os.path.join(os.getcwd(), data_path, "optuna"))
+        running_tasks = []
+        for journal_dir in journal_dirs:
+            print(f"[TrainKill] Scanning training journals: {journal_dir}")
+            running_tasks.extend(list_running_training_tasks(journal_dir))
         selected_tasks = choose_running_training_tasks(running_tasks)
         if not selected_tasks:
             return 0
@@ -387,7 +393,9 @@ def _run_main():
         return 1 if failed else 0
 
     if args.train_resume:
-        from optimizer.training_tasks import build_resume_arguments, choose_training_task, list_training_tasks
+        from optimizer.training_tasks import (
+            build_resume_arguments, choose_training_task, list_training_tasks, training_journal_dirs,
+        )
 
         if args.strategy or args.connect:
             parser.error("--train_resume restores a saved strategy and does not accept a strategy argument or --connect")
@@ -397,7 +405,10 @@ def _run_main():
         data_path = overrides.get("DATA_PATH", getattr(config, "DATA_PATH", ".data")) or ".data"
         print("Loading historical training tasks...")
         extra_arguments = [item for item in raw_cli_args if item != "--train_resume"]
-        task = choose_training_task(list_training_tasks(os.path.join(os.getcwd(), data_path, "optuna")), extra_arguments)
+        tasks = []
+        for journal_dir in training_journal_dirs(data_path):
+            tasks.extend(list_training_tasks(journal_dir))
+        task = choose_training_task(tasks, extra_arguments)
         if task is None:
             return 0
         restored = build_resume_arguments(task, extra_arguments)

@@ -362,6 +362,8 @@ class LiveTrader:
                 getattr(config, 'KEEP_OVERNIGHT_ORDERS', False),
             )
         )
+        # 日频系统状态要读取 live 账户判断连接；回测/优化解除绑定，避免探针进入快路径。
+        AlarmManager().bind_live_broker(self.broker if is_live else None)
         if self._data_manager is not None:
             bind_broker = getattr(self._data_manager, 'bind_broker', None)
             if callable(bind_broker):
