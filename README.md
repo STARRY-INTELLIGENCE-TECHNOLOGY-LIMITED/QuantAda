@@ -14,6 +14,8 @@
 
 ### 1) 安装
 
+运行环境为 Python 3.12。
+
 ```bash
 git clone https://github.com/SUTFutureCoder/QuantAda.git
 cd QuantAda

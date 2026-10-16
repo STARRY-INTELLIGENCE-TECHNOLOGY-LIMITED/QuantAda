@@ -19,7 +19,7 @@ DATA_FIELDS = (
 
 
 def _sha256_stream(stream):
-    """流式计算 SHA-256，兼容 CI 使用的 Python 3.10。"""
+    """流式计算 SHA-256，避免把整个快照一次性读入内存。"""
     digest = hashlib.sha256()
     while True:
         chunk = stream.read(1024 * 1024)

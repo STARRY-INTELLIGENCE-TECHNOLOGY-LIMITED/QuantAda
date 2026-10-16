@@ -12,6 +12,8 @@ QuantAda pushes back against the overfitting and guru culture common in quantita
 
 ### 1. Install
 
+Requires Python 3.12.
+
 ```bash
 git clone https://github.com/SUTFutureCoder/QuantAda.git
 cd QuantAda

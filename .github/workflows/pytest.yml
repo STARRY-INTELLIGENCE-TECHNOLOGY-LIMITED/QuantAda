@@ -16,7 +16,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10'
+        python-version: '3.12' # 3.10 已结束支持，当前依赖不再提供其 wheel
         cache: 'pip' # 自动缓存依赖，加快运行速度
 
     - name: Install dependencies
