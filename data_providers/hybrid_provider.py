@@ -57,6 +57,13 @@ class HybridDataProvider(BaseDataProvider):
         self.live_mode = bool(enabled)
         self._overlay.set_live_mode(enabled)
 
+    def get_earnings_calendar(self, symbols=None, start_date=None, end_date=None, as_of=None):
+        """事件日由 Hybrid 的 Futu 实时/公开日历侧提供。"""
+        method = getattr(self.futu_provider, "get_earnings_calendar", None)
+        if not callable(method):
+            return None
+        return method(symbols=symbols, start_date=start_date, end_date=end_date, as_of=as_of)
+
     def bind_broker(self, broker) -> None:
         """将实盘 Broker 已建立的 Futu 行情会话注入实时子 Provider。"""
 

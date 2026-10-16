@@ -623,6 +623,66 @@ def test_history_or_chunk_splits_before_sending_overlimit_span():
     assert len(spans) > 1
 
 
+def test_chunked_history_retries_failed_transient_chunks_after_first_pass():
+    provider = ThetaDataProvider(client=_FakeTheta())
+    calls = []
+
+    def flaky_call(method, **kwargs):
+        calls.append((method, kwargs["start_date"], kwargs["end_date"]))
+        if len(calls) == 1:
+            provider._thread_stats.fail = int(getattr(provider._thread_stats, "fail", 0) or 0) + 1
+            return None
+        return pd.DataFrame({
+            "timestamp": ["2024-01-02"],
+            "open": [1.0], "high": [1.0], "low": [1.0],
+            "close": [1.0], "volume": [1.0],
+        })
+
+    provider._call = flaky_call
+    result = provider._chunked_history(
+        "option_history_open_interest",
+        _dt.date(2024, 1, 1),
+        _dt.date(2024, 1, 10),
+        chunk_days=365,
+        symbol="AAPL",
+    )
+
+    assert result is not None and not result.empty
+    assert len(calls) == 2
+    assert calls[0][1:] == calls[1][1:]
+    assert provider.take_retryable_fail_count() == 0
+
+
+def test_history_or_chunk_retries_short_failed_range_without_same_chunk_split():
+    provider = ThetaDataProvider(client=_FakeTheta())
+    calls = []
+
+    def flaky_call(method, **kwargs):
+        calls.append((method, kwargs["start_date"], kwargs["end_date"]))
+        if len(calls) == 1:
+            provider._thread_stats.fail = int(getattr(provider._thread_stats, "fail", 0) or 0) + 1
+            return None
+        return pd.DataFrame({
+            "timestamp": ["2024-01-02"],
+            "open": [1.0], "high": [1.0], "low": [1.0],
+            "close": [1.0], "volume": [1.0],
+        })
+
+    provider._call = flaky_call
+    result = provider._history_or_chunk(
+        "option_history_open_interest",
+        _dt.date(2024, 1, 1),
+        _dt.date(2024, 1, 10),
+        365,
+        symbol="AAPL",
+    )
+
+    assert result is not None and not result.empty
+    assert len(calls) == 2
+    assert calls[0][1:] == calls[1][1:]
+    assert provider.take_retryable_fail_count() == 0
+
+
 def test_select_chain_expirations_prefers_fridays():
     as_of = _dt.date(2024, 1, 5)
     expirations = [_dt.date(2024, 1, 5) + _dt.timedelta(days=offset) for offset in range(23, 53)]

@@ -21,6 +21,7 @@ from live_trader.adapters.futu_symbols import (
     normalize_futu_symbol,
 )
 from common.options.analytics import parse_expiry, parse_option_symbol
+from common.options.events import normalize_earnings_calendar
 from common.options.chain import normalize_option_chain
 from common.options.data_safety import sanitize_market_dataframe
 from .base_provider import BaseDataProvider
@@ -1122,6 +1123,79 @@ class FutuDataProvider(BaseDataProvider):
                 print(f"[Futu] Basic-info request rejected: {data}")
             return None
         return data.copy()
+
+    def get_earnings_calendar(
+        self, symbols=None, start_date=None, end_date=None, as_of=None,
+    ) -> pd.DataFrame:
+        """通过 OpenD 的历史财报接口和日历接口返回统一财报日表。"""
+        context = self._get_quote_context()
+        if context is None:
+            return None
+        raw_symbols = [symbols] if isinstance(symbols, str) else list(symbols or [])
+        normalized_symbols = [self._normalize_symbol(item) for item in raw_symbols]
+        normalized_symbols = [item for item in normalized_symbols if item]
+        markets = sorted({item.split('.', 1)[0].upper() for item in normalized_symbols})
+        if not markets:
+            markets = ['US']
+        parts = []
+
+        # 财报日历通常偏向近期窗口；Futu 的 F10 历史接口提供更适合回测的
+        # 已公布财报交易日。两者均是当前 Provider 事实，不能宣称支持点时 as_of。
+        history_method = getattr(context, 'get_financials_earnings_price_history', None)
+        if callable(history_method):
+            history_symbols = {}
+            for item in normalized_symbols:
+                parsed = parse_option_symbol(item)
+                underlying = parsed.get('underlying') if parsed else None
+                if underlying:
+                    market = item.split('.', 1)[0]
+                    code = self._normalize_symbol(f'{market}.{underlying}')
+                else:
+                    code = item
+                history_symbols.setdefault(code, code)
+            for code in history_symbols:
+                try:
+                    with self._context_lock:
+                        ret_code, data = history_method(code)
+                except Exception as exc:
+                    print(f"[Futu] Historical earnings request failed for {code}: {exc}")
+                    continue
+                if ret_code != RET_OK or not isinstance(data, pd.DataFrame) or data.empty:
+                    continue
+                history = data.copy()
+                history['security'] = code
+                history['earnings_date'] = history.get(
+                    'pub_trading_day_str', history.get('pub_time_str')
+                )
+                history['earnings_timestamp'] = history.get('pub_time_str')
+                parts.append(history)
+
+        for market_name in markets:
+            market_value = _enum_value(Market, market_name, market_name)
+            try:
+                with self._context_lock:
+                    ret_code, data = context.get_earnings_calendar(
+                        market=market_value,
+                        begin_date=self._normalize_date(start_date, intraday=False) if start_date else None,
+                        end_date=self._normalize_date(end_date, intraday=False, end=True) if end_date else None,
+                    )
+            except Exception as exc:
+                print(f"[Futu] Earnings-calendar request failed for {market_name}: {exc}")
+                continue
+            if ret_code == RET_OK and isinstance(data, pd.DataFrame) and not data.empty:
+                parts.append(data.copy())
+        if not parts:
+            return None
+        result = normalize_earnings_calendar(
+            pd.concat(parts, ignore_index=True),
+            symbols=normalized_symbols,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if result is not None:
+            result.attrs["as_of_supported"] = False
+            result.attrs["source"] = "futu"
+        return result
 
     def close(self):
         """关闭由本 Provider 创建的 OpenD 行情连接。"""

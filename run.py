@@ -180,6 +180,18 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
         print("\nFatal: Could not fetch data for any of the specified symbols. Aborting.")
         return
 
+    # 事件快照由 data_source 提供并附加到行情 attrs；策略不直接调用 Provider SDK。
+    try:
+        data_manager.attach_earnings_calendar(
+            datas,
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            specified_sources=data_source,
+        )
+    except Exception as exc:
+        print(f"[Events] Earnings calendar unavailable; continuing without blackout data: {exc}")
+
     # --- 4. 初始化回测器并运行 ---
     print("\n--- Initializing Backtester ---")
 

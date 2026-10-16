@@ -1401,6 +1401,21 @@ class LiveTrader:
                     f"[Engine Warning] No history data for {symbol} "
                     f"({start_date} -> {end_date}, {compression} {timeframe})."
                 )
+        if datas and self._data_manager is not None:
+            try:
+                frames = {
+                    symbol: getattr(feed, "p", SimpleNamespace(dataname=None)).dataname
+                    for symbol, feed in datas.items()
+                }
+                self._data_manager.attach_earnings_calendar(
+                    frames,
+                    symbols=symbols,
+                    start_date=start_date,
+                    end_date=end_date,
+                    specified_sources=self._selected_data_source,
+                )
+            except Exception as exc:
+                print(f"[Engine Events] Earnings calendar unavailable; continuing without blackout data: {exc}")
         return datas
 
     def _refresh_live_data(self, context):

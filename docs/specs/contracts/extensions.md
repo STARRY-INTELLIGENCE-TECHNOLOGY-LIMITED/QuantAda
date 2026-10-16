@@ -60,6 +60,8 @@
 25. `data_source=theta+futu`（或 `hybrid`）使用 `HybridDataProvider`：回测/优化的正股/ETF 历史走 Futu，期权合约历史与 `as_of` 链走 ThetaData；实盘当前快照仍走 Futu。历史部分可写入 `CACHE_DATA` CSV，但 live mode 不得用缓存短路当前行情。混合层不得用 ThetaData 历史价格作为实盘成交价。期权当前快照缺失、过期或字段不完整时必须失败关闭；正股快照过期时保留 Futu 历史，不得改走 Theta。
 26. Provider 组合由 `config.DATA_PROVIDER_COMPOSITIONS` 显式声明 `historical`、`realtime`、`factory` 和可选 `factory_kwargs`/`factory_options`；`data_providers.overlay_provider.OverlayDataProvider` 只负责无券商/无 Provider 绑定的组合流程，代码映射、字段归一化和新鲜度策略必须由注入的组合适配器负责。组合定义按名称惰性构造，不得改变未指定组合的 Provider 回退链。
 27. `DataManager.get_option_chain()` 不走 CSV 缓存。回测/优化的历史展开可把每个成功 as_of 的候选合约写入 `DATA_PATH/market_cache/option_universe/`，供断点续拉；`--refresh` 或 `CACHE_DATA=False` 时不读该断点。实盘展开不写断点。展开只能使用声明 `HISTORICAL_OPTION_CHAIN` 的 Provider（ThetaData 或 Hybrid 的历史侧）；Futu 当前链不得作为历史 as_of。实盘当前链由 Hybrid 在 live_mode 下转给 Futu，缺失时失败关闭，不回退 Theta 末行。 断点文件名不含取数窗口日期；自然日平移后合并旧窗口文件，并在 as_of 步长内复用最近缓存快照。
+28. 财报事件使用 `DataManager.get_earnings_calendar()`，策略不得直接导入 Futu/Theta SDK。Provider 可选实现 `get_earnings_calendar(symbols, start_date, end_date, as_of)`；不支持时返回 `None`。回测、优化和实盘启动会把统一后的事件快照附加到行情 DataFrame.attrs，策略只读取该快照。当前 Futu `get_earnings_calendar` 不提供历史 as_of 快照，研究报告必须按实际财报日禁开仓口径说明，不能宣称拥有当时的预告发布时间信息。
+29. ThetaData 分块历史请求首轮结束后，对超时或瞬时失败的日期块补偿一次；已经返回的部分数据必须保留。OI、Greeks 等附加字段请求失败时，不得丢弃同一合约已经成功返回的 OHLC 数据。
 
 ## 4. 报警通道
 1. 继承 `alarms.base_alarm.BaseAlarm`
@@ -87,3 +89,4 @@
 2. 可用范围包括 `full`、`portfolio`、`portfolio_equity`、`portfolio_drawdown`、`monthly_heatmap`。
 3. `full` 不能与其他范围混用；其余范围可用逗号组合，并复用同一次回测结果打开多个窗口。
 4. 新增图表范围不得改变策略决策、撮合、优化目标或实盘路径。
+

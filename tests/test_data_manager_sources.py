@@ -29,6 +29,37 @@ def test_data_manager_defaults_data_path_when_config_key_is_missing(monkeypatch)
     assert DataManager().data_path == ".data"
 
 
+def test_data_manager_earnings_calendar_uses_selected_provider_and_attaches_snapshot(monkeypatch):
+    class EarningsDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1):
+            return None
+
+        def get_earnings_calendar(self, symbols=None, start_date=None, end_date=None, as_of=None):
+            return pd.DataFrame({
+                "security": ["US.AAPL"],
+                "earnings_date": ["2024-02-01"],
+            })
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [EarningsDataProvider()])
+    manager = DataManager()
+    events = manager.get_earnings_calendar(
+        symbols=["US.AAPL"], start_date="20240101", end_date="20240301", specified_sources="earnings"
+    )
+    assert events is not None and list(events["event_date"]) == [pd.Timestamp("2024-02-01")]
+
+    frame = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+    manager.attach_earnings_calendar(
+        {"US.AAPL": frame}, symbols=["US.AAPL"], start_date="20240101", end_date="20240301",
+        specified_sources="earnings",
+    )
+    assert frame.attrs["earnings_calendar"][0]["event_date"] == "2024-02-01"
+
+
 def test_data_manager_normalizes_platform_source_aliases():
     assert DataManager._split_source_names("ib tiingo") == ["ibkr", "tiingo"]
     assert DataManager._split_source_names("gmi") == ["gmi"]

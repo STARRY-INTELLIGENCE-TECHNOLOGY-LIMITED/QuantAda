@@ -12,6 +12,7 @@ from .base_provider import BaseDataProvider
 from .compositions import build_provider_composition
 from .csv_provider import CsvDataProvider
 from common.options.analytics import parse_option_symbol
+from common.options.events import normalize_earnings_calendar
 from common.options.data_safety import sanitize_market_dataframe
 
 
@@ -459,6 +460,76 @@ class DataManager:
             if result is not None:
                 return result
         return None
+
+    def get_earnings_calendar(
+        self,
+        symbols=None,
+        start_date: str = None,
+        end_date: str = None,
+        specified_sources: str = None,
+        as_of: str = None,
+    ):
+        """通过选定 data_source 查询财报日，不让策略直接依赖 Provider SDK。"""
+        if specified_sources:
+            providers = []
+            for name in self._split_source_names(specified_sources):
+                try:
+                    provider = self._provider_for_source(name)
+                except Exception as exc:
+                    print(f"Error: Failed to construct data source {name!r}: {exc}")
+                    continue
+                if provider is not None:
+                    providers.append(provider)
+        else:
+            providers = list(self._all_provider_instances())
+
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_earnings_calendar")
+            declared = next(
+                (base.__dict__.get("get_earnings_calendar") for base in type(provider).__mro__
+                 if "get_earnings_calendar" in base.__dict__),
+                None,
+            )
+            if method is None or declared is BaseDataProvider.get_earnings_calendar:
+                continue
+            try:
+                signature = inspect.signature(method)
+                kwargs = {
+                    "symbols": symbols,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "as_of": as_of,
+                }
+                if not any(item.kind == inspect.Parameter.VAR_KEYWORD for item in signature.parameters.values()):
+                    kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+                result = method(**kwargs)
+            except TypeError:
+                continue
+            except Exception as exc:
+                print(f"[DataManager] earnings calendar failed: {exc}")
+                continue
+            normalized = normalize_earnings_calendar(
+                result, symbols=symbols, start_date=start_date, end_date=end_date,
+            )
+            if normalized is not None and not normalized.empty:
+                normalized.attrs.update(getattr(result, "attrs", {}) or {})
+                return normalized
+        return None
+
+    def attach_earnings_calendar(
+        self, datas, symbols=None, start_date: str = None, end_date: str = None,
+        specified_sources: str = None,
+    ):
+        """把 data_source 财报快照附加到行情 attrs，供回测和优化复用。"""
+        from common.options.events import attach_earnings_calendar
+
+        events = self.get_earnings_calendar(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            specified_sources=specified_sources,
+        )
+        return attach_earnings_calendar(datas, events)
 
     def _load_complete_cache(self, symbol, start_date, end_date, timeframe, compression, refresh):
         """读取覆盖请求窗口的缓存；缺口或刷新请求均返回 None。"""

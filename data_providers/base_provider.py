@@ -36,3 +36,13 @@ class BaseDataProvider(ABC):
     def close(self) -> None:
         """关闭 Provider 持有的连接；无状态 Provider 默认无需处理。"""
         return None
+
+    def get_earnings_calendar(
+        self,
+        symbols=None,
+        start_date: str = None,
+        end_date: str = None,
+        as_of: str = None,
+    ) -> pd.DataFrame:
+        """按 Provider 能力返回财报事件；不支持时返回 None。"""
+        return None

@@ -1552,6 +1552,16 @@ class OptimizationJob:
 
         if not datas:
             raise ValueError("No data fetched. Check symbols, selection or date range.")
+        try:
+            self.data_manager.attach_earnings_calendar(
+                datas,
+                symbols=symbols,
+                start_date=req_fetch_start,
+                end_date=req_end,
+                specified_sources=self.args.data_source,
+            )
+        except Exception as exc:
+            print(f"[Events] Earnings calendar unavailable; continuing without blackout data: {exc}")
         return datas
 
     def _split_data(self):

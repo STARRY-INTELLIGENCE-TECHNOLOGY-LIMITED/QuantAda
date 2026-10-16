@@ -14,15 +14,19 @@ def test_futu_provider_priority_leaves_akshare_as_default_fallback():
 
 
 class FakeQuoteContext:
-    def __init__(self, history=None, option_chain=None, snapshot=None, basicinfo=None):
+    def __init__(self, history=None, option_chain=None, snapshot=None, basicinfo=None, earnings=None, earnings_history=None):
         self.history = history
         self.option_chain = option_chain
         self.snapshot = snapshot
         self.basicinfo = basicinfo
+        self.earnings = earnings
+        self.earnings_history = earnings_history
         self.history_calls = []
         self.option_chain_calls = []
         self.snapshot_calls = []
         self.basicinfo_calls = []
+        self.earnings_calls = []
+        self.earnings_history_calls = []
         self.closed = False
         self.timeout = None
 
@@ -45,8 +49,50 @@ class FakeQuoteContext:
         self.basicinfo_calls.append(kwargs)
         return 0, self.basicinfo
 
+    def get_earnings_calendar(self, **kwargs):
+        self.earnings_calls.append(kwargs)
+        return 0, self.earnings
+
+    def get_financials_earnings_price_history(self, code):
+        self.earnings_history_calls.append(code)
+        return 0, self.earnings_history
+
     def close(self):
         self.closed = True
+
+
+def test_futu_earnings_calendar_uses_data_source_api_and_normalizes_rows():
+    context = FakeQuoteContext(earnings=pd.DataFrame({
+        "security": ["US.AAPL", "US.MSFT"],
+        "earnings_date": ["2024-02-01", "2024-02-02"],
+        "period_text": ["2023Q4", "2023Q4"],
+    }))
+    provider = FutuDataProvider(quote_ctx=context)
+
+    result = provider.get_earnings_calendar(
+        symbols=["US.AAPL"], start_date="20240101", end_date="20240301"
+    )
+
+    assert list(result["symbol"]) == ["US.AAPL"]
+    assert list(result["event_date"]) == [pd.Timestamp("2024-02-01")]
+    assert context.earnings_calls[0]["begin_date"] == "2024-01-01"
+    assert context.earnings_calls[0]["end_date"] == "2024-03-01"
+
+
+def test_futu_earnings_calendar_prefers_historical_financial_report_history():
+    context = FakeQuoteContext(earnings_history=pd.DataFrame({
+        "pub_trading_day_str": ["2024-02-01", "2024-05-02"],
+        "pub_time_str": ["2024-02-01 16:00:00", "2024-05-02 16:00:00"],
+        "period_text": ["2023Q4", "2024Q1"],
+    }))
+    provider = FutuDataProvider(quote_ctx=context)
+
+    result = provider.get_earnings_calendar(
+        symbols=["US.AAPL"], start_date="20240101", end_date="20240601"
+    )
+
+    assert list(result["event_date"]) == [pd.Timestamp("2024-02-01"), pd.Timestamp("2024-05-02")]
+    assert context.earnings_history_calls == ["US.AAPL"]
 
 
 def _history_frame():

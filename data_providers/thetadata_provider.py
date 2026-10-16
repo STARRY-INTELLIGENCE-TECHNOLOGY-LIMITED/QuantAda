@@ -415,6 +415,15 @@ class ThetaDataProvider(BaseDataProvider):
         with self._stats_lock:
             self._retryable_fail_count += 1
 
+    def _resolve_retryable_failure(self):
+        """补偿成功后冲销一个已解决的当前线程失败计数。"""
+        local = int(getattr(self._thread_stats, "fail", 0) or 0)
+        if local <= 0:
+            return
+        self._thread_stats.fail = local - 1
+        with self._stats_lock:
+            self._retryable_fail_count = max(0, int(self._retryable_fail_count) - 1)
+
     def _take_thread_or_global(self, thread_attr, global_attr):
         """优先取出当前线程计数，没有则退回进程计数。"""
         local = int(getattr(self._thread_stats, thread_attr, 0) or 0)
@@ -650,15 +659,17 @@ class ThetaDataProvider(BaseDataProvider):
         return self._take_thread_or_global("fail", "_retryable_fail_count")
 
     def _chunked_history(self, method, start, end, chunk_days=_INTRADAY_CHUNK_DAYS, **kwargs):
-        """按跨日限制拆分历史请求；分钟默认约一个月，EOD 失败重试可用年块。"""
+        """按跨日限制拆分历史请求，并对瞬时失败的日期块补偿一次。"""
         try:
             span = max(1, int(chunk_days or _INTRADAY_CHUNK_DAYS))
         except (TypeError, ValueError, OverflowError):
             span = _INTRADAY_CHUNK_DAYS
         frames = []
+        failed_chunks = []
         cursor = start
         while cursor <= end:
             chunk_end = min(end, cursor + _dt.timedelta(days=span) - _dt.timedelta(days=1))
+            local_fail_before = int(getattr(self._thread_stats, "fail", 0) or 0)
             frame = self._call(
                 method,
                 start_date=cursor,
@@ -668,7 +679,23 @@ class ThetaDataProvider(BaseDataProvider):
             converted = _to_pandas(frame)
             if converted is not None and not converted.empty:
                 frames.append(converted)
+            elif int(getattr(self._thread_stats, "fail", 0) or 0) > local_fail_before:
+                # 空数据是有效的 No data found，不进入补偿；只有超时/瞬时失败才补偿。
+                failed_chunks.append((cursor, chunk_end))
             cursor = chunk_end + _dt.timedelta(days=1)
+
+        # 所有首轮请求结束后再补偿，避免失败请求在同一 session 上立即争抢重认证。
+        for retry_start, retry_end in failed_chunks:
+            frame = self._call(
+                method,
+                start_date=retry_start,
+                end_date=retry_end,
+                **kwargs,
+            )
+            converted = _to_pandas(frame)
+            if converted is not None and not converted.empty:
+                frames.append(converted)
+                self._resolve_retryable_failure()
         return pd.concat(frames, ignore_index=True, sort=False) if frames else None
 
     def _history_or_chunk(self, method, start, end, chunk_days, **kwargs):
@@ -681,13 +708,19 @@ class ThetaDataProvider(BaseDataProvider):
             width = _EOD_MAX_REQUEST_DAYS
         if (end - start).days >= width:
             return self._chunked_history(method, start, end, chunk_days=width, **kwargs)
-        fails_before = int(self._retryable_fail_count)
+        fails_before = int(getattr(self._thread_stats, "fail", 0) or 0)
         raw = self._call(method, start_date=start, end_date=end, **kwargs)
         converted = _to_pandas(raw)
         if converted is not None and not converted.empty:
             return converted
-        if self._retryable_fail_count > fails_before and (end - start).days > 1:
-            return self._chunked_history(method, start, end, chunk_days=width, **kwargs)
+        fails_after = int(getattr(self._thread_stats, "fail", 0) or 0)
+        if fails_after > fails_before and (end - start).days > 1:
+            # 小于接口上限的请求重试原区间即可；再次按同一大块切片不会减少请求负载。
+            retry_raw = self._call(method, start_date=start, end_date=end, **kwargs)
+            retry_frame = _to_pandas(retry_raw)
+            if retry_frame is not None and not retry_frame.empty:
+                self._resolve_retryable_failure()
+                return retry_frame
         return converted
 
     def get_data(
