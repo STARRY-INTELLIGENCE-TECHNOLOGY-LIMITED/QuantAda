@@ -4,7 +4,8 @@ pandas
 tushare
 akshare
 tiingo
-ta-lib
+# 0.8.2 起不再发布 Python 3.10 wheel；源码安装需要系统 TA-Lib C 库，GitHub Actions 会在编译 ta_defs.h 时失败。
+ta-lib>=0.6.5,<0.8.2
 requests
 sqlalchemy
 sqlalchemy-utils
