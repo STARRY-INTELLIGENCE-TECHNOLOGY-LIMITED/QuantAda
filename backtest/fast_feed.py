@@ -9,8 +9,25 @@ import pandas as pd
 import backtrader as bt
 
 
-_DAY_NS = np.int64(86_400_000_000_000)
 _UNIX_ORDINAL = 719163.0
+_TICKS_PER_DAY = {
+    "s": 86_400,
+    "ms": 86_400_000,
+    "us": 86_400_000_000,
+    "ns": 86_400_000_000_000,
+}
+
+
+def _datetime_unit(index):
+    """读取 DatetimeIndex 的实际精度，不能把 asi8 固定当成纳秒。"""
+    dtype = getattr(index, "dtype", None)
+    unit = getattr(dtype, "unit", None) or getattr(index, "unit", None)
+    if unit:
+        return str(unit)
+    text = str(dtype or "")
+    if "[" in text and "]" in text:
+        return text.split("[", 1)[1].split("]", 1)[0]
+    return "ns"
 
 
 def _datetime_nums(index):
@@ -19,12 +36,13 @@ def _datetime_nums(index):
         return None
     if not index.is_monotonic_increasing:
         return None
-    nanoseconds = index.asi8
-    if getattr(nanoseconds, "dtype", None) is None or nanoseconds.dtype != np.int64:
-        nanoseconds = np.asarray(nanoseconds, dtype=np.int64)
-    days = np.floor_divide(nanoseconds, _DAY_NS)
-    remainder = np.remainder(nanoseconds, _DAY_NS)
-    return _UNIX_ORDINAL + days.astype(np.float64) + remainder.astype(np.float64) / float(_DAY_NS)
+    ticks = _TICKS_PER_DAY.get(_datetime_unit(index))
+    if ticks is None:
+        return None
+    values = np.asarray(index.asi8, dtype=np.int64)
+    days = np.floor_divide(values, ticks)
+    remainder = np.remainder(values, ticks)
+    return _UNIX_ORDINAL + days.astype(np.float64) + remainder.astype(np.float64) / float(ticks)
 
 
 def _numeric_column(frame, column_index):

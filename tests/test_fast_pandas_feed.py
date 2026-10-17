@@ -128,3 +128,29 @@ def test_fast_feed_matches_intraday_timestamps():
     fast = _loaded_lines(FastPandasData, frame, start, end)
     assert fast["datetime"] == reference["datetime"]
     assert fast["close"] == reference["close"] == [1.6, 1.7, 1.8]
+
+
+def test_datetime_nums_follow_index_resolution():
+    from backtest.fast_feed import _datetime_nums
+
+    daily = pd.bdate_range("2024-01-02", periods=3)
+    intraday = pd.date_range("2024-01-02 09:30", periods=3, freq="15min")
+    indexes = [daily, intraday]
+    for unit in ("s", "ms", "us", "ns"):
+        indexes.append(daily.as_unit(unit))
+        indexes.append(intraday.as_unit(unit))
+    for index in indexes:
+        got = _datetime_nums(index)
+        expected = [bt.date2num(ts.to_pydatetime()) for ts in index]
+        assert got is not None
+        assert got.tolist() == expected
+
+
+def test_fast_feed_matches_microsecond_window():
+    index = pd.bdate_range("2024-01-02", periods=8).as_unit("us")
+    frame = _frame(index, [10, 11, 12, 13, 14, 15, 16, 17])
+    start, end = "2024-01-03", "2024-01-09"
+    reference = _loaded_lines(bt.feeds.PandasData, frame, start, end)
+    fast = _loaded_lines(FastPandasData, frame, start, end)
+    assert fast["datetime"] == reference["datetime"]
+    assert fast["close"] == reference["close"] == [11.0, 12.0, 13.0, 14.0, 15.0]
