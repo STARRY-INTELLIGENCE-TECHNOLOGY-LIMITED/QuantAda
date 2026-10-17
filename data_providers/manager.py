@@ -11,6 +11,7 @@ import config
 from .base_provider import BaseDataProvider
 from .compositions import build_provider_composition
 from .csv_provider import CsvDataProvider
+from .thetadata_provider import ENRICHMENT_INCOMPLETE_COLUMN, enrichment_retry_needed
 from common.options.analytics import parse_option_symbol
 from common.options.events import normalize_earnings_calendar
 from common.options.data_safety import sanitize_market_dataframe
@@ -550,6 +551,8 @@ class DataManager:
         if cached is None or cached.empty:
             print(f"Cached data for {symbol} contains no finite OHLCV rows.")
             return None
+        if enrichment_retry_needed(cached, symbol):
+            return None
         index = pd.to_datetime(cached.index, errors='coerce')
         index = index[~index.isna()]
         if len(index) == 0:
@@ -722,6 +725,23 @@ class DataManager:
             merged = merged[~merged.index.isna()]
             merged = merged[~merged.index.duplicated(keep='last')].sort_index()
             merged.index.name = 'datetime'
+            if ENRICHMENT_INCOMPLETE_COLUMN in merged.columns:
+                incoming_incomplete = False
+                if ENRICHMENT_INCOMPLETE_COLUMN in incoming.columns:
+                    incoming_flags = pd.to_numeric(
+                        incoming[ENRICHMENT_INCOMPLETE_COLUMN], errors="coerce"
+                    ).fillna(0)
+                    incoming_incomplete = bool(incoming_flags.gt(0).any())
+                covers_existing = (
+                    not incoming_incomplete
+                    and len(incoming.index) > 0
+                    and incoming.index.min() <= merged.index.min()
+                    and incoming.index.max() >= merged.index.max()
+                )
+                flags = pd.to_numeric(merged[ENRICHMENT_INCOMPLETE_COLUMN], errors="coerce").fillna(0)
+                # 本次完整结果已覆盖旧缓存区间时，清掉超时标记，下次直接复用。
+                if covers_existing or not bool(flags.gt(0).any()):
+                    merged = merged.drop(columns=[ENRICHMENT_INCOMPLETE_COLUMN])
             temp_filepath = f"{csv_filepath}.tmp"
             merged.to_csv(temp_filepath, mode='w')
             os.replace(temp_filepath, csv_filepath)

@@ -1478,8 +1478,11 @@ class OptimizationJob:
                 refresh=bool(getattr(self.args, "refresh", False)),
             )
 
+        from data_providers.thetadata_provider import enrichment_retry_needed, retry_unresolved_symbols
+
         datas = {}
         skipped = []
+        incomplete = []
         symbols = list(self.target_symbols or [])
         total = len(symbols)
         started = time.monotonic()
@@ -1509,7 +1512,11 @@ class OptimizationJob:
             completed += 1
             if df is not None and not df.empty:
                 datas[symbol] = df
-                status = "ok"
+                if enrichment_retry_needed(df, symbol):
+                    incomplete.append(symbol)
+                    status = "incomplete"
+                else:
+                    status = "ok"
             else:
                 skipped.append(symbol)
                 print(f"Warning: No data for {symbol}, skipping.")
@@ -1542,13 +1549,25 @@ class OptimizationJob:
                 with ThreadPoolExecutor(max_workers=retry_workers) as pool:
                     retry_pairs = list(pool.map(lambda symbol: fetch_symbol(symbol), skipped))
             for symbol, df in retry_pairs:
-                if df is not None and not df.empty:
+                if df is not None and not df.empty and not enrichment_retry_needed(df, symbol):
                     datas[symbol] = df
                     print(f"[Auto-Fetch] retry {symbol} ok")
+                elif df is not None and not df.empty:
+                    datas[symbol] = df
+                    incomplete.append(symbol)
+                    print(f"[Auto-Fetch] retry {symbol} still incomplete")
                 else:
                     still_missing.append(symbol)
                     print(f"Warning: No data for {symbol}, skipping.")
             skipped = still_missing
+
+        unresolved = list(dict.fromkeys(list(skipped) + incomplete))
+        if unresolved:
+            frames, _pending = retry_unresolved_symbols(
+                unresolved,
+                lambda symbol: fetch_symbol(symbol)[1],
+            )
+            datas.update(frames)
 
         if not datas:
             raise ValueError("No data fetched. Check symbols, selection or date range.")

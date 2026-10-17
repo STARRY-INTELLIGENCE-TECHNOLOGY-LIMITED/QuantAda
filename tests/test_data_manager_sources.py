@@ -866,3 +866,164 @@ def test_cache_write_creates_missing_data_path_and_subdir(tmp_path, monkeypatch)
     manager._cache_data(frame, "US.AAPL")
     cached = missing / "market_cache" / "US_AAPL.csv"
     assert cached.is_file()
+
+
+def test_theta_enrichment_timeout_cache_is_not_reused(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    index = pd.to_datetime(["2024-01-02", "2024-01-19"])
+    pd.DataFrame(
+        {
+            "open": [1.0, 1.2],
+            "high": [1.3, 1.4],
+            "low": [0.9, 1.1],
+            "close": [1.2, 1.3],
+            "volume": [10, 11],
+            "contract_multiplier": [100.0, 100.0],
+            "iv_percentile": [0.5, 0.5],
+            "_theta_enrichment_incomplete": [1, 1],
+        },
+        index=index,
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1):
+            calls.append(symbol)
+            return pd.DataFrame(
+                {
+                    "open": [9.0, 9.1], "high": [9.0, 9.1], "low": [9.0, 9.1],
+                    "close": [9.0, 9.1], "volume": [1, 1], "open_interest": [100.0, 110.0],
+                },
+                index=pd.to_datetime(["2024-01-02", "2024-01-19"]),
+            )
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [ThetaDataProvider()])
+    result = DataManager().get_data(
+        "US.AAPL240119P00150000", "20220101", "20250105", specified_sources="theta"
+    )
+
+    assert calls == ["US.AAPL240119P00150000"]
+    assert result is not None
+    cached = pd.read_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    assert "_theta_enrichment_incomplete" not in cached.columns or cached["_theta_enrichment_incomplete"].fillna(0).le(0).all()
+
+
+def test_legacy_theta_option_cache_without_open_interest_is_refetched(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    pd.DataFrame(
+        {
+            "open": [1.0], "high": [1.2], "low": [0.9], "close": [1.1], "volume": [10],
+            "contract_multiplier": [100.0], "iv_percentile": [0.4],
+        },
+        index=pd.to_datetime(["2024-01-19"]),
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1):
+            calls.append(symbol)
+            return None
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [ThetaDataProvider()])
+    DataManager().get_data(
+        "US.AAPL240119P00150000", "20220101", "20250105", specified_sources="theta"
+    )
+    assert calls == ["US.AAPL240119P00150000"]
+
+
+def test_checked_empty_theta_option_cache_stays_complete(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    pd.DataFrame(
+        {
+            "open": [1.0], "high": [1.2], "low": [0.9], "close": [1.1], "volume": [10],
+            "contract_multiplier": [100.0], "iv_percentile": [0.4],
+            "_theta_enrichment_checked": [1],
+        },
+        index=pd.to_datetime(["2024-01-19"]),
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1):
+            calls.append(symbol)
+            return None
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [ThetaDataProvider()])
+    result = DataManager().get_data(
+        "US.AAPL240119P00150000", "20220101", "20250105", specified_sources="theta"
+    )
+    assert calls == []
+    assert result is not None
+
+
+def test_next_execution_reuses_filled_cache_and_keeps_complete_sibling(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    index = pd.to_datetime(["2024-01-02", "2024-01-19"])
+    complete = "US.AAPL240119P00150000"
+    incomplete = "US.AAPL240119P00160000"
+    pd.DataFrame(
+        {
+            "open": [1.0, 1.2], "high": [1.3, 1.4], "low": [0.9, 1.1],
+            "close": [1.2, 1.3], "volume": [10, 11],
+            "contract_multiplier": [100.0, 100.0], "iv_percentile": [0.5, 0.5],
+            "open_interest": [20.0, 21.0],
+        },
+        index=index,
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    pd.DataFrame(
+        {
+            "open": [1.0, 1.2], "high": [1.3, 1.4], "low": [0.9, 1.1],
+            "close": [1.2, 1.3], "volume": [10, 11],
+            "contract_multiplier": [100.0, 100.0], "iv_percentile": [0.5, 0.5],
+            "_theta_enrichment_incomplete": [1, 1],
+        },
+        index=index,
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00160000.csv"))
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1):
+            calls.append(symbol)
+            return pd.DataFrame(
+                {
+                    "open": [9.0, 9.1], "high": [9.0, 9.1], "low": [9.0, 9.1],
+                    "close": [9.0, 9.1], "volume": [1, 1], "open_interest": [100.0, 110.0],
+                },
+                index=index,
+            )
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [ThetaDataProvider()])
+    manager = DataManager()
+    kept = manager.get_data(complete, "20220101", "20250105", specified_sources="theta")
+    filled = manager.get_data(incomplete, "20220101", "20250105", specified_sources="theta")
+
+    assert calls == [incomplete]
+    assert kept is not None and filled is not None
+    cached = pd.read_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00160000.csv"))
+    assert "_theta_enrichment_incomplete" not in cached.columns
+
+    calls.clear()
+    again = DataManager()
+    assert again.get_data(complete, "20220101", "20250105", specified_sources="theta") is not None
+    assert again.get_data(incomplete, "20220101", "20250105", specified_sources="theta") is not None
+    assert calls == []

@@ -59,4 +59,4 @@ python .\run.py sample_macd_cross_strategy --symbols=<example_symbol> --data_sou
 
 财报事件若由 Provider 支持，统一实现 `get_earnings_calendar(symbols, start_date, end_date, as_of)`；策略只能经 `DataManager` 使用 `data_source`，不能直接调用 SDK。历史 `as_of` 不受支持时必须显式标记，不得把当前日历冒充点时预告。
 
-ThetaData 分块历史请求首轮结束后，对超时或瞬时失败的日期块补偿一次；已经返回的部分数据必须保留。OI、Greeks 等附加字段请求失败时，不得丢弃同一合约已经成功返回的 OHLC 数据。
+ThetaData 分块历史请求首轮结束后，对超时或瞬时失败的日期块最多补偿 5 轮并打印 retry；其它请求仍在途时只追加一轮，剩余缺口标记后留给本轮末尾或下次执行。本轮末尾对失败和不完整标的串行重试最多 5 轮。中途中断或本轮仍失败时，下次执行复用完整缓存，只补缺口并合并。已经返回的部分数据必须保留。OI、Greeks 因超时缺失时不得丢弃 OHLC，也不得把该结果当作完整缓存。`No data found` 不重试、不标记不完整。

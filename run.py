@@ -111,8 +111,11 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     print("\n--- Fetching Data ---")
     print(f"  Requesting data from: {start_date or 'origin'} to {end_date or 'latest'}")
 
+    from data_providers.thetadata_provider import enrichment_retry_needed, retry_unresolved_symbols
+
     datas = {}
     skipped = []
+    incomplete = []
     symbols = list(symbols or [])
     total = len(symbols)
     started = time.monotonic()
@@ -137,7 +140,11 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
         completed += 1
         if df is not None and not df.empty:
             datas[symbol] = df
-            status = "ok"
+            if enrichment_retry_needed(df, symbol):
+                incomplete.append(symbol)
+                status = "incomplete"
+            else:
+                status = "ok"
         else:
             skipped.append(symbol)
             print(f"  Warning: Failed to fetch data for {symbol}. It will be excluded from the backtest.")
@@ -160,9 +167,9 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
                 symbol, df = future.result()
                 consume_symbol(symbol, df)
 
+    still_missing = []
     if skipped:
         print(f"[Auto-Fetch] retry {len(skipped)} skipped symbols")
-        still_missing = []
         retry_workers = max(1, min(4, len(skipped)))
         if len(skipped) == 1:
             retry_pairs = [fetch_symbol(skipped[0])]
@@ -170,11 +177,23 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
             with ThreadPoolExecutor(max_workers=retry_workers) as pool:
                 retry_pairs = list(pool.map(lambda symbol: fetch_symbol(symbol), skipped))
         for symbol, df in retry_pairs:
-            if df is not None and not df.empty:
+            if df is not None and not df.empty and not enrichment_retry_needed(df, symbol):
                 datas[symbol] = df
                 print(f"[Auto-Fetch] retry {symbol} ok")
+            elif df is not None and not df.empty:
+                datas[symbol] = df
+                incomplete.append(symbol)
+                print(f"[Auto-Fetch] retry {symbol} still incomplete")
             else:
-                print(f"  Warning: Failed to fetch data for {symbol}. It will be excluded from the backtest.")
+                still_missing.append(symbol)
+
+    unresolved = list(dict.fromkeys(still_missing + incomplete))
+    if unresolved:
+        frames, _pending = retry_unresolved_symbols(
+            unresolved,
+            lambda symbol: fetch_symbol(symbol)[1],
+        )
+        datas.update(frames)
 
     if not datas:
         print("\nFatal: Could not fetch data for any of the specified symbols. Aborting.")

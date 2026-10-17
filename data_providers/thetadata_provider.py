@@ -42,9 +42,80 @@ _MAX_CONCURRENT_CALLS = 4
 
 _OCC_RE = re.compile(r"^US\.([A-Z0-9]+?)(\d{6})([CP])(\d{8})$", re.IGNORECASE)
 _REQUIRED = ("open", "high", "low", "close", "volume")
-
-
 _VENDOR_TZ = ZoneInfo("America/New_York")
+
+# 超时缺字段不能只看日期覆盖；这两个列会随 CSV 保留，attrs 不会。
+ENRICHMENT_INCOMPLETE_COLUMN = "_theta_enrichment_incomplete"
+ENRICHMENT_CHECKED_COLUMN = "_theta_enrichment_checked"
+
+
+def enrichment_retry_needed(frame, symbol=None) -> bool:
+    """判断是否因超时缺了 OI/Greeks，需要本轮末尾或下次执行重拉。
+
+    ``No data found`` 不会留下不完整标记。旧缓存若带有 Theta 期权签名但没有
+    OI，也视为需要重拉，避免超时结果被日期覆盖误判为完整。
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return False
+    attrs = getattr(frame, "attrs", {}) or {}
+    if attrs.get("theta_enrichment_incomplete"):
+        return True
+    if ENRICHMENT_INCOMPLETE_COLUMN in frame.columns:
+        flags = pd.to_numeric(frame[ENRICHMENT_INCOMPLETE_COLUMN], errors="coerce").fillna(0)
+        if bool(flags.gt(0).any()):
+            return True
+    if ENRICHMENT_CHECKED_COLUMN in frame.columns:
+        return False
+    if "open_interest" in frame.columns:
+        return False
+    if symbol is not None and _OCC_RE.match(str(symbol).strip().upper()) is None:
+        return False
+    columns = {str(column) for column in frame.columns}
+    return "contract_multiplier" in columns and "iv_percentile" in columns
+
+
+def retry_unresolved_symbols(symbols, fetch):
+    """串行重拉失败或不完整标的，直到成功或用尽尝试。
+
+    返回本阶段拿到的最新数据，以及仍未解决的标的。部分数据会保留，
+    供本次继续使用；下次执行只补缺口，完整缓存继续复用。
+    """
+    pending = list(dict.fromkeys(symbol for symbol in symbols or [] if symbol))
+    frames = {}
+    for round_index in range(1, REQUEST_ATTEMPTS + 1):
+        if not pending:
+            break
+        print(
+            f"[Auto-Fetch] retry {len(pending)} failed or incomplete symbols "
+            f"{round_index}/{REQUEST_ATTEMPTS}"
+        )
+        still = []
+        for symbol in pending:
+            try:
+                df = fetch(symbol)
+            except Exception as exc:
+                print(f"[Auto-Fetch] retry {symbol} failed: {exc}")
+                df = None
+            usable = df is not None and not getattr(df, "empty", True)
+            if usable and not enrichment_retry_needed(df, symbol):
+                frames[symbol] = df
+                print(f"[Auto-Fetch] retry {symbol} ok")
+                continue
+            if usable:
+                frames[symbol] = df
+            still.append(symbol)
+            if round_index >= REQUEST_ATTEMPTS:
+                print(
+                    f"[Auto-Fetch] retry {symbol} still incomplete; "
+                    "will rerun next execution"
+                )
+            else:
+                print(
+                    f"[Auto-Fetch] retry {symbol} still failed; "
+                    f"continue {round_index + 1}/{REQUEST_ATTEMPTS}"
+                )
+        pending = still
+    return frames, pending
 
 
 def _vendor_today():
@@ -560,8 +631,74 @@ class ThetaDataProvider(BaseDataProvider):
         merged.index.name = "datetime"
         return merged
 
+    def _local_fail_count(self):
+        """读取当前线程的可重试失败计数。"""
+        return int(getattr(self._thread_stats, "fail", 0) or 0)
+
+    def _should_compensate(self, before):
+        """只有超时或瞬时失败才补偿；非法参数和空数据不进入后置重试。"""
+        if self._local_fail_count() <= int(before or 0):
+            return False
+        return getattr(self._thread_stats, "retryable", True) is not False
+
+    def _requests_inflight(self):
+        """当前是否还有其它请求占用 session。"""
+        with self._client_lock:
+            return int(self._inflight) > 0
+
+    def _retry_failed_windows(self, method, windows, **kwargs):
+        """对超时或瞬时失败的窗口做有界补偿，并打印显式 retry。"""
+        pending = [
+            (start, end)
+            for start, end in windows
+            if start is not None and end is not None
+        ]
+        recovered = []
+        for round_index in range(1, REQUEST_ATTEMPTS + 1):
+            if not pending:
+                break
+            if round_index > 1 and self._requests_inflight():
+                print(
+                    f"[ThetaData] {method} compensation retry deferred; "
+                    f"{len(pending)} windows remain for a later retry"
+                )
+                break
+            still_failed = []
+            for retry_start, retry_end in pending:
+                print(
+                    f"[ThetaData] {method} compensation retry "
+                    f"{round_index}/{REQUEST_ATTEMPTS} {retry_start}..{retry_end}"
+                )
+                empty_before = int(getattr(self._thread_stats, "empty", 0) or 0)
+                frame = self._call(
+                    method,
+                    start_date=retry_start,
+                    end_date=retry_end,
+                    _max_attempts=1,
+                    _count_fail=False,
+                    **kwargs,
+                )
+                converted = _to_pandas(frame)
+                if converted is not None and not converted.empty:
+                    recovered.append(converted)
+                    self._resolve_retryable_failure()
+                    continue
+                empty_after = int(getattr(self._thread_stats, "empty", 0) or 0)
+                if empty_after > empty_before:
+                    self._resolve_retryable_failure()
+                    continue
+                still_failed.append((retry_start, retry_end))
+            pending = still_failed
+        return recovered, pending
+
     def _call(self, method, **kwargs):
-        """执行 SDK 调用；同一 session 允许有界并发，超时和瞬时错误有界重试。"""
+        """执行 SDK 调用；同一 session 允许有界并发。超时和瞬时错误有界重试并打印 retry。"""
+        raw_attempts = kwargs.pop("_max_attempts", REQUEST_ATTEMPTS)
+        count_fail = bool(kwargs.pop("_count_fail", True))
+        try:
+            max_attempts = max(1, min(int(raw_attempts), REQUEST_ATTEMPTS))
+        except (TypeError, ValueError, OverflowError):
+            max_attempts = REQUEST_ATTEMPTS
         if self._is_unsupported(method):
             return None
         timeout = self._timeout_seconds(bulk=self._is_bulk_kwargs(kwargs))
@@ -569,6 +706,16 @@ class ThetaDataProvider(BaseDataProvider):
         timed_out = False
         acquired = False
         counted = False
+
+        def continue_retry(attempt, reason):
+            if attempt >= max_attempts:
+                return False
+            text = " ".join(str(reason).split())
+            if len(text) > 160:
+                text = text[:157] + "..."
+            print(f"[ThetaData] {method} retry {attempt + 1}/{max_attempts} after {text}")
+            return True
+
         try:
             self._call_sema.acquire()
             acquired = True
@@ -578,7 +725,7 @@ class ThetaDataProvider(BaseDataProvider):
                     self._client_stale = False
                 self._inflight += 1
                 counted = True
-            for _attempt in range(REQUEST_ATTEMPTS):
+            for attempt in range(1, max_attempts + 1):
                 if self._is_unsupported(method):
                     return None
                 client = self._get_client()
@@ -601,17 +748,18 @@ class ThetaDataProvider(BaseDataProvider):
                 worker.start()
                 worker.join(timeout)
                 if worker.is_alive():
-                    # 其它请求仍在使用当前 session 时不能重认证，否则会触发不同 session id 拦截。
-                    exclusive = self._mark_client_stale(reset_if_exclusive=True)
+                    # 其它请求在途时不重认证，但当前请求仍继续用尽剩余次数。
+                    self._mark_client_stale(reset_if_exclusive=True)
                     timed_out = True
                     last_error = None
-                    if exclusive:
+                    if continue_retry(attempt, "timeout"):
                         continue
                     break
                 if "error" in outcome:
                     error = outcome["error"]
                     message = str(error)
-                    if "permission_denied" in message.lower() or "professional subscription" in message.lower():
+                    lowered = message.lower()
+                    if "permission_denied" in lowered or "professional subscription" in lowered:
                         self._mark_unsupported(method)
                         print(f"[ThetaData] {method} failed: {error}")
                         return None
@@ -620,25 +768,30 @@ class ThetaDataProvider(BaseDataProvider):
                         return None
                     if _is_invalid_theta_argument(error):
                         print(f"[ThetaData] {method} failed: {error}")
-                        self._bump_fail()
+                        if count_fail:
+                            self._bump_fail()
+                            self._thread_stats.retryable = False
                         return None
-                    lowered = message.lower()
                     if "invalid session id" in lowered or "unauthenticated" in lowered:
-                        exclusive = self._mark_client_stale(reset_if_exclusive=True)
+                        self._mark_client_stale(reset_if_exclusive=True)
                         last_error = error
                         timed_out = False
-                        if exclusive:
+                        if continue_retry(attempt, "invalid session"):
                             continue
                         break
                     last_error = error
                     timed_out = False
-                    continue
+                    if continue_retry(attempt, error):
+                        continue
+                    break
                 return outcome.get("value")
             if timed_out or last_error is None:
                 print(f"[ThetaData] {method} timed out after {timeout:.1f}s")
             else:
                 print(f"[ThetaData] {method} failed: {last_error}")
-            self._bump_fail()
+            if count_fail:
+                self._bump_fail()
+                self._thread_stats.retryable = True
             return None
         finally:
             if counted:
@@ -659,7 +812,7 @@ class ThetaDataProvider(BaseDataProvider):
         return self._take_thread_or_global("fail", "_retryable_fail_count")
 
     def _chunked_history(self, method, start, end, chunk_days=_INTRADAY_CHUNK_DAYS, **kwargs):
-        """按跨日限制拆分历史请求，并对瞬时失败的日期块补偿一次。"""
+        """按跨日限制拆分历史请求，并对瞬时失败的日期块做有界补偿。"""
         try:
             span = max(1, int(chunk_days or _INTRADAY_CHUNK_DAYS))
         except (TypeError, ValueError, OverflowError):
@@ -669,7 +822,7 @@ class ThetaDataProvider(BaseDataProvider):
         cursor = start
         while cursor <= end:
             chunk_end = min(end, cursor + _dt.timedelta(days=span) - _dt.timedelta(days=1))
-            local_fail_before = int(getattr(self._thread_stats, "fail", 0) or 0)
+            local_fail_before = self._local_fail_count()
             frame = self._call(
                 method,
                 start_date=cursor,
@@ -679,24 +832,19 @@ class ThetaDataProvider(BaseDataProvider):
             converted = _to_pandas(frame)
             if converted is not None and not converted.empty:
                 frames.append(converted)
-            elif int(getattr(self._thread_stats, "fail", 0) or 0) > local_fail_before:
-                # 空数据是有效的 No data found，不进入补偿；只有超时/瞬时失败才补偿。
+            elif self._should_compensate(local_fail_before):
+                # 空数据是有效的 No data found，不进入补偿；只有超时或瞬时失败才补偿。
                 failed_chunks.append((cursor, chunk_end))
             cursor = chunk_end + _dt.timedelta(days=1)
-
-        # 所有首轮请求结束后再补偿，避免失败请求在同一 session 上立即争抢重认证。
-        for retry_start, retry_end in failed_chunks:
-            frame = self._call(
-                method,
-                start_date=retry_start,
-                end_date=retry_end,
-                **kwargs,
-            )
-            converted = _to_pandas(frame)
-            if converted is not None and not converted.empty:
-                frames.append(converted)
-                self._resolve_retryable_failure()
-        return pd.concat(frames, ignore_index=True, sort=False) if frames else None
+        recovered, unresolved = self._retry_failed_windows(method, failed_chunks, **kwargs)
+        frames.extend(recovered)
+        if not frames:
+            return None
+        merged = pd.concat(frames, ignore_index=True, sort=False)
+        if unresolved:
+            # 价格窗口仍有超时缺口时保留已拿到的数据，但不能被下次执行当成完整缓存。
+            merged.attrs["theta_history_incomplete"] = True
+        return merged
 
     def _history_or_chunk(self, method, start, end, chunk_days, **kwargs):
         """跨度达到接口上限时直接分块，避免先打一次必然失败的超限请求。"""
@@ -708,19 +856,20 @@ class ThetaDataProvider(BaseDataProvider):
             width = _EOD_MAX_REQUEST_DAYS
         if (end - start).days >= width:
             return self._chunked_history(method, start, end, chunk_days=width, **kwargs)
-        fails_before = int(getattr(self._thread_stats, "fail", 0) or 0)
+        fails_before = self._local_fail_count()
         raw = self._call(method, start_date=start, end_date=end, **kwargs)
         converted = _to_pandas(raw)
         if converted is not None and not converted.empty:
             return converted
-        fails_after = int(getattr(self._thread_stats, "fail", 0) or 0)
-        if fails_after > fails_before and (end - start).days > 1:
-            # 小于接口上限的请求重试原区间即可；再次按同一大块切片不会减少请求负载。
-            retry_raw = self._call(method, start_date=start, end_date=end, **kwargs)
-            retry_frame = _to_pandas(retry_raw)
-            if retry_frame is not None and not retry_frame.empty:
-                self._resolve_retryable_failure()
-                return retry_frame
+        if self._should_compensate(fails_before):
+            recovered, unresolved = self._retry_failed_windows(method, [(start, end)], **kwargs)
+            if recovered:
+                result = recovered[0] if len(recovered) == 1 else pd.concat(
+                    recovered, ignore_index=True, sort=False
+                )
+                if unresolved:
+                    result.attrs["theta_history_incomplete"] = True
+                return result
         return converted
 
     def get_data(
@@ -825,6 +974,7 @@ class ThetaDataProvider(BaseDataProvider):
             # 标准美股期权的 100 倍假设。
             print('[ThetaData] adjusted option contract lacks a verified multiplier; history rejected')
             return None
+        history_incomplete = bool(getattr(raw, "attrs", {}).get("theta_history_incomplete"))
         result = self._normalise_ohlcv(raw)
         if result is None:
             return None
@@ -846,6 +996,8 @@ class ThetaDataProvider(BaseDataProvider):
             # Greeks 是独立接口；失败时价格仍然可用于静态回测。
             if _ENRICH_OPTIONS:
                 root, expiry, strike, right = parsed
+                missing = []
+                greeks_fail_before = self._local_fail_count()
                 # 分钟数据应请求同频的一阶 Greeks；EOD 时间戳通常晚于盘中
                 # K 线，直接回填会造成整段盘口 Greeks 错位为 NaN。
                 greeks_method = (
@@ -895,6 +1047,9 @@ class ThetaDataProvider(BaseDataProvider):
                         "rho": ("rho",),
                     },
                 )
+                if self._should_compensate(greeks_fail_before):
+                    missing.append("greeks")
+                oi_fail_before = self._local_fail_count()
                 open_interest = self._history_or_chunk(
                     "option_history_open_interest",
                     start,
@@ -930,6 +1085,26 @@ class ThetaDataProvider(BaseDataProvider):
                     window=252,
                     explicit=False,
                 )
+                if self._should_compensate(oi_fail_before):
+                    missing.append("open_interest")
+                if history_incomplete:
+                    missing.append("history")
+                if missing:
+                    result.attrs["theta_enrichment_incomplete"] = True
+                    result.attrs["theta_enrichment_missing"] = ",".join(missing)
+                    result[ENRICHMENT_INCOMPLETE_COLUMN] = 1
+                    print(
+                        f"[ThetaData] {normalized} enrichment incomplete: {','.join(missing)}; "
+                        "marked for retry"
+                    )
+                elif "open_interest" not in result.columns:
+                    # No data found 只确认空结果，避免下次把缺字段误判为超时缺口。
+                    result[ENRICHMENT_CHECKED_COLUMN] = 1
+        if history_incomplete and not result.attrs.get("theta_enrichment_incomplete"):
+            result.attrs["theta_enrichment_incomplete"] = True
+            result.attrs["theta_enrichment_missing"] = "history"
+            result[ENRICHMENT_INCOMPLETE_COLUMN] = 1
+            print(f"[ThetaData] {normalized} history incomplete; marked for retry")
         if not is_intraday:
             # EOD 接口的 ``created``/``timestamp`` 是成交或生成时刻，股票与
             # 期权通常相差数秒；统一到交易日午夜，便于多数据源按日对齐。

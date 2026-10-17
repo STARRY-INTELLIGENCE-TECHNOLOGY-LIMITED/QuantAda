@@ -910,3 +910,222 @@ def test_thread_local_empty_counts_do_not_steal_across_workers():
         thread.join(timeout=5)
     assert counts == [1, 1, 1]
     assert provider.take_empty_result_count() == 0
+
+
+def test_concurrent_timeout_retries_without_reauth(monkeypatch, capsys):
+    class Fake:
+        def option_history_eod(self, **kwargs):
+            return pd.DataFrame({"open": [1]})
+
+        def close(self):
+            raise AssertionError("concurrent timeout must not close the shared session")
+
+    fake = Fake()
+    provider = ThetaDataProvider(api_key="token")
+    provider.client = fake
+    provider._owns_client = True
+    provider._inflight = 1
+
+    class Alive:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            return None
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return True
+
+    monkeypatch.setattr("data_providers.thetadata_provider.threading.Thread", Alive)
+    assert provider._call("option_history_eod", symbol="AAPL") is None
+    assert provider.client is fake
+    out = capsys.readouterr().out
+    assert "retry 2/5 after timeout" in out
+    assert "retry 5/5 after timeout" in out
+    assert out.count("timed out after") == 1
+
+
+def test_history_compensation_uses_attempt_budget(capsys):
+    provider = ThetaDataProvider(client=_FakeTheta())
+    calls = []
+
+    def flaky_call(method, **kwargs):
+        calls.append(kwargs.get("_max_attempts"))
+        provider._thread_stats.fail = int(getattr(provider._thread_stats, "fail", 0) or 0) + 1
+        return None
+
+    provider._call = flaky_call
+    result = provider._history_or_chunk(
+        "option_history_open_interest",
+        _dt.date(2024, 1, 1),
+        _dt.date(2024, 1, 10),
+        365,
+        symbol="AAPL",
+    )
+
+    assert result is None
+    assert len(calls) == 1 + REQUEST_ATTEMPTS
+    assert calls[0] is None
+    assert calls[1:] == [1] * REQUEST_ATTEMPTS
+    assert f"compensation retry {REQUEST_ATTEMPTS}/{REQUEST_ATTEMPTS}" in capsys.readouterr().out
+
+
+def test_history_compensation_defers_while_other_requests_are_inflight(capsys):
+    provider = ThetaDataProvider(client=_FakeTheta())
+    calls = []
+
+    def flaky_call(method, **kwargs):
+        calls.append(kwargs.get("_max_attempts"))
+        provider._thread_stats.fail = int(getattr(provider._thread_stats, "fail", 0) or 0) + 1
+        return None
+
+    provider._call = flaky_call
+    provider._inflight = 1
+    result = provider._history_or_chunk(
+        "option_history_open_interest",
+        _dt.date(2024, 1, 1),
+        _dt.date(2024, 1, 10),
+        365,
+        symbol="AAPL",
+    )
+
+    assert result is None
+    assert calls == [None, 1]
+    assert "compensation retry deferred" in capsys.readouterr().out
+
+
+def test_history_or_chunk_does_not_retry_empty_result():
+    provider = ThetaDataProvider(client=_FakeTheta())
+    calls = []
+
+    def empty_call(method, **kwargs):
+        calls.append(method)
+        return None
+
+    provider._call = empty_call
+    result = provider._history_or_chunk(
+        "option_history_open_interest",
+        _dt.date(2024, 1, 1),
+        _dt.date(2024, 1, 10),
+        365,
+        symbol="AAPL",
+    )
+
+    assert result is None
+    assert calls == ["option_history_open_interest"]
+
+
+def test_option_enrichment_timeout_marks_incomplete_without_dropping_price(capsys):
+    class Flaky(_FakeTheta):
+        def option_history_open_interest(self, **kwargs):
+            raise RuntimeError("unavailable")
+
+    result = ThetaDataProvider(client=Flaky()).get_data(
+        "US.AAPL240119P00150000", "20240101", "20240105"
+    )
+
+    assert result is not None and not result.empty
+    assert result.attrs["theta_enrichment_incomplete"] is True
+    assert "open_interest" in result.attrs["theta_enrichment_missing"]
+    assert int(result["_theta_enrichment_incomplete"].iloc[0]) == 1
+    assert result["close"].notna().all()
+    out = capsys.readouterr().out
+    assert "retry 2/5 after unavailable" in out
+    assert "enrichment incomplete" in out
+    assert "marked for retry" in out
+
+
+def test_option_enrichment_no_data_is_checked_not_retried():
+    class EmptyOI(_FakeTheta):
+        def __init__(self):
+            super().__init__()
+            self.oi_calls = 0
+
+        def option_history_open_interest(self, **kwargs):
+            self.oi_calls += 1
+            raise RuntimeError("No data found for: option_history_open_interest(AAPL)")
+
+    fake = EmptyOI()
+    result = ThetaDataProvider(client=fake).get_data(
+        "US.AAPL240119P00150000", "20240101", "20240105"
+    )
+
+    assert result is not None
+    assert fake.oi_calls == 1
+    assert "theta_enrichment_incomplete" not in result.attrs
+    assert "_theta_enrichment_incomplete" not in result.columns
+    assert int(result["_theta_enrichment_checked"].iloc[0]) == 1
+
+
+def test_chunked_history_marks_unresolved_price_windows():
+    provider = ThetaDataProvider(client=_FakeTheta())
+
+    def flaky_call(method, **kwargs):
+        if kwargs["start_date"] == _dt.date(2024, 1, 1):
+            provider._thread_stats.fail = int(getattr(provider._thread_stats, "fail", 0) or 0) + 1
+            provider._thread_stats.retryable = True
+            return None
+        return pd.DataFrame({
+            "timestamp": ["2024-01-06"],
+            "open": [1.0], "high": [1.0], "low": [1.0],
+            "close": [1.0], "volume": [1.0],
+        })
+
+    provider._call = flaky_call
+    result = provider._chunked_history(
+        "stock_history_eod",
+        _dt.date(2024, 1, 1),
+        _dt.date(2024, 1, 10),
+        chunk_days=5,
+        symbol="AAPL",
+    )
+
+    assert result is not None and not result.empty
+    assert result.attrs.get("theta_history_incomplete") is True
+
+
+def test_get_data_marks_unresolved_history_for_later_retry():
+    provider = ThetaDataProvider(client=_FakeTheta())
+    raw = pd.DataFrame({
+        "timestamp": ["2024-01-02"],
+        "open": [1.0], "high": [1.0], "low": [1.0],
+        "close": [1.0], "volume": [1.0],
+    })
+    raw.attrs["theta_history_incomplete"] = True
+    provider._history_or_chunk = lambda *args, **kwargs: raw
+
+    result = provider.get_data("US.AAPL", "20240102", "20240103")
+
+    assert result is not None
+    assert result.attrs.get("theta_enrichment_incomplete") is True
+    assert int(result["_theta_enrichment_incomplete"].iloc[0]) == 1
+
+
+def test_retry_unresolved_symbols_exhausts_failures_and_keeps_partial():
+    from data_providers.base_provider import REQUEST_ATTEMPTS
+    from data_providers.thetadata_provider import retry_unresolved_symbols
+
+    calls = []
+
+    def fetch(symbol):
+        calls.append(symbol)
+        if symbol == "OK":
+            return pd.DataFrame({"close": [1.0]})
+        if symbol == "GAP" and calls.count("GAP") >= 2:
+            return pd.DataFrame({"close": [2.0], "open_interest": [1.0]})
+        if symbol == "GAP":
+            frame = pd.DataFrame({"close": [1.0], "_theta_enrichment_incomplete": [1]})
+            frame.attrs["theta_enrichment_incomplete"] = True
+            return frame
+        return None
+
+    frames, pending = retry_unresolved_symbols(["OK", "GAP", "MISS"], fetch)
+
+    assert list(frames) == ["OK", "GAP"]
+    assert pending == ["MISS"]
+    assert calls.count("OK") == 1
+    assert calls.count("GAP") == 2
+    assert calls.count("MISS") == REQUEST_ATTEMPTS

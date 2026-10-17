@@ -1771,3 +1771,130 @@ def test_optimizer_infers_omitted_window_without_removed_schedule(monkeypatch):
     assert events == [("infer", None, None)]
     assert args.start_date == "20230922"
     assert args.end_date == "20260922"
+
+
+def test_fetch_all_data_retries_incomplete_enrichment(capsys):
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            calls.append(symbol)
+            if len(calls) == 1:
+                frame = pd.DataFrame(
+                    {
+                        "open": [1.0], "high": [1.0], "low": [1.0],
+                        "close": [1.0], "volume": [100.0],
+                        "_theta_enrichment_incomplete": [1],
+                    },
+                    index=[pd.Timestamp("2024-01-02")],
+                )
+                frame.attrs["theta_enrichment_incomplete"] = True
+                return frame
+            return pd.DataFrame(
+                {
+                    "open": [2.0], "high": [2.0], "low": [2.0],
+                    "close": [2.0], "volume": [100.0], "open_interest": [1000.0],
+                },
+                index=[pd.Timestamp("2024-01-02")],
+            )
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    job.target_symbols = ["US.AAPL240119P00150000"]
+    job.data_manager = DummyDataManager()
+    job.args = SimpleNamespace(
+        start_date="20240101",
+        end_date="20240131",
+        train_roll_period=None,
+        test_roll_period=None,
+        train_period=None,
+        test_period=None,
+        train_ratio=None,
+        data_source="theta",
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    )
+
+    got = job._fetch_all_data()
+    out = capsys.readouterr().out
+
+    assert calls == ["US.AAPL240119P00150000", "US.AAPL240119P00150000"]
+    assert got["US.AAPL240119P00150000"]["close"].iloc[0] == 2.0
+    assert "incomplete symbols" in out
+    assert "retry US.AAPL240119P00150000 ok" in out
+
+
+def _incomplete_frame():
+    frame = pd.DataFrame(
+        {
+            "open": [1.0], "high": [1.0], "low": [1.0],
+            "close": [1.0], "volume": [100.0],
+            "_theta_enrichment_incomplete": [1],
+        },
+        index=[pd.Timestamp("2024-01-02")],
+    )
+    frame.attrs["theta_enrichment_incomplete"] = True
+    return frame
+
+
+def _fetch_job(data_manager, symbol="US.AAPL240119P00150000"):
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS
+    job.target_symbols = [symbol]
+    job.data_manager = data_manager
+    job.args = SimpleNamespace(
+        start_date="20240101",
+        end_date="20240131",
+        train_roll_period=None,
+        test_roll_period=None,
+        train_period=None,
+        test_period=None,
+        train_ratio=None,
+        data_source="theta",
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    )
+    return job
+
+
+def test_fetch_all_data_retries_unresolved_until_attempt_budget(capsys):
+    from data_providers.base_provider import REQUEST_ATTEMPTS
+
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            calls.append(symbol)
+            return _incomplete_frame()
+
+    symbol = "US.AAPL240119P00150000"
+    got = _fetch_job(DummyDataManager(), symbol)._fetch_all_data()
+    out = capsys.readouterr().out
+
+    assert len(calls) == 1 + REQUEST_ATTEMPTS
+    assert got[symbol]["close"].iloc[0] == 1.0
+    assert f"{REQUEST_ATTEMPTS}/{REQUEST_ATTEMPTS}" in out
+    assert "will rerun next execution" in out
+
+
+def test_fetch_all_data_retries_missing_symbol_after_interruptible_failure(capsys):
+    from data_providers.base_provider import REQUEST_ATTEMPTS
+
+    calls = []
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            calls.append(symbol)
+            return None
+
+    symbol = "US.AAPL240119P00150000"
+    try:
+        _fetch_job(DummyDataManager(), symbol)._fetch_all_data()
+    except ValueError:
+        pass
+    out = capsys.readouterr().out
+
+    assert len(calls) == 2 + REQUEST_ATTEMPTS
+    assert "will rerun next execution" in out
