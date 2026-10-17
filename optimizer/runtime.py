@@ -2614,6 +2614,7 @@ class OptimizationJob:
         if not eval_datas:
             print("[Optimizer] Warning: Main evaluation backtest skipped (no valid data).")
             return None
+        print(f"[Optimizer] Main evaluation loading {len(eval_datas)} feeds")
 
         try:
             metrics = self._run_backtest_on_datas(

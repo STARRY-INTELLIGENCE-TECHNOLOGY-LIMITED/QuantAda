@@ -6,6 +6,7 @@ import pandas as pd
 
 import config
 from backtest.closed_trade_tracker import ClosedTradeTracker
+from backtest.fast_feed import FastPandasData
 from backtest.plotting import (
     apply_data_feed_plot_scope,
     configure_plot_observers,
@@ -1397,7 +1398,7 @@ class Backtester:
                 prepared[symbol] = frame
         self._prepared_datas = prepared
         for symbol, df in prepared.items():
-            feed = bt.feeds.PandasData(
+            feed = FastPandasData(
                 dataname=df,
                 fromdate=start,
                 todate=end,
