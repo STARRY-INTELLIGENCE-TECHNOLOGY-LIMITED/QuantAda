@@ -1488,12 +1488,8 @@ class OptimizationJob:
         started = time.monotonic()
         last_progress = started
         completed = 0
-        # 并发期权链/行情拉取只服务已声明 option_universe 的策略；普通股票
-        # 训练保留原顺序和单通道 Provider 访问，避免改变券商/CSV 读取语义。
-        option_strategy = bool(
-            getattr(getattr(self, "strategy_class", None), "option_universe", None)
-        )
-        fetch_workers = max(1, min(4, total)) if option_strategy and total else 1
+        # Theta session 必须串行复用。期权拉数不再并发，避免超时重试叠在同一条连接上。
+        fetch_workers = 1
 
         def fetch_symbol(symbol):
             df = self.data_manager.get_data(
@@ -1542,7 +1538,7 @@ class OptimizationJob:
         if skipped:
             print(f"[Auto-Fetch] retry {len(skipped)} skipped symbols")
             still_missing = []
-            retry_workers = max(1, min(4, len(skipped))) if option_strategy else 1
+            retry_workers = 1
             if len(skipped) == 1:
                 retry_pairs = [fetch_symbol(skipped[0])]
             else:

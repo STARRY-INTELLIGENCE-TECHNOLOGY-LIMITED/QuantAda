@@ -35,7 +35,7 @@ from common.options.universe import (
 from common.options.analytics import underlying_key
 
 _PROGRESS_INTERVAL_SECONDS = 30.0
-_FETCH_WORKERS = 4  # 与 Theta 单 session 并发上限对齐，禁止并发新认证。
+_FETCH_WORKERS = 1  # Theta session 必须串行复用，禁止并发请求。
 
 
 def _incomplete_vendor_day():

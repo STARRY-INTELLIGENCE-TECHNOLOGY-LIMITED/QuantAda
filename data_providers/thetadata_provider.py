@@ -37,8 +37,7 @@ _DEFAULT_AUTO_MAX_DTE = 90
 _EOD_RETRY_CHUNK_DAYS = 365
 _EOD_MAX_REQUEST_DAYS = 365
 _INTRADAY_CHUNK_DAYS = 30
-# 同一进程只允许一个 Theta session；并发只复用该 session 的 gRPC 通道。
-_MAX_CONCURRENT_CALLS = 4
+# 同一进程只复用一个 Theta session。SDK 调用必须串行，在途请求未结束不得再发下一个。
 
 _OCC_RE = re.compile(r"^US\.([A-Z0-9]+?)(\d{6})([CP])(\d{8})$", re.IGNORECASE)
 _REQUIRED = ("open", "high", "low", "close", "volume")
@@ -47,6 +46,35 @@ _VENDOR_TZ = ZoneInfo("America/New_York")
 # 超时缺字段不能只看日期覆盖；这两个列会随 CSV 保留，attrs 不会。
 ENRICHMENT_INCOMPLETE_COLUMN = "_theta_enrichment_incomplete"
 ENRICHMENT_CHECKED_COLUMN = "_theta_enrichment_checked"
+
+_SDK_GATE = threading.Condition()
+_SDK_ACTIVE = 0
+_Thread = threading.Thread
+
+
+def _acquire_sdk_slot():
+    """占用进程内唯一的 Theta session 调用位。"""
+    global _SDK_ACTIVE
+    with _SDK_GATE:
+        while _SDK_ACTIVE:
+            _SDK_GATE.wait()
+        _SDK_ACTIVE += 1
+
+
+def _release_sdk_slot():
+    """释放 session 调用位，让下一条请求继续复用同一个客户端。"""
+    global _SDK_ACTIVE
+    with _SDK_GATE:
+        _SDK_ACTIVE = max(0, _SDK_ACTIVE - 1)
+        _SDK_GATE.notify_all()
+
+
+def _release_sdk_slot_when_done(worker):
+    """等在途 SDK 线程结束后再放行，避免超时重试叠成并发。"""
+    worker.join()
+    _release_sdk_slot()
+
+
 
 
 def enrichment_retry_needed(frame, symbol=None) -> bool:
@@ -321,7 +349,6 @@ class ThetaDataProvider(BaseDataProvider):
             )
         )
         self._client_lock = threading.RLock()
-        self._call_sema = threading.BoundedSemaphore(_MAX_CONCURRENT_CALLS)
         self._stats_lock = threading.Lock()
         self._thread_stats = threading.local()
         self._inflight = 0
@@ -692,7 +719,7 @@ class ThetaDataProvider(BaseDataProvider):
         return recovered, pending
 
     def _call(self, method, **kwargs):
-        """执行 SDK 调用；同一 session 允许有界并发。超时和瞬时错误有界重试并打印 retry。"""
+        """执行 SDK 调用。同一 session 串行复用；超时不另开请求、不重认证。"""
         raw_attempts = kwargs.pop("_max_attempts", REQUEST_ATTEMPTS)
         count_fail = bool(kwargs.pop("_count_fail", True))
         try:
@@ -706,6 +733,8 @@ class ThetaDataProvider(BaseDataProvider):
         timed_out = False
         acquired = False
         counted = False
+        handoff = False
+        announced_timeout = False
 
         def continue_retry(attempt, reason):
             if attempt >= max_attempts:
@@ -717,7 +746,7 @@ class ThetaDataProvider(BaseDataProvider):
             return True
 
         try:
-            self._call_sema.acquire()
+            _acquire_sdk_slot()
             acquired = True
             with self._client_lock:
                 if self._client_stale and self._inflight == 0:
@@ -747,13 +776,28 @@ class ThetaDataProvider(BaseDataProvider):
                 worker = threading.Thread(target=invoke, name="thetadata-request", daemon=True)
                 worker.start()
                 worker.join(timeout)
+                if worker.is_alive() and timeout < _MAX_REQUEST_TIMEOUT_SECONDS:
+                    print(
+                        f"[ThetaData] {method} still in flight after {timeout:.1f}s; "
+                        "reusing session call, not starting another"
+                    )
+                    worker.join(_MAX_REQUEST_TIMEOUT_SECONDS - timeout)
                 if worker.is_alive():
-                    # 其它请求在途时不重认证，但当前请求仍继续用尽剩余次数。
-                    self._mark_client_stale(reset_if_exclusive=True)
+                    waited = max(timeout, _MAX_REQUEST_TIMEOUT_SECONDS)
+                    print(
+                        f"[ThetaData] {method} timed out after {waited:.1f}s; "
+                        "next request waits for this session call"
+                    )
+                    _Thread(
+                        target=_release_sdk_slot_when_done,
+                        args=(worker,),
+                        name="thetadata-session-wait",
+                        daemon=True,
+                    ).start()
+                    handoff = True
+                    acquired = False
+                    announced_timeout = True
                     timed_out = True
-                    last_error = None
-                    if continue_retry(attempt, "timeout"):
-                        continue
                     break
                 if "error" in outcome:
                     error = outcome["error"]
@@ -785,11 +829,11 @@ class ThetaDataProvider(BaseDataProvider):
                         continue
                     break
                 return outcome.get("value")
-            if timed_out or last_error is None:
+            if not announced_timeout and (timed_out or last_error is None):
                 print(f"[ThetaData] {method} timed out after {timeout:.1f}s")
-            else:
+            elif last_error is not None:
                 print(f"[ThetaData] {method} failed: {last_error}")
-            if count_fail:
+            if count_fail and (timed_out or last_error is not None):
                 self._bump_fail()
                 self._thread_stats.retryable = True
             return None
@@ -797,11 +841,11 @@ class ThetaDataProvider(BaseDataProvider):
             if counted:
                 with self._client_lock:
                     self._inflight = max(0, int(self._inflight) - 1)
-                    if self._client_stale and self._inflight == 0:
+                    if self._client_stale and self._inflight == 0 and not handoff:
                         self._reset_owned_client_locked()
                         self._client_stale = False
             if acquired:
-                self._call_sema.release()
+                _release_sdk_slot()
 
     def take_empty_result_count(self):
         """取出并清零空结果计数，供 OptionUniverse 进度行汇总。"""

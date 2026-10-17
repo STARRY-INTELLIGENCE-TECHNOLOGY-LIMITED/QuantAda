@@ -8,6 +8,14 @@ from data_providers.base_provider import REQUEST_ATTEMPTS
 from data_providers.thetadata_provider import ThetaDataProvider, _vendor_today
 
 
+def _frame():
+    return pd.DataFrame({
+        "open": [1], "high": [1], "low": [1],
+        "close": [1], "volume": [1],
+    })
+
+
+
 class _FakeTheta:
     def __init__(self):
         self.calls = []
@@ -497,10 +505,13 @@ def test_expiration_list_is_cached_across_as_of_dates():
     assert listed == ["option_list_expirations"]
 
 
-def test_timeout_resets_owned_client(monkeypatch):
+def test_timeout_reuses_owned_session(monkeypatch):
     class Fake:
         def option_history_eod(self, **kwargs):
-            return pd.DataFrame({"open": [1]})
+            return _frame()
+
+        def close(self):
+            raise AssertionError("timeout must reuse the owned session")
 
     provider = ThetaDataProvider(api_key="token")
     provider.client = Fake()
@@ -521,7 +532,7 @@ def test_timeout_resets_owned_client(monkeypatch):
 
     monkeypatch.setattr("data_providers.thetadata_provider.threading.Thread", Alive)
     assert provider._call("option_history_eod", symbol="AAPL") is None
-    assert provider.client is None
+    assert provider.client is not None
 
 
 def test_timeout_keeps_injected_client(monkeypatch):
@@ -807,20 +818,19 @@ def test_empty_theta_error_is_not_retried():
     assert provider.take_retryable_fail_count() == 0
 
 
-def test_concurrent_calls_reuse_single_client():
-    started = threading.Barrier(4)
-    seen = set()
+def test_calls_reuse_one_session_without_overlap():
+    current = {"n": 0, "peak": 0}
     lock = threading.Lock()
 
     class SharedTheta:
         def option_history_eod(self, **kwargs):
             with lock:
-                seen.add(id(self))
-            started.wait(timeout=2)
-            return pd.DataFrame({
-                "open": [1], "high": [1], "low": [1],
-                "close": [1], "volume": [1],
-            })
+                current["n"] += 1
+                current["peak"] = max(current["peak"], current["n"])
+            time.sleep(0.05)
+            with lock:
+                current["n"] -= 1
+            return _frame()
 
     fake = SharedTheta()
     provider = ThetaDataProvider(client=fake)
@@ -835,60 +845,63 @@ def test_concurrent_calls_reuse_single_client():
     for thread in threads:
         thread.join(timeout=5)
     assert all(item is not None for item in results)
-    assert seen == {id(fake)}
+    assert len(results) == 4
+    assert current["peak"] == 1
     assert provider.client is fake
     assert provider._inflight == 0
 
 
-def test_timeout_does_not_reauth_while_another_call_is_inflight():
-    hold_started = threading.Event()
+def test_second_call_waits_for_session_and_does_not_reauth():
+    entered = []
     release_hold = threading.Event()
+    hold_started = threading.Event()
+    slow_entered = threading.Event()
     closed = {"n": 0}
 
     class SharedTheta:
         def option_history_eod(self, **kwargs):
             symbol = str(kwargs.get("symbol") or "")
+            entered.append(symbol)
             if symbol == "HOLD":
                 hold_started.set()
                 release_hold.wait(timeout=5)
-                return pd.DataFrame({
-                    "open": [1], "high": [1], "low": [1],
-                    "close": [1], "volume": [1],
-                })
-            time.sleep(1.0)
-            return pd.DataFrame({
-                "open": [1], "high": [1], "low": [1],
-                "close": [1], "volume": [1],
-            })
+            else:
+                slow_entered.set()
+            return _frame()
 
         def close(self):
             closed["n"] += 1
 
-    fake = SharedTheta()
     provider = ThetaDataProvider(api_key="token")
-    provider.client = fake
+    provider.client = SharedTheta()
     provider._owns_client = True
-    slow_armed = threading.Event()
-    provider._timeout_seconds = lambda bulk=False: 0.2 if slow_armed.is_set() else 5.0
-
     hold_result = {}
+    slow_result = {}
 
     def hold_worker():
         hold_result["value"] = provider._call("option_history_eod", symbol="HOLD")
 
+    def slow_worker():
+        slow_result["value"] = provider._call("option_history_eod", symbol="SLOW")
+
     holder = threading.Thread(target=hold_worker)
     holder.start()
     assert hold_started.wait(timeout=2)
-    slow_armed.set()
-    timed = provider._call("option_history_eod", symbol="SLOW")
-    assert timed is None
-    assert provider.client is fake
+    slow = threading.Thread(target=slow_worker)
+    slow.start()
+    time.sleep(0.15)
+    assert entered == ["HOLD"]
+    assert not slow_entered.is_set()
     assert closed["n"] == 0
+    assert provider.client is not None
     release_hold.set()
     holder.join(timeout=5)
+    slow.join(timeout=5)
     assert hold_result.get("value") is not None
-    assert closed["n"] >= 1
-    assert provider.client is None
+    assert slow_result.get("value") is not None
+    assert entered == ["HOLD", "SLOW"]
+    assert closed["n"] == 0
+    assert provider.client is not None
 
 
 def test_thread_local_empty_counts_do_not_steal_across_workers():
@@ -912,19 +925,18 @@ def test_thread_local_empty_counts_do_not_steal_across_workers():
     assert provider.take_empty_result_count() == 0
 
 
-def test_concurrent_timeout_retries_without_reauth(monkeypatch, capsys):
+def test_timeout_does_not_start_another_call(monkeypatch, capsys):
     class Fake:
         def option_history_eod(self, **kwargs):
-            return pd.DataFrame({"open": [1]})
+            return _frame()
 
         def close(self):
-            raise AssertionError("concurrent timeout must not close the shared session")
+            raise AssertionError("timeout must not close the shared session")
 
     fake = Fake()
     provider = ThetaDataProvider(api_key="token")
     provider.client = fake
     provider._owns_client = True
-    provider._inflight = 1
 
     class Alive:
         def __init__(self, *args, **kwargs):
@@ -943,10 +955,77 @@ def test_concurrent_timeout_retries_without_reauth(monkeypatch, capsys):
     assert provider._call("option_history_eod", symbol="AAPL") is None
     assert provider.client is fake
     out = capsys.readouterr().out
-    assert "retry 2/5 after timeout" in out
-    assert "retry 5/5 after timeout" in out
+    assert "reusing session call, not starting another" in out
+    assert "next request waits for this session call" in out
+    assert "retry 2/5 after timeout" not in out
     assert out.count("timed out after") == 1
 
+
+
+def test_slow_call_is_reused_instead_of_retried(capsys):
+    calls = {"n": 0}
+
+    class Slow:
+        def option_history_eod(self, **kwargs):
+            calls["n"] += 1
+            time.sleep(0.25)
+            return _frame()
+
+    provider = ThetaDataProvider(client=Slow())
+    provider._timeout_seconds = lambda bulk=False: 0.05
+    got = provider._call("option_history_eod", symbol="AAPL")
+    assert got is not None
+    assert calls["n"] == 1
+    out = capsys.readouterr().out
+    assert "reusing session call, not starting another" in out
+    assert "retry 2/5" not in out
+
+
+
+def test_next_call_waits_until_timed_out_session_call_finishes(monkeypatch):
+    import data_providers.thetadata_provider as theta_module
+
+    monkeypatch.setattr(theta_module, "_MAX_REQUEST_TIMEOUT_SECONDS", 0.12)
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Slow:
+        def option_history_eod(self, **kwargs):
+            symbol = kwargs.get("symbol")
+            calls.append(symbol)
+            if symbol == "HANG":
+                started.set()
+                release.wait(timeout=2)
+            return _frame()
+
+    provider = ThetaDataProvider(client=Slow())
+    provider._timeout_seconds = lambda bulk=False: 0.04
+    first = {}
+
+    def run_first():
+        first["value"] = provider._call("option_history_eod", symbol="HANG")
+
+    holder = threading.Thread(target=run_first)
+    holder.start()
+    assert started.wait(timeout=1)
+    holder.join(timeout=1)
+    assert first.get("value") is None
+    assert calls == ["HANG"]
+    second = {}
+
+    def run_second():
+        second["value"] = provider._call("option_history_eod", symbol="NEXT")
+
+    follower = threading.Thread(target=run_second)
+    follower.start()
+    time.sleep(0.08)
+    assert calls == ["HANG"]
+    release.set()
+    follower.join(timeout=2)
+    holder.join(timeout=2)
+    assert second.get("value") is not None
+    assert calls == ["HANG", "NEXT"]
 
 def test_history_compensation_uses_attempt_budget(capsys):
     provider = ThetaDataProvider(client=_FakeTheta())
