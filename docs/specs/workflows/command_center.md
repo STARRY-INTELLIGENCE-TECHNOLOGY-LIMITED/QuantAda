@@ -19,7 +19,7 @@
 
 仓库内置目录只允许脱敏示例值，不得包含私有策略、账户、主机、命令集索引、策略参数、优化结果或优化搜索空间；这些内容不能以“未使用的顶层常量”形式留在公共源码中。工作台启动时按项目根目录或外部 `source_root` 的 `.data/command_center/private_catalog.json`（或 `catalog_private.json`、`private_config.json`、`private_command_set.json`、`command_set.json`）读取本机私有 JSON，并在内存中覆盖同名变量/预设、追加新项；若只需策略模块索引，也可使用 `strategies` 映射。`QUANTADA_PRIVATE_CATALOG` 可显式指定其它路径。私有层优先于公开默认值，但环境变量和当前表单输入仍可覆盖它。
 
-数据源使用可下拉选择且允许手动输入 provider 链；`theta+futu` 是 `config.DATA_PROVIDER_COMPOSITIONS` 中的显式组合：通用 Overlay 核心负责流程，历史风险字段来自 ThetaData，实盘当前行情来自 Futu，回测不会触碰 Futu。命令目录提供 `theta_futu_global` 配置档案，同时注入 ThetaData 凭据、Futu OpenD 连接和解锁凭据环境变量名；环境变量名可以保存到方案配置，密码本身不得进入方案。其它组合可在该配置中注册对应 Provider 和适配器，不应修改工作台逻辑。`--no_plot`、`--refresh` 等无值开关通过复选框控制，并与运行选项字典同步。回测现金模型按持仓自动区分未配对 Short Put 与定义风险价差，不把保证金压力参数暴露为命令行开关；实盘风险保证金仍只能由 Broker 的券商事实快照提供。
+数据源使用可下拉选择且允许手动输入 provider 链；`theta+futu` 是 `config.DATA_PROVIDER_COMPOSITIONS` 中的显式组合：通用 Overlay 核心负责流程，历史风险字段来自 ThetaData，实盘当前行情来自 Futu，回测不会触碰 Futu。命令目录提供 `theta_futu_global` 配置档案，同时注入 ThetaData 凭据、Futu OpenD 连接和解锁凭据环境变量名；环境变量名可以保存到方案配置，密码本身不得进入方案。其它组合可在该配置中注册对应 Provider 和适配器，不应修改工作台逻辑。`--no_plot`、`--refresh` 等无值开关通过复选框控制，并与运行选项字典同步。成交时点使用下拉框，默认收盘成交，不是勾选框。`--force_schedule` 在交易与风控开关区提供“启动后立即执行一次”复选框，仅实盘模式可勾选；它只进入当前启动命令，不写入方案，命令成功启动后自动取消勾选。非实盘或缺少 `--connect` 时不得生成该参数。回测现金模型按持仓自动区分未配对 Short Put 与定义风险价差，不把保证金压力参数暴露为命令行开关；实盘风险保证金仍只能由 Broker 的券商事实快照提供。
 
 运行上下文中的 `PRINT_PLAN` 开关位于结束日期右侧，作为配置覆写写入最终 `--config`；配置编辑器不再重复显示该键。
 

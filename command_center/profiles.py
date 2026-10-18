@@ -132,7 +132,12 @@ class CommandProfileStore:
                         system=str(raw.get("system", "")),
                         config_profile=str(raw.get("config_profile", "none")),
                         params=dict(raw.get("params", {})),
-                        options=dict(raw.get("options", {})),
+                        # 读取时丢掉一次性实盘开关，避免旧方案再次强制下单。
+                        options={
+                            key: value
+                            for key, value in dict(raw.get("options") or {}).items()
+                            if key != "force_schedule"
+                        },
                         config_override=dict(raw.get("config_override", {})),
                         origin=str(raw.get("origin", "用户方案")),
                         source_root=str(raw.get("source_root", "")),

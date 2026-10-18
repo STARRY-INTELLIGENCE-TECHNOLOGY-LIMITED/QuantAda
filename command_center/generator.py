@@ -364,6 +364,9 @@ def build_command(
         argv.extend(("--config", repr(config)))
     if preset.connect:
         argv.extend(("--connect", preset.connect))
+    # --force_schedule 只伴随本次实盘 --connect 生效，不能进入回测、优化或无连接命令。
+    if options.get("force_schedule") and not (preset.mode == "live" and preset.connect):
+        options.pop("force_schedule", None)
     for name in _OPTION_ORDER:
         if name in options:
             _append_option(argv, name, options[name])

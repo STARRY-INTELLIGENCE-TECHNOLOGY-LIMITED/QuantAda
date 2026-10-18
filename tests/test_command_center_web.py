@@ -91,6 +91,12 @@ def test_web_html_is_external_static_resource():
     assert "不绘图（--no_plot）" not in html
     assert "刷新数据（--refresh）" not in html
     assert 'id="no-plot"> 不绘图</label>' in html
+    assert 'id="force-schedule" title="仅对本次实盘启动生效，不写入方案"> 启动后立即执行一次</label>' in html
+    assert "if($('force-schedule')?.checked&&byId('mode-select')==='live')options.force_schedule=true;else delete options.force_schedule;" in html
+    assert "if(payload.options)delete payload.options.force_schedule;" in html
+    assert "if(activeRun&&!isResume){const force=$('force-schedule');if(force)force.checked=false;" in html
+    assert "function syncForceSchedule()" in html
+    assert "el.disabled=!live" in html
     assert 'id="refresh"> 刷新数据</label>' in html
     assert 'class="footer"' not in html
     assert "配置完成后自动生成命令" not in html
@@ -717,3 +723,24 @@ def test_gm_profile_list_exposes_serv_addr(tmp_path):
     assert "cn_gm_server" not in profiles
     assert "cn_gm_sim" not in profiles
 
+
+
+def test_saved_profile_drops_force_schedule_and_legacy_file(tmp_path):
+    service = CommandCenterService(tmp_path)
+    saved = service.save_profile(
+        {
+            "name": "live-once",
+            "strategy": "strategies.example",
+            "mode": "live",
+            "connect": "gm_broker:sim",
+            "options": {"force_schedule": True, "symbols": "SHSE.510300"},
+        }
+    )
+    assert "force_schedule" not in saved["options"]
+    assert "force_schedule" not in service.profile_store.list()[0].options
+
+    payload = json.loads(service.profile_store.path.read_text(encoding="utf-8"))
+    profile = next(iter(payload["profiles"].values()))
+    profile["options"]["force_schedule"] = True
+    service.profile_store.path.write_text(json.dumps(payload), encoding="utf-8")
+    assert "force_schedule" not in service.profile_store.list()[0].options

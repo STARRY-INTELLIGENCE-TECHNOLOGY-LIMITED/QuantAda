@@ -796,3 +796,25 @@ def test_build_command_forwards_force_schedule(tmp_path: Path) -> None:
 
     assert "--force_schedule" in generated.argv
     assert generated.argv[generated.argv.index("--connect") + 1] == "gm_broker:sim"
+
+
+def test_build_command_drops_force_schedule_without_live_connect(tmp_path: Path) -> None:
+    catalog = default_catalog()
+    preset = CommandPreset(
+        "force-backtest",
+        "force backtest",
+        "A股",
+        "backtest",
+        "strategies.sample_auto_rebalance_strategy",
+        options={"force_schedule": True, "symbols": "SHSE.510300"},
+    )
+
+    generated = build_command(catalog, preset, {}, tmp_path)
+
+    assert "--force_schedule" not in generated.argv
+    assert "force_schedule" not in generated.options
+
+    live_without_connect = replace(preset, preset_id="force-live-no-connect", mode="live", connect=None)
+    generated = build_command(catalog, live_without_connect, {}, tmp_path)
+    assert "--force_schedule" not in generated.argv
+    assert "force_schedule" not in generated.options

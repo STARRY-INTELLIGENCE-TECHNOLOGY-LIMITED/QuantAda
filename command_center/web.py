@@ -872,6 +872,8 @@ class CommandCenterService:
             raise ValueError("方案名称不能为空")
         preset = self._preset_from_payload(payload)
         options = dict(preset.options)
+        # 启动后立即执行只对当前实盘进程生效，保存方案时必须丢掉，避免下次加载再次下单。
+        options.pop("force_schedule", None)
         options["desc"] = name
         config_override = payload.get("config_override", payload.get("config", preset.config))
         if not isinstance(config_override, Mapping):
