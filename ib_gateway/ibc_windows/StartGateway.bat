@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-rem 快捷方式起始位置为空时，Windows 会把工作目录留在快捷方式所在目录。先切回脚本目录，再转给批量启动脚本。
+rem Empty shortcut Start-in leaves cwd at the shortcut directory. Enter the script directory first.
 set "IBC_SCRIPT_DIR=%~dp0"
 if "%IBC_SCRIPT_DIR:~-1%"=="\" set "IBC_SCRIPT_DIR=%IBC_SCRIPT_DIR:~0,-1%"
 cd /d "%IBC_SCRIPT_DIR%"

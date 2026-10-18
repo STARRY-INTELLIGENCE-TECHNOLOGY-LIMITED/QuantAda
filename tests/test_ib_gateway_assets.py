@@ -63,11 +63,17 @@ def test_windows_launcher_supports_new_and_old_jts_layouts():
     assert '/D "!IBC_PATH!"' in text
     assert "IBCWin-*.zip" in text
     assert "does not use the caller working directory" in text
+    assert 'call "%IBC_PATH%\\scripts\\StartIBC.bat"' in text
+    assert 'call "%IBC_PATH%\\scripts\\DisplayBannerAndLaunch.bat"' not in text
+    assert "%DATE%" not in text
+    assert all(byte < 128 for byte in raw)
     assert "7496" not in text
     assert "4001" not in text
 
     wrapper = (WINDOWS_ROOT / "StartGateway.bat").read_bytes()
     creator = (WINDOWS_ROOT / "CreateDesktopShortcut.bat").read_bytes()
+    assert all(byte < 128 for byte in wrapper)
+    assert all(byte < 128 for byte in creator)
     assert b"\r\n" in wrapper and b"\n" not in wrapper.replace(b"\r\n", b"")
     assert b"\r\n" in creator and b"\n" not in creator.replace(b"\r\n", b"")
     wrapper_text = wrapper.decode("utf-8")
@@ -136,13 +142,19 @@ def _prepare_desktop(tmp_path):
     ibc = desktop / "IBCWin-3.20260922.24.2"
     scripts = ibc / "scripts"
     scripts.mkdir(parents=True)
-    stub = (
+    vendor = (
+        "@echo off\r\n"
+        "mkdir vendor-diag-leak\r\n"
+        "exit /b 91\r\n"
+    )
+    launcher = (
         "@echo off\r\n"
         '> "%IBC_STUB_MARKER%" echo %CD%\r\n'
         "mkdir relative-leak\r\n"
         "exit /b 0\r\n"
     )
-    (scripts / "DisplayBannerAndLaunch.bat").write_bytes(stub.encode("ascii"))
+    (scripts / "DisplayBannerAndLaunch.bat").write_bytes(vendor.encode("ascii"))
+    (scripts / "StartIBC.bat").write_bytes(launcher.encode("ascii"))
     (ibc / "version").write_bytes(b"3.24.2\r\n")
     wrap = desktop / "ibc_windows"
     wrap.mkdir()
@@ -197,8 +209,41 @@ def test_windows_launcher_pins_shortcut_workdir(tmp_path):
     assert marker.is_file()
     assert marker.read_text(encoding="utf-8", errors="replace").strip().lower() == str(settings).lower()
     assert (settings / "relative-leak").is_dir()
+    assert not (desktop / "vendor-diag-leak").exists()
+    assert not (settings / "vendor-diag-leak").exists()
+    rejected = "不是内部或外部命令".encode("gbk")
+    assert rejected not in instance.stdout
+    assert rejected not in instance.stderr
     _assert_no_extra_desktop_dirs(desktop, allowed)
 
+
+
+
+def test_relative_diagnostic_log_path_does_not_create_desktop_folder(tmp_path):
+    """相对诊断日志路径必须拒绝，不能在桌面调用官方 Diagnostic 或新建目录。"""
+    desktop, ibc, wrap, jts, config = _prepare_desktop(tmp_path)
+    settings = ibc / "settings" / "live"
+    settings.mkdir(parents=True)
+    env = _launcher_env(jts, config, tmp_path / "cwd.txt")
+    env["IBC_PATH"] = str(ibc)
+    completed = _run_bat(
+        wrap / "StartGateways.bat",
+        desktop,
+        env,
+        "--instance",
+        "live",
+        str(config / "config-live.ini"),
+        str(settings),
+        "relative-log",
+        "1045",
+        str(jts),
+    )
+    output = completed.stdout.decode("utf-8", "replace") + completed.stderr.decode("utf-8", "replace")
+    assert completed.returncode != 0, output
+    assert "LOG_PATH must be an absolute directory" in output
+    assert not (desktop / "relative-log").exists()
+    assert not (desktop / "vendor-diag-leak").exists()
+    assert not (settings / "relative-leak").exists()
 
 def test_create_desktop_shortcut_pins_working_directory(tmp_path):
     """重建的桌面快捷方式必须指向已解压脚本，且起始位置不是桌面。"""

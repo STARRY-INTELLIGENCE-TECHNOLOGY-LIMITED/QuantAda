@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-rem 在桌面重建 StartGateway 快捷方式，并把起始位置固定为脚本目录。目标必须是已解压的 bat，不能指向 zip 内部。
+rem Recreate the desktop StartGateway shortcut. Start-in is the script directory, and the target must be an extracted bat.
 set "IBC_SCRIPT_DIR=%~dp0"
 if "%IBC_SCRIPT_DIR:~-1%"=="\" set "IBC_SCRIPT_DIR=%IBC_SCRIPT_DIR:~0,-1%"
 cd /d "%IBC_SCRIPT_DIR%"

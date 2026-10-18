@@ -32,16 +32,26 @@ def test_option_carry_robust_prefers_annualized_return_after_drawdown():
 
 
 def test_option_carry_robust_hard_penalizes_fewer_than_six_trades_per_year():
-    score = evaluate(_stats(total_trades=11))
+    score = evaluate(_stats(option_trade_count=11, total_trades=40))
 
     assert score == -94.5
 
 
 def test_option_carry_robust_scales_positive_score_with_activity():
-    low_activity = evaluate(_stats(total_trades=18, total_return_pct=50.0))
-    normal_activity = evaluate(_stats(total_trades=36, total_return_pct=50.0))
+    low_activity = evaluate(_stats(
+        option_trade_count=18, total_trades=36, total_return_pct=50.0,
+    ))
+    normal_activity = evaluate(_stats(
+        option_trade_count=36, total_trades=36, total_return_pct=50.0,
+    ))
 
     assert normal_activity > low_activity
+
+
+def test_option_carry_robust_counts_short_option_trades_not_spread_legs():
+    score = evaluate(_stats(option_trade_count=11, total_trades=100))
+
+    assert score == -94.5
 
 
 def test_option_carry_robust_penalizes_low_wheel_capital_utilization_through_wrapper():

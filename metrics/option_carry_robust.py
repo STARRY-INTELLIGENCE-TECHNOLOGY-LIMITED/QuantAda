@@ -95,7 +95,7 @@ def _monthly_win_rate(stats, strat):
 
 
 def evaluate(stats, strat=None, args=None):
-    """奖励有足够交易与资金使用的 CSP/Wheel 风险调整回报。"""
+    """奖励有足够期权交易与资金使用的风险调整回报。"""
     if not isinstance(stats, dict):
         return -100.0
 
@@ -103,7 +103,8 @@ def evaluate(stats, strat=None, args=None):
     coverage = _finite(stats.get("option_risk_data_coverage"), 0.0)
     years = max(0.5, _trading_days(stats, strat) / 252.0)
     total_trades = max(0.0, _finite(stats.get("total_trades"), 0.0))
-    trades_per_year = total_trades / years
+    activity_trades = option_trades if option_trades > 0 else total_trades
+    trades_per_year = activity_trades / years
     if trades_per_year < 6.0:
         return -100.0 + trades_per_year
     if coverage < 0.80:
