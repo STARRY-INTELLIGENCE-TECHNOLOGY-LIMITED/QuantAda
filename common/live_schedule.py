@@ -3,6 +3,7 @@
 该模块不依赖具体券商连接，只负责 schedule 槽位计算、prewarm 去重、
 单工作线程派发和长连接保活。事件驱动的券商可以调用 ``poll_once``，
 没有原生 schedule 回调的券商可以调用 ``run_forever``。
+``force_once`` 只在当前进程的首次轮询立即执行一次，随后等待下一个正式槽位。
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ class LiveScheduleRunner:
         poll_interval_seconds: float = 1.0,
         idle_interval_seconds: float = 5.0,
         min_sleep_seconds: float = 0.05,
+        force_once: bool = False,
     ):
         self.schedule_rule = str(schedule_rule or '').strip()
         self.parsed_schedule = parsed_schedule
@@ -71,12 +73,19 @@ class LiveScheduleRunner:
         self._scheduled_thread = None
         self._scheduled_lock = threading.Lock()
         self._stop_event = threading.Event()
+        # 只消费一次。强制键与正式槽位键隔离，避免启动诊断吃掉下一个周期。
+        self._force_once = bool(force_once)
+        self._suppress_formal_before = None
+        self._force_skip_logged_key = None
 
         interval_seconds = 0.0
         if isinstance(self.parsed_schedule, dict):
             interval_seconds = float(self.parsed_schedule.get('interval_seconds') or 0.0)
         if interval_seconds > 0 and self.prewarm_lead_seconds >= interval_seconds:
             self.prewarm_lead_seconds = 0.0
+        if self._force_once and not isinstance(self.parsed_schedule, dict):
+            self._force_once = False
+            self._log("[LiveSchedule] --force_schedule ignored: no repeating schedule configured.")
 
     @property
     def scheduled_thread(self):
@@ -181,6 +190,60 @@ class LiveScheduleRunner:
         worker.start()
         return True
 
+    def _suppress_current_formal_slot(self, current_now, slot_key):
+        """启动强制执行后，跳过已经到期的正式槽位，保留下一个周期。"""
+        boundary = self._suppress_formal_before
+        if boundary is None or not slot_key:
+            return False
+        current_slot = SchedulePlanner.resolve_current_schedule_slot(
+            current_now, self.parsed_schedule,
+        )
+        if current_slot is None or pd.Timestamp(current_slot) >= boundary:
+            return False
+        if self._force_skip_logged_key != slot_key:
+            self._force_skip_logged_key = slot_key
+            self._log(
+                "[LiveSchedule] --force_schedule already ran; "
+                f"skipping formal slot {slot_key} and waiting for "
+                f"{pd.Timestamp(boundary).strftime('%Y-%m-%d %H:%M:%S')}."
+            )
+        return True
+
+    def _consume_force_once(self, current_now, result):
+        """立即派发一次策略逻辑，并在本次启动后清除开关。"""
+        if not self._force_once:
+            return
+        self._force_once = False
+        next_slot = SchedulePlanner.resolve_next_schedule_slot(
+            current_now + pd.Timedelta(seconds=1),
+            self.parsed_schedule,
+        )
+        self._suppress_formal_before = (
+            pd.Timestamp(next_slot) if next_slot is not None else None
+        )
+        force_key = f"force:{current_now.strftime('%Y-%m-%d %H:%M:%S')}"
+        next_text = (
+            self._suppress_formal_before.strftime("%Y-%m-%d %H:%M:%S")
+            if self._suppress_formal_before is not None else "none"
+        )
+        self._log(
+            "[LiveSchedule] --force_schedule running once immediately; "
+            f"next formal slot {next_text}."
+        )
+        result["force_triggered"] = True
+        result["force_slot_key"] = force_key
+        if not callable(self.on_slot):
+            self._log("[LiveSchedule] --force_schedule ignored: no slot callback.")
+            result["force_triggered"] = False
+            return
+        # 交易时段门控只约束正式槽位；启动诊断必须真正进入策略回调。
+        self.last_schedule_run_key = force_key
+        dispatched = self._dispatch_slot(current_now, force_key)
+        result["slot_triggered"] = bool(dispatched)
+        result["overlap"] = not dispatched
+        if not dispatched and self.last_schedule_run_key == force_key:
+            self.last_schedule_run_key = None
+
     def poll_once(self, now=None) -> dict:
         """处理一次 prewarm/slot 检查，供 SDK 事件回调线程调用。"""
         current_now = self._coerce_now(now if now is not None else self.clock())
@@ -191,9 +254,13 @@ class LiveScheduleRunner:
             'slot_key': None,
             'prewarm_slot_key': None,
             'overlap': False,
+            'force_triggered': False,
+            'force_slot_key': None,
         }
         if not isinstance(self.parsed_schedule, dict):
+            self._force_once = False
             return result
+        self._consume_force_once(current_now, result)
 
         if self.prewarm_lead_seconds > 0 and callable(self.on_prewarm):
             should_prewarm, _, prewarm_key = (
@@ -229,6 +296,8 @@ class LiveScheduleRunner:
         )
         result['slot_key'] = slot_key
         result['delta'] = delta
+        if should_run and self._suppress_current_formal_slot(current_now, slot_key):
+            should_run = False
         if should_run and slot_key and self._allow_slot(current_now, slot_key, 'slot'):
             self.last_schedule_run_key = slot_key
             result['slot_triggered'] = True

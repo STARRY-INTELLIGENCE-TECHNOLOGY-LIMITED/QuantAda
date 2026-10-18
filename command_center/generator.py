@@ -102,6 +102,7 @@ _OPTION_ORDER = (
     "plot_scope",
     "refresh",
     "no_plot",
+    "force_schedule",
     "opt_params",
     "n_trials",
     "n_jobs",

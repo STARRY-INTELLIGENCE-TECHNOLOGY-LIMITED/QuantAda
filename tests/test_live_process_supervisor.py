@@ -485,3 +485,53 @@ def test_run_main_centralizes_supervised_worker_operator_stop(monkeypatch):
         ("status", "STOPPED", "Operator requested graceful shutdown."),
         ("expected_exit", "operator requested graceful shutdown"),
     ]
+
+
+
+def test_force_schedule_reaches_live_launcher_once(monkeypatch):
+    import run
+    import live_trader.engine as engine
+
+    captured = {}
+
+    def fake_launch(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(sys, "argv", [
+        "run.py", "dummy_strategy", "--connect", "gm_broker:sim", "--force_schedule",
+    ])
+    monkeypatch.setattr(run, "is_live_worker_process", lambda: True)
+    monkeypatch.setattr(run, "is_live_worker_restart", lambda: False)
+    monkeypatch.setattr(engine, "launch_live", fake_launch)
+
+    run._run_main()
+
+    assert captured["kwargs"]["force_schedule"] is True
+
+
+def test_force_schedule_is_ignored_on_supervisor_recovery(monkeypatch, capsys):
+    import run
+    import live_trader.engine as engine
+
+    captured = {}
+    monkeypatch.setattr(sys, "argv", [
+        "run.py", "dummy_strategy", "--connect", "gm_broker:sim", "--force_schedule",
+    ])
+    monkeypatch.setattr(run, "is_live_worker_process", lambda: True)
+    monkeypatch.setattr(run, "is_live_worker_restart", lambda: True)
+    monkeypatch.setattr(engine, "launch_live", lambda *args, **kwargs: captured.update(kwargs))
+
+    run._run_main()
+
+    assert captured["force_schedule"] is False
+    assert "忽略 --force_schedule" in capsys.readouterr().out
+
+
+def test_force_schedule_requires_connect(monkeypatch):
+    import run
+
+    monkeypatch.setattr(sys, "argv", ["run.py", "dummy_strategy", "--force_schedule"])
+
+    with pytest.raises(SystemExit):
+        run._run_main()

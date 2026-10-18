@@ -97,8 +97,8 @@
 5. schedule 兼容 `Nd|Nw|Nm|Nh[:HH:MM[:SS]]`；`N` 为正整数，`Nw` 以本机时间周一为周锚点，省略时刻时默认 `00:00:00`。配置 `Ns` 必须明确报错并引导使用长连接事件回调与 `timeframe='Seconds'`，不得静默降级为不运行策略。分钟级 SDK 轮询和单次调用超时应随实际周期缩短，避免跨入下一周期。
 6. 若 schedule 回调与订单状态回调共享单线程 SDK 事件循环（包括 GM schedule、IB `ib.sleep()` 主循环），不能在回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将 slot 调度到单个短生命周期工作线程，并让 SDK 回调线程立即返回。重叠 slot 只记录并跳过；worker 失败时必须释放该 slot 的去重键，允许后续同槽位重试；回测/优化不得创建该工作线程。
 7. 对 24x7 市场使用 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日及正常长周期 bar 间隔必须同时保留柜台订单及本地 `_active_buys`、`_pending_sells`、虚拟占资跟踪；仍以实时柜台快照和终态回调为事实来源。
-
 8. `common.live_schedule.LiveScheduleRunner` 是通用的 schedule 运行器：无原生 schedule 回调的 Broker 可调用 `run_forever()` 保活并轮询；共享 SDK 事件循环的 Broker 应在事件回调中调用 `poll_once()`。它集中处理 slot/prewarm 去重、重叠运行保护和短生命周期工作线程，Broker 只提供连接与 `LiveTrader.run()` 上下文。
+9. `run.py --force_schedule` 只对当前实盘进程生效。`LiveScheduleRunner` 在首次 `poll_once()` 立即派发一次，GM 原生 schedule 则在 init 后主动派发同等交易逻辑；强制键不得占用下一个正式槽位。当前已到期槽位跳过，之后继续等待下一个正式周期。失败必须暴露且不自动重试这次强制执行。回测/优化不得创建该工作线程。
 
 ## 9. Futu 官方交易适配器
 

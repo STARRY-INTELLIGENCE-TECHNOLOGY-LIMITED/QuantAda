@@ -3255,6 +3255,7 @@ class IBBrokerAdapter(BaseLiveBroker):
             on_prewarm_error=_on_prewarm_error,
             prewarm_lead_seconds=prewarm_lead_seconds,
             runtime_log=_runtime_print,
+            force_once=bool(kwargs.get('force_schedule')),
         )
 
         # --- 3. 进入“不死鸟”主循环 ---

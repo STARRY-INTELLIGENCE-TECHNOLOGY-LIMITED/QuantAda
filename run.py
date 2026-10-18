@@ -16,6 +16,7 @@ from common.live_process_supervisor import (
     LiveWorkerOperatorStop,
     install_live_worker_operator_stop_handler,
     is_live_worker_process,
+    is_live_worker_restart,
     mark_live_worker_expected_exit,
     start_live_worker_heartbeat,
     supervise_live_process,
@@ -345,6 +346,11 @@ def _run_main():
     # 实盘参数
     parser.add_argument('--connect', type=str, default=None,
                         help="实盘连接配置，格式 'broker:env' (例如: 'gm_broker:sim')")
+    parser.add_argument(
+        '--force_schedule',
+        action='store_true',
+        help="实盘启动后立即执行一次策略逻辑，完成后等待下一个正式 schedule；仅本次命令生效，不写入配置",
+    )
 
     # 工作台界面
     parser.add_argument('--ui_ip', type=str, default=None,
@@ -376,6 +382,9 @@ def _run_main():
 
     # 3. 解析参数
     args = parser.parse_args()
+
+    if args.force_schedule and not args.connect:
+        parser.error("--force_schedule 仅对本次实盘启动生效，必须与 --connect 一起使用")
 
     if args.train_resume and args.train_kill:
         parser.error("--train_resume and --train_kill cannot be used together")
@@ -565,6 +574,11 @@ def _run_main():
             # 同时也处理 symbols (转为列表)，以防没有选股器时使用
             'symbols': [s.strip() for s in args.symbols.split(',')] if args.symbols else []
         }
+        force_schedule = bool(args.force_schedule)
+        if force_schedule and is_live_worker_restart():
+            print("[Live] 监督器恢复启动，忽略 --force_schedule，等待下一个正式 schedule。")
+            force_schedule = False
+        exec_args['force_schedule'] = force_schedule
 
         # 延迟导入 launcher，避免回测时引入不必要的依赖
         from live_trader.engine import launch_live

@@ -4158,6 +4158,7 @@ class FutuBrokerAdapter(BaseLiveBroker):
             clock=now_value,
             runtime_log=runtime_print,
             idle_interval_seconds=5.0,
+            force_once=bool(kwargs.get('force_schedule')),
         )
 
         if subscription_mode:

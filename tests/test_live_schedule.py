@@ -297,3 +297,123 @@ def test_live_schedule_slot_filter_type_error_is_not_retried():
 
     assert result['slot_triggered'] is False
     assert calls == [1]
+
+
+def _join_schedule_worker(runner):
+    worker = runner.scheduled_thread
+    if worker is not None:
+        worker.join(1.0)
+
+
+def test_force_schedule_runs_once_then_waits_for_next_formal_slot():
+    calls = []
+
+    def on_slot(_now, slot_key):
+        calls.append(slot_key)
+
+    runner = LiveScheduleRunner(
+        schedule_rule="1h:10:00:00",
+        on_slot=on_slot,
+        force_once=True,
+        runtime_log=lambda _message: None,
+    )
+
+    forced = runner.poll_once(pd.Timestamp("2026-08-31 09:00:00"))
+    _join_schedule_worker(runner)
+    assert forced["force_triggered"] is True
+    assert forced["slot_triggered"] is True
+    assert calls == ["force:2026-08-31 09:00:00"]
+    assert runner.last_schedule_run_key == "force:2026-08-31 09:00:00"
+
+    again = runner.poll_once(pd.Timestamp("2026-08-31 09:00:02"))
+    _join_schedule_worker(runner)
+    assert again["force_triggered"] is False
+    assert again["slot_triggered"] is False
+    assert calls == ["force:2026-08-31 09:00:00"]
+
+    nxt = runner.poll_once(pd.Timestamp("2026-08-31 10:00:01"))
+    _join_schedule_worker(runner)
+    assert nxt["slot_triggered"] is True
+    assert calls == ["force:2026-08-31 09:00:00", "2026-08-31 10:00:00"]
+    assert runner.last_schedule_run_key == "2026-08-31 10:00:00"
+
+
+def test_force_schedule_skips_current_due_slot_without_consuming_next_key():
+    calls = []
+
+    runner = LiveScheduleRunner(
+        schedule_rule="1h:10:00:00",
+        on_slot=lambda _now, slot_key: calls.append(slot_key),
+        force_once=True,
+        runtime_log=lambda _message: None,
+    )
+
+    forced = runner.poll_once(pd.Timestamp("2026-08-31 10:00:02"))
+    _join_schedule_worker(runner)
+    assert forced["force_slot_key"] == "force:2026-08-31 10:00:02"
+    assert calls == ["force:2026-08-31 10:00:02"]
+
+    same_window = runner.poll_once(pd.Timestamp("2026-08-31 10:00:04"))
+    _join_schedule_worker(runner)
+    assert same_window["slot_triggered"] is False
+    assert runner.last_schedule_run_key == "force:2026-08-31 10:00:02"
+    assert calls == ["force:2026-08-31 10:00:02"]
+
+    nxt = runner.poll_once(pd.Timestamp("2026-08-31 11:00:01"))
+    _join_schedule_worker(runner)
+    assert nxt["slot_triggered"] is True
+    assert calls[-1] == "2026-08-31 11:00:00"
+
+
+def test_force_schedule_failure_is_exposed_and_not_retried():
+    calls = []
+    errors = []
+
+    def on_slot(_now, slot_key):
+        calls.append(slot_key)
+        raise RuntimeError("broker down")
+
+    runner = LiveScheduleRunner(
+        schedule_rule="1h:10:00:00",
+        on_slot=on_slot,
+        on_slot_error=lambda error, slot_key: errors.append((slot_key, str(error))),
+        force_once=True,
+        runtime_log=lambda _message: None,
+    )
+
+    assert runner.poll_once(pd.Timestamp("2026-08-31 09:00:00"))["force_triggered"] is True
+    _join_schedule_worker(runner)
+    assert errors == [("force:2026-08-31 09:00:00", "broker down")]
+    assert runner.last_schedule_run_key is None
+
+    retry = runner.poll_once(pd.Timestamp("2026-08-31 09:00:03"))
+    _join_schedule_worker(runner)
+    assert retry["force_triggered"] is False
+    assert retry["slot_triggered"] is False
+    assert calls == ["force:2026-08-31 09:00:00"]
+
+    nxt = runner.poll_once(pd.Timestamp("2026-08-31 10:00:01"))
+    _join_schedule_worker(runner)
+    assert calls[-1] == "2026-08-31 10:00:00"
+
+
+def test_force_schedule_bypasses_trading_slot_filter():
+    calls = []
+    filters = []
+
+    def slot_filter(*_args):
+        filters.append(1)
+        return False
+
+    runner = LiveScheduleRunner(
+        schedule_rule="1h:10:00:00",
+        on_slot=lambda _now, slot_key: calls.append(slot_key),
+        slot_filter=slot_filter,
+        force_once=True,
+        runtime_log=lambda _message: None,
+    )
+
+    runner.poll_once(pd.Timestamp("2026-08-31 10:00:02"))
+    _join_schedule_worker(runner)
+    assert calls == ["force:2026-08-31 10:00:02"]
+    assert filters == []

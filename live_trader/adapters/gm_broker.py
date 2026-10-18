@@ -1598,6 +1598,21 @@ class GmBrokerAdapter(BaseLiveBroker):
                                         slot_key = SchedulePlanner.format_schedule_slot_key(slot_ts)
                                         if delta < 0:
                                             return
+                                        skip_before = launch_state.get('force_skip_before')
+                                        if (
+                                            skip_before is not None
+                                            and slot_ts < pd.Timestamp(skip_before)
+                                        ):
+                                            skip_log_key = f"force-skip:{slot_key}"
+                                            if launch_state.get('last_schedule_skip_log_key') != skip_log_key:
+                                                _runtime_print(
+                                                    "[GmBroker] --force_schedule 已执行，"
+                                                    f"跳过当前正式槽位 {slot_key}，"
+                                                    "等待 "
+                                                    f"{pd.Timestamp(skip_before).strftime('%Y-%m-%d %H:%M:%S')}。"
+                                                )
+                                                launch_state['last_schedule_skip_log_key'] = skip_log_key
+                                            return
                                         if launch_state.get('last_schedule_run_key') == slot_key:
                                             if launch_state.get('last_schedule_skip_log_key') != slot_key:
                                                 _runtime_print(f"[GmBroker] Duplicate schedule callback ignored for slot {slot_key}.")
@@ -1630,8 +1645,55 @@ class GmBrokerAdapter(BaseLiveBroker):
 
                             schedule(schedule_func=_run_scheduled, date_rule=rule_type, time_rule=rule_time)
                             ctx.use_schedule = True
+                            if (
+                                kwargs.get('force_schedule')
+                                and getattr(getattr(trader, 'broker', None), 'is_live', False) is True
+                            ):
+                                now_snapshot = datetime.datetime.now()
+                                next_slot = SchedulePlanner.resolve_next_schedule_slot(
+                                    pd.Timestamp(now_snapshot) + pd.Timedelta(seconds=1),
+                                    parsed_schedule,
+                                ) if parsed_schedule else None
+                                launch_state['force_skip_before'] = next_slot
+                                force_key = (
+                                    "force:"
+                                    + pd.Timestamp(now_snapshot).strftime('%Y-%m-%d %H:%M:%S')
+                                )
+                                next_text = (
+                                    pd.Timestamp(next_slot).strftime('%Y-%m-%d %H:%M:%S')
+                                    if next_slot is not None else "无后续调度槽位"
+                                )
+                                _runtime_print(
+                                    "[GmBroker] --force_schedule 立即执行一次策略逻辑，"
+                                    f"随后等待下一个正式槽位 {next_text}。"
+                                )
+                                with launch_state['scheduled_run_lock']:
+                                    previous_thread = launch_state.get('scheduled_run_thread')
+                                    if previous_thread is not None and previous_thread.is_alive():
+                                        _runtime_print(
+                                            "[GmBroker 警告] 已有调度运行，跳过本次 --force_schedule。"
+                                        )
+                                        launch_state['force_schedule_dispatched'] = True
+                                    else:
+                                        worker = threading.Thread(
+                                            target=_run_scheduled_worker,
+                                            args=(now_snapshot, force_key),
+                                            name=f"quantada-gm-run-{force_key}",
+                                            daemon=True,
+                                        )
+                                        launch_state['scheduled_run_thread'] = worker
+                                        launch_state['force_schedule_dispatched'] = True
+                                        worker.start()
                         else:
                             _runtime_print(f"[GmBroker Warning] 定时配置格式错误 (应为 freq:time): {schedule_rule}")
+                        if (
+                            kwargs.get('force_schedule')
+                            and not launch_state.get('force_schedule_dispatched')
+                        ):
+                            _runtime_print(
+                                "[GmBroker] --force_schedule 已忽略："
+                                "仅已注册的实盘重复 schedule 会立即执行一次。"
+                            )
 
                     except Exception as e:
                         _runtime_print(f"[GmBroker Error] 定时任务注册失败: {e}")

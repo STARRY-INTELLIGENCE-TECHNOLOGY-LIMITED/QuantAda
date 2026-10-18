@@ -778,3 +778,21 @@ def test_parse_command_set_exports_skips_unexpanded_variables() -> None:
     assert "BAD" not in parsed
     assert parsed["HOMEISH"].endswith(".futursa")
 
+
+
+def test_build_command_forwards_force_schedule(tmp_path: Path) -> None:
+    catalog = default_catalog()
+    preset = CommandPreset(
+        "force-live",
+        "force live",
+        "A股",
+        "live",
+        "strategies.sample_auto_rebalance_strategy",
+        connect="gm_broker:sim",
+        options={"force_schedule": True, "symbols": "SHSE.510300"},
+    )
+
+    generated = build_command(catalog, preset, {}, tmp_path)
+
+    assert "--force_schedule" in generated.argv
+    assert generated.argv[generated.argv.index("--connect") + 1] == "gm_broker:sim"

@@ -2374,3 +2374,98 @@ def test_gm_temporary_connection_errors_do_not_push_exception(monkeypatch, capsy
     )
     assert len(schedule_unavailable) == 1
     assert "Waiting 10s before restart" not in captured.out
+
+
+
+def test_gm_force_schedule_runs_once_then_keeps_next_formal_slot(monkeypatch):
+    """启动强制执行不能吃掉下一个正式 GM schedule 槽位。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    scheduled_callbacks = []
+    runs = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=""):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, *args, **kwargs):
+            return None
+
+    class DummyBroker:
+        is_live = True
+        datas = [SimpleNamespace(_name="SHSE.600000")]
+
+    class DummyTrader:
+        def __init__(self, engine_config):
+            self.config = engine_config
+            self.broker = DummyBroker()
+
+        def init(self, ctx):
+            return None
+
+        def run(self, ctx):
+            runs.append((threading.get_ident(), ctx.now))
+
+    class FrozenDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime.datetime(2026, 6, 26, 14, 50, 0)
+            return value if tz is None else value.replace(tzinfo=tz)
+
+    def _schedule(schedule_func, date_rule, time_rule):
+        scheduled_callbacks.append(schedule_func)
+
+    def _wait_runs(count):
+        deadline = time.monotonic() + 1.0
+        while len(runs) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return len(runs) >= count
+
+    def _poll_force_then_stop():
+        fake_context.init_fun(fake_context)
+        assert _wait_runs(1), "启动后没有立即执行策略逻辑"
+        assert runs[0][0] != threading.get_ident()
+        assert runs[0][1] == datetime.datetime(2026, 6, 26, 14, 50, 0)
+        fake_context.now = datetime.datetime(2026, 6, 26, 14, 50, 4)
+        scheduled_callbacks[-1](fake_context)
+        time.sleep(0.05)
+        assert len(runs) == 1
+        fake_context.now = datetime.datetime(2026, 6, 27, 14, 45, 1)
+        scheduled_callbacks[-1](fake_context)
+        assert _wait_runs(2), "下一个正式槽位没有继续执行"
+        assert runs[1][1] == datetime.datetime(2026, 6, 27, 14, 45, 1)
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module.datetime, "datetime", FrozenDateTime)
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", _poll_force_then_stop, raising=False)
+    monkeypatch.setattr(gm_module, "subscribe", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr(gm_module, "LiveTrader", DummyTrader, raising=False)
+    monkeypatch.setattr(gm_module, "schedule", _schedule, raising=False)
+    monkeypatch.setitem(sys.modules, "gm.api", SimpleNamespace(schedule=_schedule))
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id", "schedule": "1d:14:45:00"},
+            strategy_path="sample_strategy",
+            params={},
+            force_schedule=True,
+        )

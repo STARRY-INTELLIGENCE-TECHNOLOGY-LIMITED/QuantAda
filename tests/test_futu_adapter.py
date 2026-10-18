@@ -1336,8 +1336,22 @@ def test_futu_launch_delegates_schedule_lifecycle_to_common_runner(monkeypatch):
     assert runner_kwargs['parsed_schedule']['interval_seconds'] == 3600.0
     assert callable(runner_kwargs['on_slot'])
     assert callable(runner_kwargs['on_prewarm'])
+    assert runner_kwargs['force_once'] is False
     assert captured['started'] is True
     assert captured['closed'] is True
+
+    FutuBrokerAdapter.launch(
+        {
+            'schedule': '1h:10:00:00',
+            'timezone': 'Asia/Shanghai',
+            'trd_env': 'SIMULATE',
+        },
+        'sample_auto_rebalance_strategy',
+        {},
+        symbols=['HK.00700'],
+        force_schedule=True,
+    )
+    assert captured['runner_kwargs']['force_once'] is True
 
 
 def test_futu_launch_supports_quote_subscription_event_mode(monkeypatch):
