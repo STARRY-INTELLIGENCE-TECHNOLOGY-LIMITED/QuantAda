@@ -55,7 +55,7 @@ def _finite_param(values, name, default=None):
 def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
     """读取策略 opt-in 声明；未声明时返回 None，表示沿用静态代码列表。"""
     raw = getattr(strategy_class, "option_universe", None)
-    if raw in {None, False, ""}:
+    if raw is None or raw is False or (isinstance(raw, str) and not raw.strip()):
         return None
 
     merged = {}
@@ -83,7 +83,10 @@ def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
             option_types = {
                 str(item).strip().upper() for item in declared or () if str(item).strip()
             }
-        for key in ("min_dte", "max_dte", "min_delta", "max_delta", "min_open_interest"):
+        for key in (
+            "min_dte", "max_dte", "min_delta", "max_delta",
+            "protective_put_delta", "min_open_interest",
+        ):
             if key in raw and raw[key] is not None:
                 overrides[key] = raw[key]
     else:
@@ -129,7 +132,10 @@ def resolve_option_universe_spec(strategy_class, params=None) -> dict | None:
             delta_values.extend(bounds)
     min_delta = min(delta_values) if delta_values else None
     max_delta = max(delta_values) if delta_values else None
-    protective_delta = _finite_param(merged, "protective_put_delta")
+    protective_delta = _finite_param(
+        overrides if "protective_put_delta" in overrides else merged,
+        "protective_put_delta",
+    )
     delta_targets = None
     if min_delta is not None and max_delta is not None and protective_delta is not None:
         delta_targets = (

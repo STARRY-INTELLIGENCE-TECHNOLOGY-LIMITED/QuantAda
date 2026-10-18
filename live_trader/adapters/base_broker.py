@@ -526,9 +526,10 @@ class BaseLiveBroker(ABC):
             )
             return None
 
-        # 风控拦截：Percent 模式与 Value 模式保持一致
-        if data._name in self._risk_locked_symbols and delta_shares > 0:
-            self._runtime_log(f"[Broker Risk Block] 🚫 风控拦截: {data._name} 触发风控，买单已被底层静默吃掉。")
+        # 风控锁拒绝扩大敞口，但必须允许把已确认空头买平到零。
+        if self.risk_lock_blocks_exposure_increase(data._name, current_size, delta_shares):
+            self._last_order_target_skip_reason = 'risk_control_lock'
+            self._runtime_log(f"[Broker Risk Block] 风控锁拒绝扩大 {data._name} 的敞口。")
             return None
 
         # 4. 决策分发
@@ -597,9 +598,10 @@ class BaseLiveBroker(ABC):
             )
             return None
 
-        # 风控拦截
-        if data._name in self._risk_locked_symbols and delta_shares > 0:
-            self._runtime_log(f"[Broker Risk Block] 🚫 风控拦截: {data._name} 触发风控，买单已被底层静默吃掉。")
+        # 风控锁拒绝扩大敞口，但必须允许把已确认空头买平到零。
+        if self.risk_lock_blocks_exposure_increase(data._name, current_size, delta_shares):
+            self._last_order_target_skip_reason = 'risk_control_lock'
+            self._runtime_log(f"[Broker Risk Block] 风控锁拒绝扩大 {data._name} 的敞口。")
             return None
 
         # 3. 决策分发
@@ -1534,8 +1536,33 @@ class BaseLiveBroker(ABC):
     def set_datas(self, datas):
         self.datas = datas
 
+    def risk_lock_blocks_exposure_increase(self, symbol, current_size, delta_shares) -> bool:
+        """风控锁只拦截扩大敞口的委托，允许把已确认仓位打回零。"""
+        if symbol not in self._risk_locked_symbols:
+            return False
+        try:
+            size = float(current_size)
+            delta = float(delta_shares)
+        except (TypeError, ValueError, OverflowError):
+            return True
+        if not math.isfinite(size) or not math.isfinite(delta):
+            return True
+        if abs(delta) <= 1e-12:
+            return False
+        new_size = size + delta
+        reduces = abs(new_size) + 1e-9 < abs(size) or abs(new_size) <= 1e-9
+        crosses = (size > 0 and new_size < -1e-9) or (size < 0 and new_size > 1e-9)
+        return not reduces or crosses
+
+    def risk_lock_blocks_option_open(self, symbol, effect, *aliases) -> bool:
+        """风控锁拦截期权新开仓，不拦截卖平或买平。"""
+        if str(effect or "").strip().upper() not in {"BUY_TO_OPEN", "SELL_TO_OPEN"}:
+            return False
+        locked = {str(item) for item in self._risk_locked_symbols}
+        return any(name and str(name) in locked for name in (symbol, *aliases))
+
     def lock_for_risk(self, symbol: str):
-        """风控专用：锁定标的，禁止买入"""
+        """风控专用：锁定标的，禁止扩大敞口。"""
         self._risk_locked_symbols.add(symbol)
 
     def unlock_for_risk(self, symbol: str):

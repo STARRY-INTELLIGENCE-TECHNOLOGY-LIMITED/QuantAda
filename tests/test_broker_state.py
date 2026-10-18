@@ -1568,3 +1568,30 @@ def test_expected_size_does_not_mix_futu_market_prefix_pending():
 
     assert broker.get_expected_size(_make_data("HK.00700")) == 100
     assert broker.get_expected_size(_make_data("HK.09988")) == 0
+
+
+def test_risk_lock_allows_covering_short_but_blocks_new_exposure():
+    """风控锁必须允许买平已确认空头，同时继续拦住加仓和翻多。"""
+    broker = MockBroker(initial_cash=100000.0)
+    data = _make_data("US.AAPL240119P00100000")
+    broker.mock_position = -100
+    broker.lock_for_risk(data._name)
+
+    covered = broker.order_target_percent(data, target=0.0)
+
+    assert covered is not None
+    assert broker.submitted_orders[-1]["side"] == "BUY"
+    assert broker.submitted_orders[-1]["volume"] == 100
+
+    broker.submitted_orders.clear()
+    stock = _make_data("SHSE.600000")
+    broker.lock_for_risk(stock._name)
+    flipped = broker.order_target_percent(stock, target=0.5)
+    assert flipped is None
+    assert broker._last_order_target_skip_reason == "risk_control_lock"
+    assert broker.submitted_orders == []
+
+    added = broker.order_target_percent(stock, target=-0.1)
+    assert added is None
+    assert broker.risk_lock_blocks_option_open(data._name, "SELL_TO_OPEN") is True
+    assert broker.risk_lock_blocks_option_open(data._name, "BUY_TO_CLOSE") is False

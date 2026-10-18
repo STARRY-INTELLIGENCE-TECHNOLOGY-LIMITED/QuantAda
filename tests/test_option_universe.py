@@ -157,6 +157,34 @@ def test_wheel_universe_keeps_both_directional_delta_anchors():
     assert set(selected) == {"US.SPY261016P00470000", "US.SPY261016C00530000"}
 
 
+class SpreadUniverseBoundsStrategy:
+    option_universe = {
+        "option_types": ("PUT",),
+        "min_dte": 25,
+        "max_dte": 50,
+        "min_delta": -0.30,
+        "max_delta": -0.05,
+        "protective_put_delta": -0.05,
+    }
+    params = {
+        "min_dte": 30,
+        "max_dte": 45,
+        "min_delta": -0.25,
+        "max_delta": -0.10,
+        "protective_put_delta": -0.10,
+    }
+
+
+def test_static_spread_universe_bounds_include_search_protective_delta():
+    spec = resolve_option_universe_spec(SpreadUniverseBoundsStrategy)
+
+    assert spec["min_dte"] == 25
+    assert spec["max_dte"] == 50
+    assert spec["min_delta"] == -0.30
+    assert spec["max_delta"] == -0.05
+    assert set(spec["delta_targets"]) == {-0.175, -0.05}
+
+
 @pytest.mark.parametrize("live", [False, True])
 def test_wheel_expansion_uses_both_sides_and_distinct_checkpoint(live):
     from common.options.universe import widen_universe_bounds

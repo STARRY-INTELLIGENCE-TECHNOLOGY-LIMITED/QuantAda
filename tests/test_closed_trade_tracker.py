@@ -79,3 +79,12 @@ def test_closed_trade_tracker_ignores_zero_padded_long_low():
     data.low[0] = 0.0
     tracker.update_active_lows()
     assert tracker._active_trade_states[data._name]["lowest_price_during_trade"] == 5.0
+
+
+def test_update_active_lows_skips_full_scan_without_open_trades():
+    class _Boom:
+        @property
+        def datas(self):
+            raise AssertionError("没有持仓时不应扫描全部行情")
+
+    ClosedTradeTracker(_Boom()).update_active_lows()

@@ -34,12 +34,66 @@ def _book_transfer(broker, owner, data, size, price, **info):
     broker._bracketize(order)
 
 
+def _datas_signature(datas):
+    """用容器身份、长度和首尾 feed 判断行情列表是否变化。"""
+    try:
+        size = len(datas)
+        first = datas[0] if size else None
+        last = datas[-1] if size else None
+    except TypeError:
+        datas = tuple(datas)
+        size = len(datas)
+        first = datas[0] if size else None
+        last = datas[-1] if size else None
+    return (
+        id(datas),
+        size,
+        id(first) if first is not None else 0,
+        id(last) if last is not None else 0,
+    )
+
+
+def settlement_stock_feeds(owner):
+    """缓存非期权 feed。列表不变时不再每个 bar 重新解析全部代码。"""
+    datas = getattr(owner, "datas", None) or []
+    signature = _datas_signature(datas)
+    cached = getattr(owner, "_quantada_settlement_stocks", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
+        return cached[1]
+    stocks = {}
+    for data in datas:
+        name = getattr(data, "_name", "")
+        if parse_option_symbol(name).get("option_type"):
+            continue
+        stocks[underlying_key(name)] = data
+    try:
+        owner._quantada_settlement_stocks = (signature, stocks)
+    except Exception:
+        pass
+    return stocks
+
+
+def _frame_clock(frame):
+    """缓存正股日期索引，避免同一到期日反复 normalize 全历史。"""
+    attrs = getattr(frame, "attrs", None)
+    index_identity = id(frame.index)
+    cached = attrs.get("_quantada_settlement_clock") if isinstance(attrs, dict) else None
+    if isinstance(cached, tuple) and cached[0] == index_identity:
+        return cached[1], cached[2]
+    index = pd.DatetimeIndex(frame.index)
+    if index.tz is not None:
+        index = index.tz_convert("UTC").tz_localize(None)
+    normalized = index.normalize()
+    if isinstance(attrs, dict):
+        attrs["_quantada_settlement_clock"] = (index_identity, index, normalized)
+    return index, normalized
+
+
 def settle_physical_options(broker):
     """日线收盘结算已到期持仓；缺少到期日正股收盘价时明确失败。"""
     owner = broker.cerebro.runningstrats[0]
     current = pd.Timestamp(broker.cerebro.datas[0].datetime.datetime(0)).normalize()
-    stocks = {underlying_key(data._name): data for data in owner.datas
-              if not parse_option_symbol(data._name).get("option_type")}
+    stocks = settlement_stock_feeds(owner)
     events = []
     for data, position in list(broker.positions.items()):
         if not position.size:
@@ -54,10 +108,8 @@ def settle_physical_options(broker):
         if stock is None:
             raise ValueError(f"Physical settlement requires underlying feed: {data._name}")
         frame = stock.p.dataname
-        index = pd.DatetimeIndex(frame.index)
-        if index.tz is not None:
-            index = index.tz_convert("UTC").tz_localize(None)
-        at_expiry = frame.loc[(index.normalize() == expiry) & (index <= current + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1))]
+        index, normalized = _frame_clock(frame)
+        at_expiry = frame.loc[(normalized == expiry) & (index <= current + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1))]
         if at_expiry.empty:
             raise ValueError(f"Physical settlement lacks expiry-day underlying close: {data._name}")
         spot = float(at_expiry["close"].iloc[-1])

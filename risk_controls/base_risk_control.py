@@ -35,7 +35,8 @@ class BaseRiskControl(ABC):
         如果策略持有该 'data' 的仓位，此方法将在每个 'next' bar 被调用。
 
         :param data: 当前K线的数据 feed (e.g., self.datas[0])
-        :return: 'SELL' 来触发平仓, 或者 None (或任何非'SELL'字符串) 来表示不执行任何操作。
+        :return: 'SELL' 表示把该 feed 的已确认仓位打回零。多头卖平，空头买平。
+                 None 或其他值表示不动作。股票百分比样例不衡量期权权利金和乘数。
         """
         pass
 

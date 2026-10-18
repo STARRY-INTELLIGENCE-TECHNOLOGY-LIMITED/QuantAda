@@ -91,7 +91,7 @@
 2. 在判定跳过前，只对上述必需失败做有限次重试；滚动期权候选无 K 线不触发重试，也不跳过整轮。
 3. `datas` 为空时，尝试恢复历史数据与 data feed。
 4. 若策略层残留 `strategy.order`，但柜台和 broker 内部已无在途状态，则自动清锁。
-5. 风控支持多模块链式挂载。
+5. 风控支持多模块链式挂载。SELL 把该 feed 已确认仓位打回零，多头卖平、空头买平。风控锁禁止扩大敞口，但不得拦住这笔平仓。
 6. GM / IB schedule 运行支持 prewarm；相关改动不得破坏 `LIVE_SCHEDULE_PREWARM_LEAD` 语义。
 7. schedule 附近的 IM 报警推送支持时间窗限制；默认读取 `LIVE_SCHEDULE_ALARM_WINDOW`，连接配置中的 `alarm_window` 可覆盖全局默认值。
 8. 使用实盘 schedule 回调的 adapter 必须在 context 上暴露 `schedule_rule` 或 `use_schedule`，使基础 broker 能区分正常调度间隔和异常长中断。

@@ -39,6 +39,7 @@
    - 期权滚动合约不要手写静态期权代码当标的池。需要展开时在策略类声明 `option_universe = ("PUT",)` 或 `True`，并提供 `min_dte`/`max_dte`；运行时会把正股池展开为历史/当前链候选。持仓、保护腿和完整历史逻辑必须基于当前 `self.broker.datas`，不要冻结 init 时的合约列表。实盘无 K 线的滚动候选会被丢弃；账户已持仓或在途的旧合约会被增补进 datas，这些合约刷新失败仍会跳过整轮。零填充或缺 K 的已有持仓/在途合约仍占用底层名额，不能当成空仓再开；保护腿缺报价时不得单独买平空头。公开样例在 `strategies/options/`：`SampleLongPutStrategy` / `SampleLongCallStrategy` / `SampleCashSecuredPutStrategy` / `SampleCoveredCallStrategy` / `SamplePutCreditSpreadStrategy`；各文件顶部有可复制的 `run.py` 命令。
    - 期权当前候选不要再次全量扫描 `self.broker.datas`；使用 `from strategies.options.support import iter_option_rows`，按 `for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"}):` 读取当前有效报价。该入口在离线回测/优化中使用交易日快照索引，实盘自动保持实时遍历语义。`meta`/`quote` 只提供标准化数据，DTE、Delta、IVP、持仓和风险过滤仍由策略决定。
    - 单个期权当前报价使用 `common.data_view.visible_row(..., require_current_quote=True, cache_owner=self.broker)`；已持仓和保护腿优先使用 `iter_held_options`、`held_protective_put` 等公共视图。历史指标、估值带和底层趋势仍直接读取完整 `data.p.dataname`，不能把当前候选索引当成历史数据。
+   - 查找正股 feed 使用 `underlying_feed(broker, key)`。同一 datas 容器会复用底层索引，不要在每个 bar 对全部合约重复解析代码来判断谁是正股。
    - PCS 若声明 `protective_put_delta`，历史链展开必须同时保留 Short Put 中心 Delta 和保护腿 Delta 的候选；不得只依赖短腿中心附近的少量合约。
 
 
@@ -162,6 +163,6 @@ class YourCustomStrategy(BaseStrategy):
 
 ## 期权卖方补充契约
 
-期权卖方策略不得把本地现金、持仓或订单意图当作事实。`SELL_TO_OPEN_PUT` 若要求灾难保护，必须同时构造包含两个 `OptionRiskLeg` 的定义风险 Put Credit Spread，并调用券商原子组合入口；入口不存在或券商不支持时直接阻断，不得顺序提交裸 Put。实盘风险 Watchdog 和清算对账只接受券商快照，未知快照必须停止新开仓；回测仍使用同步内存路径。
+期权卖方策略不得把本地现金、持仓或订单意图当作事实。`SELL_TO_OPEN_PUT` 若要求灾难保护，必须同时构造包含两个 `OptionRiskLeg` 的定义风险 Put Credit Spread，并调用券商原子组合入口；入口不存在或券商不支持时直接阻断，不得顺序提交裸 Put。实盘风险 Watchdog 和清算对账只接受券商快照，未知快照必须停止新开仓；回测仍使用同步内存路径。 可承受亏损使用 `risk_controls.sample_option_loss_budget`，不要把股票百分比止损套到期权权利金上。
 CSP 轮动独立于 PCS：Put 按执行价乘乘数全额担保，Call 读取足额正股覆盖，已有股票也属于管理范围时必须明确说明。阶段由 Broker 持仓推导，不缓存指派或补仓意图；平仓不受开仓条件限制，缺报价持仓和同底层在途仍占名额。
 双向池使用 `option_universe = ("PUT", "CALL")` 与分方向 `put_min_delta/put_max_delta/call_min_delta/call_max_delta`，框架分别保留 Delta 锚点。日线轮动可声明 `option_settlement = "physical"`，交割记账由回测柜台负责，禁止在策略内修改现金或仓位。不得沿用 PCS 提前平仓规则冒充接货轮动。该回测仅模拟到期日交割，不代表真实美式提前指派或含分红总回报。

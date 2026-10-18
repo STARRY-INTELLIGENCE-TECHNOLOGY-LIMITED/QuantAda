@@ -6,6 +6,8 @@ def _stats(**overrides):
         "option_trade_count": 24,
         "option_risk_data_coverage": 1.0,
         "years": 2.0,
+        "total_trades": 36,
+        "monthly_win_rate": 0.6,
         "total_return_pct": 8.0,
         "option_annual_risk_return_pct": 8.0,
         "option_premium_yield_pct": 14.0,
@@ -23,7 +25,39 @@ def test_option_carry_robust_requires_risk_capital_data():
     assert evaluate(_stats(option_risk_data_coverage=0.5)) == -100.0
 
 
-def test_option_carry_robust_prefers_risk_efficiency():
-    efficient = evaluate(_stats(option_annual_risk_return_pct=12.0))
-    weak = evaluate(_stats(option_annual_risk_return_pct=2.0))
+def test_option_carry_robust_prefers_annualized_return_after_drawdown():
+    efficient = evaluate(_stats(total_return_pct=25.0))
+    weak = evaluate(_stats(total_return_pct=8.0))
     assert efficient > weak
+
+
+def test_option_carry_robust_hard_penalizes_fewer_than_six_trades_per_year():
+    score = evaluate(_stats(total_trades=11))
+
+    assert score == -94.5
+
+
+def test_option_carry_robust_scales_positive_score_with_activity():
+    low_activity = evaluate(_stats(total_trades=18, total_return_pct=50.0))
+    normal_activity = evaluate(_stats(total_trades=36, total_return_pct=50.0))
+
+    assert normal_activity > low_activity
+
+
+def test_option_carry_robust_penalizes_low_wheel_capital_utilization_through_wrapper():
+    class StrategyView:
+        def __init__(self, utilization):
+            self.utilization = utilization
+
+        def get_research_summary(self):
+            return {"average_committed_fraction": self.utilization}
+
+    class BacktestWrapper:
+        def __init__(self, utilization):
+            self.strategy = StrategyView(utilization)
+
+    stats = _stats(total_return_pct=50.0)
+    active = evaluate(stats, strat=BacktestWrapper(0.40))
+    idle = evaluate(stats, strat=BacktestWrapper(0.02))
+
+    assert active > idle

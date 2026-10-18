@@ -121,6 +121,7 @@ def attach_earnings_calendar(datas, events):
         key = _symbol_key(symbol)
         attrs = dict(getattr(dataframe, "attrs", {}) or {})
         attrs["earnings_calendar"] = tuple(by_underlying.get(key, ()))
+        attrs["earnings_calendar_available"] = events is not None
         attrs["earnings_calendar_source"] = source
         attrs["earnings_calendar_as_of_supported"] = as_of_supported
         dataframe.attrs = attrs

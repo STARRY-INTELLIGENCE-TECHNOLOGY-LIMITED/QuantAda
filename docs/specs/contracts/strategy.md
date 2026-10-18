@@ -74,13 +74,14 @@
 1. 股票/ETF 仍使用静态 `--symbols` 或 selector 一次输出的代码列表。
 2. 期权策略若要把标的池展开为滚动合约，应在策略类上声明 `option_universe`，例如 `option_universe = ("PUT",)` 或 `True`。
 3. 未声明时，运行时不得自动把正股代码展开成期权链，避免股票策略误拉全链。
-4. 展开过滤读取策略 `params` 的 `min_dte`/`max_dte`，以及 `min_delta`/`max_delta`/`protective_put_delta` 的并集；缺少 DTE 窗口时失败关闭。
+4. 展开过滤读取策略 `params` 的 `min_dte`/`max_dte`，以及 `min_delta`/`max_delta`/`protective_put_delta` 的并集；缺少 DTE 窗口时失败关闭。策略也可用 `option_universe` 字典声明固定的候选池覆盖边界，支持 `min_dte`/`max_dte`/`min_delta`/`max_delta`/`protective_put_delta`/`min_open_interest`；这适用于训练空间宽于基准参数的情况，实际每个 Trial 仍按策略参数过滤。
 5. 回测/优化在取数前按 as_of 抽样历史链并求并集，必须使用 ThetaData 或 `theta+futu` 的历史链，禁止用 Futu 当前链回放。并集应按时间均匀封顶，不得只收下窗口开头的合约，否则 Optuna 训练集/测试集会没有可交易期权。展开和合约历史拉取应周期性打印进度（当前 as_of、成功数、空结果数、失败数、合约数、已用时间）。Theta 的 No data found 不逐条打印、不重试；超时与瞬时错误有界重试 5 次，失败 as_of 与漏拉合约在本轮扫完后补偿一轮。`CACHE_DATA=True` 时按 as_of 断点续拉；`--refresh` 忽略断点并全量重拉。实盘不写该断点。
    若策略声明 `option_universe_exclude_underlyings`，或声明 `option_universe_exclude_param` 指向一个参数（如反向 ETF Beta 对冲标的），这些正股保留在股票池但不展开期权链，避免对冲标的被轮动逻辑当成卖 Put/Call 的底层。
 历史链候选若声明 `protective_put_delta`，每个 as_of 必须同时覆盖 Short Put 的中心 Delta 和保护腿 Delta；断点缓存身份必须包含 Delta 锚点，不能复用只围绕短腿中心生成的旧缓存。
 6. 实盘每个 schedule slot 用当前链增补合约；账户已有持仓或在途的旧合约必须保留，即使它们还不在当前 datas。pending 快照不可信，或持仓查询异常时，不得把现有期权 feed 当作空仓丢弃。
 7. 策略仍只交易 `self.broker.datas` 中的对象，并在 `next()` 按当前 DTE/Delta 再过滤；不要缓存 init 时的合约列表。已有持仓或在途期权即使当前 K 线被零填充、没有可交易报价，也必须占用底层名额；保护腿缺报价时不得把它当成已移除后单独买平空头。
 8. 框架内置期权样例位于 `strategies/options/`，覆盖买开 Put/Call、现金担保短 Put、Covered Call 和原子 Put Credit Spread。运行使用全限定类名；各样例文件顶部有可复制的 `run.py` 命令。裸卖、Call 价差和未实现多腿组合必须失败关闭，不要在样例里顺序拆腿。
+9. 可承受亏损不要只写在策略里。股票风控样例的价格百分比不能直接用于期权。账户级回撤拔网线仍可用；结构级亏损使用 `risk_controls.sample_option_loss_budget`。它按权利金、乘数和已定义最大亏损退出，`SELL` 会平掉多头或空头。
 
 ## 11. 期权当前行情读取
 1. 期权策略按当前交易日筛选候选时，使用 `strategies.options.support.iter_option_rows()`：
@@ -96,6 +97,7 @@ for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"})
 4. 需要读取单个合约当前行时，使用 `common.data_view.visible_row(data, current_dt, require_current_quote=True, cache_owner=self.broker)`；持仓和保护腿优先使用 `iter_held_options()`、`held_protective_put()` 等专用视图。
 5. 历史指标、估值带和底层趋势需要完整 DataFrame 时，继续读取 `data.p.dataname` 并使用向量化计算；不得把当前报价索引当作历史数据集。
 6. 自定义期权 feed 至少应满足：代码可由 `parse_option_symbol()` 解析，或提供 `option_type/right/cp/put_call` 与 `strike/expiry` 等标准元数据列。否则候选索引会失败关闭，不能静默交易。
+7. 按底层代码查找正股/ETF feed 使用 `underlying_feed(broker, key)`。同一 `broker.datas` 容器在身份、长度和首尾 feed 不变时复用索引，替换列表或追加 feed 后自动重建。策略不要在每个 bar 里对全部合约重复解析代码来判断谁是正股。
 
 ## 12. 双向期权池与显式物理交割回测
 1. 双向轮动声明 `option_universe = ("PUT", "CALL")`，参数使用 `put_min_delta/put_max_delta/call_min_delta/call_max_delta`。方向参数必须完整且符号合法；发现时两侧各保留中心 Delta 锚点，边界和锚点进入缓存身份。当前优化器仅按固定参数展开池，不能假定搜索自动加载固定边界以外的合约。

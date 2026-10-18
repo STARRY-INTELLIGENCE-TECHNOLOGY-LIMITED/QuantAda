@@ -8,8 +8,14 @@ if /I "%~1"=="--instance" goto :run_instance
 if /I "%~1"=="/DRYRUN" set "IBC_DRY_RUN=1"
 
 rem 优先使用 IBC_PATH；否则使用脚本目录，或自动识别同级唯一的 IBCWin-* 目录。
+rem 快捷方式起始位置为空时，调用者工作目录通常是桌面。先进入脚本目录，后续相对路径不再依赖调用者。
 set "IBC_SCRIPT_DIR=%~dp0"
 if "%IBC_SCRIPT_DIR:~-1%"=="\" set "IBC_SCRIPT_DIR=%IBC_SCRIPT_DIR:~0,-1%"
+cd /d "%IBC_SCRIPT_DIR%"
+if errorlevel 1 (
+  echo Cannot enter script directory: %IBC_SCRIPT_DIR%
+  exit /b 1005
+)
 if not defined IBC_PATH if exist "%IBC_SCRIPT_DIR%\scripts\DisplayBannerAndLaunch.bat" set "IBC_PATH=%IBC_SCRIPT_DIR%"
 if not defined IBC_PATH (
   for %%D in ("%IBC_SCRIPT_DIR%\..") do set "IBC_SCRIPT_PARENT=%%~fD"
@@ -25,9 +31,19 @@ if not defined IBC_PATH (
   )
 )
 if not exist "%IBC_PATH%\scripts\DisplayBannerAndLaunch.bat" (
+  if defined IBC_SCRIPT_PARENT if exist "!IBC_SCRIPT_PARENT!\IBCWin-*.zip" (
+    echo Found IBCWin-*.zip but no extracted installation. Extract the zip once. A shortcut into the zip creates a new folder on every launch.
+  )
   echo IBC installation was not found. Put this script in the IBC root, keep one sibling IBCWin-* directory, or set IBC_PATH explicitly.
   exit /b 1005
 )
+rem 把 IBC_PATH 规范成绝对路径并切入该目录，避免官方 start 未带 /D 时子进程继承桌面。
+cd /d "%IBC_PATH%"
+if errorlevel 1 (
+  echo Cannot enter IBC installation: %IBC_PATH%
+  exit /b 1005
+)
+set "IBC_PATH=%CD%"
 
 rem 允许按安装目录、版本号、配置目录和日志目录覆盖默认值。
 if not defined IBC_TWS_PATH if exist "C:\Jts" set "IBC_TWS_PATH=C:\Jts"
@@ -121,7 +137,7 @@ for /r "%IBC_CONFIG_DIR%" %%F in (config-*.ini) do (
         echo Skipping running IBC Gateway instance !IBC_INSTANCE_KEY!: !IBC_CONFIG_FILE!
       ) else (
         echo Starting IBC Gateway instance !IBC_INSTANCE_KEY! from !IBC_CONFIG_FILE!
-        start "IBC Gateway !IBC_INSTANCE_KEY!" /D "%IBC_PATH%" "%ComSpec%" /d /c call "%~f0" --instance "!IBC_INSTANCE_KEY!" "!IBC_CONFIG_FILE!" "!IBC_INSTANCE_SETTINGS!" "!IBC_INSTANCE_LOG!" "!IBC_SELECTED_VERSION!" "%IBC_TWS_PATH%"
+        start "IBC Gateway !IBC_INSTANCE_KEY!" /D "!IBC_PATH!" "%ComSpec%" /d /c call "%~f0" --instance "!IBC_INSTANCE_KEY!" "!IBC_CONFIG_FILE!" "!IBC_INSTANCE_SETTINGS!" "!IBC_INSTANCE_LOG!" "!IBC_SELECTED_VERSION!" "%IBC_TWS_PATH%"
       )
     )
   )
@@ -138,7 +154,17 @@ if "%IBC_VALID%"=="0" (
 exit /b 0
 
 :run_instance
-rem 子进程继承 IBC_PATH，仅替换本实例的安装版本、配置、设置和日志路径。
+rem 子进程继承 IBC_PATH。先离开调用者目录，再进入本实例设置目录。
+rem 官方 StartIBC.bat 的 pushd 失败后会把设置目录改成 %CD%。先进入已创建的实例设置目录，避免落到桌面。
+if not defined IBC_PATH goto :run_instance_settings
+if "!IBC_PATH:~-1!"=="\" set "IBC_PATH=!IBC_PATH:~0,-1!"
+cd /d "!IBC_PATH!"
+if errorlevel 1 (
+  echo Cannot enter IBC installation: !IBC_PATH!
+  exit /b 1005
+)
+set "IBC_PATH=!CD!"
+:run_instance_settings
 set "IBC_INSTANCE=%~2"
 set "CONFIG=%~3"
 set "TWS_SETTINGS_PATH=%~4"
@@ -152,6 +178,17 @@ set "INLINE=1"
 set "TRADING_MODE="
 if not defined IBC_TWOFA_TIMEOUT_ACTION set "IBC_TWOFA_TIMEOUT_ACTION=restart"
 set "TWOFA_TIMEOUT_ACTION=%IBC_TWOFA_TIMEOUT_ACTION%"
+if defined TWS_SETTINGS_PATH if "%TWS_SETTINGS_PATH:~-1%"=="\" set "TWS_SETTINGS_PATH=%TWS_SETTINGS_PATH:~0,-1%"
+if not exist "%TWS_SETTINGS_PATH%" (
+  echo Settings directory was not found: %TWS_SETTINGS_PATH%
+  exit /b 1008
+)
+cd /d "%TWS_SETTINGS_PATH%"
+if errorlevel 1 (
+  echo Cannot enter settings directory: %TWS_SETTINGS_PATH%
+  exit /b 1008
+)
+set "TWS_SETTINGS_PATH=%CD%"
 call "%IBC_PATH%\scripts\DisplayBannerAndLaunch.bat" /INLINE
 exit /b %ERRORLEVEL%
 
@@ -170,4 +207,5 @@ echo   IBC_CONFIG_DIR    config directory (default: %%USERPROFILE%%\Documents\IB
 echo   IBC_SETTINGS_ROOT per-instance settings root
 echo   IBC_LOG_ROOT      per-instance log root
 echo   IBC_TWOFA_TIMEOUT_ACTION restart or exit after 2FA completion timeout (default: restart)
+echo Shortcut Start-in may be empty. This script does not use the caller working directory.
 exit /b 0

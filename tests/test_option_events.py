@@ -26,3 +26,16 @@ def test_attach_earnings_calendar_and_blackout_are_deterministic():
     assert rows[0]["event_date"] == "2024-02-01"
     assert earnings_blackout(rows, "2024-01-27", before_days=7, after_days=2)
     assert not earnings_blackout(rows, "2024-02-20", before_days=7, after_days=2)
+    assert frame.attrs["earnings_calendar_available"] is True
+
+
+def test_missing_earnings_provider_snapshot_is_distinct_from_empty_calendar():
+    frame = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+
+    attach_earnings_calendar({"US.AAPL": frame}, None)
+
+    assert frame.attrs["earnings_calendar"] == ()
+    assert frame.attrs["earnings_calendar_available"] is False

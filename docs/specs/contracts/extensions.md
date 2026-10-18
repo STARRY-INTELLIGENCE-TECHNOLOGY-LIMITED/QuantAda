@@ -18,14 +18,18 @@
 ## 2. 风控模块
 1. 继承 `risk_controls.base_risk_control.BaseRiskControl`
 2. 核心方法: `check(data) -> str`
-3. 返回 `'SELL'` 表示触发卖出，其余返回视为不动作
-4. 可选实现:
+3. 返回 `'SELL'` 表示把该 feed 的已确认仓位打回零。回测走 `close()`，实盘走 `order_target_percent(target=0)`：多头卖平，空头买平。其余返回视为不动作。
+4. 风控锁禁止同一标的扩大敞口，包括股票加仓和期权 `BUY_TO_OPEN`/`SELL_TO_OPEN`。它不得拦住刚触发的空头买平或价差平仓。
+5. 可选实现:
 - `notify_order(order)`
 - `notify_trade(trade)`
-5. 当前引擎支持逗号分隔的多风控链式加载
-6. `risk_params` 可为:
+6. 当前引擎支持逗号分隔的多风控链式加载
+7. `risk_params` 可为:
 - 平铺 dict
 - `{risk_name: {...}}` scoped dict
+8. `sample_stop_loss_take_profit` 和 `sample_trend_protection` 按股票多头价格方向设计，不能当作期权亏损预算。期权价格下跌对空头是盈利。
+9. `sample_max_drawdown_kill_switch` 看账户净值，股票和期权都能用。它回答账户还能亏多少，不识别期权结构。
+10. 期权结构先定可承受亏损，再选结构。`sample_option_loss_budget` 把权利金差、数量和乘数折成现金亏损。`max_loss_pct` 只作用于已定义最大亏损：多头是已付权利金，等量纵向价差是宽度减净权利金，短 Put 是执行价减权利金。裸短 Call 没有定义上限，必须另给 `max_loss_cash`。备兑短 Call 不按期权单腿止损。成本、报价或乘数不足时不触发。
 
 ## 3. 数据源
 1. 继承 `data_providers.base_provider.BaseDataProvider`
@@ -60,7 +64,7 @@
 25. `data_source=theta+futu`（或 `hybrid`）使用 `HybridDataProvider`：回测/优化的正股/ETF 历史走 Futu，期权合约历史与 `as_of` 链走 ThetaData；实盘当前快照仍走 Futu。历史部分可写入 `CACHE_DATA` CSV，但 live mode 不得用缓存短路当前行情。混合层不得用 ThetaData 历史价格作为实盘成交价。期权当前快照缺失、过期或字段不完整时必须失败关闭；正股快照过期时保留 Futu 历史，不得改走 Theta。
 26. Provider 组合由 `config.DATA_PROVIDER_COMPOSITIONS` 显式声明 `historical`、`realtime`、`factory` 和可选 `factory_kwargs`/`factory_options`；`data_providers.overlay_provider.OverlayDataProvider` 只负责无券商/无 Provider 绑定的组合流程，代码映射、字段归一化和新鲜度策略必须由注入的组合适配器负责。组合定义按名称惰性构造，不得改变未指定组合的 Provider 回退链。
 27. `DataManager.get_option_chain()` 不走 CSV 缓存。回测/优化的历史展开可把每个成功 as_of 的候选合约写入 `DATA_PATH/market_cache/option_universe/`，供断点续拉；`--refresh` 或 `CACHE_DATA=False` 时不读该断点。实盘展开不写断点。展开只能使用声明 `HISTORICAL_OPTION_CHAIN` 的 Provider（ThetaData 或 Hybrid 的历史侧）；Futu 当前链不得作为历史 as_of。实盘当前链由 Hybrid 在 live_mode 下转给 Futu，缺失时失败关闭，不回退 Theta 末行。 断点文件名不含取数窗口日期；自然日平移后合并旧窗口文件，并在 as_of 步长内复用最近缓存快照。
-28. 财报事件使用 `DataManager.get_earnings_calendar()`，策略不得直接导入 Futu/Theta SDK。Provider 可选实现 `get_earnings_calendar(symbols, start_date, end_date, as_of)`；不支持时返回 `None`。回测、优化和实盘启动会把统一后的事件快照附加到行情 DataFrame.attrs，策略只读取该快照。当前 Futu `get_earnings_calendar` 不提供历史 as_of 快照，研究报告必须按实际财报日禁开仓口径说明，不能宣称拥有当时的预告发布时间信息。
+28. 财报事件使用 `DataManager.get_earnings_calendar()`，策略不得直接导入 Futu/Theta SDK。Provider 可选实现 `get_earnings_calendar(symbols, start_date, end_date, as_of)`；不支持时返回 `None`。回测、优化和实盘启动会把统一后的事件快照附加到行情 DataFrame.attrs，同时写入 `earnings_calendar_available`，用于区分“已确认空日历”与“Provider 快照缺失”。策略只读取该快照。当前 Futu `get_earnings_calendar` 不提供历史 as_of 快照，研究报告必须按实际财报日禁开仓口径说明，不能宣称拥有当时的预告发布时间信息。
 29. ThetaData 分块历史请求首轮结束后，对超时或瞬时失败的日期块最多补偿 5 轮并打印 retry；其它请求仍在途时只追加一轮，剩余窗口标记不完整。已经返回的部分数据必须保留。OI、Greeks 因超时或瞬时错误缺失时，保留 OHLC，并标记 `theta_enrichment_incomplete` 与 `_theta_enrichment_incomplete`，不得写入后当作完整缓存。优化器和回测取数在本轮末尾把失败和不完整标的串行重拉，最多 5 轮；仍失败则保留已有数据。再次执行时完整缓存继续复用，只有缺口、不完整标记或价格分块未恢复的缓存才重拉并合并。价格分块补偿后仍有未恢复窗口时，同样标记不完整，避免只看首尾日期把中间缺口当成完整。`No data found` 不重试、不标记不完整。带有 Theta 期权签名但缺少 `open_interest` 且没有确认标记的旧缓存，同样视为未完成并重拉。
 
 ## 4. 报警通道

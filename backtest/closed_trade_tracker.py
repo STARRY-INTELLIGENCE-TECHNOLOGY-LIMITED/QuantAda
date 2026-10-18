@@ -15,6 +15,8 @@ class ClosedTradeTracker:
         self._processed_settlement_event_ids = set()
 
     def update_active_lows(self):
+        if not self._active_trade_states:
+            return
         for data in getattr(self.owner, "datas", []) or []:
             symbol = getattr(data, "_name", None)
             state = self._active_trade_states.get(symbol)

@@ -104,16 +104,38 @@ def dte_days(expiry, current_dt):
     return int((pd.Timestamp(expiry).normalize() - pd.Timestamp(current_dt).normalize()).days)
 
 
-def underlying_feed(broker, key):
-    """按归一化底层代码找到正股/ETF 行情。"""
-    target = underlying_key(key)
-    for data in getattr(broker, "datas", []) or []:
+def _underlying_feed_index(broker):
+    """按当前 datas 容器建立正股索引。容器身份、长度或首尾 feed 变化时重建。"""
+    datas = getattr(broker, "datas", None) or []
+    try:
+        size = len(datas)
+        first = datas[0] if size else None
+        last = datas[-1] if size else None
+    except TypeError:
+        datas = tuple(datas)
+        size = len(datas)
+        first = datas[0] if size else None
+        last = datas[-1] if size else None
+    signature = (id(datas), size, id(first) if first is not None else 0, id(last) if last is not None else 0)
+    cached = getattr(broker, "_quantada_underlying_feed_index", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == signature:
+        return cached[1]
+    index = {}
+    for data in datas:
         name = str(getattr(data, "_name", "") or "")
         if parse_option_symbol(name).get("option_type"):
             continue
-        if underlying_key(name) == target:
-            return data
-    return None
+        index.setdefault(underlying_key(name), data)
+    try:
+        broker._quantada_underlying_feed_index = (signature, index)
+    except Exception:
+        pass
+    return index
+
+
+def underlying_feed(broker, key):
+    """按归一化底层代码找到正股/ETF 行情。重复查找复用索引，不再逐合约解析。"""
+    return _underlying_feed_index(broker).get(underlying_key(key))
 
 
 def _normalize_option_types(option_types):

@@ -450,6 +450,11 @@ class BacktraderStrategyWrapper(bt.Strategy):
             self._last_order_target_skip_reason = 'unsupported_option_order_effect'
             return None
 
+        handled = getattr(getattr(self, 'strategy', None), 'risk_handled_symbols', None) or []
+        if effect in {'BUY_TO_OPEN', 'SELL_TO_OPEN'} and getattr(data, '_name', None) in handled:
+            self._last_order_target_skip_reason = 'risk_control_lock'
+            return None
+
         if effect == 'BUY_TO_OPEN':
             try:
                 execution_price = float(price if price is not None else data.close[0])
@@ -609,8 +614,14 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
             total_buy_cost = 0.0
             opening = []
+            handled = set(
+                getattr(getattr(self, 'strategy', None), 'risk_handled_symbols', None) or []
+            )
             for data, effect, price, risk_leg, leg_kwargs in prepared:
                 normalized_effect = normalize_option_order_effect(effect)
+                if normalized_effect in {'BUY_TO_OPEN', 'SELL_TO_OPEN'} and getattr(data, '_name', None) in handled:
+                    self._last_order_target_skip_reason = 'risk_control_lock'
+                    return None
                 current = float(self.getposition(data).size)
                 validate_option_order_effect(
                     normalized_effect,

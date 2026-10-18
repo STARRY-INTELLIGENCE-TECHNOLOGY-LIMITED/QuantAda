@@ -4,7 +4,7 @@
 
 ## 目录
 
-- `ibc_windows/`：Windows + IBC 3.24.2 的通用配置样例与批处理启动器，支持同一 Jts 根目录下的新旧 Gateway 版本并存。
+- `ibc_windows/`：Windows + IBC 3.24.2 的通用配置样例与批处理启动器，支持同一 Jts 根目录下的新旧 Gateway 版本并存。桌面快捷方式的起始位置可以为空，启动脚本不依赖调用者工作目录。
 - `ib_docker/`：原 Docker Compose、环境变量样例和 autossh 隧道模板。
 
 IBC 和 Docker 配置都只负责 Gateway 生命周期、登录、二次认证及连接保持；QuantAda 通过运行时 broker 配置选择实际的主机、端口和账户。

@@ -2894,6 +2894,10 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     f'[FutuBroker] option entry blocked by risk watchdog: {symbol}'
                 )
                 return None
+            if self.risk_lock_blocks_option_open(symbol, effect, getattr(data, '_name', '')):
+                self._last_order_target_skip_reason = 'risk_control_lock'
+                self._runtime_log(f'[FutuBroker] option open blocked by risk lock: {symbol}')
+                return None
             position = self.get_position(data)
             current_size = getattr(position, 'size', 0) or 0
             if effect == 'SELL_TO_OPEN':
@@ -3022,6 +3026,18 @@ class FutuBrokerAdapter(BaseLiveBroker):
             self._last_order_target_skip_reason = 'option_entry_kill_switch'
             self._runtime_log('[FutuBroker] option spread entry blocked by risk gate.')
             return None
+        if opening_effects & {'SELL_TO_OPEN', 'BUY_TO_OPEN'}:
+            for item in legs:
+                if not isinstance(item, dict):
+                    continue
+                leg_data = item.get('data')
+                leg_symbol = _normalise_symbol(getattr(leg_data, '_name', ''))
+                if self.risk_lock_blocks_option_open(
+                    leg_symbol, item.get('effect'), getattr(leg_data, '_name', ''),
+                ):
+                    self._last_order_target_skip_reason = 'risk_control_lock'
+                    self._runtime_log('[FutuBroker] option spread open blocked by risk lock.')
+                    return None
         try:
             quantity = _decimal(volume, None)
             if quantity is None or quantity <= 0:

@@ -8,6 +8,7 @@
 import math
 import re
 from datetime import datetime
+from functools import lru_cache
 from typing import Optional
 
 import numpy as np
@@ -132,6 +133,25 @@ def normalise_option_types(value, default=("CALL", "PUT")) -> set[str]:
     return {item for item in normalised if item} or set(default)
 
 
+def _compact_expiry(raw):
+    """解析纯数字六位或八位到期日。非法日期返回 None，继续走原有回退。"""
+    if len(raw) not in (6, 8) or not raw.isdigit():
+        return None
+    if len(raw) == 8:
+        year = int(raw[0:4])
+        month = int(raw[4:6])
+        day = int(raw[6:8])
+    else:
+        year_short = int(raw[0:2])
+        year = 1900 + year_short if year_short >= 69 else 2000 + year_short
+        month = int(raw[2:4])
+        day = int(raw[4:6])
+    try:
+        return pd.Timestamp(datetime(year, month, day))
+    except ValueError:
+        return None
+
+
 def parse_expiry(value):
     """解析六位、八位或常见分隔符格式的期权到期日。"""
     if value is None:
@@ -144,6 +164,9 @@ def parse_expiry(value):
     if isinstance(value, float) and np.isnan(value):
         return pd.NaT
     raw = str(value).strip()
+    compact = _compact_expiry(raw)
+    if compact is not None:
+        return compact
     formats = (
         (("%y%m%d", "%Y%m%d") if len(raw) == 6 else ("%Y%m%d", "%y%m%d"))
         + ("%Y-%m-%d", "%Y/%m/%d")
@@ -197,30 +220,44 @@ def series_column(dataframe: pd.DataFrame, aliases, default=np.nan, numeric=True
     return selected.astype("string")
 
 
-def parse_option_symbol(symbol: str, strike_scale: float = 1000.0) -> dict:
-    """解析常见 venue/OCC 风格代码，显式列字段优先于该猜测结果。"""
-    raw = str(symbol or "").strip().upper()
+@lru_cache(maxsize=65536)
+def _cached_option_symbol(raw: str, scale: float):
+    """缓存合约代码解析。返回不可变字段，调用方再组装新字典。"""
     code = raw.split(".", 1)[1] if "." in raw else raw
     match = _OPTION_SYMBOL_RE.match(code)
     if not match:
-        return {}
-
+        return None
     expiry = parse_expiry(match.group("expiry"))
     strike_digits = match.group("strike")
+    # 短于八位仍按 Futu 千分之一美元编码，避免同一合约得到不同执行价。
+    used_scale = 1000.0 if len(strike_digits) < 8 else scale
+    expiry_value = None if pd.isna(expiry) else int(pd.Timestamp(expiry).value)
+    return (
+        match.group("underlying"),
+        expiry_value,
+        safe_number(strike_digits) / used_scale,
+        normalise_option_type(match.group("right")),
+    )
+
+
+def parse_option_symbol(symbol: str, strike_scale: float = 1000.0) -> dict:
+    """解析常见 venue/OCC 风格代码，显式列字段优先于该猜测结果。"""
+    raw = str(symbol or "").strip().upper()
     scale = safe_number(strike_scale, 1000.0)
     if scale <= 0:
         scale = 1000.0
     # OCC 使用固定八位执行价；Futu 的代码会省略前导零，但仍以千分之一
     # 美元编码（例如 P9000 表示 9.000）。短于八位时统一按 Futu 口径解析，
     # 避免同一合约在行情、策略和交易模块得到不同执行价。
-    if len(strike_digits) < 8:
-        scale = 1000.0
-
+    cached = _cached_option_symbol(raw, float(scale))
+    if not cached:
+        return {}
+    underlying, expiry_value, strike, option_type = cached
     return {
-        "underlying": match.group("underlying"),
-        "expiry": expiry,
-        "strike": safe_number(strike_digits) / scale,
-        "option_type": normalise_option_type(match.group("right")),
+        "underlying": underlying,
+        "expiry": pd.NaT if expiry_value is None else pd.Timestamp(expiry_value),
+        "strike": strike,
+        "option_type": option_type,
     }
 
 
