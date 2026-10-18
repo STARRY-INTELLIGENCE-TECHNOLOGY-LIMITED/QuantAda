@@ -1,6 +1,8 @@
 import os
 import re
 import subprocess
+
+import pytest
 from pathlib import Path
 
 
@@ -174,6 +176,7 @@ def _assert_no_extra_desktop_dirs(desktop, allowed):
     assert not (desktop / "relative-leak").exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows 启动脚本只能由 cmd.exe 执行")
 def test_windows_launcher_pins_shortcut_workdir(tmp_path):
     """桌面快捷方式起始位置为空时，启动不得在桌面留下新的 IBCWin 目录。"""
     desktop, ibc, wrap, jts, config = _prepare_desktop(tmp_path)
@@ -219,6 +222,7 @@ def test_windows_launcher_pins_shortcut_workdir(tmp_path):
 
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows 启动脚本只能由 cmd.exe 执行")
 def test_relative_diagnostic_log_path_does_not_create_desktop_folder(tmp_path):
     """相对诊断日志路径必须拒绝，不能在桌面调用官方 Diagnostic 或新建目录。"""
     desktop, ibc, wrap, jts, config = _prepare_desktop(tmp_path)
@@ -245,6 +249,7 @@ def test_relative_diagnostic_log_path_does_not_create_desktop_folder(tmp_path):
     assert not (desktop / "vendor-diag-leak").exists()
     assert not (settings / "relative-leak").exists()
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows 启动脚本只能由 cmd.exe 执行")
 def test_create_desktop_shortcut_pins_working_directory(tmp_path):
     """重建的桌面快捷方式必须指向已解压脚本，且起始位置不是桌面。"""
     home = tmp_path / "home"

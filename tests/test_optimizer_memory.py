@@ -47,6 +47,57 @@ def test_forced_shutdown_stops_spawn_worker_before_return(tmp_path, monkeypatch)
         pool.shutdown(wait=True, cancel_futures=True)
 
 
+def test_force_shutdown_marks_reaped_worker_not_alive(monkeypatch):
+    """Linux 上 waitpid 被抢走后，已消失的 worker 不能再让 is_alive() 一直为真。"""
+    if os.name == "nt":
+        pytest.skip("Windows 退出码由 join 回收，不走 ECHILD 补写")
+
+    class Popen:
+        def __init__(self):
+            self.pid = 4242
+            self.returncode = None
+
+    class Proc:
+        def __init__(self):
+            self._popen = Popen()
+            self.pid = 4242
+
+        def is_alive(self):
+            return self._popen.returncode is None
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+        def join(self, timeout=None):
+            return None
+
+    proc = Proc()
+
+    class Executor:
+        def __init__(self):
+            self._processes = {proc.pid: proc}
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self._processes = None
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise ProcessLookupError(pid)
+        return None
+
+    def fake_waitpid(pid, flag):
+        raise ChildProcessError(pid)
+
+    monkeypatch.setattr(optimizer.os, "kill", fake_kill)
+    monkeypatch.setattr(optimizer.os, "waitpid", fake_waitpid)
+    optimizer.OptimizationJob._force_shutdown_process_pool(Executor(), [])
+    assert proc._popen.returncode is not None
+    assert proc.is_alive() is False
+
+
 def _probe_spawn_runtime(payload, study_name, log_file, n_trials, worker_idx, seed, candidates, **kwargs):
     """在真实 spawn 进程中检查导入时已生效的线程数，不运行训练或连接行情。"""
     import numpy as np

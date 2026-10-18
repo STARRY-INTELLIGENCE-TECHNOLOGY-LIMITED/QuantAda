@@ -16,6 +16,7 @@ import math
 import multiprocessing as mp
 import os
 import re
+import signal
 import socket
 import sys
 import threading
@@ -1001,13 +1002,12 @@ class OptimizationJob:
 
     @staticmethod
     def _force_shutdown_process_pool(executor, futures):
-        """
-        在 Ctrl-C 等中断场景下，尽快回收 ProcessPoolExecutor 及其子进程。
-        """
+        """在 Ctrl-C 等中断场景下，尽快回收 ProcessPoolExecutor 及其子进程。"""
         if executor is None:
             return
 
-        # shutdown 会清空执行器的进程表，必须先保留句柄才能终止仍在运行的 worker。
+        # shutdown 会清空执行器进程表，并唤醒管理线程做无超时 join。必须先保留句柄，
+        # 由本线程收退出码；否则 Linux poll() 遇到 ECHILD 不写 returncode，is_alive() 会一直为真。
         processes = list((getattr(executor, "_processes", None) or {}).values())
         for fut in futures or []:
             try:
@@ -1015,43 +1015,94 @@ class OptimizationJob:
             except Exception:
                 pass
 
+        def pid_of(proc):
+            popen = getattr(proc, "_popen", None)
+            pid = getattr(popen, "pid", None) or getattr(proc, "pid", None)
+            return pid if isinstance(pid, int) and pid > 0 else None
+
+        def note_reaped(proc, code=-9):
+            popen = getattr(proc, "_popen", None)
+            if popen is not None and popen.returncode is None:
+                popen.returncode = code
+
+        def collect_status(proc):
+            # 只在 POSIX 上补写退出码。Windows 的 join 已能让 is_alive() 变假，不能误标仍在运行的进程。
+            popen = getattr(proc, "_popen", None)
+            pid = pid_of(proc)
+            if popen is None or popen.returncode is not None or pid is None or os.name == "nt":
+                return
+            try:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                waited = 0
+            except OSError:
+                waited = 0
+            else:
+                if waited == pid:
+                    try:
+                        popen.returncode = os.waitstatus_to_exitcode(status)
+                    except Exception:
+                        popen.returncode = -9
+                    return
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                popen.returncode = -9
+            except OSError:
+                return
+
+        def signal_processes(force):
+            sig = getattr(signal, "SIGKILL", signal.SIGTERM) if force else signal.SIGTERM
+            for proc in processes:
+                try:
+                    if force and hasattr(proc, "kill"):
+                        proc.kill()
+                    else:
+                        proc.terminate()
+                except Exception:
+                    pass
+                pid = pid_of(proc)
+                if pid is None or (os.name == "nt" and force):
+                    collect_status(proc)
+                    continue
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    note_reaped(proc)
+                except OSError:
+                    pass
+                collect_status(proc)
+
+        def join_processes(timeout):
+            # timeout>0 的 join 在哨兵就绪后会进入阻塞 waitpid，可能超过调用方时限。
+            deadline = time.monotonic() + timeout
+            while True:
+                pending = False
+                for proc in processes:
+                    try:
+                        proc.join(timeout=0)
+                    except Exception:
+                        pass
+                    collect_status(proc)
+                    popen = getattr(proc, "_popen", None)
+                    if popen is not None and popen.returncode is None and pid_of(proc):
+                        pending = True
+                if not pending or time.monotonic() >= deadline:
+                    return
+                time.sleep(0.05)
+
+        # 先终止 worker，再唤醒管理线程，避免它抢先 waitpid 后把退出状态弄丢。
+        signal_processes(False)
+        join_processes(0.5)
         try:
             executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-
         if not processes:
             return
-
-        for proc in processes:
-            try:
-                if proc.is_alive():
-                    proc.terminate()
-            except Exception:
-                pass
-
-        deadline = time.monotonic() + 2.0
-        for proc in processes:
-            try:
-                remain = max(0.0, deadline - time.monotonic())
-                proc.join(timeout=remain)
-            except Exception:
-                pass
-
-        for proc in processes:
-            try:
-                if proc.is_alive() and hasattr(proc, "kill"):
-                    proc.kill()
-            except Exception:
-                pass
-
-        # kill 异步完成；回收句柄后才允许调用方释放共享行情和 Journal 运行锁。
-        deadline = time.monotonic() + 2.0
-        for proc in processes:
-            try:
-                proc.join(timeout=max(0.0, deadline - time.monotonic()))
-            except Exception:
-                pass
+        signal_processes(True)
+        # kill 异步完成；确认进程消失后才允许调用方释放共享行情和 Journal 运行锁。
+        join_processes(2.0)
 
     def _build_spawn_shared_payload(self, worker_payload):
         """
