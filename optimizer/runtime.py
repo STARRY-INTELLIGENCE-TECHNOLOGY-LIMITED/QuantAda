@@ -39,6 +39,7 @@ from common.data_paths import ensure_data_dir, resolve_data_path, share_data_fil
 from common.formatters import format_float, format_recent_backtest_metrics
 from common.indicator_cache import BoundedIndicatorCache
 from common.loader import get_class_from_name, parse_period_string
+from common.options.analytics import parse_option_symbol
 from common import process_elevation
 from common.terminal_log import (
     build_optimizer_terminal_log_path,
@@ -526,6 +527,12 @@ def _run_optimizer_mode_impl(
         else:
             print("[Optimizer] The original study has no data snapshot. Still loading the original study; completed trials count toward the budget. Data prepared this run will be bound to that study.")
 
+    if shared_context is not None:
+        refuse_incomplete_training_universe(
+            shared_context.get("target_symbols"),
+            shared_context.get("raw_datas"),
+        )
+
     # 快照或初次取数都只准备一次；失败时终止，不能逐指标偷偷改用不同的数据宇宙。
     bootstrap_args = copy.deepcopy(args)
     bootstrap_args.metric = metrics_list[0]
@@ -720,6 +727,86 @@ def _run_optimizer_mode_impl(
         print("\n[Warning] All metrics returned no results")
         print_run_summary()
     return 0
+
+
+
+_OBVIOUS_MISSING_RATIO = 0.05
+_OBVIOUS_UNDERLYING_MISSING_RATIO = 0.10
+_OBVIOUS_UNDERLYING_MIN_CONTRACTS = 20
+
+
+def _has_training_bars(frame) -> bool:
+    return frame is not None and not getattr(frame, "empty", True)
+
+
+def _option_underlying(symbol: str):
+    parsed = parse_option_symbol(symbol) or {}
+    if not parsed.get("option_type"):
+        return None
+    underlying = str(parsed.get("underlying") or "").strip().upper()
+    return underlying or None
+
+
+def refuse_incomplete_training_universe(requested, datas) -> None:
+    """请求宇宙出现明显空洞时拒绝开始训练。
+
+    少量确实没有历史的合约可以继续。没有可用行情的比例超过 5%，任一标的至少
+    20 个合约里缺失超过 10%，或请求的正股本身没有行情，都视为明显异常。
+    """
+    symbols = list(dict.fromkeys(str(symbol) for symbol in requested or [] if symbol))
+    if not symbols:
+        return
+    frames = datas or {}
+    missing = [symbol for symbol in symbols if not _has_training_bars(frames.get(symbol))]
+    if not missing:
+        return
+
+    requested_contracts = {}
+    missing_contracts = {}
+    missing_assets = []
+    for symbol in symbols:
+        underlying = _option_underlying(symbol)
+        if underlying:
+            requested_contracts[underlying] = requested_contracts.get(underlying, 0) + 1
+    for symbol in missing:
+        underlying = _option_underlying(symbol)
+        if underlying:
+            missing_contracts[underlying] = missing_contracts.get(underlying, 0) + 1
+        else:
+            missing_assets.append(symbol)
+
+    hollow = []
+    for underlying, missing_count in missing_contracts.items():
+        requested_count = requested_contracts.get(underlying, 0)
+        if (
+            requested_count >= _OBVIOUS_UNDERLYING_MIN_CONTRACTS
+            and missing_count / requested_count > _OBVIOUS_UNDERLYING_MISSING_RATIO
+        ):
+            hollow.append((underlying, missing_count, requested_count))
+    ratio = len(missing) / len(symbols)
+    if not missing_assets and ratio <= _OBVIOUS_MISSING_RATIO and not hollow:
+        print(
+            f"[Auto-Fetch] {len(missing)}/{len(symbols)} symbols have no bars; "
+            "below refusal threshold, continuing"
+        )
+        return
+
+    hollow.sort(key=lambda item: (-item[1], item[0]))
+    parts = [f"{name} {count}/{total}" for name, count, total in hollow[:8]]
+    if missing_assets:
+        parts.append("assets " + ",".join(missing_assets[:8]))
+    sample = ",".join(missing[:8])
+    detail = "; ".join(part for part in parts if part)
+    message = (
+        f"Refusing to start: incomplete training universe "
+        f"{len(missing)}/{len(symbols)} symbols have no bars"
+    )
+    if detail:
+        message += f" ({detail})"
+    if sample:
+        message += f". sample={sample}"
+    print(f"[Auto-Fetch] {message}")
+    raise ValueError(message)
 
 
 class OptimizationJob:
@@ -1712,6 +1799,7 @@ class OptimizationJob:
             )
         except Exception as exc:
             print(f"[Events] Earnings calendar unavailable; continuing without blackout data: {exc}")
+        refuse_incomplete_training_universe(symbols, datas)
         return datas
 
     def _split_data(self):

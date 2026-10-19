@@ -40,7 +40,8 @@ def _context():
         index=pd.date_range("2026-09-21", periods=2, tz="America/New_York"),
     )
     frame.attrs["contract_multiplier"] = 100
-    return {"raw_datas": {"OPTION": frame}, "train_datas": {"OPTION": frame.iloc[:1]},
+    spy = frame[["close"]].copy()
+    return {"raw_datas": {"OPTION": frame, "SPY": spy}, "train_datas": {"OPTION": frame.iloc[:1]},
             "test_datas": {"OPTION": frame.iloc[1:]}, "target_symbols": ["SPY", "OPTION"],
             "source_symbols": ["SPY"], "warmup_days": 400, "train_range": ("20260921", "20260921"),
             "test_range": ("20260922", "20260922"), "raw_data_fetch_range": ("20250101", "20260922")}

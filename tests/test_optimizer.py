@@ -2,6 +2,7 @@ import base64
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 import optimizer.runtime as optimizer
 import common.process_elevation as process_elevation
@@ -1897,4 +1898,59 @@ def test_fetch_all_data_retries_missing_symbol_after_interruptible_failure(capsy
     out = capsys.readouterr().out
 
     assert len(calls) == 2 + REQUEST_ATTEMPTS
+    assert "will rerun next execution" in out
+
+
+def _bars(symbol="US.AAPL"):
+    return pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]},
+        index=[pd.Timestamp("2024-01-02")],
+    )
+
+
+def _option(root, number):
+    return f"US.{root}240119P{number:08d}"
+
+
+def test_incomplete_universe_refuses_obvious_hole_but_keeps_small_gap():
+    options = [_option("AAPL", 150000 + i) for i in range(20)]
+    datas = {symbol: _bars() for symbol in options[2:]}
+    with pytest.raises(ValueError, match="Refusing to start"):
+        optimizer.refuse_incomplete_training_universe(options, datas)
+
+    small = [_option("MSFT", 200000 + i) for i in range(40)]
+    small_datas = {symbol: _bars() for symbol in small[1:]}
+    optimizer.refuse_incomplete_training_universe(small, small_datas)
+
+    diluted = [_option("NVDA", 100000 + i) for i in range(20)]
+    diluted.extend(_option("AMZN", 300000 + i) for i in range(100))
+    diluted_datas = {symbol: _bars() for symbol in diluted if not symbol.startswith("US.NVDA")}
+    with pytest.raises(ValueError, match="NVDA 20/20"):
+        optimizer.refuse_incomplete_training_universe(diluted, diluted_datas)
+
+    with pytest.raises(ValueError, match="assets US.AAPL"):
+        optimizer.refuse_incomplete_training_universe(
+            ["US.AAPL", _option("AAPL", 150000)],
+            {_option("AAPL", 150000): _bars()},
+        )
+
+
+def test_fetch_all_data_refuses_obvious_universe_hole(capsys):
+    symbols = [_option("AVGO", 320000 + i) for i in range(8)]
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            if symbol == symbols[0]:
+                return None
+            return _bars()
+
+        def attach_earnings_calendar(self, *args, **kwargs):
+            return None
+
+    job = _fetch_job(DummyDataManager(), symbols[0])
+    job.target_symbols = symbols
+    with pytest.raises(ValueError, match="Refusing to start"):
+        job._fetch_all_data()
+    out = capsys.readouterr().out
+    assert "2/8" in out or "1/8" in out
     assert "will rerun next execution" in out

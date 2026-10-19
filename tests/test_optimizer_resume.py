@@ -912,3 +912,40 @@ def test_missing_batch_anchor_still_loads_dedicated_study(tmp_path):
     unnamed = _plan(_args(metric="return", study_journal=str(anchor)), tmp_path)
     assert unnamed["studies"]["return"] == "return-study"
     assert Path(unnamed["journal"]).resolve() == anchor.resolve()
+
+
+def test_saved_snapshot_with_obvious_hole_refuses_before_training(monkeypatch, tmp_path, capsys):
+    journal = tmp_path / "data" / "optuna" / "hole.log"
+    journal.parent.mkdir(parents=True)
+    args = _args(metric="return", study_journal=str(journal), study_name="hole_return", n_trials=1)
+    study = _write_study(journal, "hole_return", args, metric="return")
+    study.set_user_attr("_optimizer_identity_hash", training_identity_hash(args))
+    study.set_user_attr("_optimizer_data_snapshot", {"id": "a" * 32, "sha256": "b" * 64})
+    symbols = ["US.AVGO240119P%08d" % (320000 + i) for i in range(20)]
+    frame = pd.DataFrame({"close": [1.0]}, index=[pd.Timestamp("2024-01-02")])
+    context = {
+        "strategy_class": SimpleNamespace(),
+        "risk_control_classes": [],
+        "data_manager": None,
+        "target_symbols": symbols,
+        "source_symbols": ["US.AVGO"],
+        "raw_datas": {symbols[0]: frame},
+        "train_datas": {symbols[0]: frame},
+        "test_datas": {},
+        "train_range": ("20240101", "20240131"),
+        "test_range": (None, None),
+        "runtime_config": {},
+    }
+
+    def load_hole(*_args, **_kwargs):
+        return dict(context), {"original_argv": ["run.py"], "original_exact": True}
+
+    monkeypatch.setattr(runtime, "load_training_snapshot", load_hole)
+    monkeypatch.setattr(runtime.process_elevation, "request_optimizer_elevation_if_needed", lambda *_: False)
+    monkeypatch.setattr(runtime.OptimizationJob, "__init__", lambda *a, **k: pytest.fail("must not start training"))
+
+    code = runtime.run_optimizer_mode(args, ast.literal_eval(args.params), {}, ["US.AVGO"])
+    output = capsys.readouterr().out
+    assert code == 1
+    assert "Refusing to start" in output
+    assert "AVGO 19/20" in output
