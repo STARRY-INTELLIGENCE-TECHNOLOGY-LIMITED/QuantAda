@@ -20,6 +20,9 @@ def install_protobuf_field_label_compat(descriptor_cls):
         stored = getattr(field, '_quantada_field_label', _MISSING_FIELD_LABEL)
         if stored is not _MISSING_FIELD_LABEL:
             return stored
+        internal = getattr(field, '_label', _MISSING_FIELD_LABEL)
+        if internal is not _MISSING_FIELD_LABEL:
+            return internal
         try:
             return _STORED_FIELD_LABELS[field]
         except Exception:
@@ -43,8 +46,7 @@ def install_protobuf_field_label_compat(descriptor_cls):
 try:
     from google.protobuf.descriptor import FieldDescriptor
 
-    # protobuf 3.20 的 label 只在构造器里赋值，类上 hasattr 仍为 False。
-    # 只读 property 会把 self.label = label 变成 can't set attribute。
+    # 3.20 构造器写 self.label，新版写 self._label。类上都没有 label，只读 property 会让旧版赋值失败。
     install_protobuf_field_label_compat(FieldDescriptor)
 except Exception:
     # protobuf 不可用时由 GM Provider 的依赖检查负责报告错误。

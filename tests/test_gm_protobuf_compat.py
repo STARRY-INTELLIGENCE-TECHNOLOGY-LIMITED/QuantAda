@@ -37,3 +37,18 @@ def test_existing_label_attribute_is_not_replaced():
 
     assert install_protobuf_field_label_compat(FieldDescriptor) is False
     assert FieldDescriptor.label == 7
+
+
+def test_new_protobuf_internal_label_is_not_collapsed_to_optional():
+    class FieldDescriptor:
+        LABEL_OPTIONAL = 1
+        LABEL_REQUIRED = 2
+        LABEL_REPEATED = 3
+
+        def __init__(self, label):
+            self._label = label
+            self.is_repeated = label == self.LABEL_REPEATED
+
+    install_protobuf_field_label_compat(FieldDescriptor)
+    assert FieldDescriptor(2).label == 2
+    assert FieldDescriptor(3).label == 3
