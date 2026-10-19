@@ -9,6 +9,7 @@ from optimizer.trial_progress import (
     TrialProgressFilter,
     SharedFinishCounter,
     format_remaining_duration,
+    progress_eta,
     installed_trial_progress,
     make_trial_progress,
     remaining_label,
@@ -291,3 +292,21 @@ def test_trial_log_shows_warming_up_until_each_worker_reports(monkeypatch):
     assert "ETA warming up (1/13 workers)" in record.msg
     assert record.msg.startswith("Metric 2/2 us_robust | Trial 14/1200 ETA warming up")
     assert " | Total Trial 1/1200 ETA warming up" in record.msg
+
+
+def test_progress_eta_uses_recent_completions_not_cache_burst():
+    recent = [(255, 60.0), (256, 100.0), (257, 140.0), (258, 180.0), (259, 220.0)]
+    assert progress_eta(259, 7175, 0.0, 220.0, recent) == "ETA 3d4h"
+    assert progress_eta(100, 7175, 0.0, 400.0, [(90, 390.0), (100, 400.0)]) == "ETA 1h57m"
+
+
+def test_progress_eta_hides_subsecond_samples_and_finished_work():
+    assert progress_eta(1, 100, 0.0, 0.2) == "ETA unavailable"
+    assert progress_eta(1, 11, 0.0, 40.0) == "ETA 6m40s"
+    assert progress_eta(11, 11, 0.0, 40.0) == "finishing"
+
+
+def test_progress_eta_reuses_training_parallel_warmup():
+    assert progress_eta(1, 100, 0.0, 40.0, parallel_workers=4) == "ETA warming up (1/4 workers)"
+    assert progress_eta(4, 100, 0.0, 40.0, parallel_workers=4) == "ETA 16m"
+

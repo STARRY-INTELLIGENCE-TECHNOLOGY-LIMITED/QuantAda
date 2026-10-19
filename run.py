@@ -9,6 +9,7 @@ import config
 from backtest.backtester import Backtester
 import optimizer
 from optimizer.runtime import infer_omitted_backtest_window
+from optimizer.trial_progress import progress_eta
 from common.loader import get_class_from_name, pascal_to_snake
 from common.detached_process import spawn_detached_python
 from common.process_tree import stop_optimizer_owners
@@ -122,6 +123,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     started = time.monotonic()
     last_progress = started
     completed = 0
+    recent_completions = []
     fetch_workers = max(1, min(4, total)) if total else 1
 
     def fetch_symbol(symbol):
@@ -151,10 +153,12 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
             print(f"  Warning: Failed to fetch data for {symbol}. It will be excluded from the backtest.")
             status = "skip"
         now = time.monotonic()
+        recent_completions.append((completed, now))
+        eta = progress_eta(completed, total, started, now, recent_completions, fetch_workers)
         if completed == 1 or completed == total or now - last_progress >= 30:
             print(
                 f"[Auto-Fetch] {completed}/{total} {symbol} {status} "
-                f"elapsed={now - started:.0f}s"
+                f"elapsed={now - started:.0f}s {eta}"
             )
             last_progress = now
 

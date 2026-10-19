@@ -216,6 +216,9 @@ def test_single_online_source_reuses_complete_cache_and_refresh_bypasses_it(tmp_
     )
 
     assert first is not None and second is not None and refreshed is not None
+    assert first.attrs.get("data_origin") == "fetch"
+    assert second.attrs.get("data_origin") == "cache"
+    assert refreshed.attrs.get("data_origin") == "fetch"
     assert len(calls) == 2
     pd.testing.assert_frame_equal(first, second, check_names=False)
     assert (_market_cache_csv(tmp_path, 'US_AAPL240119P00150000.csv')).is_file()

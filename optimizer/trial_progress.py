@@ -178,20 +178,47 @@ def format_remaining_duration(seconds):
     return f"{days}d{hours}h" if hours else f"{days}d"
 
 
-def _eta_label(remaining, counted, started_at, now, parallel_workers=1):
-    """按当前运行速度格式化给定剩余 trial 的 ETA。"""
-    if remaining <= 0:
+
+_RECENT_ETA_SAMPLES = 4
+
+
+def progress_eta(completed, total, started_at, now, recent=None, parallel_workers=1):
+    """按最近几笔完成速度估计剩余项耗时，并复用训练 ETA 的格式化规则。"""
+    remaining = max(0, int(total) - int(completed))
+    samples = list(recent or ())[-_RECENT_ETA_SAMPLES:]
+    counted = None
+    elapsed = None
+    if len(samples) >= 2:
+        done = int(samples[-1][0]) - int(samples[0][0])
+        window = float(samples[-1][1]) - float(samples[0][1])
+        if done > 0 and window >= 1.0:
+            counted = done
+            elapsed = window
+    if counted is None:
+        counted = int(completed)
+        elapsed = float(now) - float(started_at)
+    return _format_eta(remaining, counted, elapsed, parallel_workers, observed=int(completed))
+
+
+def _format_eta(remaining, counted, elapsed, parallel_workers=1, observed=None):
+    """按已观测速度格式化 ETA。未满一轮并行样本或不足 1 秒时不外推。"""
+    if int(remaining) <= 0:
         return "finishing"
-    elapsed = float(now) - float(started_at)
-    if int(counted) <= 0 or elapsed < 1.0:
+    if int(counted) <= 0 or float(elapsed) < 1.0:
         return "ETA unavailable"
-    parallel_workers = max(1, int(parallel_workers or 1))
-    if parallel_workers > 1 and int(counted) < parallel_workers:
-        return f"ETA warming up ({int(counted)}/{parallel_workers} workers)"
-    eta = remaining * elapsed / int(counted)
+    workers = max(1, int(parallel_workers or 1))
+    seen = int(counted if observed is None else observed)
+    if workers > 1 and seen < workers:
+        return f"ETA warming up ({seen}/{workers} workers)"
+    eta = int(remaining) * float(elapsed) / int(counted)
     if int(round(eta)) <= 0:
         return "finishing"
     return f"ETA {format_remaining_duration(eta)}"
+
+
+def _eta_label(remaining, counted, started_at, now, parallel_workers=1):
+    """按当前轮墙钟速度格式化给定剩余 trial 的 ETA。"""
+    return _format_eta(remaining, counted, float(now) - float(started_at), parallel_workers)
 
 
 def remaining_label(target_trials, finished_before, counted, started_at, now, parallel_workers=1, future_remaining=0):

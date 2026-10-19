@@ -1954,3 +1954,30 @@ def test_fetch_all_data_refuses_obvious_universe_hole(capsys):
     out = capsys.readouterr().out
     assert "2/8" in out or "1/8" in out
     assert "will rerun next execution" in out
+
+
+def test_fetch_progress_marks_cache_separately_from_network_fetch(capsys):
+    symbols = ["US.AAPL", "US.MSFT"]
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            frame = _bars()
+            frame.attrs["data_origin"] = "cache" if symbol == "US.AAPL" else "fetch"
+            return frame
+
+        def attach_earnings_calendar(self, *args, **kwargs):
+            return None
+
+    job = _fetch_job(DummyDataManager(), symbols[0])
+    job.target_symbols = symbols
+    job._fetch_all_data()
+    out = capsys.readouterr().out
+    assert "not a full refetch" in out
+    assert "US.AAPL cache " in out
+    assert "US.MSFT fetch " in out
+    assert "scanned 2/2 cache=1 fetch=1 incomplete=0 skip=0" in out
+    progress = [line for line in out.splitlines() if line.startswith("[Auto-Fetch]") and " elapsed=" in line]
+    assert progress
+    assert all(("ETA " in line) or (" finishing" in line) for line in progress)
+    assert "finishing" in out
+

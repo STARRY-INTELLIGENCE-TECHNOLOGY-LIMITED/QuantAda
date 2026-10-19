@@ -71,6 +71,7 @@ from optimizer.trial_progress import (
     TrialFinishCounter,
     installed_trial_progress,
     make_trial_progress,
+    progress_eta,
 )
 from optimizer.reporting import (
     collect_dashboard_logs,
@@ -1706,10 +1707,18 @@ class OptimizationJob:
         started = time.monotonic()
         last_progress = started
         completed = 0
+        cache_hits = 0
+        fetched = 0
         # Theta session 必须串行复用。期权拉数不再并发，避免超时重试叠在同一条连接上。
         cache_root = resolve_data_path(getattr(self.data_manager, "data_path", None))
         print(f"[Auto-Fetch] cache root: {os.path.abspath(cache_root)}")
+        print(
+            f"[Auto-Fetch] {total} symbols; each line is cache or fetch, not a full refetch"
+        )
         self._prefetch_option_history(symbols, req_fetch_start, req_end)
+        # 逐标的计时从预取之后开始，ETA 只看最近几笔，避免预取或缓存突发扭曲剩余时间。
+        rate_started = time.monotonic()
+        recent_completions = []
         # VALUE 账户全账号最多 2 个并发。同一 session 不能重叠，所以这里保持 1 个 worker。
         fetch_workers = 1
 
@@ -1726,24 +1735,32 @@ class OptimizationJob:
             return symbol, df
 
         def consume_symbol(symbol, df):
-            nonlocal completed, last_progress
+            nonlocal completed, last_progress, cache_hits, fetched
             completed += 1
             if df is not None and not df.empty:
                 datas[symbol] = df
+                origin = "cache" if getattr(df, "attrs", {}).get("data_origin") == "cache" else "fetch"
+                if origin == "cache":
+                    cache_hits += 1
+                else:
+                    fetched += 1
                 if enrichment_retry_needed(df, symbol):
                     incomplete.append(symbol)
-                    status = "incomplete"
+                    status = "fetch-incomplete" if origin == "fetch" else "cache-incomplete"
                 else:
-                    status = "ok"
+                    status = origin
             else:
                 skipped.append(symbol)
                 print(f"Warning: No data for {symbol}, skipping.")
                 status = "skip"
             now = time.monotonic()
+            recent_completions.append((completed, now))
+            eta = progress_eta(completed, total, rate_started, now, recent_completions, fetch_workers)
             if completed == 1 or completed == total or now - last_progress >= 30:
                 print(
                     f"[Auto-Fetch] {completed}/{total} {symbol} {status} "
-                    f"elapsed={now - started:.0f}s"
+                    f"cache={cache_hits} fetch={fetched} incomplete={len(incomplete)} "
+                    f"skip={len(skipped)} elapsed={now - started:.0f}s {eta}"
                 )
                 last_progress = now
 
@@ -1756,6 +1773,15 @@ class OptimizationJob:
                 for future in as_completed(futures):
                     symbol, df = future.result()
                     consume_symbol(symbol, df)
+
+        if total:
+            finished_at = time.monotonic()
+            print(
+                f"[Auto-Fetch] scanned {completed}/{total} "
+                f"cache={cache_hits} fetch={fetched} incomplete={len(incomplete)} "
+                f"skip={len(skipped)} elapsed={finished_at - started:.0f}s "
+                f"{progress_eta(completed, total, rate_started, finished_at, recent_completions, fetch_workers)}"
+            )
 
         if skipped:
             print(f"[Auto-Fetch] retry {len(skipped)} skipped symbols")

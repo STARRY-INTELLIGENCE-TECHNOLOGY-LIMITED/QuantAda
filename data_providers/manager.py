@@ -328,6 +328,7 @@ class DataManager:
         - 如果指定了 specified_sources，则按指定顺序尝试。
         - 否则，执行默认的责任链逻辑（带增量更新）。
         """
+        origin = "fetch"
         final_df = None
 
         # 路径一: 用户指定了数据源
@@ -364,6 +365,8 @@ class DataManager:
                     compression,
                     refresh,
                 )
+                if final_df is not None and not final_df.empty:
+                    origin = "cache"
             else:
                 final_df = None
             if final_df is None or final_df.empty:
@@ -371,6 +374,7 @@ class DataManager:
                     symbol, start_date, end_date, providers_to_use,
                     timeframe, compression, refresh=refresh,
                 )
+                origin = "fetch"
 
         # 路径二: 执行默认的责任链逻辑
         else:
@@ -415,6 +419,9 @@ class DataManager:
                 end_dt = align_date(normalize_boundary(end_date, is_end=True), final_df.index)
                 final_df = final_df[final_df.index <= end_dt]
 
+            # 切片后再标记，避免布尔索引丢掉来源。进度行用它区分缓存和实拉。
+            if not final_df.empty:
+                final_df.attrs["data_origin"] = origin
             return final_df
 
         print(f"Error: All data providers failed for symbol {symbol}.")
