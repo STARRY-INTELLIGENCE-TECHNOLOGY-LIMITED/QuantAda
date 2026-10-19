@@ -1019,3 +1019,43 @@ def test_expand_does_not_retry_empty_as_of_snapshots():
     eleven = [call[1] for call in manager.calls if call[1] == "2026-09-11"]
     assert eleven == ["2026-09-11"]
     assert not any("retry " in item and "failed as_of" in item for item in logs)
+
+
+
+def test_expand_ignores_checkpoint_from_another_cache_root(tmp_path, monkeypatch):
+    import config
+
+    image = tmp_path / "image"
+    cwd_data = tmp_path / "cwd"
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(image))
+    seeded = DummyManager(_window_chains())
+    expand_option_universe(
+        ["US.SPY"],
+        strategy_class=DummyStrategy,
+        data_manager=seeded,
+        specified_sources="theta",
+        start_date="2026-09-04",
+        end_date="2026-09-18",
+        live=False,
+        log=None,
+    )
+    assert seeded.calls
+    assert list((image / "market_cache" / "option_universe").glob("*.json"))
+
+    monkeypatch.setattr(config, "DATA_PATH", str(cwd_data))
+    resumed = DummyManager(_window_chains())
+    resumed.data_path = str(cwd_data)
+    resumed._cache_roots = lambda: [str(cwd_data), str(image)]
+    expand_option_universe(
+        ["US.SPY"],
+        strategy_class=DummyStrategy,
+        data_manager=resumed,
+        specified_sources="theta",
+        start_date="2026-09-04",
+        end_date="2026-09-18",
+        live=False,
+        log=None,
+    )
+
+    assert resumed.calls == seeded.calls

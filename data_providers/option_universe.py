@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 import config
+from common.data_paths import ensure_data_dir, resolve_data_path, share_data_file
 from .csv_provider import CsvDataProvider
 
 from common.options.universe import (
@@ -356,15 +357,14 @@ def _checkpoint_parts(underlying, spec, snapshot_limit):
 
 
 def _checkpoint_dir(data_manager):
-    """option_universe 目录；父目录不存在时一并创建。"""
-    data_path = (
+    """option_universe 目录；只使用解析后的同一个数据根。"""
+    data_path = resolve_data_path(
         getattr(data_manager, "data_path", None)
         or getattr(config, "DATA_PATH", ".data")
         or ".data"
     )
     folder = os.path.join(CsvDataProvider.ensure_cache_dir(data_path), "option_universe")
-    os.makedirs(folder, exist_ok=True)
-    return folder
+    return ensure_data_dir(folder)
 
 
 def _checkpoint_path(data_manager, underlying, spec, snapshot_limit):
@@ -385,18 +385,18 @@ def _legacy_checkpoint_paths(folder, underlying, spec, snapshot_limit):
     return sorted(glob.glob(pattern))
 
 
-def _load_merged_checkpoints(path, data_manager, underlying, spec, snapshot_limit):
-    """合并稳定断点与旧窗口文件中的 as_of。"""
+def _load_merged_checkpoints(path, underlying, spec, snapshot_limit):
+    """只合并当前数据根里的同名断点和可迁移旧窗口文件。"""
+    folder = os.path.dirname(path) if path else ""
+    if not folder:
+        return {}
     merged = {}
-    folder = os.path.dirname(path) if path else _checkpoint_dir(data_manager)
-    # 旧窗口文件名不包含 Delta 锚点；PCS 保护腿需要独立候选池，不能复用旧的
-    # Short Put 中心 Delta 快照，否则会静默丢失保护腿合约。
-    # 新版 spec 始终带 delta_targets 字段；旧窗口文件名不包含 Delta 身份，
-    # 不能再把它们静默迁移为当前策略的候选池。
     if "delta_targets" not in spec:
         for candidate in _legacy_checkpoint_paths(folder, underlying, spec, snapshot_limit):
             merged.update(_load_checkpoint(candidate))
-    merged.update(_load_checkpoint(path))
+    stem = os.path.basename(path)
+    if stem:
+        merged.update(_load_checkpoint(os.path.join(folder, stem)))
     return merged
 
 
@@ -424,12 +424,14 @@ def _load_checkpoint(path):
 def _save_checkpoint(path, snapshots):
     """原子写入 as_of 断点，避免中断留下半截 JSON。"""
     folder = os.path.dirname(path)
-    os.makedirs(folder, exist_ok=True)
+    if folder:
+        ensure_data_dir(folder)
     temp_path = f"{path}.tmp"
     payload = {"version": 1, "snapshots": snapshots}
     with open(temp_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
     os.replace(temp_path, path)
+    share_data_file(path)
 
 
 def _append_unique(union, seen, symbols, live=False):
@@ -542,7 +544,6 @@ def expand_option_universe(
             )
             cached_snapshots = _load_merged_checkpoints(
                 checkpoint_path,
-                data_manager,
                 underlying,
                 filter_spec,
                 snapshot_limit,

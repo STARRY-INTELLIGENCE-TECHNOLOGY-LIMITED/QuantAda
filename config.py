@@ -16,6 +16,7 @@ LIVE_RUN_MAX_EXECUTION_SECONDS = 600
 ANNUAL_FACTOR = 252
 
 # 运行时数据根目录。行情 CSV 缓存在 DATA_PATH/market_cache/，日志等其它文件仍可放在根下。
+# 相对路径固定到 run.py 同级，不随启动目录变化；绝对路径才是强指定。
 DATA_PATH = '.data'
 
 # 缓存数据；启用后单一显式在线 data_source 会优先复用 market_cache 中的完整 CSV。

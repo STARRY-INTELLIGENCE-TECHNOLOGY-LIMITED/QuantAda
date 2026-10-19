@@ -6,13 +6,14 @@ import subprocess
 import sys
 
 import config
+from common.data_paths import ensure_data_dir, resolve_data_path, share_data_file
 
 
 def build_optimizer_result_file_path(run_dt=None, run_pid=None):
     """构造当前训练批次的 UTF-8 文本结果文件路径。"""
-    data_path = getattr(config, "DATA_PATH", ".data") or ".data"
-    directory = os.path.join(os.getcwd(), data_path, "optimizer")
-    os.makedirs(directory, exist_ok=True)
+    data_path = resolve_data_path(getattr(config, "DATA_PATH", ".data"))
+    ensure_data_dir(data_path)
+    directory = ensure_data_dir(os.path.join(data_path, "optimizer"))
     run_dt = run_dt or datetime.datetime.now()
     run_pid = os.getpid() if run_pid is None else run_pid
     name = f"optimizer_result_{run_dt.strftime('%Y%m%d-%H%M%S-%f')}_{run_pid}.txt"
@@ -26,6 +27,7 @@ def append_optimizer_result(path, text):
     payload = str(text).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n\n"
     with open(path, "a", encoding="utf-8", newline="\n") as stream:
         stream.write(payload)
+    share_data_file(path)
 
 
 def open_optimizer_result_file(path):

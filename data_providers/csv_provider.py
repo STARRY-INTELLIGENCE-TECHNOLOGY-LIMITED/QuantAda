@@ -3,6 +3,7 @@ import os
 import pandas as pd
 
 import config
+from common.data_paths import ensure_data_dir, resolve_data_path
 from .base_provider import BaseDataProvider
 
 
@@ -18,20 +19,21 @@ class CsvDataProvider(BaseDataProvider):
         # 可能早于命令行参数解析完成导入。
         if data_path is None:
             data_path = getattr(config, "DATA_PATH", ".data") or ".data"
-        self.data_path = data_path
+        self.data_path = resolve_data_path(data_path)
         self.ensure_cache_dir(self.data_path)
 
     @staticmethod
     def resolve_cache_dir(data_path: str) -> str:
         """行情 CSV 目录；放在 DATA_PATH/market_cache，避免和日志混放。"""
-        return os.path.join(str(data_path or ""), CsvDataProvider.CACHE_SUBDIR)
+        root = resolve_data_path(data_path)
+        return os.path.join(root, CsvDataProvider.CACHE_SUBDIR)
 
     @staticmethod
     def ensure_cache_dir(data_path: str) -> str:
-        """创建 DATA_PATH 与 market_cache；父目录不存在时一并创建。"""
-        cache_dir = CsvDataProvider.resolve_cache_dir(data_path)
-        os.makedirs(cache_dir, exist_ok=True)
-        return cache_dir
+        """创建数据根与 market_cache，并尽量放开共享权限。"""
+        root = resolve_data_path(data_path)
+        ensure_data_dir(root)
+        return ensure_data_dir(CsvDataProvider.resolve_cache_dir(root))
 
     @staticmethod
     def get_cache_filepath(data_path: str, symbol: str, timeframe: str, compression: int) -> str:

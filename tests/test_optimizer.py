@@ -1064,7 +1064,7 @@ def test_windows_elevation_command_forwards_process_env(monkeypatch):
 
 
 def test_optimizer_terminal_log_path_uses_optuna_style_name(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(terminal_log.config, "DATA_PATH", str(tmp_path / "runtime-data"))
     args = _build_args(
         metric="mix_score_us_turbo,mix_score_origin",
         train_roll_period="5y",
@@ -1081,7 +1081,7 @@ def test_optimizer_terminal_log_path_uses_optuna_style_name(tmp_path, monkeypatc
         run_pid=12345,
     )
 
-    assert str(tmp_path / ".data" / "optimizer") in got
+    assert str(tmp_path / "runtime-data" / "optimizer") in got
     assert (
         "optimizer_terminal_5Y_6M_mix_score_us_turbo_mix_score_origin_US_"
         "TR20201206-20251205_TE20251206-20260606_RUN20260607-123456_12345.log"
@@ -1089,8 +1089,8 @@ def test_optimizer_terminal_log_path_uses_optuna_style_name(tmp_path, monkeypatc
 
 
 def test_optimizer_terminal_log_path_defaults_when_data_path_is_missing(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
     monkeypatch.delattr(terminal_log.config, "DATA_PATH")
+    monkeypatch.setattr(terminal_log, "resolve_data_path", lambda value=None: str(tmp_path / ".data"))
 
     got = terminal_log.build_optimizer_terminal_log_path("legacy_config")
 

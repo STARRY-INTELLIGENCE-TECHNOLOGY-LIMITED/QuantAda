@@ -5,15 +5,16 @@ from __future__ import annotations
 import datetime
 import os
 from pathlib import Path
+
+from common.data_paths import ensure_data_dir, resolve_data_path
 import subprocess
 from typing import Mapping, Sequence
 
 
 def _default_log_path(cwd=None, data_path=".data"):
-    """返回后台启动器自身的引导日志路径。"""
-    root = Path(cwd or os.getcwd()).resolve()
-    directory = root / (str(data_path or ".data")) / "optimizer"
-    directory.mkdir(parents=True, exist_ok=True)
+    """返回后台启动器自身的引导日志路径。数据目录不随 cwd 漂移。"""
+    root = ensure_data_dir(resolve_data_path(data_path))
+    directory = Path(ensure_data_dir(Path(root) / "optimizer"))
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     return directory / f"resume_launcher_{stamp}_{os.getpid()}.log"
 

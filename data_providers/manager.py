@@ -8,6 +8,7 @@ from collections import OrderedDict
 import pandas as pd
 
 import config
+from common.data_paths import resolve_data_path, share_data_file
 from .base_provider import BaseDataProvider
 from .compositions import build_provider_composition
 from .csv_provider import CsvDataProvider
@@ -49,7 +50,7 @@ def normalize_source_name(source: str) -> str:
 class DataManager:
     def __init__(self):
         self.providers = self.auto_discover_and_sort_providers()
-        self.data_path = getattr(config, "DATA_PATH", ".data") or ".data"
+        self.data_path = resolve_data_path(getattr(config, "DATA_PATH", ".data"))
         # 创建一个从字符串名称到提供者实例的映射
         self.provider_map = OrderedDict(
             (p.__class__.__name__.replace('DataProvider', '').lower(), p)
@@ -532,12 +533,98 @@ class DataManager:
         )
         return attach_earnings_calendar(datas, events)
 
+
+    def _cache_roots(self):
+        """只返回一个行情根。相对路径已锚定 run.py 同级，避免两份缓存混读。"""
+        return [resolve_data_path(self.data_path)]
+
     def _load_complete_cache(self, symbol, start_date, end_date, timeframe, compression, refresh):
         """读取覆盖请求窗口的缓存；缺口或刷新请求均返回 None。"""
         if not getattr(config, 'CACHE_DATA', False) or refresh:
             return None
+
+        def covered(frame):
+            index = pd.to_datetime(frame.index, errors='coerce')
+            index = index[~index.isna()]
+            if len(index) == 0:
+                return None
+
+            def boundary(value, is_end=False):
+                if value is None or str(value).strip() == '':
+                    return None
+                result = pd.Timestamp(value)
+                is_intraday = str(timeframe or '').strip().lower() in {
+                    'minutes', 'minute', 'min', 'm', 'seconds', 'second', 'sec', 's',
+                }
+                if is_end and is_intraday and not re.search(r'[T\s]\d', str(value).strip()):
+                    result = result + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+                return result
+
+            try:
+                start_bound = boundary(start_date)
+                end_bound = boundary(end_date, is_end=True)
+                parsed = parse_option_symbol(symbol)
+                raw_expiry = parsed.get('expiry') if parsed else None
+                expiry = pd.Timestamp(raw_expiry) if raw_expiry is not None else pd.NaT
+                if not pd.isna(expiry):
+                    # 到期后没有 K 线，结束边界裁到到期日。
+                    # 请求起点早于缓存时，只要已经接到到期日，就视为覆盖请求窗与上市区间的交集。
+                    expiry = expiry.normalize()
+                    if end_bound is None or end_bound > expiry:
+                        end_bound = expiry
+                elif end_bound is not None:
+                    daily = str(timeframe or "").strip().lower() in {"", "days", "day", "d"}
+                    if daily:
+                        # 日线完整缓存把周末请求窗回退到周五，避免周六启动训练误判缺口。
+                        while int(end_bound.weekday()) >= 5:
+                            end_bound = end_bound - pd.Timedelta(days=1)
+                index_tz = getattr(index, 'tz', None)
+                is_intraday = str(timeframe or '').strip().lower() in {
+                    'minutes', 'minute', 'min', 'm', 'seconds', 'second', 'sec', 's',
+                }
+                start_date_only = bool(
+                    start_date is not None
+                    and not re.search(r'[T\s]\d', str(start_date).strip())
+                )
+                end_date_only = bool(
+                    end_date is not None
+                    and not re.search(r'[T\s]\d', str(end_date).strip())
+                )
+
+                def align(value):
+                    if value is None:
+                        return None
+                    if index_tz is not None:
+                        return value.tz_localize(index_tz) if value.tzinfo is None else value.tz_convert(index_tz)
+                    return value.tz_convert(None) if value.tzinfo is not None else value
+
+                cache_min = index.min()
+                cache_max = index.max()
+                start_compare = align(start_bound)
+                end_compare = align(end_bound)
+                if is_intraday and start_date_only and start_compare is not None:
+                    start_compare = start_compare.normalize()
+                    cache_min = cache_min.normalize()
+                if is_intraday and end_date_only and end_compare is not None:
+                    end_compare = end_compare.normalize()
+                    cache_max = cache_max.normalize()
+                expiry_compare = align(expiry) if not pd.isna(expiry) else None
+                if is_intraday and end_date_only and expiry_compare is not None:
+                    expiry_compare = expiry_compare.normalize()
+                if start_compare is not None and cache_min > start_compare:
+                    # 期权缓存起点可以晚于请求窗；未接到到期日的残段仍算缺口。
+                    if expiry_compare is None or cache_max < expiry_compare:
+                        return None
+                if end_compare is not None and cache_max < end_compare:
+                    return None
+            except Exception as exc:
+                print(f"Invalid cache boundary for {symbol}: {exc}")
+                return None
+            return frame
+
+        root = resolve_data_path(self.data_path)
         try:
-            cached = CsvDataProvider(self.data_path).get_data(
+            candidate = CsvDataProvider(root).get_data(
                 symbol,
                 timeframe=timeframe,
                 compression=compression,
@@ -545,91 +632,15 @@ class DataManager:
         except Exception as exc:
             print(f"Failed to read cache for {symbol}: {exc}")
             return None
-        if cached is None or cached.empty:
+        if candidate is None or candidate.empty:
             return None
-        cached = sanitize_market_dataframe(cached)
-        if cached is None or cached.empty:
+        candidate = sanitize_market_dataframe(candidate)
+        if candidate is None or candidate.empty:
             print(f"Cached data for {symbol} contains no finite OHLCV rows.")
             return None
-        if enrichment_retry_needed(cached, symbol):
+        if enrichment_retry_needed(candidate, symbol):
             return None
-        index = pd.to_datetime(cached.index, errors='coerce')
-        index = index[~index.isna()]
-        if len(index) == 0:
-            return None
-
-        def boundary(value, is_end=False):
-            if value is None or str(value).strip() == '':
-                return None
-            result = pd.Timestamp(value)
-            is_intraday = str(timeframe or '').strip().lower() in {
-                'minutes', 'minute', 'min', 'm', 'seconds', 'second', 'sec', 's',
-            }
-            if is_end and is_intraday and not re.search(r'[T\s]\d', str(value).strip()):
-                result = result + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
-            return result
-
-        try:
-            start_bound = boundary(start_date)
-            end_bound = boundary(end_date, is_end=True)
-            parsed = parse_option_symbol(symbol)
-            raw_expiry = parsed.get('expiry') if parsed else None
-            expiry = pd.Timestamp(raw_expiry) if raw_expiry is not None else pd.NaT
-            if not pd.isna(expiry):
-                # 到期后没有 K 线，结束边界裁到到期日。
-                # 请求起点早于缓存时，只要已经接到到期日，就视为覆盖请求窗与上市区间的交集。
-                expiry = expiry.normalize()
-                if end_bound is None or end_bound > expiry:
-                    end_bound = expiry
-            elif end_bound is not None:
-                daily = str(timeframe or "").strip().lower() in {"", "days", "day", "d"}
-                if daily:
-                    # 日线完整缓存把周末请求窗回退到周五，避免周六启动训练误判缺口。
-                    while int(end_bound.weekday()) >= 5:
-                        end_bound = end_bound - pd.Timedelta(days=1)
-            index_tz = getattr(index, 'tz', None)
-            is_intraday = str(timeframe or '').strip().lower() in {
-                'minutes', 'minute', 'min', 'm', 'seconds', 'second', 'sec', 's',
-            }
-            start_date_only = bool(
-                start_date is not None
-                and not re.search(r'[T\s]\d', str(start_date).strip())
-            )
-            end_date_only = bool(
-                end_date is not None
-                and not re.search(r'[T\s]\d', str(end_date).strip())
-            )
-
-            def align(value):
-                if value is None:
-                    return None
-                if index_tz is not None:
-                    return value.tz_localize(index_tz) if value.tzinfo is None else value.tz_convert(index_tz)
-                return value.tz_convert(None) if value.tzinfo is not None else value
-
-            cache_min = index.min()
-            cache_max = index.max()
-            start_compare = align(start_bound)
-            end_compare = align(end_bound)
-            if is_intraday and start_date_only and start_compare is not None:
-                start_compare = start_compare.normalize()
-                cache_min = cache_min.normalize()
-            if is_intraday and end_date_only and end_compare is not None:
-                end_compare = end_compare.normalize()
-                cache_max = cache_max.normalize()
-            expiry_compare = align(expiry) if not pd.isna(expiry) else None
-            if is_intraday and end_date_only and expiry_compare is not None:
-                expiry_compare = expiry_compare.normalize()
-            if start_compare is not None and cache_min > start_compare:
-                # 期权缓存起点可以晚于请求窗；未接到到期日的残段仍算缺口。
-                if expiry_compare is None or cache_max < expiry_compare:
-                    return None
-            if end_compare is not None and cache_max < end_compare:
-                return None
-        except Exception as exc:
-            print(f"Invalid cache boundary for {symbol}: {exc}")
-            return None
-        return cached
+        return covered(candidate)
 
     def _get_data_smart(self, symbol, start_date, end_date, timeframe: str, compression: int, refresh: bool):
         """
@@ -694,8 +705,9 @@ class DataManager:
         """将数据按时间索引与既有缓存合并后写入，避免分段下载覆盖历史。"""
         if not getattr(config, 'CACHE_DATA', False):
             return
-        CsvDataProvider.ensure_cache_dir(self.data_path)
-        csv_filepath = CsvDataProvider.get_cache_filepath(self.data_path, symbol, timeframe, compression)
+        root = resolve_data_path(self.data_path)
+        CsvDataProvider.ensure_cache_dir(root)
+        csv_filepath = CsvDataProvider.get_cache_filepath(root, symbol, timeframe, compression)
         temp_filepath = None
         try:
             incoming = sanitize_market_dataframe(df)
@@ -745,6 +757,7 @@ class DataManager:
             temp_filepath = f"{csv_filepath}.tmp"
             merged.to_csv(temp_filepath, mode='w')
             os.replace(temp_filepath, csv_filepath)
+            share_data_file(csv_filepath)
         except Exception as e:
             if temp_filepath and os.path.isfile(temp_filepath):
                 try:

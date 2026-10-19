@@ -13,6 +13,7 @@ import sys
 import threading
 
 import config
+from common.data_paths import ensure_data_dir, resolve_data_path, share_data_file
 
 
 OPTIMIZER_TERMINAL_LOG_ENV = "QUANTADA_OPTIMIZER_TERMINAL_LOG"
@@ -48,9 +49,9 @@ def _safe_log_token(value, max_len=180):
 
 
 def build_optimizer_terminal_log_path(name_tag=None, run_dt=None, run_pid=None):
-    data_path = getattr(config, "DATA_PATH", ".data") or ".data"
-    log_dir = os.path.join(os.getcwd(), data_path, "optimizer")
-    os.makedirs(log_dir, exist_ok=True)
+    data_path = resolve_data_path(getattr(config, "DATA_PATH", ".data"))
+    ensure_data_dir(data_path)
+    log_dir = ensure_data_dir(os.path.join(data_path, "optimizer"))
 
     if name_tag:
         token = _safe_log_token(name_tag)
@@ -88,6 +89,7 @@ class _AsyncTerminalLogTee:
         self._original_stdout = sys.stdout
         self._original_stderr = sys.stderr
         self._file = open(self.log_file, "a", encoding="utf-8", buffering=1)
+        share_data_file(self.log_file)
         self._thread = threading.Thread(target=self._writer_loop, name="optimizer-terminal-log", daemon=True)
         self._thread.start()
 
@@ -227,7 +229,9 @@ def install_optimizer_terminal_log(log_file=None, announce=True):
         except Exception:
             pass
 
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    parent = os.path.dirname(log_file)
+    if parent:
+        ensure_data_dir(parent)
     tee = _AsyncTerminalLogTee(log_file)
     tee.install()
     _TERMINAL_LOG_TEE = tee

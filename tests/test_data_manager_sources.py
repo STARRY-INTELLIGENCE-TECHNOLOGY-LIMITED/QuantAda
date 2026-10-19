@@ -1,3 +1,6 @@
+import inspect
+import os
+
 import pandas as pd
 
 from data_providers.base_provider import BaseDataProvider
@@ -22,11 +25,12 @@ def test_platform_default_data_source_is_owned_by_data_providers():
 
 def test_data_manager_defaults_data_path_when_config_key_is_missing(monkeypatch):
     import config
+    from common.data_paths import resolve_data_path
 
     monkeypatch.delattr(config, "DATA_PATH")
     monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [])
 
-    assert DataManager().data_path == ".data"
+    assert DataManager().data_path == resolve_data_path(".data")
 
 
 def test_data_manager_earnings_calendar_uses_selected_provider_and_attaches_snapshot(monkeypatch):
@@ -1027,3 +1031,108 @@ def test_next_execution_reuses_filled_cache_and_keeps_complete_sibling(tmp_path,
     assert again.get_data(complete, "20220101", "20250105", specified_sources="theta") is not None
     assert again.get_data(incomplete, "20220101", "20250105", specified_sources="theta") is not None
     assert calls == []
+
+
+def test_complete_cache_ignores_another_data_root(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [])
+    filled = tmp_path / "image"
+    empty = tmp_path / "cwd"
+    pd.DataFrame(
+        {
+            "open": [1.0, 1.2],
+            "high": [1.3, 1.4],
+            "low": [0.9, 1.1],
+            "close": [1.2, 1.3],
+            "volume": [10, 11],
+            "open_interest": [100, 110],
+        },
+        index=pd.to_datetime(["2024-01-02", "2024-01-19"]),
+    ).rename_axis("datetime").to_csv(_market_cache_csv(filled, "US_AAPL240119P00150000.csv"))
+    manager = DataManager()
+    manager.data_path = str(empty)
+    monkeypatch.setattr(manager, "_cache_roots", lambda: [str(empty), str(filled)])
+
+    cached = manager._load_complete_cache(
+        "US.AAPL240119P00150000",
+        "20240102",
+        "20240630",
+        "Days",
+        1,
+        False,
+    )
+
+    assert cached is None
+
+
+
+def test_complete_cache_does_not_skip_to_a_later_root(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    short = tmp_path / "short"
+    full = tmp_path / "full"
+    index_short = pd.to_datetime(["2024-01-02"])
+    index_full = pd.to_datetime(["2024-01-02", "2024-01-19"])
+    columns = {
+        "open": 1.0, "high": 1.2, "low": 0.9, "close": 1.1, "volume": 10,
+        "open_interest": 100,
+    }
+    pd.DataFrame(columns, index=index_short).rename_axis("datetime").to_csv(
+        _market_cache_csv(short, "US_AAPL240119P00150000.csv")
+    )
+    pd.DataFrame(
+        {key: [value, value] for key, value in columns.items()},
+        index=index_full,
+    ).rename_axis("datetime").to_csv(_market_cache_csv(full, "US_AAPL240119P00150000.csv"))
+    manager = DataManager()
+    manager.data_path = str(short)
+    monkeypatch.setattr(manager, "_cache_roots", lambda: [str(short), str(full)])
+
+    cached = manager._load_complete_cache(
+        "US.AAPL240119P00150000", "20240102", "20240630", "Days", 1, False,
+    )
+
+    assert cached is None
+
+
+def test_cache_root_stays_next_to_run_py_when_cwd_also_has_data(tmp_path, monkeypatch):
+    import config
+    from common.data_paths import resolve_data_path
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "DATA_PATH", ".data")
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [])
+    cwd_cache = tmp_path / ".data" / "market_cache"
+    cwd_cache.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "open": [1.0], "high": [1.1], "low": [0.9], "close": [1.0], "volume": [1],
+            "open_interest": [10],
+        },
+        index=pd.to_datetime(["2024-01-02"]),
+    ).rename_axis("datetime").to_csv(cwd_cache / "US_ZZZCACHEPROBE240119P00150000.csv")
+    manager = DataManager()
+
+    assert manager.data_path == resolve_data_path(".data")
+    assert manager._cache_roots() == [manager.data_path]
+    assert os.path.normcase(manager.data_path) != os.path.normcase(str(tmp_path / ".data"))
+    assert manager._load_complete_cache(
+        "US.ZZZCACHEPROBE240119P00150000", "20240102", "20240119", "Days", 1, False,
+    ) is None
+
+
+def test_absolute_data_path_is_the_only_cache_root(tmp_path, monkeypatch):
+    import config
+
+    custom = tmp_path / "custom-data"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "DATA_PATH", str(custom))
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [])
+    manager = DataManager()
+
+    assert os.path.normcase(manager.data_path) == os.path.normcase(str(custom))
+    assert manager._cache_roots() == [manager.data_path]

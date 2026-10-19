@@ -344,16 +344,16 @@ def test_running_training_tasks_keep_owner_pids_and_filter_stale_tasks(tmp_path,
     assert tasks[0]["running_pids"] == [1234]
 
 
-def test_training_journal_dirs_check_current_project_and_home_for_relative_data_path(tmp_path):
+def test_training_journal_dirs_ignore_cwd_and_parent_data(tmp_path):
+    from common.data_paths import resolve_data_path
     from optimizer.training_tasks import training_journal_dirs
 
     roots = [tmp_path / "cwd", tmp_path / "project", tmp_path / "home"]
-    directories = training_journal_dirs(
-        ".data", working_directory=roots[0], project_directory=roots[1], home_directory=roots[2],
-    )
+    directories = training_journal_dirs(".data")
 
-    assert directories == [str((root / ".data" / "optuna").resolve()) for root in roots]
-    absolute = training_journal_dirs(roots[0] / "custom-data", working_directory=roots[1])
+    assert directories == [str((Path(resolve_data_path(".data")) / "optuna").resolve())]
+    assert all(str(root) not in directories[0] for root in roots)
+    absolute = training_journal_dirs(roots[0] / "custom-data")
     assert absolute == [str((roots[0] / "custom-data" / "optuna").resolve())]
 
 

@@ -1208,3 +1208,202 @@ def test_retry_unresolved_symbols_exhausts_failures_and_keeps_partial():
     assert calls.count("OK") == 1
     assert calls.count("GAP") == 2
     assert calls.count("MISS") == REQUEST_ATTEMPTS
+
+
+def test_prefetch_option_histories_uses_one_wildcard_per_expiration():
+    class Bulk(_FakeTheta):
+        def option_history_eod(self, **kwargs):
+            self.calls.append(("option_history_eod", kwargs))
+            return pd.DataFrame({
+                "expiration": ["2024-01-19", "2024-01-19"],
+                "strike": [150.0, 155.0],
+                "right": ["PUT", "PUT"],
+                "timestamp": ["2024-01-02", "2024-01-02"],
+                "open": [1.0, 1.1],
+                "high": [1.2, 1.3],
+                "low": [0.9, 1.0],
+                "close": [1.1, 1.2],
+                "volume": [10, 11],
+            })
+
+        def option_history_greeks_eod(self, **kwargs):
+            self.calls.append(("option_history_greeks_eod", kwargs))
+            return pd.DataFrame({
+                "expiration": ["2024-01-19", "2024-01-19"],
+                "strike": [150.0, 155.0],
+                "right": ["PUT", "PUT"],
+                "timestamp": ["2024-01-02", "2024-01-02"],
+                "delta": [-0.2, -0.15],
+                "implied_volatility": [0.3, 0.28],
+            })
+
+        def option_history_open_interest(self, **kwargs):
+            self.calls.append(("option_history_open_interest", kwargs))
+            return pd.DataFrame({
+                "expiration": ["2024-01-19", "2024-01-19"],
+                "strike": [150.0, 155.0],
+                "right": ["PUT", "PUT"],
+                "timestamp": ["2024-01-02", "2024-01-02"],
+                "open_interest": [100, 80],
+            })
+
+    fake = Bulk()
+    frames = ThetaDataProvider(client=fake).prefetch_option_histories(
+        ["US.AAPL240119P00150000", "US.AAPL240119P00155000"],
+        "20240102",
+        "20240119",
+    )
+
+    assert set(frames) == {"US.AAPL240119P00150000", "US.AAPL240119P00155000"}
+    assert "open_interest" in frames["US.AAPL240119P00150000"].columns
+    assert "delta" in frames["US.AAPL240119P00150000"].columns
+    eod_calls = [kwargs for name, kwargs in fake.calls if name == "option_history_eod"]
+    assert len(eod_calls) == 1
+    assert eod_calls[0]["strike"] == "*"
+    assert eod_calls[0]["right"] == "put"
+    assert all(kwargs.get("strike") == "*" for _name, kwargs in fake.calls)
+
+
+def test_prefetch_option_histories_falls_back_when_wildcard_is_empty():
+    class Empty(_FakeTheta):
+        def option_history_eod(self, **kwargs):
+            self.calls.append(("option_history_eod", kwargs))
+            return pd.DataFrame()
+
+    fake = Empty()
+    frames = ThetaDataProvider(client=fake).prefetch_option_histories(
+        ["US.AAPL240119P00150000", "US.AAPL240119P00155000"],
+        "20240102",
+        "20240119",
+    )
+
+    assert frames == {}
+    assert [name for name, _kwargs in fake.calls] == ["option_history_eod"]
+
+
+def _bulk_rows(strikes, timestamp="2024-01-02", deliverable=None):
+    rows = {
+        "expiration": ["2024-03-15"] * len(strikes),
+        "strike": list(strikes),
+        "right": ["PUT"] * len(strikes),
+        "timestamp": [timestamp] * len(strikes),
+        "open": [1.0] * len(strikes),
+        "high": [1.2] * len(strikes),
+        "low": [0.9] * len(strikes),
+        "close": [1.1] * len(strikes),
+        "volume": [10] * len(strikes),
+        "delta": [-0.2] * len(strikes),
+        "implied_volatility": [0.3] * len(strikes),
+        "open_interest": [100] * len(strikes),
+    }
+    if deliverable is not None:
+        rows["deliverable"] = list(deliverable)
+    return pd.DataFrame(rows)
+
+
+def test_prefetch_option_histories_skips_group_that_is_cheaper_per_contract():
+    class Recording(_FakeTheta):
+        def option_history_eod(self, **kwargs):
+            self.calls.append(("option_history_eod", kwargs))
+            return _bulk_rows([150.0, 155.0])
+
+    fake = Recording()
+    frames = ThetaDataProvider(client=fake).prefetch_option_histories(
+        ["US.AAPL240315P00150000", "US.AAPL240315P00155000"],
+        "20240102",
+        "20240315",
+    )
+
+    assert frames == {}
+    assert fake.calls == []
+
+
+def test_prefetch_option_histories_chunks_month_and_writes_immediately():
+    ready = []
+
+    class Recording(_FakeTheta):
+        def option_history_eod(self, **kwargs):
+            self.calls.append(("option_history_eod", kwargs))
+            return _bulk_rows([150.0, 155.0, 160.0, 165.0])
+
+        def option_history_greeks_eod(self, **kwargs):
+            self.calls.append(("option_history_greeks_eod", kwargs))
+            return _bulk_rows([150.0, 155.0, 160.0, 165.0])
+
+        def option_history_open_interest(self, **kwargs):
+            self.calls.append(("option_history_open_interest", kwargs))
+            return _bulk_rows([150.0, 155.0, 160.0, 165.0])
+
+    fake = Recording()
+    symbols = [
+        "US.AAPL240315P00150000",
+        "US.AAPL240315P00155000",
+        "US.AAPL240315P00160000",
+        "US.AAPL240315P00165000",
+    ]
+    frames = ThetaDataProvider(client=fake).prefetch_option_histories(
+        symbols,
+        "20240102",
+        "20240315",
+        on_ready=lambda symbol, frame: ready.append(symbol),
+    )
+
+    assert set(frames) == set(symbols)
+    assert ready == list(frames)
+    eod_calls = [kwargs for name, kwargs in fake.calls if name == "option_history_eod"]
+    assert [(item["start_date"].isoformat(), item["end_date"].isoformat()) for item in eod_calls] == [
+        ("2024-01-02", "2024-02-01"),
+        ("2024-02-02", "2024-03-03"),
+        ("2024-03-04", "2024-03-15"),
+    ]
+    assert all(item["strike"] == "*" for _name, item in fake.calls)
+    assert [name for name, _kwargs in fake.calls].count("option_history_greeks_eod") == 3
+
+
+def test_prefetch_option_histories_aborts_expiration_after_timeout():
+    class Boom(_FakeTheta):
+        def option_history_eod(self, **kwargs):
+            self.calls.append(("option_history_eod", kwargs))
+            raise RuntimeError("bulk timeout")
+
+        def option_history_greeks_eod(self, **kwargs):
+            self.calls.append(("option_history_greeks_eod", kwargs))
+            return _bulk_rows([150.0, 155.0, 160.0, 165.0])
+
+    fake = Boom()
+    frames = ThetaDataProvider(client=fake).prefetch_option_histories(
+        [
+            "US.AAPL240315P00150000",
+            "US.AAPL240315P00155000",
+            "US.AAPL240315P00160000",
+            "US.AAPL240315P00165000",
+        ],
+        "20240102",
+        "20240315",
+    )
+
+    assert frames == {}
+    assert [name for name, _kwargs in fake.calls] == ["option_history_eod"]
+
+
+def test_prefetch_option_histories_skips_adjusted_contract():
+    class Adjusted(_FakeTheta):
+        def option_history_eod(self, **kwargs):
+            self.calls.append(("option_history_eod", kwargs))
+            return _bulk_rows([150.0, 155.0], deliverable=[50.0, 100.0])
+
+        def option_history_greeks_eod(self, **kwargs):
+            self.calls.append(("option_history_greeks_eod", kwargs))
+            return _bulk_rows([150.0, 155.0], deliverable=[50.0, 100.0])
+
+        def option_history_open_interest(self, **kwargs):
+            self.calls.append(("option_history_open_interest", kwargs))
+            return _bulk_rows([150.0, 155.0], deliverable=[50.0, 100.0])
+
+    frames = ThetaDataProvider(client=Adjusted()).prefetch_option_histories(
+        ["US.AAPL240119P00150000", "US.AAPL240119P00155000"],
+        "20240102",
+        "20240119",
+    )
+
+    assert list(frames) == ["US.AAPL240119P00155000"]

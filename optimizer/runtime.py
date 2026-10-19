@@ -35,6 +35,7 @@ from optuna.samplers import TPESampler
 
 import config
 from backtest.backtester import Backtester
+from common.data_paths import ensure_data_dir, resolve_data_path, share_data_file
 from common.formatters import format_float, format_recent_backtest_metrics
 from common.indicator_cache import BoundedIndicatorCache
 from common.loader import get_class_from_name, parse_period_string
@@ -410,8 +411,8 @@ def _run_optimizer_mode_impl(
     else:
         opt_p_def = raw_opt_p_def
 
-    data_path = getattr(config, "DATA_PATH", ".data") or ".data"
-    log_dir = os.path.join(os.getcwd(), data_path, "optuna")
+    data_path = resolve_data_path(getattr(config, "DATA_PATH", ".data"))
+    log_dir = os.path.join(data_path, "optuna")
     plan = resolve_study_plan(args, fixed_params, opt_p_def, risk_params, metrics_list, log_dir, requested_window)
     for study_info in plan["source_studies"]:
         owner = study_info["attrs"].get("_optimizer_owner")
@@ -1444,6 +1445,85 @@ class OptimizationJob:
             if shared_counter is not None:
                 shared_counter.close(unlink=True)
 
+    def _theta_history_provider(self):
+        """找到可批量拉期权历史的 Theta provider；没有时保持逐合约路径。"""
+        manager = getattr(self, "data_manager", None)
+        if manager is None:
+            return None
+        names = []
+        specified = getattr(getattr(self, "args", None), "data_source", None)
+        if specified:
+            names.append(specified)
+        names.extend(["theta+futu", "hybrid", "theta"])
+        seen = set()
+        for name in names:
+            key = str(name or "").strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            getter = getattr(manager, "_provider_for_source", None)
+            provider = getter(key) if callable(getter) else None
+            if provider is None:
+                continue
+            theta = getattr(provider, "theta_provider", None) or provider
+            if hasattr(theta, "prefetch_option_histories"):
+                return theta
+        return None
+
+    def _prefetch_option_history(self, symbols, start_date, end_date):
+        """把同一到期日的未缓存日线期权一次拉完，并在每个合约完成后立刻写 CSV。"""
+        if bool(getattr(self.args, "refresh", False)):
+            return
+        if not getattr(config, "CACHE_DATA", False):
+            return
+        timeframe = str(getattr(self.args, "timeframe", "Days") or "Days").strip().lower()
+        if timeframe not in {"", "days", "day", "d"}:
+            return
+        try:
+            if int(getattr(self.args, "compression", 1) or 1) != 1:
+                return
+        except (TypeError, ValueError, OverflowError):
+            return
+        provider = self._theta_history_provider()
+        if provider is None:
+            return
+        missing = []
+        for symbol in symbols or []:
+            cached = self.data_manager._load_complete_cache(
+                symbol,
+                start_date,
+                end_date,
+                self.args.timeframe,
+                self.args.compression,
+                False,
+            )
+            if cached is None:
+                missing.append(symbol)
+        if len(missing) < 2:
+            return
+        saved = 0
+
+        def on_ready(symbol, frame):
+            nonlocal saved
+            self.data_manager._cache_data(
+                frame,
+                symbol,
+                self.args.timeframe,
+                self.args.compression,
+            )
+            saved += 1
+            print(f"[Auto-Fetch] bulk cached {saved} {symbol}")
+
+        try:
+            provider.prefetch_option_histories(
+                missing,
+                start_date,
+                end_date,
+                on_ready=on_ready,
+            )
+        except Exception as exc:
+            print(f"[Auto-Fetch] bulk prefetch failed, continuing per contract: {exc}")
+
     def _fetch_all_data(self):
         print("\n--- Fetching Data for Optimization ---")
 
@@ -1540,6 +1620,10 @@ class OptimizationJob:
         last_progress = started
         completed = 0
         # Theta session 必须串行复用。期权拉数不再并发，避免超时重试叠在同一条连接上。
+        cache_root = resolve_data_path(getattr(self.data_manager, "data_path", None))
+        print(f"[Auto-Fetch] cache root: {os.path.abspath(cache_root)}")
+        self._prefetch_option_history(symbols, req_fetch_start, req_end)
+        # VALUE 账户全账号最多 2 个并发。同一 session 不能重叠，所以这里保持 1 个 worker。
         fetch_workers = 1
 
         def fetch_symbol(symbol):
@@ -2809,15 +2893,15 @@ class OptimizationJob:
 
         if use_journal_storage:
             if HAS_JOURNAL:
-                data_path = getattr(config, 'DATA_PATH', '.data') or '.data'
-                log_dir = os.path.join(os.getcwd(), data_path, 'optuna')
-                os.makedirs(log_dir, exist_ok=True)
+                data_path = resolve_data_path(getattr(config, 'DATA_PATH', '.data'))
+                ensure_data_dir(data_path)
+                log_dir = ensure_data_dir(os.path.join(data_path, 'optuna'))
 
                 # 批次 Journal 只作为锚点。每个 Study 独占文件，避免 trial_id 与控制台编号岔开。
                 if shared_journal_log_file:
                     shared_dir = os.path.dirname(shared_journal_log_file)
                     if shared_dir:
-                        os.makedirs(shared_dir, exist_ok=True)
+                        ensure_data_dir(shared_dir)
                     log_file = shared_journal_log_file
                 else:
                     log_file = os.path.join(log_dir, f"optuna_{self.args.study_name}.log")
@@ -2838,6 +2922,7 @@ class OptimizationJob:
                         )
                     else:
                         print(f"\n[Optimizer] JournalStorage enabled for dashboard/log persistence (n_jobs=1).")
+                    share_data_file(log_file)
                     print(f"[Optimizer] Using JournalStorage: {log_file}")
                     reference = getattr(self, "_data_snapshot", None)
                     announce_training_scope(

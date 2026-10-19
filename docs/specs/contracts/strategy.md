@@ -75,7 +75,7 @@
 2. 期权策略若要把标的池展开为滚动合约，应在策略类上声明 `option_universe`，例如 `option_universe = ("PUT",)` 或 `True`。
 3. 未声明时，运行时不得自动把正股代码展开成期权链，避免股票策略误拉全链。
 4. 展开过滤读取策略 `params` 的 `min_dte`/`max_dte`，以及 `min_delta`/`max_delta`/`protective_put_delta` 的并集；缺少 DTE 窗口时失败关闭。策略也可用 `option_universe` 字典声明固定的候选池覆盖边界，支持 `min_dte`/`max_dte`/`min_delta`/`max_delta`/`protective_put_delta`/`min_open_interest`；这适用于训练空间宽于基准参数的情况，实际每个 Trial 仍按策略参数过滤。
-5. 回测/优化在取数前按 as_of 抽样历史链并求并集，必须使用 ThetaData 或 `theta+futu` 的历史链，禁止用 Futu 当前链回放。并集应按时间均匀封顶，不得只收下窗口开头的合约，否则 Optuna 训练集/测试集会没有可交易期权。展开和合约历史拉取应周期性打印进度（当前 as_of、成功数、空结果数、失败数、合约数、已用时间）。Theta 的 No data found 不逐条打印、不重试；超时与瞬时错误有界重试 5 次，失败 as_of 与漏拉合约在本轮扫完后补偿一轮。`CACHE_DATA=True` 时按 as_of 断点续拉；`--refresh` 忽略断点并全量重拉。实盘不写该断点。
+5. 回测/优化在取数前按 as_of 抽样历史链并求并集，必须使用 ThetaData 或 `theta+futu` 的历史链，禁止用 Futu 当前链回放。并集应按时间均匀封顶，不得只收下窗口开头的合约，否则 Optuna 训练集/测试集会没有可交易期权。展开和合约历史拉取应周期性打印进度（当前 as_of、成功数、空结果数、失败数、合约数、已用时间）。Theta 的 No data found 不逐条打印、不重试；超时与瞬时错误有界重试 5 次，失败 as_of 与漏拉合约在本轮扫完后补偿一轮。`CACHE_DATA=True` 时按 as_of 断点续拉；`--refresh` 忽略断点并全量重拉。实盘不写该断点。同一到期日未缓存合约足够多时，按 31 天 wildcard 拉取并立即按合约落盘；失败或请求数不划算则回退逐合约。中断后已落盘 CSV 不再重拉。option_universe 断点只读写解析后的同一个 DATA_PATH，不并入其它目录的同名断点。
    若策略声明 `option_universe_exclude_underlyings`，或声明 `option_universe_exclude_param` 指向一个参数（如反向 ETF Beta 对冲标的），这些正股保留在股票池但不展开期权链，避免对冲标的被轮动逻辑当成卖 Put/Call 的底层。
 历史链候选若声明 `protective_put_delta`，每个 as_of 必须同时覆盖 Short Put 的中心 Delta 和保护腿 Delta；断点缓存身份必须包含 Delta 锚点，不能复用只围绕短腿中心生成的旧缓存。
 6. 实盘每个 schedule slot 用当前链增补合约；账户已有持仓或在途的旧合约必须保留，即使它们还不在当前 datas。pending 快照不可信，或持仓查询异常时，不得把现有期权 feed 当作空仓丢弃。

@@ -2,8 +2,8 @@
 
 该模块仅负责将 ThetaData 的股票/期权历史接口转换为 QuantAda 数据契约。
 令牌和 gRPC 连接均采用惰性初始化；未安装 SDK 或未配置令牌时返回 ``None``，
-不会阻断其他 Provider。期权合约使用 OCC 代码解析后请求单一合约，避免把链
-快照误当成历史数据。
+不会阻断其他 Provider。期权合约使用 OCC 代码解析。同一到期日合约足够多时按月
+wildcard 批量拉取，失败则回退单一合约，避免把链快照误当成历史数据。
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ _AUTO_CHAIN_STRIKE_RANGE = 40
 _DEFAULT_AUTO_MAX_DTE = 90
 _EOD_RETRY_CHUNK_DAYS = 365
 _EOD_MAX_REQUEST_DAYS = 365
+# wildcard 历史按官方 EOD 建议不超过 1 个月，避免 LARGE_REQUEST 和超时。
+_BULK_EOD_CHUNK_DAYS = 31
 _INTRADAY_CHUNK_DAYS = 30
 # 同一进程只复用一个 Theta session。SDK 调用必须串行，在途请求未结束不得再发下一个。
 
@@ -1594,6 +1596,204 @@ class ThetaDataProvider(BaseDataProvider):
             return None
         prepared["timestamp"] = pd.Timestamp(as_of_date, tz="UTC")
         return prepared
+
+    def _bulk_wildcard_history(self, method, start, end, **kwargs):
+        """按月拉取 wildcard。超时或错误立即放弃，空月份继续，不做 5 次补偿。"""
+        frames = []
+        cursor = start
+        while cursor <= end:
+            chunk_end = min(
+                end,
+                cursor + _dt.timedelta(days=_BULK_EOD_CHUNK_DAYS) - _dt.timedelta(days=1),
+            )
+            fails_before = self._local_fail_count()
+            raw = self._call(
+                method,
+                start_date=cursor,
+                end_date=chunk_end,
+                _max_attempts=1,
+                **kwargs,
+            )
+            converted = _to_pandas(raw)
+            if converted is not None and not converted.empty:
+                frames.append(converted)
+            elif self._local_fail_count() > fails_before:
+                return None
+            cursor = chunk_end + _dt.timedelta(days=1)
+        if not frames:
+            return None
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    def prefetch_option_histories(self, symbols, start_date=None, end_date=None, on_ready=None):
+        """按到期日批量拉取期权 EOD、Greeks 和持仓量，仍只占用一条 session。
+
+        VALUE 账户全账号并发上限是 2，超额请求排队，队列溢出才返回 429。同一
+        gRPC session 不能重叠，所以这里保持 1 个在途请求。wildcard 按 EOD 建议
+        切成 31 天；只有这样比逐合约更少请求时才批量。失败的到期日不落盘。
+        on_ready 在每个成功合约完成后立即调用，中断后只补尚未落盘的合约。
+        """
+        grouped = {}
+        for raw in symbols or []:
+            parsed = self._parse_option(raw)
+            if parsed is None:
+                continue
+            root, expiry, _strike, right = parsed
+            grouped.setdefault((root, expiry), []).append((str(raw).strip().upper(), right))
+        frames = {}
+        skipped_small = 0
+        for (root, expiry), contracts in grouped.items():
+            requested = {symbol for symbol, _right in contracts}
+            if len(requested) < 2:
+                skipped_small += 1
+                continue
+            rights = {_normalize_chain_right(right) for _symbol, right in contracts}
+            if rights == {"put"}:
+                right_value = "put"
+            elif rights == {"call"}:
+                right_value = "call"
+            else:
+                right_value = "both"
+            start = _as_date(start_date)
+            end = _as_date(end_date)
+            today = _vendor_today()
+            if start is None and end is None:
+                end = today
+                start = end - _dt.timedelta(days=365)
+            elif start is None:
+                start = end - _dt.timedelta(days=365)
+            elif end is None:
+                end = start + _dt.timedelta(days=365)
+            if end > today:
+                end = today
+            start, end = _clip_option_history_window(start, end, expiry)
+            if start is None or end is None or start > end:
+                continue
+            span_days = (end - start).days + 1
+            chunks = max(1, math.ceil(span_days / _BULK_EOD_CHUNK_DAYS))
+            if len(requested) <= chunks:
+                skipped_small += 1
+                continue
+            print(
+                f"[ThetaData] bulk {root} {expiry.isoformat()} "
+                f"contracts={len(requested)} chunks={chunks} right={right_value}"
+            )
+            common = {
+                "symbol": root,
+                "expiration": expiry,
+                "strike": "*",
+                "right": right_value,
+            }
+            eod = self._bulk_wildcard_history("option_history_eod", start, end, **common)
+            if eod is None or getattr(eod, "empty", True):
+                continue
+            greeks = self._bulk_wildcard_history(
+                "option_history_greeks_eod", start, end, **common
+            )
+            if greeks is None or getattr(greeks, "empty", True):
+                continue
+            open_interest = self._bulk_wildcard_history(
+                "option_history_open_interest", start, end, **common
+            )
+            if open_interest is None or getattr(open_interest, "empty", True):
+                continue
+            split_eod = self._split_bulk_option_frame(eod, root, expiry)
+            split_greeks = self._split_bulk_option_frame(greeks, root, expiry)
+            split_oi = self._split_bulk_option_frame(open_interest, root, expiry)
+            for symbol in requested:
+                built = self._finalize_bulk_contract(
+                    symbol,
+                    split_eod.get(symbol),
+                    split_greeks.get(symbol),
+                    split_oi.get(symbol),
+                )
+                if built is None:
+                    continue
+                frames[symbol] = built
+                if on_ready is None:
+                    continue
+                try:
+                    on_ready(symbol, built)
+                except Exception as exc:
+                    print(f"[ThetaData] bulk cache callback failed for {symbol}: {exc}")
+        if skipped_small:
+            print(
+                f"[ThetaData] bulk skipped {skipped_small} expirations; "
+                "per-contract uses fewer requests"
+            )
+        return frames
+
+    def _split_bulk_option_frame(self, frame, root, expiry):
+        """把 wildcard 历史按 OCC 代码拆开；缺行权价或方向时无法安全拆分。"""
+        converted = _to_pandas(frame)
+        if converted is None or converted.empty:
+            return {}
+        prepared = self._prepare_chain_frame(converted, root, expiry)
+        if "option_symbol" not in prepared.columns:
+            return {}
+        grouped = {}
+        for symbol, rows in prepared.groupby("option_symbol", dropna=True):
+            key = str(symbol or "").strip().upper()
+            if not key:
+                continue
+            grouped[key] = rows.drop(columns=["option_symbol"], errors="ignore").copy()
+        return grouped
+
+    def _finalize_bulk_contract(self, symbol, eod, greeks, open_interest):
+        """把单个合约的批量切片整理成与逐合约历史相同的缓存行。"""
+        if eod is None or getattr(eod, "empty", True):
+            return None
+        if greeks is None or getattr(greeks, "empty", True):
+            return None
+        if open_interest is None or getattr(open_interest, "empty", True):
+            return None
+        if _is_adjusted_option_response(eod):
+            return None
+        result = self._normalise_ohlcv(eod)
+        if result is None or result.empty:
+            return None
+        multiplier = self._option_multiplier()
+        if multiplier is None:
+            return None
+        result = self._merge_metadata(
+            result,
+            greeks,
+            {
+                "iv": ("iv", "implied_volatility", "implied_vol"),
+                "delta": ("delta",),
+                "gamma": ("gamma",),
+                "theta": ("theta",),
+                "vega": ("vega",),
+                "rho": ("rho",),
+            },
+        )
+        result = self._merge_metadata(
+            result,
+            open_interest,
+            {"open_interest": ("open_interest", "oi")},
+        )
+        if "open_interest" not in result.columns or "delta" not in result.columns:
+            return None
+        result.attrs["option_symbol"] = symbol
+        result.attrs["contract_multiplier"] = multiplier
+        result.attrs["contract_multiplier_source"] = "standard_market_assumption"
+        result["contract_multiplier"] = multiplier
+        iv_series = (
+            pd.to_numeric(result["iv"], errors="coerce")
+            if "iv" in result.columns
+            else pd.Series(float("nan"), index=result.index)
+        )
+        result["iv_percentile"] = iv_percentile(
+            result,
+            iv_series,
+            window=252,
+            explicit=False,
+        )
+        attrs = dict(result.attrs)
+        result.index = pd.DatetimeIndex(result.index).normalize()
+        result = result[~result.index.duplicated(keep="last")].sort_index()
+        result.index.name = "datetime"
+        result.attrs.update(attrs)
+        return result
 
     def close(self):
         """关闭 ThetaData 客户端（若 SDK 提供 close）。"""
