@@ -1,23 +1,51 @@
 """GM Broker 的连接凭据和连接环境默认值。"""
 
 import os
+import weakref
 
 # GM SDK 的旧版 protobuf 生成代码与新版 C++ 实现不兼容；必须在任何 gm.api
 # 导入前启用纯 Python protobuf 实现，历史行情接口才能正常加载。
 os.environ.setdefault('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'python')
 
+_MISSING_FIELD_LABEL = object()
+_STORED_FIELD_LABELS = weakref.WeakKeyDictionary()
+
+
+def install_protobuf_field_label_compat(descriptor_cls):
+    """给缺少 label 的 FieldDescriptor 补上可读写属性。旧版构造器仍会执行 self.label = label。"""
+    if hasattr(descriptor_cls, 'label'):
+        return False
+
+    def _get_label(field):
+        stored = getattr(field, '_quantada_field_label', _MISSING_FIELD_LABEL)
+        if stored is not _MISSING_FIELD_LABEL:
+            return stored
+        try:
+            return _STORED_FIELD_LABELS[field]
+        except Exception:
+            pass
+        repeated = getattr(descriptor_cls, 'LABEL_REPEATED', 3)
+        optional = getattr(descriptor_cls, 'LABEL_OPTIONAL', 1)
+        if getattr(field, 'is_repeated', False):
+            return repeated
+        return optional
+
+    def _set_label(field, value):
+        try:
+            object.__setattr__(field, '_quantada_field_label', value)
+        except Exception:
+            _STORED_FIELD_LABELS[field] = value
+
+    descriptor_cls.label = property(_get_label, _set_label)
+    return True
+
+
 try:
     from google.protobuf.descriptor import FieldDescriptor
 
-    if not hasattr(FieldDescriptor, 'label'):
-        # GM 3.0.183 的转换器仍读取旧版 protobuf 的 label 属性；新版只保留 is_repeated。
-        FieldDescriptor.label = property(
-            lambda field: (
-                FieldDescriptor.LABEL_REPEATED
-                if getattr(field, 'is_repeated', False)
-                else FieldDescriptor.LABEL_OPTIONAL
-            )
-        )
+    # protobuf 3.20 的 label 只在构造器里赋值，类上 hasattr 仍为 False。
+    # 只读 property 会把 self.label = label 变成 can't set attribute。
+    install_protobuf_field_label_compat(FieldDescriptor)
 except Exception:
     # protobuf 不可用时由 GM Provider 的依赖检查负责报告错误。
     pass
