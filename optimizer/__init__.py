@@ -8,6 +8,7 @@ __all__ = [
     "OptimizationJob",
     "get_metric_function",
     "is_port_in_use",
+    "run_fetch_only",
     "run_optimizer_mode",
 ]
 

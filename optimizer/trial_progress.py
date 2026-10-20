@@ -179,24 +179,39 @@ def format_remaining_duration(seconds):
 
 
 
-_RECENT_ETA_SAMPLES = 4
+_ETA_WINDOW_SECONDS = 10 * 60
+
+
+def _windowed_rate(samples):
+    """用最近约 10 分钟的完成数和耗时估计速度；样本都在窗口内时用全部样本。"""
+    if not samples or len(samples) < 2:
+        return None
+    end_count = int(samples[-1][0])
+    end_time = float(samples[-1][1])
+    cutoff = end_time - _ETA_WINDOW_SECONDS
+    start_index = 0
+    for index in range(len(samples) - 1, -1, -1):
+        if float(samples[index][1]) < cutoff:
+            start_index = index + 1
+            break
+    if start_index >= len(samples) - 1:
+        start_index = len(samples) - 2
+    done = end_count - int(samples[start_index][0])
+    elapsed = end_time - float(samples[start_index][1])
+    if done > 0 and elapsed >= 1.0:
+        return done, elapsed
+    return None
 
 
 def progress_eta(completed, total, started_at, now, recent=None, parallel_workers=1):
-    """按最近几笔完成速度估计剩余项耗时，并复用训练 ETA 的格式化规则。"""
+    """按最近约 10 分钟的完成速度估计剩余项耗时，并复用训练 ETA 的格式化规则。"""
     remaining = max(0, int(total) - int(completed))
-    samples = list(recent or ())[-_RECENT_ETA_SAMPLES:]
-    counted = None
-    elapsed = None
-    if len(samples) >= 2:
-        done = int(samples[-1][0]) - int(samples[0][0])
-        window = float(samples[-1][1]) - float(samples[0][1])
-        if done > 0 and window >= 1.0:
-            counted = done
-            elapsed = window
-    if counted is None:
+    window = _windowed_rate(list(recent or ()))
+    if window is None:
         counted = int(completed)
         elapsed = float(now) - float(started_at)
+    else:
+        counted, elapsed = window
     return _format_eta(remaining, counted, elapsed, parallel_workers, observed=int(completed))
 
 

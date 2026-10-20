@@ -308,6 +308,11 @@ def _run_main():
         ),
     )
     parser.add_argument(
+        '--fetch_only',
+        action='store_true',
+        help="只按当前标的空间拉取行情并写入缓存，不启动回测、优化或实盘",
+    )
+    parser.add_argument(
         '--refresh',
         action='store_true',
         help="忽略完整行情缓存和期权池断点，重新在线拉取并合并回写；不会删除整个缓存目录",
@@ -389,6 +394,11 @@ def _run_main():
 
     if args.force_schedule and not args.connect:
         parser.error("--force_schedule 仅对本次实盘启动生效，必须与 --connect 一起使用")
+
+    if args.fetch_only and args.connect:
+        parser.error("--fetch_only 不能与 --connect 一起使用")
+    if args.fetch_only and (args.train_resume or args.train_kill):
+        parser.error("--fetch_only 不能与 --train_resume 或 --train_kill 一起使用")
 
     if args.train_resume and args.train_kill:
         parser.error("--train_resume and --train_kill cannot be used together")
@@ -547,6 +557,17 @@ def _run_main():
     except (ValueError, SyntaxError) as e:
         print(f"Error parsing risk_params JSON: {e}")
         r_params = {}
+
+    # ==========================
+    # 仅拉数
+    # ==========================
+    if args.fetch_only:
+        sys.exit(optimizer.run_fetch_only(
+            args=args,
+            fixed_params=s_params,
+            risk_params=r_params,
+            symbol_list=symbol_list,
+        ))
 
     # ==========================
     # 实盘模式

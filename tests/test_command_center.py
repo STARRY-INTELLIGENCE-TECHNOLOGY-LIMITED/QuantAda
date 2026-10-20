@@ -798,6 +798,28 @@ def test_build_command_forwards_force_schedule(tmp_path: Path) -> None:
     assert generated.argv[generated.argv.index("--connect") + 1] == "gm_broker:sim"
 
 
+def test_build_command_forwards_fetch_only_and_drops_live_connect(tmp_path: Path) -> None:
+    catalog = default_catalog()
+    preset = CommandPreset(
+        "fetch-only",
+        "fetch only",
+        "全球",
+        "optimize",
+        "strategies.options.sample_cash_secured_put_strategy",
+        options={"fetch_only": True, "symbols": "US.AAPL", "opt_params": {"min_dte": {"type": "int", "low": 15, "high": 30}}},
+    )
+
+    generated = build_command(catalog, preset, {}, tmp_path)
+
+    assert "--fetch_only" in generated.argv
+    assert generated.options["fetch_only"] is True
+
+    live = replace(preset, preset_id="fetch-live", mode="live", connect="gm_broker:sim")
+    generated = build_command(catalog, live, {}, tmp_path)
+    assert "--fetch_only" not in generated.argv
+    assert "fetch_only" not in generated.options
+
+
 def test_build_command_drops_force_schedule_without_live_connect(tmp_path: Path) -> None:
     catalog = default_catalog()
     preset = CommandPreset(

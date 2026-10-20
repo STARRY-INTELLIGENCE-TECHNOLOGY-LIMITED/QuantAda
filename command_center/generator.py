@@ -101,6 +101,7 @@ _OPTION_ORDER = (
     "desc",
     "plot_scope",
     "refresh",
+    "fetch_only",
     "no_plot",
     "force_schedule",
     "opt_params",
@@ -367,6 +368,9 @@ def build_command(
     # --force_schedule 只伴随本次实盘 --connect 生效，不能进入回测、优化或无连接命令。
     if options.get("force_schedule") and not (preset.mode == "live" and preset.connect):
         options.pop("force_schedule", None)
+    # --fetch_only 只写行情缓存。实盘连接不能同时拉历史空间并启动交易。
+    if options.get("fetch_only") and (preset.mode == "live" or preset.connect):
+        options.pop("fetch_only", None)
     for name in _OPTION_ORDER:
         if name in options:
             _append_option(argv, name, options[name])

@@ -98,6 +98,9 @@ def test_web_html_is_external_static_resource():
     assert "function syncForceSchedule()" in html
     assert "el.disabled=!live" in html
     assert 'id="refresh"> 刷新数据</label>' in html
+    assert 'id="fetch-only" title="只写入行情缓存，不启动训练"> 只拉数据</label>' in html
+    assert "function syncFetchOnly()" in html
+    assert "if(!options.fetch_only)delete options.fetch_only;" in html
     assert 'class="footer"' not in html
     assert "配置完成后自动生成命令" not in html
     assert "方案别名会自动作为默认说明" not in html

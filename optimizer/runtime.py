@@ -337,6 +337,37 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
         terminal_tee.close()
 
 
+def run_fetch_only(args, fixed_params, risk_params, symbol_list=None):
+    """按当前选股和策略参数展开标的空间并写入缓存，不进入训练。"""
+    del symbol_list
+    print("\n>>> Mode: FETCH ONLY <<<")
+    print("[FetchOnly] 只拉取当前标的空间的行情缓存，不创建 Study，不启动训练、基准回测或 worker。")
+    strategy_name = str(getattr(args, "strategy", "") or "")
+    selection_name = str(getattr(args, "selection", "") or "")
+    if "," in strategy_name or "," in selection_name:
+        print("[FetchOnly] 一次只处理一个策略；选股器并集请使用 +，不要用逗号分组。")
+        return 1
+    infer_omitted_backtest_window(args)
+    try:
+        job = OptimizationJob(args, fixed_params or {}, {}, risk_params or {})
+    except (ValueError, OSError) as exc:
+        print(f"[FetchOnly] stopped before training: {exc}")
+        return 1
+    datas = getattr(job, "raw_datas", {}) or {}
+    symbols = list(getattr(job, "target_symbols", []) or [])
+    fetch_range = getattr(job, "_raw_data_fetch_range", (None, None))
+    print(
+        f"[FetchOnly] ready {len(datas)}/{len(symbols)} symbols "
+        f"window={fetch_range[0]} to {fetch_range[1]}. "
+        "Training was not started. Remove --fetch_only to train from this cache."
+    )
+    job.raw_datas = {}
+    job.train_datas = {}
+    job.test_datas = {}
+    gc.collect()
+    return 0
+
+
 def infer_omitted_backtest_window(args):
     """缺省 start/end 按本次训练启动时刻补全。"""
     if not getattr(args, "end_date", None):
@@ -885,8 +916,16 @@ class OptimizationJob:
             sys.exit(1)
         self._source_symbols = list(self.target_symbols)
 
+        fetch_only = bool(getattr(self.args, "fetch_only", False))
         try:
             self.raw_datas = self._fetch_all_data()
+            if fetch_only:
+                # 缓存已落盘。不切分、不改 Study 名，避免进入训练准备。
+                self.train_datas = {}
+                self.test_datas = {}
+                self.train_range = (None, None)
+                self.test_range = (None, None)
+                return
             self.train_datas, self.test_datas, self.train_range, self.test_range = self._split_data()
         finally:
             # 数据窗口已经落入内存；后续 trial 不再依赖在线 Provider 会话。
@@ -1716,7 +1755,7 @@ class OptimizationJob:
             f"[Auto-Fetch] {total} symbols; each line is cache or fetch, not a full refetch"
         )
         self._prefetch_option_history(symbols, req_fetch_start, req_end)
-        # 逐标的计时从预取之后开始，ETA 只看最近几笔，避免预取或缓存突发扭曲剩余时间。
+        # 逐标的计时从预取之后开始。ETA 看最近约 10 分钟，避免几笔缓存或慢请求把剩余时间打跳。
         rate_started = time.monotonic()
         recent_completions = []
         # VALUE 账户全账号最多 2 个并发。同一 session 不能重叠，所以这里保持 1 个 worker。

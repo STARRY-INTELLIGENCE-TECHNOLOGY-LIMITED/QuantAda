@@ -300,6 +300,22 @@ def test_progress_eta_uses_recent_completions_not_cache_burst():
     assert progress_eta(100, 7175, 0.0, 400.0, [(90, 390.0), (100, 400.0)]) == "ETA 1h57m"
 
 
+def test_progress_eta_ignores_short_cache_or_slow_burst():
+    samples = [(index, index * 20.0) for index in range(1, 91)]
+    fast_end = samples[-1][1]
+    for index in range(91, 95):
+        fast_end += 0.5
+        samples.append((index, fast_end))
+    assert progress_eta(94, 7175, 0.0, fast_end, samples) == "ETA 1d10h"
+
+    slow = [(index, index * 10.0) for index in range(1, 91)]
+    slow_end = slow[-1][1]
+    for index in range(91, 95):
+        slow_end += 60.0
+        slow.append((index, slow_end))
+    assert progress_eta(94, 7175, 0.0, slow_end, slow) == "ETA 1d5h"
+
+
 def test_progress_eta_hides_subsecond_samples_and_finished_work():
     assert progress_eta(1, 100, 0.0, 0.2) == "ETA unavailable"
     assert progress_eta(1, 11, 0.0, 40.0) == "ETA 6m40s"

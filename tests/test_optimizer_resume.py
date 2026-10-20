@@ -864,7 +864,7 @@ def test_isolate_renumbers_interleaved_trials_and_resume_finds_sibling(tmp_path)
 
 def test_training_identity_hash_ignores_non_training_flags():
     base = _args()
-    flagged = _args(connect="ibkr:paper", ui=True, train_resume=True, ui_port=8080)
+    flagged = _args(connect="ibkr:paper", ui=True, train_resume=True, ui_port=8080, fetch_only=True)
     assert training_identity_hash(base) == training_identity_hash(flagged)
     assert training_identity_hash(base) != training_identity_hash(_args(params="{'contracts': 2}"))
 
