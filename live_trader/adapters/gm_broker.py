@@ -37,6 +37,7 @@ _GM_SDK_HEALTH_DEADLINE_SECONDS = 180.0
 _GM_AGGRESSIVE_RETRY_SECONDS = 10.0
 _GM_QUIET_PROBE_SECONDS = 10 * 60.0
 _GM_CONNECTIVITY_LOG_INTERVAL_SECONDS = 10 * 60.0
+_GM_TRADE_DISCONNECT_ALARM_DELAY_SECONDS = 5 * 60.0
 _GM_API_IMPORT_ERROR = None
 _GM_CSDK_IMPORT_ERROR = None
 
@@ -1303,6 +1304,11 @@ class GmBrokerAdapter(BaseLiveBroker):
             return True
 
         def _log_connectivity_recovered(detail):
+            pending = launch_state.get('trade_disconnect_alarm')
+            if isinstance(pending, dict):
+                launch_state['trade_disconnect_alarm'] = None
+                if not pending.get('sent'):
+                    _runtime_print(f"[GM Warning] trade service recovered before IM alarm: {detail}")
             if not launch_state.get('connectivity_failure_seen'):
                 return
             previous = launch_state.get('connectivity_log') or {}
@@ -1707,6 +1713,58 @@ class GmBrokerAdapter(BaseLiveBroker):
             def on_order_status(ctx, order):
                 on_order_status_callback(ctx, order)
 
+            def _trade_service_available():
+                if not callable(get_cash):
+                    return False
+                try:
+                    return get_cash() is not None
+                except Exception:
+                    return False
+
+            def _defer_trade_disconnect_alarm(msg):
+                now_mono = time.monotonic()
+                pending = launch_state.get('trade_disconnect_alarm')
+                if isinstance(pending, dict):
+                    pending['msg'] = msg
+                    return
+                launch_state['trade_disconnect_alarm'] = {
+                    'msg': msg,
+                    'due': now_mono + _GM_TRADE_DISCONNECT_ALARM_DELAY_SECONDS,
+                    'sent': False,
+                }
+                _runtime_print(
+                    f"[GM Warning] {msg}; deferring IM alarm for "
+                    f"{int(_GM_TRADE_DISCONNECT_ALARM_DELAY_SECONDS)}s"
+                )
+
+            def _flush_deferred_trade_disconnect_alarm():
+                pending = launch_state.get('trade_disconnect_alarm')
+                if not isinstance(pending, dict):
+                    return
+                now_mono = time.monotonic()
+                if pending.get('sent'):
+                    if now_mono < float(pending.get('next_probe') or 0.0):
+                        return
+                    pending['next_probe'] = now_mono + _GM_TRADE_DISCONNECT_ALARM_DELAY_SECONDS
+                    if _trade_service_available():
+                        launch_state['trade_disconnect_alarm'] = None
+                        _runtime_print(
+                            "[GM Warning] trade service recovered after IM alarm: "
+                            f"{pending.get('msg')}"
+                        )
+                    return
+                if now_mono < float(pending.get('due') or 0.0):
+                    return
+                if _trade_service_available():
+                    launch_state['trade_disconnect_alarm'] = None
+                    _runtime_print(
+                        f"[GM Warning] trade service recovered before IM alarm: {pending.get('msg')}"
+                    )
+                    return
+                pending['sent'] = True
+                pending['next_probe'] = now_mono + _GM_TRADE_DISCONNECT_ALARM_DELAY_SECONDS
+                AlarmManager().push_exception("GM Kernel Error", pending.get('msg'))
+
             def on_error(ctx, code, info):
                 msg = f"Code: {code}, Msg: {info}"
                 if _log_temporary_market_data_error(code, info):
@@ -1716,6 +1774,13 @@ class GmBrokerAdapter(BaseLiveBroker):
                     code_int = int(code)
                 except (TypeError, ValueError):
                     code_int = None
+                if mode == MODE_LIVE and (
+                    code_int == 1101 or "交易消息服务断开" in str(info or "")
+                ):
+                    # 掘金终端定时重启会短暂断开交易服务。5 分钟后仍失败才推 IM。
+                    _defer_trade_disconnect_alarm(msg)
+                    return
+
                 if mode == MODE_LIVE and code_int == 1100:
                     now_value = datetime.datetime.now()
                     quiet, _, wake_at = _connectivity_retry_plan(now_value)
@@ -1899,6 +1964,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                     while True:
                         try:
                             poll_status = gmi_poll()
+                            _flush_deferred_trade_disconnect_alarm()
                         except SystemExit as e:
                             restart_reason = (
                                 "shutdown callback"

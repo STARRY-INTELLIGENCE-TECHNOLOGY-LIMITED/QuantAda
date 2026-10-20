@@ -2469,3 +2469,231 @@ def test_gm_force_schedule_runs_once_then_keeps_next_formal_slot(monkeypatch):
             params={},
             force_schedule=True,
         )
+
+
+def _patch_gm_live_launch(monkeypatch, gm_module, fake_context, poll, alarm_cls):
+    """复用现有 GM launch 假对象，只替换本用例关心的轮询和报警。"""
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 0, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_poll", poll, raising=False)
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: True,
+        raising=False,
+    )
+    monkeypatch.setattr(gm_module, "AlarmManager", alarm_cls, raising=False)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+
+def test_gm_trade_disconnect_alarm_waits_five_minutes(monkeypatch, capsys):
+    """实盘 1101 持续断开满 5 分钟才推一次，重复回调不重置计时。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    clock = {"mono": 1000.0}
+    cash_ok = {"value": False}
+    cash_calls = []
+    exceptions = []
+    poll_count = {"value": 0}
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=""):
+            return None
+
+        def push_text(self, content, level="INFO"):
+            raise AssertionError("deferred trade disconnect must not push text")
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            raise AssertionError("1101 must not use the schedule unavailable alarm")
+
+        def push_exception(self, module, message, *args, **kwargs):
+            exceptions.append((module, message))
+
+    def _cash():
+        cash_calls.append(clock["mono"])
+        if cash_ok["value"]:
+            return SimpleNamespace(nav=1)
+        raise RuntimeError("trade service down")
+
+    def _poll():
+        poll_count["value"] += 1
+        step = poll_count["value"]
+        if step == 1:
+            fake_context.on_error_fun(fake_context, 9999, "other kernel error")
+            fake_context.on_error_fun(fake_context, 1101, "交易消息服务断开")
+            fake_context.on_error_fun(fake_context, 1101, "交易消息服务断开 latest")
+            return 0
+        if step == 2:
+            clock["mono"] = 1299.0
+            fake_context.on_error_fun(fake_context, 1101, "交易消息服务断开 latest")
+            return 0
+        if step == 3:
+            clock["mono"] = 1300.0
+            return 0
+        if step == 4:
+            clock["mono"] = 1600.0
+            return 0
+        if step == 5:
+            cash_ok["value"] = True
+            clock["mono"] = 1900.0
+            return 0
+        if step == 6:
+            cash_ok["value"] = False
+            fake_context.on_error_fun(fake_context, 1101, "交易消息服务断开 again")
+            return 0
+        if step == 7:
+            clock["mono"] = 2200.0
+            return 0
+        raise StopPhoenix()
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(gm_module, "get_cash", _cash, raising=False)
+    _patch_gm_live_launch(monkeypatch, gm_module, fake_context, _poll, DummyAlarm)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert captured.out.count("deferring IM alarm for 300s") == 2
+    assert "trade service recovered after IM alarm" in captured.out
+    assert exceptions == [
+        ("GM Kernel Error", "Code: 9999, Msg: other kernel error"),
+        ("GM Kernel Error", "Code: 1101, Msg: 交易消息服务断开 latest"),
+        ("GM Kernel Error", "Code: 1101, Msg: 交易消息服务断开 again"),
+    ]
+    assert cash_calls == [1300.0, 1600.0, 1900.0, 2200.0]
+
+
+def test_gm_trade_disconnect_alarm_cancelled_when_service_recovers(monkeypatch, capsys):
+    """5 分钟内恢复则取消本次 IM；再次断开必须重新计时。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    clock = {"mono": 1000.0}
+    cash_ok = {"value": True}
+    cash_calls = []
+    exceptions = []
+    poll_count = {"value": 0}
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_status(self, status, detail=""):
+            return None
+
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            return []
+
+        def push_exception(self, module, message, *args, **kwargs):
+            exceptions.append((module, message))
+
+    def _cash():
+        cash_calls.append(clock["mono"])
+        if cash_ok["value"]:
+            return SimpleNamespace(nav=1)
+        raise RuntimeError("trade service down")
+
+    def _poll():
+        poll_count["value"] += 1
+        step = poll_count["value"]
+        if step == 1:
+            fake_context.on_error_fun(fake_context, "abc", "交易消息服务断开")
+            return 0
+        if step == 2:
+            clock["mono"] = 1300.0
+            return 0
+        if step == 3:
+            fake_context.on_error_fun(fake_context, 1101, "交易消息服务断开")
+            return 0
+        if step == 4:
+            clock["mono"] = 1599.0
+            return 0
+        if step == 5:
+            cash_ok["value"] = False
+            clock["mono"] = 1600.0
+            return 0
+        raise StopPhoenix()
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["mono"])
+    monkeypatch.setattr(gm_module, "get_cash", _cash, raising=False)
+    _patch_gm_live_launch(monkeypatch, gm_module, fake_context, _poll, DummyAlarm)
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    captured = capsys.readouterr()
+    assert "trade service recovered before IM alarm" in captured.out
+    assert captured.out.count("deferring IM alarm for 300s") == 2
+    assert exceptions == [
+        ("GM Kernel Error", "Code: 1101, Msg: 交易消息服务断开"),
+    ]
+    assert cash_calls == [1300.0, 1600.0]
+
+
+def test_gm_backtest_trade_disconnect_pushes_immediately(monkeypatch, capsys):
+    """回测不套用 5 分钟缓冲，同类断开仍立即推送。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    exceptions = []
+
+    class DummyAlarm:
+        def push_status(self, status, detail=""):
+            return None
+
+        def push_exception(self, module, message, *args, **kwargs):
+            exceptions.append((module, message))
+
+    def _run():
+        fake_context.on_error_fun(fake_context, 1101, "交易消息服务断开")
+        return 0
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_backtest_config", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_run", _run, raising=False)
+    monkeypatch.setattr(gm_module, "check_gm_status", lambda status: None, raising=False)
+    monkeypatch.setattr(gm_module, "AlarmManager", DummyAlarm, raising=False)
+
+    GmBrokerAdapter.launch(
+        {"token": "token", "strategy_id": "strategy-id"},
+        strategy_path="sample_strategy",
+        params={},
+        start_date="20260101",
+        end_date="20260105",
+    )
+
+    captured = capsys.readouterr()
+    assert exceptions == [
+        ("GM Kernel Error", "Code: 1101, Msg: 交易消息服务断开"),
+    ]
+    assert "deferring IM alarm" not in captured.out
