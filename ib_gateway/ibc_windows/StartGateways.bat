@@ -1,21 +1,15 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-rem Enumerate config-*.ini under Documents\IBC and start one Gateway per file.
+rem 递归遍历 Documents\IBC 下的 config-*.ini，并为每个实例启动一个 IBC Gateway。
 if /I "%~1"=="/?" goto :usage
 if /I "%~1"=="/HELP" goto :usage
 if /I "%~1"=="--instance" goto :run_instance
 if /I "%~1"=="/DRYRUN" set "IBC_DRY_RUN=1"
 
-rem Prefer IBC_PATH, else the script directory, else one sibling IBCWin-* directory.
-rem Empty shortcut Start-in leaves the caller cwd on the desktop. Enter the script directory first.
+rem 优先使用 IBC_PATH；否则使用脚本目录，或自动识别同级唯一的 IBCWin-* 目录。
 set "IBC_SCRIPT_DIR=%~dp0"
 if "%IBC_SCRIPT_DIR:~-1%"=="\" set "IBC_SCRIPT_DIR=%IBC_SCRIPT_DIR:~0,-1%"
-cd /d "%IBC_SCRIPT_DIR%"
-if errorlevel 1 (
-  echo Cannot enter script directory: %IBC_SCRIPT_DIR%
-  exit /b 1005
-)
 if not defined IBC_PATH if exist "%IBC_SCRIPT_DIR%\scripts\DisplayBannerAndLaunch.bat" set "IBC_PATH=%IBC_SCRIPT_DIR%"
 if not defined IBC_PATH (
   for %%D in ("%IBC_SCRIPT_DIR%\..") do set "IBC_SCRIPT_PARENT=%%~fD"
@@ -31,21 +25,11 @@ if not defined IBC_PATH (
   )
 )
 if not exist "%IBC_PATH%\scripts\DisplayBannerAndLaunch.bat" (
-  if defined IBC_SCRIPT_PARENT if exist "!IBC_SCRIPT_PARENT!\IBCWin-*.zip" (
-    echo Found IBCWin-*.zip but no extracted installation. Extract the zip once. A shortcut into the zip creates a new folder on every launch.
-  )
   echo IBC installation was not found. Put this script in the IBC root, keep one sibling IBCWin-* directory, or set IBC_PATH explicitly.
   exit /b 1005
 )
-rem Canonicalize IBC_PATH so a later start without /D cannot inherit the desktop.
-cd /d "%IBC_PATH%"
-if errorlevel 1 (
-  echo Cannot enter IBC installation: %IBC_PATH%
-  exit /b 1005
-)
-set "IBC_PATH=%CD%"
 
-rem Optional overrides: install root, version, config directory, and log directory.
+rem 允许按安装目录、版本号、配置目录和日志目录覆盖默认值。
 if not defined IBC_TWS_PATH if exist "C:\Jts" set "IBC_TWS_PATH=C:\Jts"
 if not defined IBC_TWS_PATH if exist "D:\Jts" set "IBC_TWS_PATH=D:\Jts"
 if not defined IBC_TWS_PATH (
@@ -137,7 +121,7 @@ for /r "%IBC_CONFIG_DIR%" %%F in (config-*.ini) do (
         echo Skipping running IBC Gateway instance !IBC_INSTANCE_KEY!: !IBC_CONFIG_FILE!
       ) else (
         echo Starting IBC Gateway instance !IBC_INSTANCE_KEY! from !IBC_CONFIG_FILE!
-        start "IBC Gateway !IBC_INSTANCE_KEY!" /D "!IBC_PATH!" "%ComSpec%" /d /c call "%~f0" --instance "!IBC_INSTANCE_KEY!" "!IBC_CONFIG_FILE!" "!IBC_INSTANCE_SETTINGS!" "!IBC_INSTANCE_LOG!" "!IBC_SELECTED_VERSION!" "%IBC_TWS_PATH%"
+        start "IBC Gateway !IBC_INSTANCE_KEY!" /D "%IBC_PATH%" "%ComSpec%" /d /c call "%~f0" --instance "!IBC_INSTANCE_KEY!" "!IBC_CONFIG_FILE!" "!IBC_INSTANCE_SETTINGS!" "!IBC_INSTANCE_LOG!" "!IBC_SELECTED_VERSION!" "%IBC_TWS_PATH%"
       )
     )
   )
@@ -154,17 +138,7 @@ if "%IBC_VALID%"=="0" (
 exit /b 0
 
 :run_instance
-if not defined IBC_PATH (
-  echo IBC_PATH is not set.
-  exit /b 1005
-)
-if "!IBC_PATH:~-1!"=="\" set "IBC_PATH=!IBC_PATH:~0,-1!"
-cd /d "!IBC_PATH!"
-if errorlevel 1 (
-  echo Cannot enter IBC installation: !IBC_PATH!
-  exit /b 1005
-)
-set "IBC_PATH=!CD!"
+rem 子进程继承 IBC_PATH，仅替换本实例的安装版本、配置、设置和日志路径。
 set "IBC_INSTANCE=%~2"
 set "CONFIG=%~3"
 set "TWS_SETTINGS_PATH=%~4"
@@ -174,77 +148,13 @@ set "IBC_TWS_MAJOR_VRSN=%~6"
 set "TWS_PATH=%~7"
 set "IBC_TWS_PATH=%~7"
 set "APP=GATEWAY"
+set "INLINE=1"
 set "TRADING_MODE="
 if not defined IBC_TWOFA_TIMEOUT_ACTION set "IBC_TWOFA_TIMEOUT_ACTION=restart"
 set "TWOFA_TIMEOUT_ACTION=%IBC_TWOFA_TIMEOUT_ACTION%"
-if defined TWS_SETTINGS_PATH if "%TWS_SETTINGS_PATH:~-1%"=="\" set "TWS_SETTINGS_PATH=%TWS_SETTINGS_PATH:~0,-1%"
-set "IBC_SETTINGS_ABS="
-if "%TWS_SETTINGS_PATH:~1,2%"==":\" set "IBC_SETTINGS_ABS=1"
-if "%TWS_SETTINGS_PATH:~0,2%"=="\\" set "IBC_SETTINGS_ABS=1"
-if not defined IBC_SETTINGS_ABS (
-  echo Settings path must be absolute: %TWS_SETTINGS_PATH%
-  exit /b 1008
-)
-if not exist "%TWS_SETTINGS_PATH%" (
-  echo Settings directory was not found: %TWS_SETTINGS_PATH%
-  exit /b 1008
-)
-cd /d "%TWS_SETTINGS_PATH%"
-if errorlevel 1 (
-  echo Cannot enter settings directory: %TWS_SETTINGS_PATH%
-  exit /b 1008
-)
-set "TWS_SETTINGS_PATH=%CD%"
-if not exist "%IBC_PATH%\scripts\StartIBC.bat" (
-  echo StartIBC.bat was not found: %IBC_PATH%\scripts\StartIBC.bat
-  exit /b 1005
-)
-set "IBC_VRSN="
-if exist "%IBC_PATH%\version" for /f "usebackq delims=" %%i in ("%IBC_PATH%\version") do if not defined IBC_VRSN set "IBC_VRSN=%%i"
-if not defined IBC_VRSN set "IBC_VRSN=unknown"
-set "LOG_FILE=NUL"
-if not defined LOG_PATH goto :log_ready
-if /I "%LOG_PATH%"=="CON" (
-  set "LOG_FILE=CON"
-  goto :log_ready
-)
-set "IBC_LOG_ABS="
-if "%LOG_PATH:~1,2%"==":\" set "IBC_LOG_ABS=1"
-if "%LOG_PATH:~0,2%"=="\\" set "IBC_LOG_ABS=1"
-if not defined IBC_LOG_ABS (
-  echo LOG_PATH must be an absolute directory: %LOG_PATH%
-  exit /b 1
-)
-if not exist "%LOG_PATH%" mkdir "%LOG_PATH%"
-if not exist "%LOG_PATH%" (
-  echo Cannot create log directory: %LOG_PATH%
-  exit /b 1
-)
-set "DAYOFWEEK=UNKNOWN"
-for /f "delims=" %%a in ('powershell -NoLogo -NoProfile -Command "(Get-Date).DayOfWeek.ToString().ToUpper()"') do set "DAYOFWEEK=%%a"
-set "LOG_FILE=%LOG_PATH%\IBC-%IBC_VRSN%_%APP%-%TWS_MAJOR_VRSN%_%DAYOFWEEK%.txt"
-if exist "%LOG_FILE%" powershell -NoLogo -NoProfile -Command "if ((Get-Item -LiteralPath $env:LOG_FILE).LastWriteTime.Date -lt (Get-Date).Date) { Remove-Item -LiteralPath $env:LOG_FILE -Force }"
-:log_ready
-set "IBC_STAMP="
-for /f "delims=" %%t in ('powershell -NoLogo -NoProfile -Command "Get-Date -Format yyyyMMdd-HHmmss"') do set "IBC_STAMP=%%t"
-echo +==============================================================================
-echo +
-echo + IBC version %IBC_VRSN%
-echo +
-echo + Running %APP% %TWS_MAJOR_VRSN% at %IBC_STAMP%
-echo +
-if /I not "%LOG_FILE%"=="NUL" if /I not "%LOG_FILE%"=="CON" (
-  echo + Diagnostic information is logged in:
-  echo +
-  echo + %LOG_FILE%
-  echo +
-  >>"%LOG_FILE%" echo Diagnostic log: %LOG_FILE%
-)
-echo +
-echo + ** Caution: closing this window will close %APP% %TWS_MAJOR_VRSN% **
-echo +
-call "%IBC_PATH%\scripts\StartIBC.bat" "%TWS_MAJOR_VRSN%" /G "/TwsPath:%TWS_PATH%" "/TwsSettingsPath:%TWS_SETTINGS_PATH%" "/IbcPath:%IBC_PATH%" "/Config:%CONFIG%" "/User:%TWSUSERID%" "/PW:%TWSPASSWORD%" "/FIXUser:%FIXUSERID%" "/FIXPW:%FIXPASSWORD%" "/JavaPath:%JAVA_PATH%" "/Mode:%TRADING_MODE%" "/On2FATimeout:%TWOFA_TIMEOUT_ACTION%" >> "%LOG_FILE%" 2>&1
+call "%IBC_PATH%\scripts\DisplayBannerAndLaunch.bat" /INLINE
 exit /b %ERRORLEVEL%
+
 :usage
 echo Usage: StartGateways.bat [/DRYRUN]
 echo.
@@ -260,6 +170,4 @@ echo   IBC_CONFIG_DIR    config directory (default: %%USERPROFILE%%\Documents\IB
 echo   IBC_SETTINGS_ROOT per-instance settings root
 echo   IBC_LOG_ROOT      per-instance log root
 echo   IBC_TWOFA_TIMEOUT_ACTION restart or exit after 2FA completion timeout (default: restart)
-echo Shortcut Start-in may be empty. This script does not use the caller working directory.
-echo Vendor DisplayBannerAndLaunch.bat is not used. Its DATE parsing can create desktop folders.
 exit /b 0

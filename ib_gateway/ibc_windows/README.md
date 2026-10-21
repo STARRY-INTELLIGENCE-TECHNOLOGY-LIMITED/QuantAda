@@ -16,7 +16,7 @@
 以下两种目录结构均可：
 
 ```text
-方案一：把 StartGateway.bat、StartGateways.bat 和 CreateDesktopShortcut.bat 放入 IBCWin-3.24.2 根目录
+方案一：把 StartGateways.bat 放入 IBCWin-3.24.2 根目录
 
 方案二：保持两个同级目录
 Desktop\IBCWin-3.24.2
@@ -34,17 +34,6 @@ StartGateways.bat
 脚本会递归遍历 `%USERPROFILE%\Documents\IBC\config-*.ini`，为每个文件创建独立设置/日志目录并并行启动 IBC Gateway。直接放在配置根目录的文件使用 `IBC_TWS_MAJOR_VRSN` 或自动探测到的数值最高有效版本；位于数字目录下的文件优先使用该目录版本，因此新旧版本可以共存。版本探测同时兼容 `Jts\ibgateway\<版本>\jars` 和旧式 `Jts\<版本>\jars` 布局。交易模式由每个 INI 的 `TradingMode` 决定，批处理不会强制改成 live。IBC 安装根目录、Gateway 安装根目录、默认版本和配置目录分别可用 `IBC_PATH`、`IBC_TWS_PATH`、`IBC_TWS_MAJOR_VRSN`、`IBC_CONFIG_DIR` 覆盖。
 
 先用 `StartGateways.bat /DRYRUN` 检查发现的配置和路径。正常启动时脚本会根据 Java 命令行中的配置文件路径跳过已运行实例，并拒绝本次扫描中重复的实例键；任务计划程序仍应选择“如果任务已在运行则不启动新实例”。
-
-
-## 桌面快捷方式
-
-快捷方式的“起始位置”可以留空。Windows 这时会把工作目录设成快捷方式所在目录，通常就是桌面。启动脚本会先进入脚本目录和绝对的 `IBC_PATH`，再进入已经创建的实例设置目录，因此不会把桌面当成 Gateway 的工作目录。
-
-官方 `scripts\DisplayBannerAndLaunch.bat` 不再被调用。它用 `%DATE%` 判断诊断日志是否过期，而中文 Windows 的日期包含 `/`。这段替换写在括号块里，cmd 会在解析时展开日期；`/` 会被当成路径分隔符。官方 `StartIBC.bat` 在 `pushd` 失败后还会把设置目录改成当前目录。起始位置为空时，这个当前目录就是桌面，所以每次启动都可能留下一个新文件夹。现在日志目录必须是绝对路径，诊断日志由启动器自己生成，再直接调用 `scripts\StartIBC.bat`。
-
-把上面三个 bat 一起复制到 IBC 根目录，或按方案二放在 `IBCWin-*` 的同级目录，然后运行一次 `CreateDesktopShortcut.bat`。它会在桌面生成 `StartGateway.lnk`，目标是已解压的启动脚本，起始位置是脚本目录。
-
-不要让快捷方式指向 zip 里面的 bat。Windows 会把 zip 当成目录，每次打开都可能再解压出一个新的 `IBCWin-*` 文件夹。桌面上每次启动新增的那些副本可以删除；保留真正解压出来的那一份安装目录。确认新快捷方式可用后，删除旧快捷方式。批处理注释只使用 ASCII，避免中文 Windows 的 cmd 把 UTF-8 注释拆成命令。
 
 ## 持久在线与二次认证
 
