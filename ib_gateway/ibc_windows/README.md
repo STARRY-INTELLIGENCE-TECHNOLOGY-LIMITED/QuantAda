@@ -16,27 +16,35 @@
 以下两种目录结构均可：
 
 ```text
-方案一：把 StartGateways.bat 放入 IBCWin-3.24.2 根目录
+方案一：把 StartGateway.bat 放入 IBCWin-3.24.2 根目录
 
 方案二：保持两个同级目录
 Desktop\IBCWin-3.24.2
-Desktop\ibc_windows\StartGateways.bat
+Desktop\ibc_windows\StartGateway.bat
 ```
 
-方案二中，脚本会自动寻找同级唯一且包含 `scripts\DisplayBannerAndLaunch.bat` 的 `IBCWin-*` 目录。如果同级存在多个 IBC 版本，必须显式设置 `IBC_PATH`，避免自动选错 IBC 主程序。
+方案二中，脚本会优先使用同级的 `IBCWin-3.24.2`。如果同级存在多个 IBC 版本，必须显式设置 `IBC_PATH`，避免自动选错 IBC 主程序。桌面上名为 `IBCWin-3.20yymmdd.24.2` 的目录是日期路径残留，可以删除。
 
 然后运行：
 
 ```bat
-StartGateways.bat
+StartGateway.bat
 ```
 
 脚本会递归遍历 `%USERPROFILE%\Documents\IBC\config-*.ini`，为每个文件创建独立设置/日志目录并并行启动 IBC Gateway。直接放在配置根目录的文件使用 `IBC_TWS_MAJOR_VRSN` 或自动探测到的数值最高有效版本；位于数字目录下的文件优先使用该目录版本，因此新旧版本可以共存。版本探测同时兼容 `Jts\ibgateway\<版本>\jars` 和旧式 `Jts\<版本>\jars` 布局。交易模式由每个 INI 的 `TradingMode` 决定，批处理不会强制改成 live。IBC 安装根目录、Gateway 安装根目录、默认版本和配置目录分别可用 `IBC_PATH`、`IBC_TWS_PATH`、`IBC_TWS_MAJOR_VRSN`、`IBC_CONFIG_DIR` 覆盖。
 
-先用 `StartGateways.bat /DRYRUN` 检查发现的配置和路径。正常启动时脚本会根据 Java 命令行中的配置文件路径跳过已运行实例，并拒绝本次扫描中重复的实例键；任务计划程序仍应选择“如果任务已在运行则不启动新实例”。
+先用 `StartGateway.bat /DRYRUN` 检查发现的配置和路径。正常启动时脚本会根据 Java 命令行中的配置文件路径跳过已运行实例，并拒绝本次扫描中重复的实例键；任务计划程序仍应选择“如果任务已在运行则不启动新实例”。桌面快捷方式 `StartGateway.lnk` 指向这份脚本。
+
+官方 `scripts\DisplayBannerAndLaunch.bat` 不再被调用。它用 `%DATE%` 判断诊断日志是否过期，中文 Windows 的日期包含 `/`，每次启动或自动重启都可能在桌面留下新的 `IBCWin-*` 文件夹。现在改为直接调用 `scripts\StartIBC.bat`。
 
 ## 持久在线与二次认证
 
-样例的 `AutoRestartTime=08:30 AM` 会让 Gateway 每日自动重启并复用本周会话凭据，正常情况下不会每天重复验证。IBKR 在每周会话过期后仍可能要求一次完整 passkey，这是券商策略，IBC 无法绕过。`ReloginAfterSecondFactorAuthenticationTimeout=yes` 配合脚本的 restart 行为处理超时。
+IBKR 要求 Gateway 每天重启一次，这无法关闭。`AutoRestartTime=08:30 AM` 走的是自动重启而不是注销：复用本周会话，不需要每天 passkey，和 1045 时一周一认证相同。不要设置 `AutoLogoffTime`。多实例把重启时间错开一两分钟。
 
-断开 RDP 时不要注销 Windows 用户；锁屏或断开会话不会停止 Gateway，但 passkey 弹窗需要在该用户桌面中确认。
+登录界面依赖 1050 自带 JRE 里的 JavaFX。在 RDP 里双击 `StartGateway`，用 RDP 2FA 透传完成认证。两个黑窗都登录成功后关掉远程窗口即可，不要点注销，也不要点 `no_lock`。
+
+`StartGateway.bat` 每次启动会写入终端服务策略（需管理员）：断开 RDP 只断开不注销、断开会话不限时结束、同一用户再连回原会话。换机器时带上这份脚本再启动一次即可。
+
+1050 自动重启有时会留下僵死 Java（进程在、API 不听）。`WatchGateway.ps1` 在后台运行、不另开窗口，只在这种无密码静默重启卡住时结束 Java，让 IBC 用已有会话令牌再拉起。脚本不会在没有 `autorestart` 令牌时自行冷启动。
+
+`ExistingSessionDetectedAction=primary` 避免重连时自己把会话让掉。IBKR 每周会话过期后仍要一次完整 passkey，这是券商策略，IBC 无法绕过。
