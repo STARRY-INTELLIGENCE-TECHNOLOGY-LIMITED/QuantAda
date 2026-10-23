@@ -44,7 +44,7 @@ def test_ibc_sample_is_generic_and_contains_no_credentials():
 
 
 def test_windows_launcher_supports_new_and_old_jts_layouts():
-    path = WINDOWS_ROOT / "StartGateways.bat"
+    path = WINDOWS_ROOT / "StartGateway.bat"
     raw = path.read_bytes()
     text = raw.decode("utf-8")
 
@@ -63,7 +63,7 @@ def test_windows_launcher_supports_new_and_old_jts_layouts():
     assert 'cd /d "!IBC_PATH!"' in text
     assert 'cd /d "%TWS_SETTINGS_PATH%"' in text
     assert '/D "!IBC_PATH!"' in text
-    assert "IBCWin-*.zip" in text
+    assert "IBCWin-3.24.2" in text
     assert "does not use the caller working directory" in text
     assert 'call "%IBC_PATH%\\scripts\\StartIBC.bat"' in text
     assert 'call "%IBC_PATH%\\scripts\\DisplayBannerAndLaunch.bat"' not in text
@@ -71,20 +71,9 @@ def test_windows_launcher_supports_new_and_old_jts_layouts():
     assert all(byte < 128 for byte in raw)
     assert "7496" not in text
     assert "4001" not in text
-
-    wrapper = (WINDOWS_ROOT / "StartGateway.bat").read_bytes()
-    creator = (WINDOWS_ROOT / "CreateDesktopShortcut.bat").read_bytes()
-    assert all(byte < 128 for byte in wrapper)
-    assert all(byte < 128 for byte in creator)
-    assert b"\r\n" in wrapper and b"\n" not in wrapper.replace(b"\r\n", b"")
-    assert b"\r\n" in creator and b"\n" not in creator.replace(b"\r\n", b"")
-    wrapper_text = wrapper.decode("utf-8")
-    creator_text = creator.decode("utf-8")
-    assert 'cd /d "%IBC_SCRIPT_DIR%"' in wrapper_text
-    assert 'call "%IBC_SCRIPT_DIR%\\StartGateways.bat"' in wrapper_text
-    assert "WorkingDirectory=$env:IBC_SCRIPT_DIR" in creator_text
-    assert "TargetPath=$env:IBC_LAUNCHER" in creator_text
-    assert "Desktop\\StartGateway.lnk" in creator_text
+    assert 'set "IBC_SCRIPT_DIR=%~dp0"' in text
+    assert 'cd /d "%IBC_SCRIPT_DIR%"' in text
+    assert "Shortcut Start-in may be empty. This script does not use the caller working directory." in text
 
 
 def test_sensitive_instance_files_are_ignored_but_samples_are_kept():
@@ -141,7 +130,7 @@ def _run_bat(bat, cwd, env, *args):
 
 def _prepare_desktop(tmp_path):
     desktop = tmp_path / "Desktop"
-    ibc = desktop / "IBCWin-3.20260922.24.2"
+    ibc = desktop / "IBCWin-3.24.2"
     scripts = ibc / "scripts"
     scripts.mkdir(parents=True)
     vendor = (
@@ -158,10 +147,10 @@ def _prepare_desktop(tmp_path):
     (scripts / "DisplayBannerAndLaunch.bat").write_bytes(vendor.encode("ascii"))
     (scripts / "StartIBC.bat").write_bytes(launcher.encode("ascii"))
     (ibc / "version").write_bytes(b"3.24.2\r\n")
+    (ibc / "IBC.jar").write_bytes(b"")
     wrap = desktop / "ibc_windows"
     wrap.mkdir()
-    for name in ("StartGateway.bat", "StartGateways.bat", "CreateDesktopShortcut.bat"):
-        (wrap / name).write_bytes((WINDOWS_ROOT / name).read_bytes())
+    (wrap / "StartGateway.bat").write_bytes((WINDOWS_ROOT / "StartGateway.bat").read_bytes())
     jts = tmp_path / "Jts"
     (jts / "ibgateway" / "1045" / "jars").mkdir(parents=True)
     config = tmp_path / "configs"
@@ -181,23 +170,19 @@ def test_windows_launcher_pins_shortcut_workdir(tmp_path):
     """桌面快捷方式起始位置为空时，启动不得在桌面留下新的 IBCWin 目录。"""
     desktop, ibc, wrap, jts, config = _prepare_desktop(tmp_path)
     marker = tmp_path / "cwd.txt"
-    allowed = {"IBCWin-3.20260922.24.2", "ibc_windows"}
+    allowed = {"IBCWin-3.24.2", "ibc_windows"}
     env = _launcher_env(jts, config, marker)
 
-    dry = _run_bat(wrap / "StartGateways.bat", desktop, env, "/DRYRUN")
+    dry = _run_bat(wrap / "StartGateway.bat", desktop, env, "/DRYRUN")
     assert dry.returncode == 0, dry.stdout.decode("utf-8", "replace") + dry.stderr.decode("utf-8", "replace")
     assert (ibc / "settings" / "live").is_dir()
     assert not (desktop / "settings").exists()
     _assert_no_extra_desktop_dirs(desktop, allowed)
 
-    wrapped = _run_bat(wrap / "StartGateway.bat", desktop, env, "/DRYRUN")
-    assert wrapped.returncode == 0, wrapped.stdout.decode("utf-8", "replace") + wrapped.stderr.decode("utf-8", "replace")
-    _assert_no_extra_desktop_dirs(desktop, allowed)
-
     settings = ibc / "settings" / "live"
     env["IBC_PATH"] = str(ibc)
     instance = _run_bat(
-        wrap / "StartGateways.bat",
+        wrap / "StartGateway.bat",
         desktop,
         env,
         "--instance",
@@ -231,7 +216,7 @@ def test_relative_diagnostic_log_path_does_not_create_desktop_folder(tmp_path):
     env = _launcher_env(jts, config, tmp_path / "cwd.txt")
     env["IBC_PATH"] = str(ibc)
     completed = _run_bat(
-        wrap / "StartGateways.bat",
+        wrap / "StartGateway.bat",
         desktop,
         env,
         "--instance",
@@ -248,41 +233,3 @@ def test_relative_diagnostic_log_path_does_not_create_desktop_folder(tmp_path):
     assert not (desktop / "relative-log").exists()
     assert not (desktop / "vendor-diag-leak").exists()
     assert not (settings / "relative-leak").exists()
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows 启动脚本只能由 cmd.exe 执行")
-def test_create_desktop_shortcut_pins_working_directory(tmp_path):
-    """重建的桌面快捷方式必须指向已解压脚本，且起始位置不是桌面。"""
-    home = tmp_path / "home"
-    desktop = home / "Desktop"
-    install = tmp_path / "ibc_windows"
-    desktop.mkdir(parents=True)
-    install.mkdir()
-    for name in ("StartGateway.bat", "StartGateways.bat", "CreateDesktopShortcut.bat"):
-        (install / name).write_bytes((WINDOWS_ROOT / name).read_bytes())
-    env = os.environ.copy()
-    env["USERPROFILE"] = str(home)
-    completed = _run_bat(install / "CreateDesktopShortcut.bat", tmp_path, env)
-    assert completed.returncode == 0, completed.stdout.decode("utf-8", "replace") + completed.stderr.decode("utf-8", "replace")
-    link = desktop / "StartGateway.lnk"
-    assert link.is_file()
-    assert not any(path.name.startswith("IBCWin-") for path in desktop.iterdir())
-
-    probe = subprocess.run(
-        [
-            "powershell",
-            "-NoLogo",
-            "-NoProfile",
-            "-Command",
-            "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:IBC_LINK); Write-Output $s.TargetPath; Write-Output $s.WorkingDirectory",
-        ],
-        env={**env, "IBC_LINK": str(link)},
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
-    assert probe.returncode == 0, probe.stderr
-    assert lines[0].lower() == str(install / "StartGateway.bat").lower()
-    assert lines[1].lower() == str(install).lower()
-    assert lines[1].lower() != str(desktop).lower()
