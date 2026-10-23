@@ -21,7 +21,8 @@ def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
 4. 返回的 `DataFrame` 必须:
 - 含 `open/high/low/close/volume` 字段。
 - 以时间索引为 `DatetimeIndex`，索引名建议为 `datetime`。
-- 升序排序，去重，失败返回 `None`。
+- 升序排序，去重；日线 `Days/1` 按交易日归一化为每个交易日一根 K 线，失败返回 `None`。
+- 回测/优化保留历史交易日的完整日线，并在窗口末日保留最新可见行；实盘保留同日最新可验证快照。相同交易日只保留一行，不同标的的日线时间键必须对齐。
 5. 必须提供 `PRIORITY`（数值越小优先级越高）。
 6. 必须容错:
 - 网络失败、空返回、字段缺失要有降级与日志。

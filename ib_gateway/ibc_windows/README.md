@@ -11,6 +11,16 @@
 4. `OverrideTwsApiPort` 默认留空；如需指定端口，在实例副本中填写实际 Gateway API 端口。
 5. 在 Gateway API 设置中把 QuantAda 主机加入 `TrustedIPs`，并按实际端口限制防火墙来源。模板将未知来源连接设为拒绝。
 
+## rdp_java
+
+换机器时带上整个 `ibc_windows` 目录。在新机器以管理员运行一次：
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File rdp_java\Setup-RdpJava.ps1
+```
+
+它会安装 Liberica 21 Full 到 `rdp_java\jre-21-fx`（含 JavaFX），并写入 RDP 断开会话保留策略。`jre-21-fx` 不提交 Git。`StartGateway.bat` 每次启动也会调用该脚本。
+
 ## 批量启动
 
 以下两种目录结构均可：
@@ -41,7 +51,9 @@ StartGateway.bat
 
 IBKR 要求 Gateway 每天重启一次，这无法关闭。`AutoRestartTime=08:30 AM` 走的是自动重启而不是注销：复用本周会话，不需要每天 passkey，和 1045 时一周一认证相同。不要设置 `AutoLogoffTime`。多实例把重启时间错开一两分钟。
 
-登录界面依赖 1050 自带 JRE 里的 JavaFX。在 RDP 里双击 `StartGateway`，用 RDP 2FA 透传完成认证。两个黑窗都登录成功后关掉远程窗口即可，不要点注销，也不要点 `no_lock`。
+RDP 与 Java 相关操作收在 `rdp_java\Setup-RdpJava.ps1`：安装 Liberica 21 Full（带 JavaFX）到 `rdp_java\jre-21-fx`，并写入断开 RDP 保会话的注册表。`StartGateway.bat` 启动时会调用它。JRE 不进 Git，换机器可先拷 `rdp_java\jre-21-fx`，或在新机器上再跑一次该脚本。
+
+在 RDP 里双击 `StartGateway`，用 RDP 2FA 透传完成认证。两个黑窗都登录成功后关掉远程窗口即可，不要点注销，也不要点 `no_lock`。
 
 `StartGateway.bat` 每次启动会写入终端服务策略（需管理员）：断开 RDP 只断开不注销、断开会话不限时结束、同一用户再连回原会话。换机器时带上这份脚本再启动一次即可。
 

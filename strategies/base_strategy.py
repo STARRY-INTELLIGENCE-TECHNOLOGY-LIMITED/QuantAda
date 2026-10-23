@@ -68,14 +68,14 @@ class BaseStrategy(ABC):
         订单状态通知
         """
         exec_dt = extract_order_execution_dt(order)
-        if order.is_completed() and order.executed.size > 0:
+        if order.is_completed() and abs(order.executed.size) > 0:
             if order.is_buy():
                 self.log(
-                    f'BUY EXECUTED, Size: {order.executed.size:.2f}, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.5f}',
+                    f'BUY EXECUTED, Size: {abs(order.executed.size):.2f}, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.5f}',
                     dt=exec_dt)
             elif order.is_sell():
                 self.log(
-                    f'SELL EXECUTED, Size: {order.executed.size:.2f}, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.5f}',
+                    f'SELL EXECUTED, Size: {abs(order.executed.size):.2f}, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.5f}',
                     dt=exec_dt)
         elif order.is_rejected():
             self.log(f'Order Canceled/Rejected/Margin')

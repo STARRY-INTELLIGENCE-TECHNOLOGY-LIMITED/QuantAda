@@ -271,6 +271,47 @@ class DataManager:
                 continue
         return closed
 
+    @staticmethod
+    def _normalize_daily_sessions(frame, timeframe='Days', compression=1):
+        """日线只保留每个交易日一根 K 线，并把时间戳对齐到交易日键。"""
+        normalized_timeframe = str(timeframe or '').strip().lower()
+        try:
+            normalized_compression = int(compression or 1)
+        except (TypeError, ValueError, OverflowError):
+            normalized_compression = 1
+        if normalized_timeframe not in {'', 'days', 'day', 'd'} or normalized_compression != 1:
+            return frame
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return frame
+
+        result = frame.copy()
+        try:
+            index = pd.to_datetime(result.index, errors='coerce', format='mixed')
+        except (TypeError, ValueError):
+            index = pd.to_datetime(result.index, errors='coerce')
+        valid = ~pd.isna(index)
+        if not bool(valid.all()):
+            result = result.loc[valid].copy()
+            index = index[valid]
+        if result.empty:
+            return result
+
+        session_keys = pd.DatetimeIndex(index).normalize()
+        keep_mask = ~session_keys.duplicated(keep='first')
+        # 中间日期保留完整历史日线；窗口末日用最新快照反映最后可见状态。
+        final_session = session_keys.max()
+        final_positions = [
+            position for position, session in enumerate(session_keys)
+            if session == final_session
+        ]
+        if len(final_positions) > 1:
+            keep_mask[final_positions] = False
+            keep_mask[final_positions[-1]] = True
+        result = result.loc[keep_mask].copy()
+        result.index = session_keys[keep_mask]
+        result.index.name = getattr(frame.index, 'name', None) or 'datetime'
+        return result.sort_index()
+
     def auto_discover_and_sort_providers(self, provider_dir=None):
         """
         自动扫描、加载并根据PRIORITY属性排序所有数据提供者。
@@ -382,6 +423,12 @@ class DataManager:
 
         # 【最终切片】确保返回的数据在请求的日期范围内
         if final_df is not None and not final_df.empty:
+            final_df = self._normalize_daily_sessions(
+                final_df,
+                timeframe=timeframe,
+                compression=compression,
+            )
+
             # 辅助函数：将输入的日期字符串对齐到 df 索引的时区，防止比较报错
             def align_date(dt_input, index):
                 dt = pd.to_datetime(dt_input)
@@ -692,6 +739,11 @@ class DataManager:
                     if df is None or df.empty:
                         print(f"{provider_name} returned no finite OHLCV rows for {symbol}.")
                         continue
+                    df = self._normalize_daily_sessions(
+                        df,
+                        timeframe=timeframe,
+                        compression=compression,
+                    )
 
                     if (
                         not isinstance(provider, CsvDataProvider)
@@ -722,11 +774,22 @@ class DataManager:
                 return
             incoming.index = pd.to_datetime(incoming.index, errors='coerce', utc=True).tz_localize(None)
             incoming = incoming[~incoming.index.isna()]
+            incoming = self._normalize_daily_sessions(
+                incoming,
+                timeframe=timeframe,
+                compression=compression,
+            )
             if os.path.isfile(csv_filepath):
                 try:
                     existing = pd.read_csv(csv_filepath, index_col='datetime', parse_dates=True)
                     existing.index = pd.to_datetime(existing.index, errors='coerce', utc=True).tz_localize(None)
                     existing = sanitize_market_dataframe(existing)
+                    if existing is not None and not existing.empty:
+                        existing = self._normalize_daily_sessions(
+                            existing,
+                            timeframe=timeframe,
+                            compression=compression,
+                        )
                     merged = (
                         pd.concat([existing, incoming], axis=0, sort=False)
                         if existing is not None and not existing.empty
@@ -743,6 +806,11 @@ class DataManager:
             merged.index = pd.to_datetime(merged.index, errors='coerce', utc=True).tz_localize(None)
             merged = merged[~merged.index.isna()]
             merged = merged[~merged.index.duplicated(keep='last')].sort_index()
+            merged = self._normalize_daily_sessions(
+                merged,
+                timeframe=timeframe,
+                compression=compression,
+            )
             merged.index.name = 'datetime'
             if ENRICHMENT_INCOMPLETE_COLUMN in merged.columns:
                 incoming_incomplete = False

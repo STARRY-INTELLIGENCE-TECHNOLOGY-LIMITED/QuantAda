@@ -1188,6 +1188,74 @@ class SignalLoggingBroker(bt.brokers.BackBroker):
             from backtest.option_settlement import settle_physical_options
             settle_physical_options(self)
 
+    def _try_exec_market(self, order, popen, phigh, plow):
+        """次日开盘按实际可用现金当场缩减超额买单，避免整笔保证金拒单。"""
+        if (
+            getattr(self, "execution_price", "close") != "next_open"
+            or not order.isbuy()
+            or self.p.coc and order.info.get("coc", True)
+        ):
+            return super()._try_exec_market(order, popen, phigh, plow)
+        if not self.p.coo and order.data.datetime[0] <= order.created.dt:
+            return
+
+        execution_price = self._slip_up(phigh, popen, doslip=self.p.slip_open)
+        if execution_price is None:
+            return super()._try_exec_market(order, popen, phigh, plow)
+        position = self.positions[order.data]
+        if position.size < 0:
+            return super()._try_exec_market(order, popen, phigh, plow)
+
+        comminfo = self.getcommissioninfo(order.data)
+        try:
+            leverage = float(comminfo.get_leverage())
+        except (TypeError, ValueError, OverflowError):
+            leverage = 1.0
+        if not math.isfinite(leverage) or leverage <= 0:
+            leverage = 1.0
+        available_cash = max(0.0, float(self.cash))
+        requested_size = abs(float(order.executed.remsize or 0.0))
+
+        def required_cash(size):
+            operation_cost = float(comminfo.getoperationcost(size, execution_price)) / leverage
+            commission = float(comminfo.getcommission(size, execution_price))
+            return operation_cost + commission
+
+        try:
+            unit_cash = required_cash(1.0)
+        except (TypeError, ValueError, OverflowError):
+            return super()._try_exec_market(order, popen, phigh, plow)
+        if not math.isfinite(unit_cash) or unit_cash <= 0:
+            return super()._try_exec_market(order, popen, phigh, plow)
+
+        lot_size = normalize_quantity_step(getattr(config, "LOT_SIZE", 1))
+        cash_tolerance = max(1e-8, available_cash * 1e-12)
+        cash_budget = max(0.0, available_cash - cash_tolerance)
+        affordable_size = align_quantity_down(
+            min(requested_size, cash_budget / unit_cash),
+            lot_size,
+        )
+        while affordable_size > 0:
+            try:
+                cash_required = required_cash(affordable_size)
+            except (TypeError, ValueError, OverflowError):
+                return super()._try_exec_market(order, popen, phigh, plow)
+            if cash_required <= available_cash:
+                break
+            affordable_size = align_quantity_down(
+                float(affordable_size) - float(lot_size),
+                lot_size,
+            )
+
+        if affordable_size <= 0:
+            return super()._try_exec_market(order, popen, phigh, plow)
+        if affordable_size < requested_size:
+            order.size = affordable_size
+            order.created.size = affordable_size
+            order.executed.remsize = affordable_size
+
+        self._execute(order, ago=0, price=execution_price, dtcoc=None)
+
     def buy(self, owner, data, size, price=None, **kwargs):
         # 训练/优化场景下 owner.verbose=False，直接静音避免刷屏。
         if size > 0 and getattr(owner, 'verbose', True):
@@ -1441,6 +1509,7 @@ class Backtester:
                 raise ValueError("Physical option settlement requires daily bars with compression=1")
             self.cerebro.broker.physical_option_settlement = True
             self.cerebro.broker.option_settlement_events = []
+        self.cerebro.broker.execution_price = self.execution_price
         self.cerebro.broker.setcash(self.cash)
         self.cerebro.broker.setcommission(commission=self.commission)
 

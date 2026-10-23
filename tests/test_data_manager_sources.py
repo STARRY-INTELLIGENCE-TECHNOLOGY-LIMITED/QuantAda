@@ -90,6 +90,172 @@ def test_cache_data_merges_segments_without_duplicate_timestamps(tmp_path, monke
     assert float(cached.loc['2024-01-01', 'close']) == 3.5
 
 
+def test_daily_sessions_keep_one_row_per_day_and_align_timestamps():
+    frame = pd.DataFrame(
+        {
+            'open': [100.0, 101.0, 102.0, 103.0],
+            'high': [100.0, 101.0, 102.0, 103.0],
+            'low': [100.0, 101.0, 102.0, 103.0],
+            'close': [100.0, 101.0, 102.0, 103.0],
+            'volume': [10.0, 11.0, 12.0, 13.0],
+        },
+        index=pd.to_datetime([
+            '2024-01-02 00:00:00',
+            '2024-01-02 13:16:15',
+            '2024-01-03 00:00:00',
+            '2024-01-03 13:16:15',
+        ]),
+    )
+
+    normalized = DataManager._normalize_daily_sessions(frame)
+
+    assert list(normalized.index) == [pd.Timestamp('2024-01-02'), pd.Timestamp('2024-01-03')]
+    assert list(normalized['close']) == [100.0, 103.0]
+
+
+def test_provider_daily_result_is_normalized_before_return():
+    class FutuDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            return pd.DataFrame(
+                {
+                    'open': [100.0, 101.0], 'high': [100.0, 101.0],
+                    'low': [100.0, 101.0], 'close': [100.0, 101.0],
+                    'volume': [10.0, 11.0],
+                },
+                index=pd.to_datetime(['2024-01-02 00:00:00', '2024-01-02 13:16:15']),
+            )
+
+    manager = object.__new__(DataManager)
+    result = manager._fetch_from_providers(
+        'US.SPY', '20240102', '20240102', [FutuDataProvider()], 'Days', 1,
+    )
+
+    assert result is not None
+    assert list(result.index) == [pd.Timestamp('2024-01-02')]
+    assert float(result.iloc[0]['close']) == 101.0
+
+
+def test_live_provider_daily_result_uses_latest_terminal_snapshot():
+    class FutuDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            return pd.DataFrame(
+                {
+                    'open': [100.0, 101.0, 102.0, 103.0],
+                    'high': [100.0, 101.0, 102.0, 103.0],
+                    'low': [100.0, 101.0, 102.0, 103.0],
+                    'close': [100.0, 101.0, 102.0, 103.0],
+                    'volume': [10.0, 11.0, 12.0, 13.0],
+                },
+                index=pd.to_datetime([
+                    '2024-01-02 00:00:00', '2024-01-02 13:16:15',
+                    '2024-01-03 00:00:00', '2024-01-03 13:16:15',
+                ]),
+            )
+
+    manager = object.__new__(DataManager)
+    manager._live_mode = True
+    cached_frames = []
+    manager._cache_data = lambda frame, *args, **kwargs: cached_frames.append(frame.copy())
+    result = manager._fetch_from_providers(
+        'US.SPY', '20240102', '20240103', [FutuDataProvider()], 'Days', 1,
+    )
+
+    assert list(result.index) == [pd.Timestamp('2024-01-02'), pd.Timestamp('2024-01-03')]
+    assert list(result['close']) == [100.0, 103.0]
+    assert len(cached_frames) == 1
+    assert list(cached_frames[0].index) == list(result.index)
+
+
+def test_normalized_daily_feeds_produce_one_backtest_cycle_per_session():
+    from backtest.backtester import Backtester
+    from strategies.base_strategy import BaseStrategy
+
+    class ProbeStrategy(BaseStrategy):
+        def init(self):
+            self.seen = []
+
+        def next(self):
+            self.seen.append(self.broker.datetime.datetime(0))
+
+    manager = object.__new__(DataManager)
+    manager._live_mode = False
+    index_a = pd.to_datetime([
+        '2024-01-01 00:00:00',
+        '2024-01-02 00:00:00',
+        '2024-01-02 13:16:15',
+    ])
+    index_b = pd.to_datetime([
+        '2024-01-01 00:00:00',
+        '2024-01-02 00:00:00',
+        '2024-01-02 13:16:25',
+    ])
+
+    def frame(index):
+        return pd.DataFrame(
+            {
+                'open': [10.0, 11.0, 11.0], 'high': [10.0, 11.0, 11.0],
+                'low': [10.0, 11.0, 11.0], 'close': [10.0, 11.0, 11.0],
+                'volume': [10.0, 11.0, 11.0],
+            },
+            index=index,
+        )
+
+    datas = {
+        'US.AAA': manager._normalize_daily_sessions(frame(index_a)),
+        'US.BBB': manager._normalize_daily_sessions(frame(index_b)),
+    }
+    engine = Backtester(
+        datas,
+        ProbeStrategy,
+        start_date='20240101',
+        end_date='20240102',
+        execution_price='next_open',
+        enable_plot=False,
+        verbose=False,
+    )
+    engine.run()
+
+    assert engine.results[0].strategy.seen == [
+        pd.Timestamp('2024-01-01').to_pydatetime(),
+        pd.Timestamp('2024-01-02').to_pydatetime(),
+    ]
+
+
+def test_cache_write_normalizes_same_day_rows(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, 'CACHE_DATA', True)
+    manager = object.__new__(DataManager)
+    manager.data_path = str(tmp_path)
+    frame = pd.DataFrame(
+        {
+            'open': [100.0, 101.0], 'high': [100.0, 101.0],
+            'low': [100.0, 101.0], 'close': [100.0, 101.0],
+            'volume': [10.0, 11.0],
+        },
+        index=pd.to_datetime(['2024-01-02 00:00:00', '2024-01-02 13:16:15']),
+    )
+
+    manager._cache_data(frame, 'US.SPY', 'Days', 1)
+    cached = pd.read_csv(_market_cache_csv(tmp_path, 'US_SPY.csv'), index_col='datetime', parse_dates=True)
+
+    assert list(cached.index) == [pd.Timestamp('2024-01-02')]
+    assert float(cached.iloc[0]['close']) == 101.0
+
+    corrected = frame.iloc[[0]].copy()
+    corrected['close'] = 102.0
+    manager._cache_data(corrected, 'US.SPY', 'Days', 1)
+    cached = pd.read_csv(_market_cache_csv(tmp_path, 'US_SPY.csv'), index_col='datetime', parse_dates=True)
+    assert len(cached) == 1
+    assert float(cached.iloc[0]['close']) == 102.0
+
+
 def test_cache_data_recovers_from_corrupt_file(tmp_path, monkeypatch):
     import config
     monkeypatch.setattr(config, 'CACHE_DATA', True)

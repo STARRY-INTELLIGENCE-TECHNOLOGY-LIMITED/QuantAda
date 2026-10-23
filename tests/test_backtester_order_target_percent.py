@@ -78,6 +78,29 @@ class _BuyThenSellProbeStrategy(BaseStrategy):
             self.phase = 2
 
 
+class _NextOpenGapRebalanceProbeStrategy(BaseStrategy):
+    statuses = []
+    completed = []
+
+    def init(self):
+        self.phase = 0
+
+    def next(self):
+        source, target = self.broker.datas
+        if self.phase == 0:
+            self.broker.order_target_value(source, 1000.0)
+            self.phase = 1
+        elif self.phase == 1 and self.broker.getposition(source).size > 0:
+            self.broker.order_target_value(source, 0.0)
+            self.broker.order_target_value(target, 1000.0)
+            self.phase = 2
+
+    def notify_order(self, order):
+        self.__class__.statuses.append(order.getstatusname())
+        if order.is_completed():
+            self.__class__.completed.append((order.data._name, order.executed.size))
+
+
 class _FractionalBuyThenSellProbeStrategy(BaseStrategy):
     completed_sizes = []
 
@@ -336,6 +359,26 @@ def test_backtester_prints_trade_attribution_before_performance_metrics(monkeypa
     assert out.index("Trade Attribution by Symbol") < out.index("Backtest Performance Metrics")
 
 
+def test_backtest_logs_both_buy_and_sell_execution_sizes(monkeypatch, capsys):
+    monkeypatch.setattr(config, 'LOT_SIZE', 1)
+    monkeypatch.setattr(config, 'LOG', True)
+    engine = Backtester(
+        datas={'AAA': _make_constant_price_df(10.0, bars=4)},
+        strategy_class=_BuyThenSellProbeStrategy,
+        cash=100.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=True,
+    )
+
+    engine.run()
+
+    output = capsys.readouterr().out
+    assert 'BUY EXECUTED, Size: 10.00' in output
+    assert 'SELL EXECUTED, Size: 10.00' in output
+
+
 def test_backtester_results_report_keeps_attribution_above_performance_metrics():
     from backtest.reporting import format_backtest_results_report
 
@@ -423,6 +466,52 @@ def test_order_target_value_submits_exact_one_share_when_cash_allows(monkeypatch
 
     assert 'Margin' not in _ExactOneShareBuyProbeStrategy.statuses
     assert _ExactOneShareBuyProbeStrategy.final_size == 1
+
+
+def test_next_open_gap_rebalance_resizes_at_fill_without_margin_alert(monkeypatch):
+    monkeypatch.setattr(config, 'LOT_SIZE', 1)
+    _NextOpenGapRebalanceProbeStrategy.statuses = []
+    _NextOpenGapRebalanceProbeStrategy.completed = []
+    index = pd.date_range('2024-01-01', periods=4, freq='D')
+    source = pd.DataFrame(
+        {
+            'open': [100.0, 100.0, 89.0, 90.0],
+            'high': [100.0, 101.0, 90.0, 91.0],
+            'low': [100.0, 90.0, 88.0, 89.0],
+            'close': [100.0, 100.0, 89.0, 90.0],
+            'volume': [1000.0] * 4,
+        },
+        index=index,
+    )
+    target = pd.DataFrame(
+        {
+            'open': [10.0, 10.0, 10.3, 10.4],
+            'high': [10.0, 10.2, 10.4, 10.5],
+            'low': [10.0, 9.8, 10.2, 10.3],
+            'close': [10.0, 10.0, 10.3, 10.4],
+            'volume': [1000.0] * 4,
+        },
+        index=index,
+    )
+
+    engine = Backtester(
+        datas={'AAA': source, 'BBB': target},
+        strategy_class=_NextOpenGapRebalanceProbeStrategy,
+        cash=1000.0,
+        commission=0.001,
+        slippage=0.001,
+        execution_price='next_open',
+        enable_plot=False,
+        verbose=False,
+    )
+    engine.run()
+
+    assert 'Margin' not in _NextOpenGapRebalanceProbeStrategy.statuses
+    assert ('AAA', -9.0) in _NextOpenGapRebalanceProbeStrategy.completed
+    assert any(
+        symbol == 'BBB' and 0 < size < 100
+        for symbol, size in _NextOpenGapRebalanceProbeStrategy.completed
+    )
 
 
 def test_backtester_applies_contract_multiplier_to_option_cash_and_position_value():

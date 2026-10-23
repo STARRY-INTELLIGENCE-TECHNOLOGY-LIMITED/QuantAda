@@ -90,7 +90,14 @@ if not exist "%IBC_CONFIG_DIR%" (
 if not defined IBC_SETTINGS_ROOT set "IBC_SETTINGS_ROOT=%IBC_PATH%\settings"
 if not defined IBC_LOG_ROOT set "IBC_LOG_ROOT=%IBC_PATH%\Logs"
 
-if not defined IBC_DRY_RUN call :apply_rdp_keepalive
+set "IBC_RDP_JAVA=%IBC_SCRIPT_DIR%\rdp_java"
+if not defined IBC_DRY_RUN if exist "%IBC_RDP_JAVA%\Setup-RdpJava.ps1" (
+  echo Applying rdp_java runtime and session-keep settings
+  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%IBC_RDP_JAVA%\Setup-RdpJava.ps1"
+)
+if not defined JAVA_PATH if exist "%IBC_RDP_JAVA%\jre-21-fx\bin\java.exe" set "JAVA_PATH=%IBC_RDP_JAVA%\jre-21-fx\bin"
+if not defined JAVA_PATH if exist "C:\Jts\jre-21-fx\bin\java.exe" set "JAVA_PATH=C:\Jts\jre-21-fx\bin"
+if not defined IBC_DRY_RUN if not defined JAVA_PATH echo Warning: JavaFX JRE not found. Run rdp_java\Setup-RdpJava.ps1. Gateway 1050 bundled Java 25 crashes on RDP display change.
 
 set "IBC_FOUND=0"
 set "IBC_VALID=0"
@@ -179,6 +186,8 @@ set "TWS_PATH=%~7"
 set "IBC_TWS_PATH=%~7"
 set "APP=GATEWAY"
 set "TRADING_MODE="
+if not defined JAVA_PATH if exist "%~dp0rdp_java\jre-21-fx\bin\java.exe" set "JAVA_PATH=%~dp0rdp_java\jre-21-fx\bin"
+if not defined JAVA_PATH if exist "C:\Jts\jre-21-fx\bin\java.exe" set "JAVA_PATH=C:\Jts\jre-21-fx\bin"
 if not defined IBC_TWOFA_TIMEOUT_ACTION set "IBC_TWOFA_TIMEOUT_ACTION=restart"
 set "TWOFA_TIMEOUT_ACTION=%IBC_TWOFA_TIMEOUT_ACTION%"
 if defined TWS_SETTINGS_PATH if "%TWS_SETTINGS_PATH:~-1%"=="\" set "TWS_SETTINGS_PATH=%TWS_SETTINGS_PATH:~0,-1%"
@@ -305,25 +314,5 @@ echo Shortcut Start-in may be empty. This script does not use the caller working
 echo Vendor DisplayBannerAndLaunch.bat is not used. Its DATE parsing can create desktop folders.
 echo Daily AutoRestart reuses the weekly session. The watchdog only kills a hung silent restart.
 echo The launcher does not start a new passkey login by itself.
-echo On start it keeps disconnected RDP sessions and reconnects the same user to the existing session.
+echo rdp_java\Setup-RdpJava.ps1 installs Liberica 21 Full and keeps disconnected RDP sessions.
 exit /b 0
-:apply_rdp_keepalive
-rem Closing the RDP window must disconnect, not log off. Reconnect must resume this session.
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxDisconnectionTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxIdleTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxConnectionTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fResetBroken /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fSingleSessionPerUser /t REG_DWORD /d 1 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fSingleSessionPerUser /t REG_DWORD /d 1 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v KeepAliveEnable /t REG_DWORD /d 1 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v KeepAliveInterval /t REG_DWORD /d 1 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fResetBroken /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fInheritResetBroken /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v MaxDisconnectionTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v MaxIdleTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v MaxConnectionTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fInheritMaxDisconnectionTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fInheritMaxIdleTime /t REG_DWORD /d 0 /f >NUL 2>&1
-reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fInheritMaxSessionTime /t REG_DWORD /d 0 /f >NUL 2>&1
-if errorlevel 1 echo Warning: could not apply RDP session-keep settings. Run StartGateway as Administrator.
-goto :eof

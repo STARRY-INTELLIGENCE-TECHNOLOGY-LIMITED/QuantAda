@@ -38,7 +38,8 @@
 4. 返回 DataFrame 要求:
 - 包含 `open/high/low/close/volume`
 - 时间索引为 `DatetimeIndex`
-- 升序、去重
+- 升序、去重；日线 `Days/1` 按交易日归一化为每个交易日一根 K 线
+- 回测/优化保留历史交易日的完整日线，并在窗口末日保留最新可见行；实盘保留同日最新可验证快照。相同交易日只保留一行，不同标的的日线时间键必须对齐
 - 失败时返回 `None`
 5. DataManager 支持单个或多个 `data_source` 名称，多个 provider 可按逗号或空格分隔
 6. 日内 provider 必须同时按能力支持 `timeframe='Minutes'|'Seconds'` 与 `compression`；日期参数在日内模式应保留到秒，增量窗口不得擅自扩成整年高频明细。
