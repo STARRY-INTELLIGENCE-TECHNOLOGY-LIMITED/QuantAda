@@ -268,7 +268,7 @@ def test_futu_history_can_use_raw_prices_for_hybrid_option_research():
 
     assert result is not None
     assert result['futu_price_adjustment_type'].eq('NONE').all()
-    assert context.history_calls[0][1]['autype'] == getattr(futu_module.AuType, 'NONE', 'none')
+    assert context.history_calls[0][1]['autype'] == getattr(futu_module.AuType, 'NONE', 'None')
 
 
 def test_futu_intraday_request_preserves_seconds_and_uses_native_period():
