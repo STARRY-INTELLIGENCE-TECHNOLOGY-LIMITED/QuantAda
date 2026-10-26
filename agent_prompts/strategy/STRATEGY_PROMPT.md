@@ -41,6 +41,7 @@
    - 单个期权当前报价使用 `common.data_view.visible_row(..., require_current_quote=True, cache_owner=self.broker)`；已持仓和保护腿优先使用 `iter_held_options`、`held_protective_put` 等公共视图。历史指标、估值带和底层趋势仍直接读取完整 `data.p.dataname`，不能把当前候选索引当成历史数据。
    - 查找正股 feed 使用 `underlying_feed(broker, key)`。同一 datas 容器会复用底层索引，不要在每个 bar 对全部合约重复解析代码来判断谁是正股。
    - PCS 若声明 `protective_put_delta`，历史链展开必须同时保留 Short Put 中心 Delta 和保护腿 Delta 的候选；不得只依赖短腿中心附近的少量合约。
+   - 若策略使用基本面 V/W，优先通过 `common.options.valuation` 读取通用点时估值快照，不依赖某个 App 或券商。快照至少含 `ticker/asof/v/confidence/method/source_id`，`w` 可由显式 `w_multiple` 派生；`asof` 表示估值首次可用日期。决策日只能读取 `asof < decision_date` 的最新记录。同日更新、未来修订、重复快照或无效 V/W 必须失败关闭。缺少 V/W 时，只有策略明确允许才可用滚动代理，并在交易信号中标明代理来源；代理不等同于基本面估值。
 
 
 ---

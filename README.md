@@ -48,7 +48,7 @@ DB_URL = "sqlite:///quantada_logs.db"
 | 配置文件 | 主要配置项 | 用途 |
 | --- | --- | --- |
 | `config.py` | `LOT_SIZE`、`DATA_PATH`、`LOG`、`PRINT_PLAN`、`KEEP_OVERNIGHT_ORDERS` | 框架、回测和通用执行 |
-| `configs/providers.py` | `TUSHARE_TOKEN`、`SXSC_TUSHARE_TOKEN`、`TIINGO_TOKEN`、`THETADATA_TOKEN`、`DATA_PROVIDER_COMPOSITIONS` | 历史行情 Provider 与可配置组合 |
+| `configs/providers.py` | `TUSHARE_TOKEN`、`SXSC_TUSHARE_TOKEN`、`TIINGO_TOKEN`、`THETADATA_TOKEN`、`SEC_USER_AGENT`、`OCC_ACTIONS_URL/PATH`、`EARNINGS_ARCHIVE_PATH`、`DATA_PROVIDER_COMPOSITIONS`、`DATA_PROVIDER_ALIASES` | 历史行情、估值、调整合约、点时财报与可配置组合 |
 | `configs/futu.py` | `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH`、账户/交易键、`FUTU_BROKER_ENVIRONMENTS` | 富途 OpenD 行情与官方交易连接；RSA 路径为空时使用明文协议；常规配置通过 `FUTU_TRADE_PASSWORD_ENV` 或 `FUTU_TRADE_PASSWORD_MD5_ENV` 引用外部环境变量，私有工作台方案可单独保存本机解锁凭据 |
 | `configs/alarms.py` | `ALARMS_ENABLED`、`DINGTALK_WEBHOOK`、`DINGTALK_SECRET`、`WECOM_WEBHOOK`、`ALARM_LEVEL` | 报警通道 |
 | `configs/gm.py` | `GM_TOKEN`、`GM_BROKER_ENVIRONMENTS` | GM Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['gm_broker']`） |
@@ -81,12 +81,15 @@ Futu 配置页可编辑账户 ID、账户索引和账户现金币种，期权/�
 
 默认仅监听 `127.0.0.1`；也可使用 `--ui_ip 0.0.0.0`（或其它明确地址）显式暴露到网络。工作台面向内部使用，当前会话中的 Token、Webhook、账户配置及 Futu 解锁凭据均按原样展示，请勿将监听地址暴露到不受信任网络。
 
-Futu 期权 Credit Spread 使用券商原子组合接口；若当前 OpenD 仿真环境返回“不支持组合期权”，框架会安全拒绝，不会拆分成裸腿。需要同时使用历史 IV/IVP 与实时盘口时，可将 `--data_source` 设置为 `theta+futu` 并选择命令工作台的 `theta_futu_global` 配置档案：通用 `OverlayDataProvider` 负责组合流程，Theta/Futu 适配规则由 `HybridDataProvider` 注入；历史字段来自 ThetaData，实盘当前行由 Futu 快照合并，回测路径不会访问 Futu。声明了 `option_universe` 的期权策略可用正股/ETF 池自动展开历史或当前期权链，不必把到期合约写死在 `--symbols`。私有命令工作台也支持将 Futu 解锁口令保存到 Git 忽略的本机方案文件；内网工作台会按原样显示当前命令与凭据。完整提前指派同步仍需券商提供明确清算事件字段。
+Futu 期权 Credit Spread 使用券商原子组合接口；若当前 OpenD 仿真环境返回“不支持组合期权”，框架会安全拒绝，不会拆分成裸腿。需要同时使用历史 IV/IVP 与实时盘口时，可将 `--data_source` 设置为 `theta+futu` 并选择命令工作台的 `theta_futu_global` 配置档案：通用 `OverlayDataProvider` 负责组合流程，Theta/Futu 适配规则由 `HybridDataProvider` 注入；期权历史来自 ThetaData，正股历史用 Futu 未复权价格与期权行权价对齐，实盘当前行由 Futu 快照合并，回测路径不会访问 Futu。声明了 `option_universe` 的期权策略可用正股/ETF 池自动展开历史或当前期权链，不必把到期合约写死在 `--symbols`。私有命令工作台也支持将 Futu 解锁口令保存到 Git 忽略的本机方案文件；内网工作台会按原样显示当前命令与凭据。完整提前指派同步仍需券商提供明确清算事件字段。
 
-Provider 组合在 `configs/providers.py` 的 `DATA_PROVIDER_COMPOSITIONS` 中声明。每项配置指定历史 Provider、实时 Provider 和 `package.module:factory`；新增组合只需实现自己的适配器工厂并注册配置，不需修改 DataManager 或工作台。
+Futu 还可向期权 Wheel 提供带公告日的分红事件。实盘 Covered Call 使用当前完整券商事实；历史回测只有版本化 PIT 归档才使用分红前置判断，Futu 当前 corporate-actions 不会被宣称为历史 as-of。策略只使用早于决策日的公告；除息前最后一个交易日若每股分红高于 Call 时间价值，会阻止新开或买平对应短 Call。ThetaData 日线 OHLC 会另取 15:59--16:00 ET 历史 NBBO 并缓存报价量和源时间戳；无有效双边报价时不以 Last 代替，候选不开仓。该分红规则缓解提前指派风险，但不替代券商清算事件，也不构成完整美式期权回测。
+
+Provider 组合在 `configs/providers.py` 的 `DATA_PROVIDER_COMPOSITIONS` 中声明。每项配置指定历史 Provider、实时 Provider 和 `package.module:factory`；新增组合只需实现自己的适配器工厂并注册配置，不需修改 DataManager 或工作台。核心 alias `theta_futu_sec` 只加载行情和 SEC V/W；`theta_futu_research` 才追加点时财报和 Treasury 利率；`us_options_research` 只追加 CBOE。OCC 调整文件和全天 NBBO 都通过显式研究接口调用，避免普通训练放大网络和缓存成本。ETF 或 SEC 不支持的主体应使用 `theta_futu_cboe`，因为显式加入 `sec` 会在无估值快照时阻断价格代理。
 
 CBOE 官方日频指数 CSV 由 `cboe` Provider 按代码读取，例如 `US.VIX`、`US.VIX3M`、`US.VVIX` 和 `US.SKEW`；完整代码、字段语义和 `close-only` 指数限制见 [`docs/specs/contracts/cboe_provider.md`](docs/specs/contracts/cboe_provider.md)。
 
+美国普通股点时基本面估值可选使用 `sec` 辅助源，例如 `--data_source=theta+futu,sec`：SEC Company Facts 提供已披露的 10-K/10-Q 现金流、资本支出和稀释股数，框架按 filing 日期重建 TTM FCFE 并计算 V，策略再按显式 `w_multiple` 计算 W。SEC 原始 JSON 与合并后的行情估值列均有缓存；估值超过 200 天会失效。使用前须在 `SEC_USER_AGENT` 中提供应用标识和真实联系邮箱；ETF、金融公司或基本面字段不足时没有该估值，不会自动用股票价格代理替代。
 ### 4) 基础回测示例
 
 ```bash

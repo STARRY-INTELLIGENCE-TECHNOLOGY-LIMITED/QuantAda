@@ -26,6 +26,8 @@ class HybridDataProvider(BaseDataProvider):
     PRIORITY = 95
     HYBRID_ONLY = True
     HISTORICAL_OPTION_CHAIN = True
+    HISTORICAL_OPTION_QUOTES = True
+    UNDERLYING_PRICE_ADJUSTMENT = "NONE"
     _MARKET_TIMEZONES = {
         "US": "America/New_York",
         "HK": "Asia/Hong_Kong",
@@ -56,6 +58,9 @@ class HybridDataProvider(BaseDataProvider):
 
         self.live_mode = bool(enabled)
         self._overlay.set_live_mode(enabled)
+        setter = getattr(self.theta_provider, "set_live_mode", None)
+        if callable(setter):
+            setter(enabled)
 
     def get_earnings_calendar(self, symbols=None, start_date=None, end_date=None, as_of=None):
         """事件日由 Hybrid 的 Futu 实时/公开日历侧提供。"""
@@ -63,6 +68,21 @@ class HybridDataProvider(BaseDataProvider):
         if not callable(method):
             return None
         return method(symbols=symbols, start_date=start_date, end_date=end_date, as_of=as_of)
+
+    def get_dividend_calendar(
+        self, symbols=None, start_date=None, end_date=None, as_of=None, deadline=None,
+    ):
+        """分红公告由 Hybrid 的 Futu 数据侧提供。"""
+        method = getattr(self.futu_provider, "get_dividend_calendar", None)
+        if not callable(method):
+            return None
+        return method(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            as_of=as_of,
+            deadline=deadline,
+        )
 
     def bind_broker(self, broker) -> None:
         """将实盘 Broker 已建立的 Futu 行情会话注入实时子 Provider。"""
@@ -391,6 +411,24 @@ class HybridDataProvider(BaseDataProvider):
             **kwargs,
         )
 
+    def get_option_history_quotes(
+        self, symbol, start_date=None, end_date=None, interval="1m", **kwargs,
+    ):
+        """转发历史全天 NBBO 到 ThetaData，不使用 Futu 当前快照。"""
+        getter = getattr(self.theta_provider, "get_option_history_quotes", None)
+        if not callable(getter):
+            return None
+        return getter(symbol, start_date, end_date, interval, **kwargs)
+
+    def get_option_history_trades(
+        self, symbol, start_date=None, end_date=None, interval="1m", **kwargs,
+    ):
+        """转发历史期权成交到 ThetaData。"""
+        getter = getattr(self.theta_provider, "get_option_history_trades", None)
+        if not callable(getter):
+            return None
+        return getter(symbol, start_date, end_date, interval, **kwargs)
+
     def take_empty_result_count(self):
         """转发 Theta 空结果计数；正股 Futu 路径没有该计数。"""
         getter = getattr(self.theta_provider, "take_empty_result_count", None)
@@ -424,7 +462,14 @@ class HybridDataProvider(BaseDataProvider):
         frame = None
         if callable(getter):
             try:
-                frame = getter(symbol, start_date, end_date, timeframe, compression)
+                frame = getter(
+                    symbol,
+                    start_date,
+                    end_date,
+                    timeframe,
+                    compression,
+                    price_adjustment=self.UNDERLYING_PRICE_ADJUSTMENT,
+                )
             except Exception:
                 frame = None
         if frame is None or getattr(frame, "empty", False):

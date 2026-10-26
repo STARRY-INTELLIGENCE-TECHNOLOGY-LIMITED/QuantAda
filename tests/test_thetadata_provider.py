@@ -266,6 +266,88 @@ def test_daily_quote_does_not_falsely_use_eod_close_as_nbbo():
     assert fake.calls == []
 
 
+def test_old_option_cache_without_nbbo_is_incomplete_only_for_quote_capable_sources():
+    from data_providers.thetadata_provider import enrichment_retry_needed
+
+    cached = pd.DataFrame({
+        "open": [1.0], "high": [1.2], "low": [0.8], "close": [1.0],
+        "volume": [100.0], "contract_multiplier": [100.0],
+        "iv_percentile": [50.0], "open_interest": [1000.0],
+    }, index=pd.to_datetime(["2026-10-22"]))
+
+    assert not enrichment_retry_needed(cached, "US.AAPL261023P00260000")
+    assert enrichment_retry_needed(
+        cached, "US.AAPL261023P00260000", require_quotes=True,
+    )
+
+    cached["_theta_quote_checked"] = 1
+    cached["_theta_quote_incomplete"] = 0
+    assert not enrichment_retry_needed(
+        cached, "US.AAPL261023P00260000", require_quotes=True,
+    )
+    cached["_theta_quote_incomplete"] = 1
+    assert enrichment_retry_needed(
+        cached, "US.AAPL261023P00260000", require_quotes=True,
+    )
+
+
+def test_daily_quote_requests_close_window_and_keeps_last_real_nbbo():
+    class Quoted(_FakeTheta):
+        def option_history_quote(self, **kwargs):
+            self.calls.append(("option_history_quote", kwargs))
+            return pd.DataFrame({
+                "timestamp": [
+                    "2024-01-04 15:59:00-05:00",
+                    "2024-01-04 16:00:00-05:00",
+                ],
+                "bid": [1.00, 1.10],
+                "ask": [1.20, 1.30],
+                "bid_size": [10, 12],
+                "ask_size": [8, 9],
+            })
+
+    fake = Quoted()
+    result = ThetaDataProvider(client=fake).get_option_history_quote(
+        "US.AAPL240119P00150000", "20240104", "20240104", timeframe="Days",
+    )
+
+    assert result is not None
+    assert list(result.index) == [pd.Timestamp("2024-01-04")]
+    assert result.iloc[0]["bid"] == 1.10
+    assert result.iloc[0]["ask"] == 1.30
+    assert result.iloc[0]["bid_size"] == 12
+    request = next(kwargs for name, kwargs in fake.calls if name == "option_history_quote")
+    assert request["interval"] == "1m"
+    assert request["start_time"] == "15:59:00"
+    assert request["end_time"] == "16:00:00"
+
+
+def test_option_history_merges_historical_nbbo_and_quote_check_marker():
+    class Quoted(_FakeTheta):
+        def option_history_quote(self, **kwargs):
+            self.calls.append(("option_history_quote", kwargs))
+            return pd.DataFrame({
+                "timestamp": [
+                    "2024-01-02 16:00:00-05:00",
+                    "2024-01-03 16:00:00-05:00",
+                ],
+                "bid": [1.05, 1.10],
+                "ask": [1.15, 1.20],
+                "bid_size": [10, 11],
+                "ask_size": [8, 9],
+            })
+
+    result = ThetaDataProvider(client=Quoted()).get_data(
+        "US.AAPL240119P00150000", "20240101", "20240105",
+    )
+
+    assert result is not None
+    assert result["bid"].tolist() == [1.05, 1.10]
+    assert result["ask"].tolist() == [1.15, 1.20]
+    assert result["_theta_quote_checked"].eq(1).all()
+    assert result["_theta_quote_incomplete"].eq(0).all()
+
+
 def test_historical_chain_requires_as_of_boundary():
     provider = ThetaDataProvider(client=_FakeTheta())
     assert provider.get_option_chain("US.AAPL", start="2024-01-01", end="2024-01-31") is None
@@ -407,7 +489,7 @@ def test_bulk_requests_use_longer_timeout():
     assert ThetaDataProvider._is_bulk_kwargs({"expiration": "*"}) is True
     assert ThetaDataProvider._is_bulk_kwargs({"strike": "150"}) is False
     assert ThetaDataProvider._timeout_seconds(bulk=True) == 300.0
-    assert ThetaDataProvider._timeout_seconds() == 60.0
+    assert ThetaDataProvider._timeout_seconds() == 120.0
 
 
 def test_historical_chain_filters_dte_and_sends_strike_range():
@@ -1247,6 +1329,20 @@ def test_prefetch_option_histories_uses_one_wildcard_per_expiration():
                 "open_interest": [100, 80],
             })
 
+        def option_history_quote(self, **kwargs):
+            self.calls.append(("option_history_quote", kwargs))
+            return pd.DataFrame({
+                "expiration": ["2024-01-19", "2024-01-19"],
+                "strike": [150.0, 155.0],
+                "right": ["PUT", "PUT"],
+                "timestamp": [
+                    "2024-01-02 16:00:00-05:00",
+                    "2024-01-02 16:00:00-05:00",
+                ],
+                "bid": [1.0, 1.1], "ask": [1.2, 1.3],
+                "bid_size": [20, 15], "ask_size": [10, 12],
+            })
+
     fake = Bulk()
     frames = ThetaDataProvider(client=fake).prefetch_option_histories(
         ["US.AAPL240119P00150000", "US.AAPL240119P00155000"],
@@ -1257,10 +1353,15 @@ def test_prefetch_option_histories_uses_one_wildcard_per_expiration():
     assert set(frames) == {"US.AAPL240119P00150000", "US.AAPL240119P00155000"}
     assert "open_interest" in frames["US.AAPL240119P00150000"].columns
     assert "delta" in frames["US.AAPL240119P00150000"].columns
+    assert frames["US.AAPL240119P00150000"].loc["2024-01-02", "bid"] == 1.0
+    assert frames["US.AAPL240119P00150000"]["_theta_quote_checked"].eq(1).all()
     eod_calls = [kwargs for name, kwargs in fake.calls if name == "option_history_eod"]
     assert len(eod_calls) == 1
     assert eod_calls[0]["strike"] == "*"
     assert eod_calls[0]["right"] == "put"
+    quote_calls = [kwargs for name, kwargs in fake.calls if name == "option_history_quote"]
+    assert len(quote_calls) == 1
+    assert quote_calls[0]["interval"] == "1m"
     assert all(kwargs.get("strike") == "*" for _name, kwargs in fake.calls)
 
 

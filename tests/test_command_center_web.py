@@ -76,6 +76,7 @@ def test_web_html_is_external_static_resource():
     assert "function optionInput(" in html
     assert "replace(/_/g,'-')" in html
     assert "function syncConfigProfile(" in html
+    assert "state.catalog.data_source_aliases||{}" in html
     assert "state.form.config_profile='none'" in html
     assert "type==='string'" in html
     assert "el.type==='date'" in html
@@ -558,7 +559,12 @@ def test_public_futu_generate_uses_futu_source(tmp_path):
 
 def test_catalog_exposes_cboe_data_source(tmp_path):
     service = CommandCenterService(tmp_path)
-    assert "cboe" in service.catalog_snapshot()["data_sources"]
+    catalog = service.catalog_snapshot()
+    assert "cboe" in catalog["data_sources"]
+    assert "theta_futu_sec" in catalog["data_sources"]
+    assert catalog["data_source_aliases"]["theta_futu_sec"] == "thetadata+futu,sec"
+    assert "us_options_research" in catalog["data_sources"]
+    assert catalog["data_source_aliases"]["us_options_research"] == "thetadata+futu,sec,cboe"
 
 
 def test_hybrid_catalog_profile_resolves_theta_and_futu_configuration(tmp_path):
@@ -569,10 +575,11 @@ def test_hybrid_catalog_profile_resolves_theta_and_futu_configuration(tmp_path):
     result = service.generate(
         {
             "strategy": "strategies.example",
-            "data_source": "theta+futu",
+            "data_source": "theta+futu,sec",
             "config_profile": "theta_futu_global",
             "variables": {
                 "THETADATA_TOKEN": "theta-token",
+                "SEC_USER_AGENT": "QuantAda test test@example.com",
                 "FUTU_HOST": "127.0.0.1",
                 "FUTU_PORT": "11111",
                 "FUTU_RSA_KEY_PATH": "key.pem",
@@ -580,10 +587,31 @@ def test_hybrid_catalog_profile_resolves_theta_and_futu_configuration(tmp_path):
             },
         }
     )
-    assert result["argv"][result["argv"].index("--data_source") + 1] == "theta+futu"
+    assert result["argv"][result["argv"].index("--data_source") + 1] == "theta+futu,sec"
     assert result["config"]["THETADATA_TOKEN"] == "theta-token"
+    assert result["config"]["SEC_USER_AGENT"] == "QuantAda test test@example.com"
     assert result["config"]["FUTU_TRADE_PASSWORD_ENV"] == "TEST_UNLOCK_SLOT"
     assert "fixture" not in repr(result)
+
+
+def test_provider_alias_is_available_as_one_data_source_in_command_center(tmp_path):
+    service = CommandCenterService(tmp_path)
+    result = service.generate({
+        "strategy": "strategies.example",
+        "data_source": "theta_futu_sec",
+        "config_profile": "theta_futu_global",
+        "variables": {
+            "THETADATA_TOKEN": "theta-token",
+            "SEC_USER_AGENT": "QuantAda test test@example.com",
+            "FUTU_HOST": "127.0.0.1",
+            "FUTU_PORT": "11111",
+            "FUTU_RSA_KEY_PATH": "key.pem",
+        },
+    })
+
+    assert result["argv"][result["argv"].index("--data_source") + 1] == "theta_futu_sec"
+    assert result["config"]["THETADATA_TOKEN"] == "theta-token"
+    assert result["config"]["SEC_USER_AGENT"] == "QuantAda test test@example.com"
 
 
 def test_command_center_loads_private_catalog_from_source_root(tmp_path):

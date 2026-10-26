@@ -141,7 +141,9 @@ class _SampleLongOptionStrategy(BaseStrategy):
                 occupied.add(meta["underlying_key"])
                 rejects["non_flat"] = rejects.get("non_flat", 0) + 1
                 continue
-            reason = chain_window_reject_reason(meta, quote, current_dt, self.p)
+            reason = chain_window_reject_reason(
+                meta, quote, current_dt, self.p, allow_ask_only=True,
+            )
             if reason:
                 rejects[reason] = rejects.get(reason, 0) + 1
                 continue

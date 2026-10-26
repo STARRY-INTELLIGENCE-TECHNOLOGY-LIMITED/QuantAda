@@ -76,6 +76,10 @@ Provider 只支持 `Days/1`。同一 Provider 实例对同一指数每天最多�
 DataManager 负责把结果写入 `market_cache`。CBOE 文件是美东日终数据，最新一根通常是前一个已完成的
 美股交易日。
 
+Provider 实现 `supports_symbol(symbol)` 固定白名单能力声明。显式数据源链含 `cboe` 时，DataManager
+只在 CBOE 白名单命中时保留该回退 Provider；不相关的股票或期权会在链构造时被移除，因此不影响其它
+Provider 的完整缓存命中。
+
 需要股票历史优先走 Futu、期权历史走 Theta、VIX 走 CBOE 时，使用混合 Provider 加 CBOE 回退：
 
 ```text

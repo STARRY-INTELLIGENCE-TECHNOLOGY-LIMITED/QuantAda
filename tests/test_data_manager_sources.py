@@ -2,6 +2,7 @@ import inspect
 import os
 
 import pandas as pd
+import pytest
 
 from data_providers.base_provider import BaseDataProvider
 from data_providers.manager import DataManager, resolve_platform_default_source
@@ -64,6 +65,160 @@ def test_data_manager_earnings_calendar_uses_selected_provider_and_attaches_snap
     assert frame.attrs["earnings_calendar"][0]["event_date"] == "2024-02-01"
 
 
+def test_data_manager_dividend_calendar_preserves_announcement_provenance(monkeypatch):
+    class DividendDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1):
+            return None
+
+        def get_dividend_calendar(self, symbols=None, start_date=None, end_date=None, as_of=None):
+            result = pd.DataFrame({
+                "security": ["US.AAPL"],
+                "ex_date": ["2024-02-12"],
+                "pub_date": ["2024-02-01"],
+                "per_cash_div": [0.24],
+                "currency": ["USD"],
+            })
+            result.attrs.update({"source": "futu", "as_of_supported": True})
+            return result
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [DividendDataProvider()])
+    manager = DataManager()
+    frame = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0], "volume": [1.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+    manager.attach_dividend_calendar(
+        {"US.AAPL": frame}, symbols=["US.AAPL"], start_date="20240101",
+        end_date="20240301", specified_sources="dividend", as_of="20240301",
+    )
+    row = frame.attrs["dividend_calendar"][0]
+    assert row["announcement_date"] == "2024-02-01"
+    assert row["ex_date"] == "2024-02-12"
+    assert row["cash_per_share"] == 0.24
+    assert frame.attrs["dividend_calendar_as_of_supported"] is True
+
+
+def test_data_manager_rejects_nonempty_invalid_dividend_snapshot(monkeypatch):
+    class DividendDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, *args, **kwargs):
+            return None
+
+        def get_dividend_calendar(self, **kwargs):
+            result = pd.DataFrame({"security": ["US.AAPL"], "cash_amount": [0.24]})
+            result.attrs.update({"current_snapshot_supported": True})
+            return result
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [DividendDataProvider()])
+
+    assert DataManager().get_dividend_calendar(
+        symbols=["US.AAPL"], specified_sources="dividend",
+    ) is None
+
+
+def test_data_manager_prefers_point_in_time_earnings_archive(monkeypatch):
+    class CurrentCalendar(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, *args, **kwargs):
+            return None
+
+        def get_earnings_calendar(self, **kwargs):
+            return pd.DataFrame({
+                "symbol": ["US.AAPL"], "event_date": ["2026-10-29"],
+            })
+
+    class PitCalendar(BaseDataProvider):
+        PRIORITY = 2
+
+        def get_data(self, *args, **kwargs):
+            return None
+
+        def get_earnings_calendar(self, **kwargs):
+            result = pd.DataFrame({
+                "symbol": ["US.AAPL"], "event_date": ["2026-10-29"],
+                "visible_from": ["2026-10-01"],
+            })
+            result.attrs["as_of_supported"] = True
+            return result
+
+    monkeypatch.setattr(
+        DataManager, "auto_discover_and_sort_providers",
+        lambda self: [CurrentCalendar(), PitCalendar()],
+    )
+    manager = DataManager()
+    result = manager.get_earnings_calendar(
+        symbols=["US.AAPL"], start_date="20261001", end_date="20261101",
+        specified_sources="currentcalendar,pitcalendar",
+    )
+
+    assert result.attrs["as_of_supported"] is True
+    assert result.iloc[0]["visible_from"] == pd.Timestamp("2026-10-01")
+
+
+def test_data_manager_attaches_dynamic_rate_to_option_frame(monkeypatch):
+    class RatesDataProvider(BaseDataProvider):
+        AUXILIARY_ONLY = True
+        RATE_CURVE = True
+
+        def get_data(self, *args, **kwargs):
+            return None
+
+        def get_rate_curve(self, **kwargs):
+            result = pd.DataFrame({
+                "date": pd.to_datetime(["2026-09-14"]),
+                "risk_free_rate": [0.04],
+            })
+            result.attrs["source"] = "test-rates"
+            return result
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [RatesDataProvider()])
+    manager = DataManager()
+    frame = pd.DataFrame(
+        {"open": [1.0], "high": [1.1], "low": [0.9], "close": [1.0], "volume": [1.0]},
+        index=pd.to_datetime(["2026-09-14"]),
+    )
+    manager.attach_market_inputs(
+        {"US.AAPL261012P00080000": frame},
+        symbols=["US.AAPL261012P00080000"],
+        start_date="20260914", end_date="20260914", specified_sources="rates",
+    )
+
+    assert frame["risk_free_rate"].iloc[0] == 0.04
+    assert frame.attrs["market_inputs_available"] is True
+
+
+def test_market_inputs_never_uses_option_close_as_underlying_spot(monkeypatch):
+    class RatesDataProvider(BaseDataProvider):
+        AUXILIARY_ONLY = True
+
+        def get_data(self, *args, **kwargs):
+            return None
+
+        def get_rate_curve(self, **kwargs):
+            return pd.DataFrame({
+                "date": pd.to_datetime(["2026-09-14"]),
+                "risk_free_rate": [0.04],
+            })
+
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [RatesDataProvider()])
+    manager = DataManager()
+    frame = pd.DataFrame(
+        {"open": [1.0], "high": [1.1], "low": [0.9], "close": [1.0], "volume": [1.0]},
+        index=pd.to_datetime(["2026-09-14"]),
+    )
+    manager.attach_market_inputs(
+        {"US.AAPL261012P00080000": frame},
+        symbols=["US.AAPL261012P00080000"],
+        start_date="20260914", end_date="20260914", specified_sources="rates",
+    )
+
+    assert pd.isna(frame["dividend_yield"].iloc[0])
+
+
 def test_data_manager_normalizes_platform_source_aliases():
     assert DataManager._split_source_names("ib tiingo") == ["ibkr", "tiingo"]
     assert DataManager._split_source_names("gmi") == ["gmi"]
@@ -72,6 +227,127 @@ def test_data_manager_normalizes_platform_source_aliases():
     assert DataManager._split_source_names("sxsc_tushare") == ["sxsctushare"]
     assert DataManager._split_source_names("theta + futu") == ["hybrid"]
     assert DataManager._split_source_names("theta+futu,cboe") == ["hybrid", "cboe"]
+    assert DataManager._split_source_names("theta_futu_sec") == ["hybrid", "sec"]
+    assert DataManager._split_source_names("theta_futu_research") == ["hybrid", "sec", "earnings", "rates"]
+    assert DataManager._split_source_names("theta_futu_sec,cboe") == ["hybrid", "sec", "cboe"]
+    assert DataManager._split_source_names("us_options_research") == ["hybrid", "sec", "cboe"]
+
+
+def test_data_manager_expands_nested_provider_aliases_and_rejects_cycles(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "DATA_PROVIDER_ALIASES", {
+        "options": "thetadata+futu,sec",
+        "options_with_indices": "options,cboe",
+    })
+
+    assert DataManager._split_source_names("options_with_indices") == ["hybrid", "sec", "cboe"]
+    assert DataManager._split_source_names("options,tiingo") == ["hybrid", "sec", "tiingo"]
+
+    monkeypatch.setattr(config, "DATA_PROVIDER_ALIASES", {"first": "second", "second": "first"})
+    with pytest.raises(ValueError, match="Provider alias cycle"):
+        DataManager._split_source_names("first")
+
+
+def test_data_manager_batches_quote_capable_option_histories_into_cache(tmp_path, monkeypatch):
+    import config
+
+    class Theta:
+        def __init__(self):
+            self.calls = []
+
+        def prefetch_option_histories(self, symbols, start_date, end_date, on_ready=None):
+            self.calls.append((list(symbols), start_date, end_date))
+            frame = pd.DataFrame(
+                {
+                    "open": [1.0], "high": [1.1], "low": [0.9], "close": [1.0],
+                    "volume": [100], "bid": [0.95], "ask": [1.05],
+                    "contract_multiplier": [100], "iv_percentile": [50],
+                    "open_interest": [1000], "_theta_quote_checked": [1],
+                },
+                index=pd.to_datetime(["2026-10-22"]),
+            )
+            for symbol in symbols:
+                on_ready(symbol, frame)
+
+    class Hybrid:
+        HISTORICAL_OPTION_QUOTES = True
+
+        def __init__(self):
+            self.theta_provider = Theta()
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    manager = object.__new__(DataManager)
+    manager.provider_map = {"hybrid": Hybrid()}
+    manager.providers = []
+    manager._composed_providers = {}
+    manager.data_path = str(tmp_path)
+    manager._load_complete_cache = lambda *args, **kwargs: None
+    cached = []
+    manager._cache_data = lambda frame, symbol, *args, **kwargs: cached.append(symbol)
+
+    saved = manager.prefetch_option_histories(
+        ["US.AAPL261120P00250000", "US.AAPL261120P00255000"],
+        "2026-10-01", "2026-10-24", specified_sources="theta+futu",
+    )
+
+    assert saved == 2
+    assert set(cached) == {"US.AAPL261120P00250000", "US.AAPL261120P00255000"}
+    assert manager.provider_map["hybrid"].theta_provider.calls[0][0] == cached
+
+
+def test_broad_research_alias_filters_cboe_for_stocks_and_keeps_cache(tmp_path, monkeypatch):
+    import config
+    from data_providers.cboe_provider import CboeDataProvider
+
+    calls = []
+
+    class ThetaDataProvider:
+        def get_data(self, *_args, **_kwargs):
+            raise AssertionError("hybrid stock history must stay on Futu")
+
+    class FutuDataProvider:
+        def get_data(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1,
+                     price_adjustment=None):
+            assert price_adjustment == "NONE"
+            calls.append(symbol)
+            return pd.DataFrame(
+                {"open": [100.0], "high": [101.0], "low": [99.0], "close": [100.5], "volume": [1000],
+                 "futu_price_adjustment_type": ["NONE"]},
+                index=pd.to_datetime(["2024-01-02"]),
+            )
+
+    class SecDataProvider:
+        VALUATION_ONLY = True
+
+        def get_valuation_snapshots(self, symbol, start_date=None, end_date=None):
+            return pd.DataFrame([{
+                "ticker": "US.AAPL", "asof": "2024-01-01", "v": 110.0,
+                "confidence": None, "method": "fixture", "source_id": "sec-fixture",
+            }])
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [
+            ThetaDataProvider(), FutuDataProvider(), SecDataProvider(), CboeDataProvider(),
+        ],
+    )
+    manager = DataManager()
+
+    first = manager.get_data(
+        "US.AAPL", "20240102", "20240102", specified_sources="us_options_research",
+    )
+    second = manager.get_data(
+        "US.AAPL", "20240102", "20240102", specified_sources="us_options_research",
+    )
+
+    assert first is not None and second is not None
+    assert first["underlying_fair_value"].iloc[0] == 110.0
+    assert second.attrs["data_origin"] == "cache"
+    assert calls == ["US.AAPL"]
 
 
 def test_cache_data_merges_segments_without_duplicate_timestamps(tmp_path, monkeypatch):
@@ -522,6 +798,69 @@ def test_option_cache_covering_contract_life_is_complete(tmp_path, monkeypatch):
     assert result is not None
     assert result.index.min() <= expiry - pd.Timedelta(days=45)
     assert result.index.max() >= expiry
+
+
+def test_option_cache_before_expiry_uses_requested_end_boundary(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    pd.DataFrame(
+        {
+            "open": [1.0, 1.1], "high": [1.2, 1.3], "low": [0.9, 1.0],
+            "close": [1.1, 1.2], "volume": [10, 11],
+        },
+        index=pd.to_datetime(["2024-02-01", "2024-03-01"]),
+    ).rename_axis("datetime").to_csv(
+        _market_cache_csv(tmp_path, "US_AAPL241127P00150000.csv")
+    )
+    calls = []
+
+    class ThetaDataProvider(BaseDataProvider):
+        PRIORITY = 1
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1):
+            calls.append(symbol)
+            return None
+
+    monkeypatch.setattr(
+        DataManager,
+        "auto_discover_and_sort_providers",
+        lambda self, provider_dir=None: [ThetaDataProvider()],
+    )
+    result = DataManager().get_data(
+        "US.AAPL241127P00150000", "20240101", "20240301", specified_sources="theta",
+    )
+
+    assert calls == []
+    assert result is not None
+
+
+def test_auxiliary_source_cache_namespace_stays_under_one_data_root(tmp_path):
+    manager = object.__new__(DataManager)
+    manager.data_path = str(tmp_path)
+
+    assert manager._cache_root_for_source("theta+futu") == str(tmp_path)
+    assert manager._cache_root_for_source("theta_futu_sec") == str(
+        tmp_path / "sources" / "hybrid_sec"
+    )
+    assert manager._cache_root_for_source("theta_futu_research") == str(
+        tmp_path / "sources" / "hybrid_sec_earnings_rates"
+    )
+
+
+def test_unselected_auxiliary_columns_are_removed_from_old_cache():
+    frame = pd.DataFrame({
+        "close": [1.0],
+        "underlying_fair_value": [2.0],
+        "valuation_status": ["available"],
+        "fundamental_revenue": [3.0],
+    })
+
+    result = DataManager._strip_unselected_auxiliary_columns(frame, [])
+
+    assert list(result.columns) == ["close"]
 
 
 def test_option_cache_missing_expiry_is_incomplete(tmp_path, monkeypatch):
@@ -1305,3 +1644,50 @@ def test_absolute_data_path_is_the_only_cache_root(tmp_path, monkeypatch):
 
     assert os.path.normcase(manager.data_path) == os.path.normcase(str(custom))
     assert manager._cache_roots() == [manager.data_path]
+
+
+def test_hybrid_unadjusted_underlying_rejects_legacy_qfq_cache(tmp_path, monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path))
+    monkeypatch.setattr(config, "CACHE_DATA", True)
+    pd.DataFrame(
+        {
+            "open": [90.0, 91.0], "high": [91.0, 92.0],
+            "low": [89.0, 90.0], "close": [90.0, 91.0],
+            "volume": [1000.0, 1100.0],
+            "futu_price_adjustment_type": ["QFQ", "QFQ"],
+        },
+        index=pd.to_datetime(["2026-10-22", "2026-10-23"]),
+    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL.csv"))
+
+    class HybridDataProvider(BaseDataProvider):
+        HYBRID_ONLY = True
+        UNDERLYING_PRICE_ADJUSTMENT = "NONE"
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_data(self, symbol, start_date=None, end_date=None,
+                     timeframe="Days", compression=1, refresh=False):
+            self.calls += 1
+            return pd.DataFrame(
+                {
+                    "open": [100.0, 101.0], "high": [101.0, 102.0],
+                    "low": [99.0, 100.0], "close": [100.5, 101.5],
+                    "volume": [1000.0, 1100.0],
+                    "futu_price_adjustment_type": ["NONE", "NONE"],
+                },
+                index=pd.to_datetime(["2026-10-22", "2026-10-23"]),
+            )
+
+    provider = HybridDataProvider()
+    monkeypatch.setattr(DataManager, "auto_discover_and_sort_providers", lambda self: [provider])
+    manager = DataManager()
+
+    result = manager.get_data(
+        "US.AAPL", "20261022", "20261023", specified_sources="hybrid",
+    )
+
+    assert provider.calls == 1
+    assert result["futu_price_adjustment_type"].eq("NONE").all()

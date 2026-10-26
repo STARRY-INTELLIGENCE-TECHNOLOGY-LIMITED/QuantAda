@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
+import pandas as pd
 from backtest.backtester import Backtester
 import optimizer
 from optimizer.runtime import infer_omitted_backtest_window
@@ -81,6 +82,11 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
         print("\nFatal: You must provide either --selection or --symbols. Aborting.")
         return
 
+    from common.options.universe import split_symbol_pool
+
+    source_symbols = list(symbols)
+    event_symbols, _explicit_options = split_symbol_pool(source_symbols)
+
     print("--- Starting Backtest ---")
     print(f"  Selection: {selection_filename}")
     print(f"  Strategy: {strategy_filename}")
@@ -95,7 +101,7 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     try:
         from data_providers.option_universe import expand_option_universe
         symbols = expand_option_universe(
-            symbols,
+            source_symbols,
             strategy_class=strategy_class,
             params=params,
             data_manager=data_manager,
@@ -109,6 +115,23 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
         print(f"\nFatal: {exc}")
         return
     print(f"  Tradable symbols: {', '.join(str(item) for item in symbols)}")
+
+    prefetch_option_histories = getattr(data_manager, "prefetch_option_histories", None)
+    if callable(prefetch_option_histories):
+        try:
+            bulk_cached = prefetch_option_histories(
+                symbols,
+                start_date,
+                end_date,
+                specified_sources=data_source,
+                timeframe=timeframe,
+                compression=compression,
+                refresh=refresh,
+            )
+            if bulk_cached:
+                print(f"[Auto-Fetch] bulk cached {bulk_cached} option histories")
+        except Exception as exc:
+            print(f"[Auto-Fetch] option history batch prefetch failed, continuing per contract: {exc}")
 
     print("\n--- Fetching Data ---")
     print(f"  Requesting data from: {start_date or 'origin'} to {end_date or 'latest'}")
@@ -208,14 +231,25 @@ def run_backtest(selection_filename, strategy_filename, symbols, cash, commissio
     try:
         data_manager.attach_earnings_calendar(
             datas,
-            symbols=symbols,
+            symbols=event_symbols,
             start_date=start_date,
             end_date=end_date,
             specified_sources=data_source,
         )
     except Exception as exc:
         print(f"[Events] Earnings calendar unavailable; continuing without blackout data: {exc}")
-
+    try:
+        event_as_of = pd.Timestamp(end_date)
+        data_manager.attach_dividend_calendar(
+            datas,
+            symbols=event_symbols,
+            start_date=start_date,
+            end_date=(event_as_of + pd.Timedelta(days=365)).strftime("%Y-%m-%d"),
+            specified_sources=data_source,
+            as_of=event_as_of.strftime("%Y-%m-%d"),
+        )
+    except Exception as exc:
+        print(f"[Events] Dividend calendar unavailable; covered calls will fail closed: {exc}")
     # --- 4. 初始化回测器并运行 ---
     print("\n--- Initializing Backtester ---")
 

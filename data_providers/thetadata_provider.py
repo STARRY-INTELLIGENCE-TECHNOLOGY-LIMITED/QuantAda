@@ -28,7 +28,7 @@ THETADATA_API_KEY = os.getenv("THETADATA_API_KEY", "").strip()
 # 以下为低频、实现固定的安全默认值；如需调整应通过代码评审修改。
 _OPTION_CONTRACT_MULTIPLIER = 100.0
 _ENRICH_OPTIONS = True
-_REQUEST_TIMEOUT_SECONDS = 60.0
+_REQUEST_TIMEOUT_SECONDS = 120.0
 _MAX_REQUEST_TIMEOUT_SECONDS = 300.0
 _BULK_REQUEST_TIMEOUT_SECONDS = _MAX_REQUEST_TIMEOUT_SECONDS
 _MAX_AUTO_CHAIN_EXPIRATIONS = 16
@@ -48,6 +48,13 @@ _VENDOR_TZ = ZoneInfo("America/New_York")
 # 超时缺字段不能只看日期覆盖；这两个列会随 CSV 保留，attrs 不会。
 ENRICHMENT_INCOMPLETE_COLUMN = "_theta_enrichment_incomplete"
 ENRICHMENT_CHECKED_COLUMN = "_theta_enrichment_checked"
+QUOTE_INCOMPLETE_COLUMN = "_theta_quote_incomplete"
+QUOTE_CHECKED_COLUMN = "_theta_quote_checked"
+_EOD_QUOTE_INTERVAL = "1m"
+_EOD_QUOTE_START_TIME = "15:59:00"
+_EOD_QUOTE_END_TIME = "16:00:00"
+_FULL_SESSION_QUOTE_START_TIME = "09:30:00"
+_FULL_SESSION_QUOTE_END_TIME = "16:00:00"
 
 _SDK_GATE = threading.Condition()
 _SDK_ACTIVE = 0
@@ -79,11 +86,11 @@ def _release_sdk_slot_when_done(worker):
 
 
 
-def enrichment_retry_needed(frame, symbol=None) -> bool:
-    """判断是否因超时缺了 OI/Greeks，需要本轮末尾或下次执行重拉。
+def enrichment_retry_needed(frame, symbol=None, *, require_quotes=False) -> bool:
+    """判断是否因超时缺了 OI/Greeks/NBBO，需要本轮末尾或下次执行重拉。
 
     ``No data found`` 不会留下不完整标记。旧缓存若带有 Theta 期权签名但没有
-    OI，也视为需要重拉，避免超时结果被日期覆盖误判为完整。
+    OI 或报价检查标记，也视为需要重拉，避免超时结果被日期覆盖误判为完整。
     """
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return False
@@ -94,14 +101,27 @@ def enrichment_retry_needed(frame, symbol=None) -> bool:
         flags = pd.to_numeric(frame[ENRICHMENT_INCOMPLETE_COLUMN], errors="coerce").fillna(0)
         if bool(flags.gt(0).any()):
             return True
-    if ENRICHMENT_CHECKED_COLUMN in frame.columns:
-        return False
-    if "open_interest" in frame.columns:
-        return False
     if symbol is not None and _OCC_RE.match(str(symbol).strip().upper()) is None:
         return False
     columns = {str(column) for column in frame.columns}
-    return "contract_multiplier" in columns and "iv_percentile" in columns
+    theta_signature = "contract_multiplier" in columns and "iv_percentile" in columns
+    if not theta_signature:
+        return False
+    if QUOTE_INCOMPLETE_COLUMN in frame.columns:
+        quote_flags = pd.to_numeric(frame[QUOTE_INCOMPLETE_COLUMN], errors="coerce").fillna(0)
+        if bool(quote_flags.gt(0).any()):
+            return True
+    if require_quotes and QUOTE_CHECKED_COLUMN not in frame.columns:
+        has_nbbo = "bid" in columns and "ask" in columns
+        if not has_nbbo:
+            return True
+        bid = pd.to_numeric(frame["bid"], errors="coerce")
+        ask = pd.to_numeric(frame["ask"], errors="coerce")
+        if not bool((bid.gt(0) & ask.ge(bid)).all()):
+            return True
+    if ENRICHMENT_CHECKED_COLUMN in frame.columns or "open_interest" in columns:
+        return False
+    return True
 
 
 def retry_unresolved_symbols(symbols, fetch):
@@ -322,6 +342,7 @@ class ThetaDataProvider(BaseDataProvider):
 
     PRIORITY = 45
     HISTORICAL_OPTION_CHAIN = True
+    HISTORICAL_OPTION_QUOTES = True
 
     @staticmethod
     def _option_multiplier():
@@ -334,6 +355,7 @@ class ThetaDataProvider(BaseDataProvider):
 
     def __init__(self, client=None, api_key=None):
         self.client = client
+        self.live_mode = False
         configured = api_key
         if configured is None:
             configured = os.getenv("THETADATA_API_KEY")
@@ -361,6 +383,10 @@ class ThetaDataProvider(BaseDataProvider):
         self._expiration_cache = {}
         self._empty_result_count = 0
         self._retryable_fail_count = 0
+
+    def set_live_mode(self, enabled):
+        """切换实盘数据边界；当前盘口由实时 Provider 提供。"""
+        self.live_mode = bool(enabled)
 
     def _get_client(self):
         """惰性创建 ThetaClient；不在 Provider 构造阶段执行网络认证。"""
@@ -457,7 +483,7 @@ class ThetaDataProvider(BaseDataProvider):
     def _timeout_seconds(bulk=False):
         """读取并限制 Provider 内置的单次 ThetaData 操作超时。"""
         source = _BULK_REQUEST_TIMEOUT_SECONDS if bulk else _REQUEST_TIMEOUT_SECONDS
-        fallback = _MAX_REQUEST_TIMEOUT_SECONDS if bulk else 60.0
+        fallback = _MAX_REQUEST_TIMEOUT_SECONDS if bulk else 120.0
         try:
             timeout = float(source)
         except (TypeError, ValueError, OverflowError):
@@ -581,6 +607,7 @@ class ThetaDataProvider(BaseDataProvider):
             "last": ("last", "last_price"), "open_interest": ("open_interest", "oi"),
             "iv": ("iv", "implied_volatility", "implied_vol"), "delta": ("delta",),
             "gamma": ("gamma",), "theta": ("theta",), "vega": ("vega",), "rho": ("rho",),
+            "underlying_spot": ("underlying_price", "underlying_spot", "spot"),
         }.items():
             source = _column(df, aliases)
             if source is not None:
@@ -591,6 +618,85 @@ class ThetaDataProvider(BaseDataProvider):
             return None
         result = result[~result.index.duplicated(keep="last")].sort_index()
         result.index.name = "datetime"
+        return result
+
+    @staticmethod
+    def _normalise_eod_option_quotes(raw):
+        """把每个交易日收盘前的最新 NBBO 对齐到无时区交易日。"""
+        frame = _to_pandas(raw)
+        if frame is None or frame.empty:
+            return None
+        time_col = _column(frame, ("timestamp", "datetime", "time", "time_key", "date", "created"))
+        if time_col is None:
+            return None
+        quote_times = ThetaDataProvider._parse_timestamps(frame, time_col)
+        quote_times = pd.DatetimeIndex(quote_times)
+        if quote_times.tz is None:
+            quote_times = quote_times.tz_localize("UTC")
+        local_times = quote_times.tz_convert(_VENDOR_TZ)
+        seconds = (
+            local_times.hour * 3600 + local_times.minute * 60 + local_times.second
+        )
+        valid = (
+            ~quote_times.isna()
+            & (seconds >= 15 * 3600 + 59 * 60)
+            & (seconds <= 16 * 3600)
+        )
+        if not bool(valid.any()):
+            return None
+        selected = frame.loc[valid].copy()
+        selected_times = quote_times[valid]
+        local_dates = local_times[valid].normalize().tz_localize(None)
+        result = pd.DataFrame(index=selected.index)
+        for name, aliases in {
+            "bid": ("bid", "bid_price"),
+            "ask": ("ask", "ask_price"),
+            "bid_size": ("bid_size", "bid_volume"),
+            "ask_size": ("ask_size", "ask_volume"),
+            "bid_exchange": ("bid_exchange",),
+            "ask_exchange": ("ask_exchange",),
+            "bid_condition": ("bid_condition",),
+            "ask_condition": ("ask_condition",),
+        }.items():
+            source = _column(selected, aliases)
+            if source is not None:
+                result[name] = (
+                    selected[source].astype("string")
+                    if name.endswith(("exchange", "condition"))
+                    else pd.to_numeric(selected[source], errors="coerce")
+                ).to_numpy()
+        if "bid" not in result.columns or "ask" not in result.columns:
+            return None
+        result["quote_timestamp"] = selected_times.astype(str)
+        result["_session_date"] = local_dates
+        result["_quote_order"] = selected_times.asi8
+        result = result.sort_values("_quote_order", kind="stable")
+        result = result.drop_duplicates("_session_date", keep="last")
+        result = result.drop(columns="_quote_order").set_index("_session_date").sort_index()
+        result.index.name = "datetime"
+        return result
+
+    @staticmethod
+    def _merge_eod_option_quotes(base, quotes, *, checked=True, incomplete=False):
+        """把 NBBO 和报价时间并入期权日线，保留逐日报价检查状态。"""
+        if not isinstance(base, pd.DataFrame) or base.empty:
+            return base
+        result = base.copy()
+        index = pd.DatetimeIndex(result.index)
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        session_dates = index.normalize()
+        if isinstance(quotes, pd.DataFrame) and not quotes.empty:
+            for name in quotes.columns:
+                incoming = pd.Series(session_dates, index=result.index).map(quotes[name])
+                if name in result.columns:
+                    current = result[name]
+                    result[name] = incoming.where(incoming.notna(), current)
+                else:
+                    result[name] = incoming.to_numpy()
+            result["option_quote_source"] = "thetadata_history_quote"
+        result[QUOTE_CHECKED_COLUMN] = 1 if checked else 0
+        result[QUOTE_INCOMPLETE_COLUMN] = 1 if incomplete else 0
         return result
 
     @staticmethod
@@ -765,6 +871,7 @@ class ThetaDataProvider(BaseDataProvider):
                 try:
                     callable_method = getattr(client, method)
                 except Exception as exc:
+                    self._mark_unsupported(method)
                     print(f"[ThetaData] {method} failed: {exc}")
                     return None
                 outcome = {}
@@ -1091,6 +1198,7 @@ class ThetaDataProvider(BaseDataProvider):
                         "theta": ("theta",),
                         "vega": ("vega",),
                         "rho": ("rho",),
+                        "underlying_spot": ("underlying_price", "underlying_spot", "spot"),
                     },
                 )
                 if self._should_compensate(greeks_fail_before):
@@ -1111,6 +1219,33 @@ class ThetaDataProvider(BaseDataProvider):
                     open_interest,
                     {"open_interest": ("open_interest", "oi")},
                 )
+                quote_checked = False
+                quote_incomplete = False
+                if not self.live_mode and not is_intraday:
+                    quote_index = pd.DatetimeIndex(result.index)
+                    if quote_index.tz is not None:
+                        quote_index = quote_index.tz_localize(None)
+                    quote_fail_before = self._local_fail_count()
+                    quotes = self.get_option_history_quote(
+                        normalized,
+                        quote_index.min().date(),
+                        quote_index.max().date(),
+                        timeframe="Days",
+                        compression=1,
+                    )
+                    quote_incomplete = self._should_compensate(quote_fail_before)
+                    quote_incomplete = quote_incomplete or bool(
+                        getattr(quotes, "attrs", {}).get("theta_history_incomplete")
+                    )
+                    quote_checked = not quote_incomplete
+                    result = self._merge_eod_option_quotes(
+                        result,
+                        quotes,
+                        checked=quote_checked,
+                        incomplete=quote_incomplete,
+                    )
+                    if quote_incomplete:
+                        missing.append("nbbo")
                 result.attrs.update(result_attrs)
                 result.attrs["option_symbol"] = normalized
                 result.attrs["contract_multiplier"] = multiplier
@@ -1464,13 +1599,270 @@ class ThetaDataProvider(BaseDataProvider):
         return frame
 
     def get_option_history_quote(self, symbol, start_date=None, end_date=None, timeframe="Days", compression=1):
-        """获取单一期权历史买卖报价。"""
+        """获取单一期权历史报价；日线模式只采样收盘前最后一分钟。"""
         normalized = str(timeframe or "").strip().lower()
         if normalized in {"days", "day", "d"}:
-            # ThetaData 没有可由 OHLC EOD 替代的历史 NBBO；避免把收盘价伪装成 bid/ask。
-            return None
+            parsed = self._parse_option(symbol)
+            if parsed is None:
+                return None
+            root, expiry, strike, right = parsed
+            today = _vendor_today()
+            start = _as_date(start_date) or expiry - _dt.timedelta(days=365)
+            end = _as_date(end_date) or today
+            if start > today:
+                return None
+            end = min(end, today)
+            start, end = _clip_option_history_window(start, end, expiry)
+            if start > end:
+                return None
+            raw = self._chunked_history(
+                "option_history_quote",
+                start,
+                end,
+                chunk_days=_BULK_EOD_CHUNK_DAYS,
+                symbol=root,
+                expiration=expiry,
+                interval=_EOD_QUOTE_INTERVAL,
+                strike=strike,
+                right=right,
+                start_time=_EOD_QUOTE_START_TIME,
+                end_time=_EOD_QUOTE_END_TIME,
+            )
+            result = self._normalise_eod_option_quotes(raw)
+            if result is not None:
+                result.attrs["option_symbol"] = str(symbol).strip().upper()
+                result.attrs["quote_source"] = "thetadata_historical_nbbo"
+            return result
         method = "option_history_quote"
         return self._option_request(symbol, method, start_date, end_date, timeframe, compression)
+
+    def get_option_history_quotes(
+        self, symbol, start_date=None, end_date=None, interval="1m",
+        *, full_session=True, refresh=False, cache=True,
+    ):
+        """获取全天 regular-session 历史 NBBO，返回逐报价时间序列。
+
+        默认的日线策略仍使用 ``get_option_history_quote`` 收盘窄窗口；该入口用于
+        需要成交模拟的研究，并按合约与窗口独立缓存，避免每次训练重复拉取大表。
+        """
+        parsed = self._parse_option(symbol)
+        if parsed is None:
+            return None
+        root, expiry, strike, right = parsed
+        today = _vendor_today()
+        start = _as_date(start_date) or expiry - _dt.timedelta(days=365)
+        end = _as_date(end_date) or today
+        if start > today:
+            return None
+        end = min(end, today)
+        start, end = _clip_option_history_window(start, end, expiry)
+        if start > end:
+            return None
+        cache_path = self._full_quote_cache_path(
+            symbol, start, end, interval, session="full" if full_session else "close",
+        ) if cache else None
+        if cache_path is not None and not refresh:
+            cached = self._read_full_quote_cache(cache_path)
+            if cached is not None:
+                return cached
+        raw = self._chunked_history(
+            "option_history_quote",
+            start,
+            end,
+            chunk_days=_BULK_EOD_CHUNK_DAYS,
+            symbol=root,
+            expiration=expiry,
+            interval=str(interval or "1m"),
+            strike=strike,
+            right=right,
+            start_time=(
+                _FULL_SESSION_QUOTE_START_TIME if full_session else _EOD_QUOTE_START_TIME
+            ),
+            end_time=(
+                _FULL_SESSION_QUOTE_END_TIME if full_session else _EOD_QUOTE_END_TIME
+            ),
+        )
+        result = self._normalise_full_option_quotes(raw, full_session=full_session)
+        if result is None:
+            return None
+        if bool(getattr(raw, "attrs", {}).get("theta_history_incomplete")):
+            result.attrs["theta_history_incomplete"] = True
+        result.attrs["option_symbol"] = str(symbol).strip().upper()
+        result.attrs["quote_source"] = "thetadata_historical_nbbo_full_session" if full_session else "thetadata_historical_nbbo"
+        result.attrs["quote_interval"] = str(interval or "1m")
+        if cache_path is not None and not bool(result.attrs.get("theta_history_incomplete")):
+            self._write_full_quote_cache(cache_path, result)
+        return result
+
+    def get_option_history_trades(
+        self, symbol, start_date=None, end_date=None, interval="1m",
+        *, full_session=True, refresh=False, cache=True,
+    ):
+        """获取全天历史期权成交，权限或接口不支持时返回 None。"""
+        parsed = self._parse_option(symbol)
+        if parsed is None:
+            return None
+        root, expiry, strike, right = parsed
+        today = _vendor_today()
+        start = _as_date(start_date) or expiry - _dt.timedelta(days=365)
+        end = min(_as_date(end_date) or today, today)
+        start, end = _clip_option_history_window(start, end, expiry)
+        if start > end:
+            return None
+        cache_path = self._full_quote_cache_path(
+            symbol, start, end, interval, kind="trades",
+            session="full" if full_session else "close",
+        ) if cache else None
+        if cache_path is not None and not refresh:
+            cached = self._read_full_quote_cache(cache_path, kind="trades")
+            if cached is not None:
+                return cached
+        raw = self._chunked_history(
+            "option_history_trade", start, end, chunk_days=_BULK_EOD_CHUNK_DAYS,
+            # ThetaData 的 trade endpoint 返回逐笔记录，不接受 interval 参数。
+            symbol=root, expiration=expiry,
+            strike=strike, right=right,
+            start_time=_FULL_SESSION_QUOTE_START_TIME if full_session else _EOD_QUOTE_START_TIME,
+            end_time=_FULL_SESSION_QUOTE_END_TIME if full_session else _EOD_QUOTE_END_TIME,
+        )
+        result = self._normalise_full_option_trades(raw, full_session=full_session)
+        if result is None:
+            return None
+        if bool(getattr(raw, "attrs", {}).get("theta_history_incomplete")):
+            result.attrs["theta_history_incomplete"] = True
+        result.attrs["option_symbol"] = str(symbol).strip().upper()
+        result.attrs["trade_source"] = "thetadata_historical_trades"
+        result.attrs["trade_interval"] = str(interval or "1m")
+        if cache_path is not None and not bool(result.attrs.get("theta_history_incomplete")):
+            self._write_full_quote_cache(cache_path, result, kind="trades")
+        return result
+
+    def _full_quote_cache_path(self, symbol, start, end, interval, kind="quotes", session="full"):
+        if not bool(getattr(config, "CACHE_DATA", False)):
+            return None
+        from common.data_paths import ensure_data_dir, resolve_data_path
+        import re as _re
+        root = resolve_data_path(getattr(config, "DATA_PATH", ".data"))
+        folder = ensure_data_dir(
+            f"{root}/market_cache/option_quotes/{kind}"
+        )
+        safe = _re.sub(r"[^A-Za-z0-9._-]+", "_", str(symbol or "").upper())
+        return f"{folder}/{safe}_{session}_{start:%Y%m%d}_{end:%Y%m%d}_{interval}.csv"
+
+    @staticmethod
+    def _read_full_quote_cache(path, kind="quotes"):
+        try:
+            frame = pd.read_csv(path, index_col="datetime", parse_dates=True)
+        except (OSError, ValueError, KeyError):
+            return None
+        if frame.empty:
+            return None
+        if kind == "quotes" and not {"bid", "ask"}.issubset(frame.columns):
+            return None
+        if kind == "trades" and "price" not in frame.columns:
+            return None
+        if "_theta_history_incomplete" in frame.columns:
+            incomplete = pd.to_numeric(frame["_theta_history_incomplete"], errors="coerce").fillna(0)
+            if bool(incomplete.gt(0).any()):
+                return None
+        frame.index.name = "datetime"
+        frame.attrs["quote_source" if kind == "quotes" else "trade_source"] = "cache"
+        return frame
+
+    @staticmethod
+    def _write_full_quote_cache(path, frame, kind="quotes"):
+        try:
+            frame.to_csv(path)
+            from common.data_paths import share_data_file
+            share_data_file(path)
+        except OSError as exc:
+            print(f"[ThetaData] full-session {kind} cache write failed: {exc}")
+
+    @staticmethod
+    def _normalise_full_option_quotes(raw, *, full_session=True):
+        frame = _to_pandas(raw)
+        if frame is None or frame.empty:
+            return None
+        time_col = _column(frame, ("timestamp", "datetime", "time", "time_key", "date", "created"))
+        if time_col is None:
+            return None
+        quote_times = pd.DatetimeIndex(ThetaDataProvider._parse_timestamps(frame, time_col))
+        if quote_times.tz is None:
+            quote_times = quote_times.tz_localize("UTC")
+        local_times = quote_times.tz_convert(_VENDOR_TZ)
+        seconds = local_times.hour * 3600 + local_times.minute * 60 + local_times.second
+        valid = ~quote_times.isna()
+        if full_session:
+            valid &= (
+                seconds >= 9 * 3600 + 30 * 60
+            ) & (seconds <= 16 * 3600)
+        if not bool(valid.any()):
+            return None
+        selected = frame.loc[valid].copy()
+        selected_times = quote_times[valid]
+        result = pd.DataFrame(index=selected.index)
+        for name, aliases in {
+            "bid": ("bid", "bid_price"), "ask": ("ask", "ask_price"),
+            "bid_size": ("bid_size", "bid_volume"), "ask_size": ("ask_size", "ask_volume"),
+            "bid_exchange": ("bid_exchange",), "ask_exchange": ("ask_exchange",),
+            "bid_condition": ("bid_condition",), "ask_condition": ("ask_condition",),
+        }.items():
+            source = _column(selected, aliases)
+            if source is not None:
+                result[name] = (
+                    selected[source].astype("string")
+                    if name.endswith(("exchange", "condition"))
+                    else pd.to_numeric(selected[source], errors="coerce")
+                ).to_numpy()
+        if "bid" not in result.columns or "ask" not in result.columns:
+            return None
+        result["quote_timestamp"] = selected_times.astype(str)
+        result["session_date"] = local_times[valid].normalize().tz_localize(None).strftime("%Y-%m-%d")
+        result.index = selected_times.tz_convert("UTC").tz_localize(None)
+        result.index.name = "datetime"
+        result = result[~result.index.duplicated(keep="last")].sort_index()
+        return result
+
+    @staticmethod
+    def _normalise_full_option_trades(raw, *, full_session=True):
+        frame = _to_pandas(raw)
+        if frame is None or frame.empty:
+            return None
+        time_col = _column(frame, ("timestamp", "datetime", "time", "time_key", "date", "created"))
+        if time_col is None:
+            return None
+        times = pd.DatetimeIndex(ThetaDataProvider._parse_timestamps(frame, time_col))
+        if times.tz is None:
+            times = times.tz_localize("UTC")
+        local = times.tz_convert(_VENDOR_TZ)
+        seconds = local.hour * 3600 + local.minute * 60 + local.second
+        valid = ~times.isna()
+        if full_session:
+            valid &= (seconds >= 9 * 3600 + 30 * 60) & (seconds <= 16 * 3600)
+        if not bool(valid.any()):
+            return None
+        selected = frame.loc[valid].copy()
+        result = pd.DataFrame(index=selected.index)
+        for name, aliases in {
+            "price": ("price", "trade_price", "last", "last_price"),
+            "size": ("size", "trade_size", "quantity", "volume"),
+            "exchange": ("exchange", "trade_exchange"),
+            "condition": ("condition", "trade_condition"),
+        }.items():
+            source = _column(selected, aliases)
+            if source is not None:
+                result[name] = (
+                    selected[source].astype("string")
+                    if name in {"exchange", "condition"}
+                    else pd.to_numeric(selected[source], errors="coerce")
+                ).to_numpy()
+        if "price" not in result.columns:
+            return None
+        result["trade_timestamp"] = times[valid].astype(str)
+        result["session_date"] = local[valid].normalize().tz_localize(None).strftime("%Y-%m-%d")
+        result.index = times[valid].tz_convert("UTC").tz_localize(None)
+        result.index.name = "datetime"
+        return result[~result.index.duplicated(keep="last")].sort_index()
 
     def get_option_history_open_interest(self, symbol, start_date=None, end_date=None):
         """获取单一期权历史未平仓量。"""
@@ -1696,15 +2088,32 @@ class ThetaDataProvider(BaseDataProvider):
             )
             if open_interest is None or getattr(open_interest, "empty", True):
                 continue
+            quote_fail_before = self._local_fail_count()
+            quotes = None
+            if not self._is_unsupported("option_history_quote"):
+                quotes = self._bulk_wildcard_history(
+                    "option_history_quote",
+                    start,
+                    end,
+                    interval=_EOD_QUOTE_INTERVAL,
+                    start_time=_EOD_QUOTE_START_TIME,
+                    end_time=_EOD_QUOTE_END_TIME,
+                    **common,
+                )
+            quote_incomplete = self._should_compensate(quote_fail_before)
             split_eod = self._split_bulk_option_frame(eod, root, expiry)
             split_greeks = self._split_bulk_option_frame(greeks, root, expiry)
             split_oi = self._split_bulk_option_frame(open_interest, root, expiry)
+            split_quotes = self._split_bulk_option_frame(quotes, root, expiry)
             for symbol in requested:
                 built = self._finalize_bulk_contract(
                     symbol,
                     split_eod.get(symbol),
                     split_greeks.get(symbol),
                     split_oi.get(symbol),
+                    split_quotes.get(symbol),
+                    quote_checked=not quote_incomplete,
+                    quote_incomplete=quote_incomplete,
                 )
                 if built is None:
                     continue
@@ -1738,7 +2147,10 @@ class ThetaDataProvider(BaseDataProvider):
             grouped[key] = rows.drop(columns=["option_symbol"], errors="ignore").copy()
         return grouped
 
-    def _finalize_bulk_contract(self, symbol, eod, greeks, open_interest):
+    def _finalize_bulk_contract(
+        self, symbol, eod, greeks, open_interest, quotes=None, *,
+        quote_checked=True, quote_incomplete=False,
+    ):
         """把单个合约的批量切片整理成与逐合约历史相同的缓存行。"""
         if eod is None or getattr(eod, "empty", True):
             return None
@@ -1764,12 +2176,20 @@ class ThetaDataProvider(BaseDataProvider):
                 "theta": ("theta",),
                 "vega": ("vega",),
                 "rho": ("rho",),
+                "underlying_spot": ("underlying_price", "underlying_spot", "spot"),
             },
         )
         result = self._merge_metadata(
             result,
             open_interest,
             {"open_interest": ("open_interest", "oi")},
+        )
+        daily_quotes = self._normalise_eod_option_quotes(quotes)
+        result = self._merge_eod_option_quotes(
+            result,
+            daily_quotes,
+            checked=quote_checked,
+            incomplete=quote_incomplete,
         )
         if "open_interest" not in result.columns or "delta" not in result.columns:
             return None

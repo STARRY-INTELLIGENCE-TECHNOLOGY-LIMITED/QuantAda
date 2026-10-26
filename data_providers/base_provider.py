@@ -46,3 +46,13 @@ class BaseDataProvider(ABC):
     ) -> pd.DataFrame:
         """按 Provider 能力返回财报事件；不支持时返回 None。"""
         return None
+
+    def get_dividend_calendar(
+        self,
+        symbols=None,
+        start_date: str = None,
+        end_date: str = None,
+        as_of: str = None,
+    ) -> pd.DataFrame:
+        """按 Provider 能力返回带公告日的分红事件；不支持时返回 None。"""
+        return None

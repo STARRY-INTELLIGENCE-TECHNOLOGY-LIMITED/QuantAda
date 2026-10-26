@@ -75,7 +75,7 @@
 2. 期权策略若要把标的池展开为滚动合约，应在策略类上声明 `option_universe`，例如 `option_universe = ("PUT",)` 或 `True`。
 3. 未声明时，运行时不得自动把正股代码展开成期权链，避免股票策略误拉全链。
 4. 展开过滤读取策略 `params` 的 `min_dte`/`max_dte`，以及 `min_delta`/`max_delta`/`protective_put_delta` 的并集；缺少 DTE 窗口时失败关闭。策略也可用 `option_universe` 字典声明固定的候选池覆盖边界，支持 `min_dte`/`max_dte`/`min_delta`/`max_delta`/`protective_put_delta`/`min_open_interest`；这适用于训练空间宽于基准参数的情况，实际每个 Trial 仍按策略参数过滤。
-5. 回测/优化在取数前按 as_of 抽样历史链并求并集，必须使用 ThetaData 或 `theta+futu` 的历史链，禁止用 Futu 当前链回放。并集应按时间均匀封顶，不得只收下窗口开头的合约，否则 Optuna 训练集/测试集会没有可交易期权。展开和合约历史拉取应周期性打印进度（当前 as_of、成功数、空结果数、失败数、合约数、已用时间）。Theta 的 No data found 不逐条打印、不重试；超时与瞬时错误有界重试 5 次，失败 as_of 与漏拉合约在本轮扫完后补偿一轮。`CACHE_DATA=True` 时按 as_of 断点续拉；`--refresh` 忽略断点并全量重拉。实盘不写该断点。同一到期日未缓存合约足够多时，按 31 天 wildcard 拉取并立即按合约落盘；失败或请求数不划算则回退逐合约。中断后已落盘 CSV 不再重拉。option_universe 断点只读写解析后的同一个 DATA_PATH，不并入其它目录的同名断点。
+5. 回测/优化在取数前按 as_of 抽样历史链并求并集，必须使用 ThetaData 或 `theta+futu` 的历史链，禁止用 Futu 当前链回放。并集应按时间均匀封顶，不得只收下窗口开头的合约，否则 Optuna 训练集/测试集会没有可交易期权。展开和合约历史拉取应周期性打印进度（当前 as_of、成功数、空结果数、失败数、合约数、已用时间）。Theta 的 No data found 不逐条打印、不重试；超时与瞬时错误有界重试 5 次，失败 as_of 与漏拉合约在本轮扫完后补偿一轮。`CACHE_DATA=True` 时按 as_of 断点续拉；窗口平移在步长内复用断点时，只能使用不晚于目标 as_of 的最近历史快照，不能用未来链回答更早决策日；`--refresh` 忽略断点并全量重拉。实盘不写该断点。同一到期日未缓存合约足够多时，按 31 天 wildcard 拉取并立即按合约落盘；失败或请求数不划算则回退逐合约。中断后已落盘 CSV 不再重拉。option_universe 断点只读写解析后的同一个 DATA_PATH，不并入其它目录的同名断点。
    若策略声明 `option_universe_exclude_underlyings`，或声明 `option_universe_exclude_param` 指向一个参数（如反向 ETF Beta 对冲标的），这些正股保留在股票池但不展开期权链，避免对冲标的被轮动逻辑当成卖 Put/Call 的底层。
 历史链候选若声明 `protective_put_delta`，每个 as_of 必须同时覆盖 Short Put 的中心 Delta 和保护腿 Delta；断点缓存身份必须包含 Delta 锚点，不能复用只围绕短腿中心生成的旧缓存。
 6. 实盘每个 schedule slot 用当前链增补合约；账户已有持仓或在途的旧合约必须保留，即使它们还不在当前 datas。pending 快照不可信，或持仓查询异常时，不得把现有期权 feed 当作空仓丢弃。
@@ -99,11 +99,19 @@ for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"})
 6. 自定义期权 feed 至少应满足：代码可由 `parse_option_symbol()` 解析，或提供 `option_type/right/cp/put_call` 与 `strike/expiry` 等标准元数据列。否则候选索引会失败关闭，不能静默交易。
 7. 按底层代码查找正股/ETF feed 使用 `underlying_feed(broker, key)`。同一 `broker.datas` 容器在身份、长度和首尾 feed 不变时复用索引，替换列表或追加 feed 后自动重建。策略不要在每个 bar 里对全部合约重复解析代码来判断谁是正股。
 
+## 11.5 点时估值快照
+1. 需要使用基本面 V/W 的策略优先通过 `common.options.valuation` 读取标准化估值锚；该模块只处理通用表格和纯计算，不绑定 App、券商或估值供应商。
+2. CSV/Parquet 快照必需字段为 `ticker`、`asof`、`v`、`confidence`、`method`、`source_id`；`w` 可缺省，但只有调用方显式提供 `w_multiple` 时才能由 V 派生。`asof` 表示该估值快照首次可供策略使用的日期，不是财报所属期。
+3. 点时查询仅接受 `asof < decision_date` 的最新记录；同一 ticker/asof 重复、V/W 非正、估值来源身份缺失或其它必需字段缺失时失败关闭。不得用同日更新或未来修订值回放历史。
+4. `resolve_valuation_anchor()` 可读取行情 DataFrame 中的历史 V/W 列，也可读取 `data.p.dataname.attrs['valuation_snapshots']` 中按 ticker 提供的标准快照表。回退到滞后滚动中位数必须由策略显式启用，并把来源标成 `lagged_median_proxy`；该代理不等同于基本面估值。
+5. 策略应在交易信号中保留实际使用的 `asof`、`method`、`confidence`、`source_id` 和来源类型，便于审计及对照不同估值模型。
+
 ## 12. 双向期权池与显式物理交割回测
 1. 双向轮动声明 `option_universe = ("PUT", "CALL")`，参数使用 `put_min_delta/put_max_delta/call_min_delta/call_max_delta`。方向参数必须完整且符号合法；发现时两侧各保留中心 Delta 锚点，边界和锚点进入缓存身份。当前优化器仅按固定参数展开池，不能假定搜索自动加载固定边界以外的合约。
 2. 策略声明 `option_settlement = "physical"` 才启用日线物理交割。已有股票和 PCS 策略不改变行为；实盘不执行历史交割模拟。
 3. 机械记账集中在 `backtest/option_settlement.py`，策略不保存现金、虚拟仓位或等待指派队列。
 4. 仅支持 Days/compression=1；到期日正股收盘价决定价内价外，按执行价转移现金和股票，期权归零。缺到期日价格、标的或足额担保时明确失败，不用次日价格代替。
 5. 交割通过引擎原生成交通知更新持仓、归因和净值，避免重复入账，回测结束日在到期日时也结算。交割转移不加交易佣金/滑点；普通订单仍走原有成本路径。
-6. 该模型不模拟提前指派、放弃行权、盘后价格、分红现金流、行权费用或拆股调整合约；不能当成完整美式期权结算模型。
+6. 该模型不模拟提前指派、放弃行权、盘后价格、分红现金流、行权费用或拆股调整合约；不能当成完整美式期权结算模型。支持 `dividend_calendar` 的 Wheel 策略可用已公告分红在除息前最后一个正股交易日比较每股分红与 Call 时间价值，阻止新开或买平高指派风险短 Call；这只是风险缓解，不等于指派仿真或清算对账。
 7. 轮动按券商股票/期权持仓重新判阶段，不能推断股票来源；所有在途与缺报价持仓占用底层名额，已有股票卖 Call 不占第二个名额。卖 Call 必须足额股票覆盖，退出不受开仓 Delta/IVP/OI 过滤。
+8. 卖方候选开仓必须有未交叉的实际 Bid/Ask；多头买入可使用有效 Ask 单边盘口，但不能把 Last 填为 Ask。`quote_snapshot()` 保留 Last 作为成交参考，但不得填充缺失盘口。若 Provider 提供报价量且对应可执行一侧为零，该盘口不可执行。ThetaData 日线期权通过历史 Quote 接口取收盘前快照；缺 quote 时不应用 EOD OHLC 伪造 Bid/Ask。

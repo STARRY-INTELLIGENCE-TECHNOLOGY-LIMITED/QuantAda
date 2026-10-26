@@ -224,6 +224,7 @@ def test_default_catalog_exposes_notification_and_provider_credentials() -> None
         "TUSHARE_TOKEN",
         "TIINGO_TOKEN",
         "THETADATA_TOKEN",
+        "SEC_USER_AGENT",
     } <= names
 
     variables = catalog.variable_values(

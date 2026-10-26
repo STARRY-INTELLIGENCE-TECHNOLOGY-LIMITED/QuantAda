@@ -1860,6 +1860,38 @@ def _fetch_job(data_manager, symbol="US.AAPL240119P00150000"):
     return job
 
 
+def test_fetch_all_data_queries_events_only_for_source_underlyings(monkeypatch):
+    import data_providers.option_universe as option_universe
+
+    option_symbol = "US.AAPL240119P00150000"
+    event_calls = {}
+
+    class DummyDataManager:
+        def get_data(self, symbol, **kwargs):
+            return _bars(symbol)
+
+        def attach_earnings_calendar(self, datas, **kwargs):
+            event_calls["earnings"] = list(kwargs["symbols"])
+
+        def attach_dividend_calendar(self, datas, **kwargs):
+            event_calls["dividend"] = list(kwargs["symbols"])
+
+    monkeypatch.setattr(
+        option_universe,
+        "expand_option_universe",
+        lambda symbols, **kwargs: ["US.AAPL", option_symbol],
+    )
+    job = _fetch_job(DummyDataManager(), "US.AAPL")
+    job.target_symbols = ["US.AAPL"]
+    job._source_symbols = ["US.AAPL"]
+    job.strategy_class = SimpleNamespace(option_universe=("PUT",))
+
+    got = job._fetch_all_data()
+
+    assert set(got) == {"US.AAPL", option_symbol}
+    assert event_calls == {"earnings": ["US.AAPL"], "dividend": ["US.AAPL"]}
+
+
 def test_fetch_all_data_retries_unresolved_until_attempt_budget(capsys):
     from data_providers.base_provider import REQUEST_ATTEMPTS
 

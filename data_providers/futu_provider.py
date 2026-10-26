@@ -21,10 +21,10 @@ from live_trader.adapters.futu_symbols import (
     normalize_futu_symbol,
 )
 from common.options.analytics import parse_expiry, parse_option_symbol
-from common.options.events import normalize_earnings_calendar
+from common.options.events import normalize_dividend_calendar, normalize_earnings_calendar
 from common.options.chain import normalize_option_chain
 from common.options.data_safety import sanitize_market_dataframe
-from .base_provider import BaseDataProvider
+from .base_provider import BaseDataProvider, REQUEST_ATTEMPTS
 from common.live_runtime import dependency_install_hint
 
 try:
@@ -56,6 +56,7 @@ _HISTORY_PAGE_SIZE = 1000
 _MAX_HISTORY_PAGES = 100
 _CONTEXT_INIT_TIMEOUT_SECONDS = 5.0
 _QUOTE_CONTEXT_RETRY_BACKOFF_SECONDS = 5.0
+_EVENT_QUERY_BACKOFF_SECONDS = 0.2
 _REQUIRED_COLUMNS = ('open', 'high', 'low', 'close', 'volume')
 _MARKET_TIMEZONES = {
     'US': 'America/New_York',
@@ -634,7 +635,9 @@ class FutuDataProvider(BaseDataProvider):
         return result
 
     def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
-                 timeframe: str = 'Days', compression: int = 1) -> pd.DataFrame:
+                 timeframe: str = 'Days', compression: int = 1,
+                 price_adjustment: str = None) -> pd.DataFrame:
+        """读取历史行情；组合调用方可显式指定 QFQ、HFQ 或 NONE 口径。"""
         ktype, local_compression = self._resolve_kline_type(timeframe, compression)
         if ktype is None:
             print(f"[Futu] Unsupported timeframe/compression: {timeframe}/{compression}")
@@ -691,16 +694,26 @@ class FutuDataProvider(BaseDataProvider):
         end = self._normalize_date(history_end, intraday=intraday, end=True)
         market_name = futu_symbol.split('.', 1)[0]
         non_adjusted = market_name in {'FX', 'HK_FUTURE', 'EC'}
+        requested_adjustment = str(price_adjustment or '').strip().upper()
+        if requested_adjustment and requested_adjustment not in {'NONE', 'QFQ', 'HFQ'}:
+            print(f'[Futu] Unsupported price adjustment type: {price_adjustment!r}.')
+            return None
+        force_unadjusted = (
+            non_adjusted
+            or futu_symbol in self._known_option_symbols
+            or self._is_option_symbol(futu_symbol)
+        )
         autype_name = (
-            'NONE'
-            if non_adjusted or futu_symbol in self._known_option_symbols or self._is_option_symbol(futu_symbol)
-            else 'QFQ'
+            'NONE' if force_unadjusted
+            else requested_adjustment or 'QFQ'
         )
         autype = _enum_value(AuType, autype_name, 'None' if autype_name == 'NONE' else 'qfq')
         raw_df = self._request_history(futu_symbol, start, end, ktype, autype)
         result = self._normalize_dataframe(raw_df)
         if result is None:
             return None
+        result['futu_price_adjustment_type'] = autype_name
+        result.attrs['price_adjustment_type'] = autype_name
         if crosses_current and not intraday:
             # 过去到当前/未来的请求统一合并一根当前完整快照；普通股票默认
             # 历史数据可能是 QFQ，而快照无法复权，因此显式留下口径标记。
@@ -708,6 +721,7 @@ class FutuDataProvider(BaseDataProvider):
             if current_row is not None:
                 current_normalized = self._normalize_dataframe(current_row)
                 if current_normalized is not None:
+                    current_normalized["futu_price_adjustment_type"] = "NONE"
                     result = pd.concat([result, current_normalized])
                     result = result[~result.index.duplicated(keep='last')].sort_index()
             result.attrs['requested_end'] = requested_end
@@ -799,6 +813,9 @@ class FutuDataProvider(BaseDataProvider):
             if contract_multiplier is not None:
                 result.attrs['contract_multiplier'] = contract_multiplier
                 result['contract_multiplier'] = contract_multiplier
+        if 'futu_price_adjustment_type' not in result.columns:
+            result['futu_price_adjustment_type'] = autype_name
+        result.attrs['price_adjustment_type'] = autype_name
         return result
 
     def get_market_snapshot(self, symbols) -> pd.DataFrame:
@@ -1193,6 +1210,193 @@ class FutuDataProvider(BaseDataProvider):
             end_date=end_date,
         )
         if result is not None:
+            result.attrs["as_of_supported"] = False
+            result.attrs["source"] = "futu"
+        return result
+
+    def get_dividend_calendar(
+        self, symbols=None, start_date=None, end_date=None, as_of=None, deadline=None,
+    ) -> pd.DataFrame:
+        """读取带公告日的分红记录，并用 rehab 每股金额补足已匹配事件。"""
+        context = self._get_quote_context()
+        if context is None:
+            return None
+        raw_symbols = [symbols] if isinstance(symbols, str) else list(symbols or [])
+        codes = []
+        for item in raw_symbols:
+            normalized = self._normalize_symbol(item)
+            parsed = parse_option_symbol(normalized)
+            if parsed.get("underlying"):
+                market = normalized.split('.', 1)[0]
+                normalized = self._normalize_symbol(f"{market}.{parsed['underlying']}")
+            if normalized and normalized not in codes:
+                codes.append(normalized)
+        if not codes:
+            return None
+
+        parts = []
+        requests_complete = True
+        dividends_method = getattr(context, "get_corporate_actions_dividends", None)
+        rehab_method = getattr(context, "get_rehab", None)
+        if not callable(dividends_method):
+            return None
+
+        def values(frame, names):
+            columns = {str(column).strip().lower(): column for column in frame.columns}
+            selected = next((columns.get(name.lower()) for name in names if columns.get(name.lower()) is not None), None)
+            return frame[selected] if selected is not None else pd.Series([None] * len(frame), index=frame.index)
+
+        def request_event(method, code, label):
+            last_error = "unknown error"
+            for attempt in range(1, REQUEST_ATTEMPTS + 1):
+                if deadline is not None and time.monotonic() >= float(deadline) - _DEFAULT_QUERY_TIMEOUT_SECONDS:
+                    return None, False
+                try:
+                    with self._context_lock:
+                        ret_code, response = method(code)
+                except Exception as exc:
+                    ret_code, response = None, None
+                    last_error = str(exc)
+                else:
+                    if ret_code == RET_OK:
+                        return response, True
+                    last_error = str(response)
+                if attempt >= REQUEST_ATTEMPTS:
+                    break
+                delay = min(_EVENT_QUERY_BACKOFF_SECONDS * attempt, 1.0)
+                if deadline is not None and time.monotonic() + delay >= float(deadline) - _DEFAULT_QUERY_TIMEOUT_SECONDS:
+                    break
+                print(f"[Futu] {label} retry {attempt + 1}/{REQUEST_ATTEMPTS} after {last_error}")
+                time.sleep(delay)
+            print(f"[Futu] {label} failed after {REQUEST_ATTEMPTS} attempts: {last_error}")
+            return None, False
+
+        for code in codes:
+            data, request_complete = request_event(
+                dividends_method, code, "corporate-actions dividend query",
+            )
+            if not request_complete:
+                requests_complete = False
+                continue
+            if data is None:
+                data = pd.DataFrame()
+            if isinstance(data, dict):
+                records = data.get("dividend_list")
+                if isinstance(records, list):
+                    data = pd.DataFrame(records)
+            if not isinstance(data, pd.DataFrame):
+                requests_complete = False
+                print(f"[Futu] Dividend request returned an unsupported response for {code}.")
+                continue
+            if data.empty:
+                continue
+
+            corporate = data.copy()
+            corporate["security"] = code
+            cash_column = next((
+                column for column in corporate.columns
+                if str(column).strip().lower() in {
+                    "cash_per_share", "per_cash_div", "dividend_per_share",
+                    "cash_dividend", "dividend_amount", "cash_amount", "amount",
+                }
+            ), None)
+            if cash_column is None:
+                corporate["cash_per_share"] = float("nan")
+                cash_column = "cash_per_share"
+            ex_column = next((
+                column for column in corporate.columns
+                if str(column).strip().lower() in {
+                    "ex_date", "ex_div_date", "dividend_ex_date", "event_date", "date",
+                }
+            ), None)
+            if "statement" in corporate.columns:
+                def parse_statement(value):
+                    text = "" if pd.isna(value) else str(value)
+                    currency_match = re.search(r"([A-Z]{3})\s*$", text)
+                    numbers = re.findall(r"\d+(?:\.\d+)?", text)
+                    if currency_match is None or not numbers:
+                        return pd.Series({"cash_per_share": float("nan"), "currency": None})
+                    amount = float(numbers[-1])
+                    shares = float(numbers[-2]) if len(numbers) > 1 else 1.0
+                    cash = amount / shares if shares > 0 else float("nan")
+                    return pd.Series({"cash_per_share": cash, "currency": currency_match.group(1)})
+
+                statement_values = pd.DataFrame(
+                    corporate["statement"].map(parse_statement).tolist(), index=corporate.index,
+                )
+                current_cash = pd.to_numeric(corporate[cash_column], errors="coerce")
+                current_cash_valid = current_cash.map(
+                    lambda value: math.isfinite(float(value)) and float(value) > 0
+                    if pd.notna(value) else False
+                )
+                corporate[cash_column] = current_cash.where(
+                    current_cash_valid, statement_values["cash_per_share"]
+                )
+                if "currency" not in corporate.columns:
+                    corporate["currency"] = statement_values["currency"]
+                else:
+                    existing_currency = corporate["currency"].astype("string")
+                    corporate["currency"] = existing_currency.fillna(statement_values["currency"])
+
+            current_cash = pd.to_numeric(corporate[cash_column], errors="coerce")
+            missing_cash = ~current_cash.map(
+                lambda value: math.isfinite(float(value)) and float(value) > 0
+                if pd.notna(value) else False
+            )
+            if missing_cash.any() and callable(rehab_method):
+                rehab_data, _rehab_complete = request_event(
+                    rehab_method, code, "rehab dividend enrichment",
+                )
+                if isinstance(rehab_data, pd.DataFrame) and not rehab_data.empty and ex_column is not None:
+                    rehab_dates = values(rehab_data, ("ex_date", "ex_div_date", "dividend_ex_date"))
+                    rehab_cash = values(rehab_data, ("cash_per_share", "per_cash_div", "dividend_per_share"))
+                    rehab = pd.DataFrame({
+                        "ex_date": pd.to_datetime(rehab_dates, errors="coerce").dt.normalize(),
+                        "cash_per_share": pd.to_numeric(rehab_cash, errors="coerce"),
+                    }).dropna(subset=["ex_date", "cash_per_share"])
+                    if not rehab.empty:
+                        corporate["_ex_date_key"] = pd.to_datetime(
+                            corporate[ex_column], errors="coerce"
+                        ).dt.normalize()
+                        rehab_by_date = rehab.drop_duplicates("ex_date", keep="last").set_index("ex_date")["cash_per_share"]
+                        current_cash = pd.to_numeric(corporate[cash_column], errors="coerce")
+                        current_cash_valid = current_cash.map(
+                            lambda value: math.isfinite(float(value)) and float(value) > 0
+                            if pd.notna(value) else False
+                        )
+                        corporate[cash_column] = current_cash.where(
+                            current_cash_valid, corporate["_ex_date_key"].map(rehab_by_date)
+                        )
+                        corporate = corporate.drop(columns=["_ex_date_key"])
+            parts.append(corporate)
+
+        if not parts and requests_complete:
+            result = normalize_dividend_calendar(
+                pd.DataFrame(), symbols=codes, start_date=start_date, end_date=end_date, as_of=as_of,
+            )
+        elif not parts:
+            return None
+        else:
+            result = normalize_dividend_calendar(
+                pd.concat(parts, ignore_index=True),
+                symbols=codes,
+                start_date=start_date,
+                end_date=end_date,
+                as_of=as_of,
+            )
+        if result is not None:
+            required = result.empty or (
+                result["announcement_date"].notna().all()
+                and pd.to_numeric(result["cash_per_share"], errors="coerce").map(
+                    lambda value: math.isfinite(float(value)) and float(value) > 0
+                    if pd.notna(value) else False
+                ).all()
+                and result["currency"].astype("string").fillna("").str.strip().ne("").all()
+            )
+            # OpenD corporate-actions 是当前事实快照，不提供历史版本化 as-of。
+            # 实盘可以使用当前完整事实，历史回测不得把它当成当时可见的数据库。
+            result.attrs["historical_as_of_supported"] = False
+            result.attrs["current_snapshot_supported"] = bool(requests_complete and required)
             result.attrs["as_of_supported"] = False
             result.attrs["source"] = "futu"
         return result

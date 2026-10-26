@@ -12,7 +12,11 @@ from common.options.universe import (
     select_chain_candidates,
     split_symbol_pool,
 )
-from data_providers.option_universe import expand_option_universe, supports_historical_option_chain
+from data_providers.option_universe import (
+    _cached_snapshot_for_as_of,
+    expand_option_universe,
+    supports_historical_option_chain,
+)
 
 
 class DummyStrategy:
@@ -792,6 +796,20 @@ def test_expand_resumes_cached_as_of_snapshots(tmp_path, monkeypatch):
     assert manager.calls == first_calls
     checkpoint_dir = tmp_path / "market_cache" / "option_universe"
     assert list(checkpoint_dir.glob("*.json"))
+
+
+def test_cached_as_of_never_reuses_a_future_snapshot():
+    snapshots = {
+        "2026-09-11": ["US.SPY261023P00445000"],
+        "2026-09-18": ["US.SPY261030P00440000"],
+    }
+
+    # 9 月 15 日不能拿 9 月 18 日的链回答；应回退到更早快照。
+    assert _cached_snapshot_for_as_of(snapshots, "2026-09-15", step_days=7) == (
+        snapshots["2026-09-11"]
+    )
+    # 早于所有缓存时宁可重新请求，也不能使用未来链。
+    assert _cached_snapshot_for_as_of(snapshots, "2026-09-04", step_days=7) is None
 
 
 def test_expand_retries_uncached_as_of_snapshots(tmp_path, monkeypatch):

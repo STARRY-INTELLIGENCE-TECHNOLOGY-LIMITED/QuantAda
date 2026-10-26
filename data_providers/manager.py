@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import math
 import os
 import re
 import threading
@@ -14,8 +15,9 @@ from .compositions import build_provider_composition
 from .csv_provider import CsvDataProvider
 from .thetadata_provider import ENRICHMENT_INCOMPLETE_COLUMN, enrichment_retry_needed
 from common.options.analytics import parse_option_symbol
-from common.options.events import normalize_earnings_calendar
+from common.options.events import normalize_dividend_calendar, normalize_earnings_calendar
 from common.options.data_safety import sanitize_market_dataframe
+from common.options.market_inputs import align_rate_curve, forward_dividend_yield_series
 
 
 _PLATFORM_DEFAULT_SOURCES = {
@@ -40,7 +42,10 @@ def resolve_platform_default_source(platform: str) -> str:
 def normalize_source_name(source: str) -> str:
     """将平台或 Provider 别名规范化为 DataManager 使用的名称。"""
     normalized = str(source or '').strip().lower()
-    if normalized in {'hybrid', 'option_hybrid', 'theta+futu', 'futu+theta', 'theta_futu', 'futu_theta'}:
+    if normalized in {
+        'hybrid', 'option_hybrid', 'theta+futu', 'futu+theta',
+        'thetadata+futu', 'futu+thetadata', 'theta_futu', 'futu_theta',
+    }:
         return 'hybrid'
     if normalized == 'sxsc_tushare':
         return 'sxsctushare'
@@ -98,6 +103,32 @@ class DataManager:
                         binder(self._bound_broker)
         return composed[composition_name]
 
+    def _cache_root_for_source(self, specified_sources=None):
+        """按辅助源自动选择 DATA_PATH 下的缓存子目录。"""
+        base_root = getattr(self, "data_path", None) or resolve_data_path(
+            getattr(config, "DATA_PATH", ".data")
+        )
+        if not specified_sources:
+            return base_root
+        names = self._split_source_names(specified_sources)
+        if not any(name in {"sec", "earnings", "rates", "occ"} for name in names):
+            return base_root
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", "_".join(names)) or "source"
+        return os.path.join(base_root, "sources", safe)
+
+    @staticmethod
+    def _strip_unselected_auxiliary_columns(frame, valuation_providers):
+        """不选择估值/基本面源时清除旧缓存残留列。"""
+        if not isinstance(frame, pd.DataFrame) or valuation_providers:
+            return frame
+        prefixes = ("valuation_", "fundamental_")
+        columns = [
+            column for column in frame.columns
+            if str(column).startswith(prefixes)
+            or str(column) in {"underlying_fair_value", "underlying_weighted_value"}
+        ]
+        return frame.drop(columns=columns, errors="ignore") if columns else frame
+
     def _all_provider_instances(self):
         """返回普通和已构造组合 Provider，供运行时注入/关闭使用。"""
 
@@ -121,6 +152,16 @@ class DataManager:
                 return getattr(provider, name)
         return None
 
+    def _provider_supports_symbol(self, provider, symbol):
+        """有 Provider 显式白名单时跳过不匹配标的，保留未知能力的既有回退行为。"""
+        method = self._explicit_provider_method(provider, "supports_symbol")
+        if method is None:
+            return True
+        try:
+            return bool(method(symbol))
+        except Exception:
+            return True
+
     @staticmethod
     def _explicit_provider_value(provider, name, default=None):
         """读取显式 Provider 字段，不触发动态 ``__getattr__``。"""
@@ -136,29 +177,97 @@ class DataManager:
                     return default
         return default
 
+    def _provider_supports_historical_option_quotes(self, provider):
+        """判断组合 Provider 是否能为历史期权补充真实 NBBO。"""
+        if bool(self._explicit_provider_value(provider, "HISTORICAL_OPTION_QUOTES", False)):
+            return True
+        for name in ("theta_provider", "historical_provider"):
+            child = self._explicit_provider_value(provider, name, None)
+            if child is not None and bool(
+                self._explicit_provider_value(child, "HISTORICAL_OPTION_QUOTES", False)
+            ):
+                return True
+        return False
+
+    def _option_history_prefetch_provider(self, specified_sources):
+        """查找所选源中的 Theta 历史批量取数能力。"""
+        if specified_sources:
+            providers = []
+            for name in self._split_source_names(specified_sources):
+                try:
+                    provider = self._provider_for_source(name)
+                except Exception:
+                    continue
+                if provider is not None:
+                    providers.append(provider)
+        else:
+            providers = list(self._all_provider_instances())
+        for provider in providers:
+            candidates = [provider]
+            for name in ("theta_provider", "historical_provider"):
+                child = self._explicit_provider_value(provider, name, None)
+                if child is not None:
+                    candidates.append(child)
+            for candidate in candidates:
+                method = self._explicit_provider_method(candidate, "prefetch_option_histories")
+                if callable(method):
+                    return candidate
+        return None
+
     @staticmethod
     def _split_source_names(specified_sources: str) -> list:
         """
         将 data_source 字符串拆分为 provider 名称列表。
-        支持空格/逗号分隔（如: "tiingo, akshare" 或 "tiingo akshare"）。
+        支持组合表达式、空格/逗号分隔和配置的嵌套别名。
         """
         if not specified_sources:
             return []
         raw = str(specified_sources).strip().lower()
         if not raw:
             return []
-        # ``theta+futu`` 表示字段合并 Provider；逗号/空格仍表示普通回退链。
-        compact = re.sub(r'\s*\+\s*', '+', raw)
         compositions = getattr(config, 'DATA_PROVIDER_COMPOSITIONS', {})
         if not isinstance(compositions, dict):
             compositions = {}
-        if (
-            compact in compositions
-        ):
-            return [compact]
-        if normalize_source_name(compact) == 'hybrid':
-            return ['hybrid']
-        return [normalize_source_name(s) for s in re.split(r"[,\s]+", compact) if s]
+        configured_aliases = getattr(config, 'DATA_PROVIDER_ALIASES', {})
+        aliases = {}
+        if isinstance(configured_aliases, dict):
+            for alias, target in configured_aliases.items():
+                key = str(alias or '').strip().lower()
+                if (
+                    key
+                    and not re.search(r'[+,\s]', key)
+                    and isinstance(target, str)
+                    and target.strip()
+                ):
+                    aliases[key] = re.sub(r'\s*\+\s*', '+', target.strip().lower())
+
+        def expand(expression, alias_stack=()):
+            compact = re.sub(r'\s*\+\s*', '+', str(expression or '').strip().lower())
+            if not compact:
+                return []
+            if compact in aliases:
+                if compact in alias_stack:
+                    cycle = ' -> '.join((*alias_stack, compact))
+                    raise ValueError(f'Provider alias cycle: {cycle}')
+                return expand(aliases[compact], (*alias_stack, compact))
+            if compact in compositions:
+                return [compact]
+            if normalize_source_name(compact) == 'hybrid':
+                return ['hybrid']
+
+            sources = []
+            for token in re.split(r'[,\s]+', compact):
+                if not token:
+                    continue
+                if token in aliases:
+                    sources.extend(expand(token, alias_stack))
+                elif token in compositions:
+                    sources.append(token)
+                else:
+                    sources.append(normalize_source_name(token))
+            return sources
+
+        return expand(raw)
 
     def apply_runtime_token(self, token: str, specified_sources: str = None) -> bool:
         """将外部运行时令牌注入选中的托管数据源。"""
@@ -371,6 +480,8 @@ class DataManager:
         """
         origin = "fetch"
         final_df = None
+        valuation_providers = []
+        cache_root = self._cache_root_for_source(specified_sources)
 
         # 路径一: 用户指定了数据源
         if specified_sources:
@@ -389,13 +500,37 @@ class DataManager:
             if not providers_to_use:
                 print(f"Error: None of the specified sources '{specified_sources}' are valid.")
                 return None
-            # 单一在线 Provider 显式指定时，优先复用完整本地缓存；多 Provider
-            # 仍严格保持调用方给出的责任链顺序，避免缓存改变 fallback 语义。
+            valuation_providers = [
+                provider
+                for provider in providers_to_use
+                if callable(self._explicit_provider_method(provider, "get_valuation_snapshots"))
+            ]
+            price_providers = [
+                provider
+                for provider in providers_to_use
+                if not bool(self._explicit_provider_value(provider, "VALUATION_ONLY", False))
+                and not bool(self._explicit_provider_value(provider, "AUXILIARY_ONLY", False))
+                and not bool(self._explicit_provider_value(provider, "EVENT_ONLY", False))
+                and self._provider_supports_symbol(provider, symbol)
+            ]
+            if not price_providers:
+                print(f"Error: data_source '{specified_sources}' contains no OHLCV provider for {symbol}.")
+                return None
+            require_option_quotes = bool(parse_option_symbol(symbol).get("option_type")) and any(
+                self._provider_supports_historical_option_quotes(provider)
+                for provider in price_providers
+            )
+            expected_price_adjustment = None
+            if len(price_providers) == 1 and not parse_option_symbol(symbol):
+                expected_price_adjustment = self._explicit_provider_value(
+                    price_providers[0], "UNDERLYING_PRICE_ADJUSTMENT", None
+                )
+            # 估值辅助源不进入 OHLCV 回退链；唯一行情源仍可独立复用完整缓存。
             # 实盘必须重新读取在线事实；即使本地 CSV 覆盖完整窗口，也不能
             # 用历史缓存短路当前行情。回测/优化的 hybrid 正股与期权历史可以走 CSV。
             if (
-                len(source_names) == 1
-                and source_names[0] != 'csv'
+                len(price_providers) == 1
+                and not isinstance(price_providers[0], CsvDataProvider)
                 and not bool(getattr(self, '_live_mode', False))
             ):
                 final_df = self._load_complete_cache(
@@ -405,6 +540,9 @@ class DataManager:
                     timeframe,
                     compression,
                     refresh,
+                    require_option_quotes=require_option_quotes,
+                    expected_price_adjustment=expected_price_adjustment,
+                    cache_root=cache_root,
                 )
                 if final_df is not None and not final_df.empty:
                     origin = "cache"
@@ -412,8 +550,8 @@ class DataManager:
                 final_df = None
             if final_df is None or final_df.empty:
                 final_df = self._fetch_from_providers(
-                    symbol, start_date, end_date, providers_to_use,
-                    timeframe, compression, refresh=refresh,
+                    symbol, start_date, end_date, price_providers,
+                    timeframe, compression, refresh=refresh, cache_root=cache_root,
                 )
                 origin = "fetch"
 
@@ -423,6 +561,47 @@ class DataManager:
 
         # 【最终切片】确保返回的数据在请求的日期范围内
         if final_df is not None and not final_df.empty:
+            final_df = self._strip_unselected_auxiliary_columns(
+                final_df, valuation_providers,
+            )
+            if valuation_providers and not parse_option_symbol(symbol):
+                from common.options.valuation import merge_valuation_snapshots
+
+                for provider in valuation_providers:
+                    method = self._explicit_provider_method(provider, "get_valuation_snapshots")
+                    if method is None:
+                        continue
+                    try:
+                        snapshots = method(symbol, start_date=start_date, end_date=end_date)
+                    except Exception as exc:
+                        print(f"[DataManager] valuation snapshot failed for {symbol}: {exc}")
+                        snapshots = None
+                    final_df = merge_valuation_snapshots(
+                        final_df,
+                        snapshots,
+                        symbol,
+                        max_age_days=self._explicit_provider_value(
+                            provider, "VALUATION_MAX_AGE_DAYS", None
+                        ),
+                    )
+                    if snapshots is not None:
+                        break
+                if bool(getattr(config, "CACHE_DATA", False)) and not bool(
+                    getattr(self, "_live_mode", False)
+                ):
+                    self._cache_data(
+                        final_df, symbol, timeframe, compression, cache_root=cache_root,
+                    )
+
+            if parse_option_symbol(symbol).get("option_type"):
+                self._attach_occ_contract_metadata(
+                    final_df,
+                    symbol,
+                    providers_to_use,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+
             final_df = self._normalize_daily_sessions(
                 final_df,
                 timeframe=timeframe,
@@ -539,6 +718,7 @@ class DataManager:
         else:
             providers = list(self._all_provider_instances())
 
+        fallback = None
         for provider in providers:
             method = self._explicit_provider_method(provider, "get_earnings_calendar")
             declared = next(
@@ -567,14 +747,20 @@ class DataManager:
             normalized = normalize_earnings_calendar(
                 result, symbols=symbols, start_date=start_date, end_date=end_date,
             )
-            if normalized is not None and not normalized.empty:
-                normalized.attrs.update(getattr(result, "attrs", {}) or {})
-                return normalized
-        return None
+            normalized_attrs = dict(getattr(result, "attrs", {}) or {})
+            if normalized is not None and (
+                not normalized.empty or bool(normalized_attrs.get("as_of_supported", False))
+            ):
+                normalized.attrs.update(normalized_attrs)
+                if bool(normalized_attrs.get("as_of_supported", False)):
+                    return normalized
+                if fallback is None:
+                    fallback = normalized
+        return fallback
 
     def attach_earnings_calendar(
         self, datas, symbols=None, start_date: str = None, end_date: str = None,
-        specified_sources: str = None,
+        specified_sources: str = None, as_of: str = None,
     ):
         """把 data_source 财报快照附加到行情 attrs，供回测和优化复用。"""
         from common.options.events import attach_earnings_calendar
@@ -584,15 +770,429 @@ class DataManager:
             start_date=start_date,
             end_date=end_date,
             specified_sources=specified_sources,
+            as_of=as_of,
         )
         return attach_earnings_calendar(datas, events)
+
+    def get_rate_curve(self, start_date=None, end_date=None, specified_sources=None, as_of=None, deadline=None):
+        """从指定辅助源读取动态无风险利率曲线。"""
+        names = self._split_source_names(specified_sources) if specified_sources else []
+        providers = []
+        for name in names:
+            try:
+                provider = self._provider_for_source(name)
+            except Exception:
+                continue
+            if provider is not None:
+                providers.append(provider)
+        if not providers:
+            providers = list(self._all_provider_instances())
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_rate_curve")
+            if method is None:
+                continue
+            try:
+                result = method(
+                    start_date=start_date, end_date=end_date, as_of=as_of, deadline=deadline,
+                )
+            except TypeError:
+                result = method(start_date, end_date)
+            except Exception as exc:
+                print(f"[DataManager] rate curve failed: {exc}")
+                continue
+            if isinstance(result, pd.DataFrame) and not result.empty:
+                return result
+        return None
+
+    def get_option_contract_adjustments(
+        self, symbols=None, start_date=None, end_date=None,
+        specified_sources=None, as_of=None,
+    ):
+        """通过选定辅助源读取 OCC 合约调整事实。"""
+        names = self._split_source_names(specified_sources) if specified_sources else []
+        providers = []
+        for name in names:
+            try:
+                provider = self._provider_for_source(name)
+            except Exception:
+                continue
+            if provider is not None:
+                providers.append(provider)
+        if not providers:
+            providers = list(self._all_provider_instances())
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_contract_adjustments")
+            if method is None:
+                continue
+            try:
+                result = method(
+                    symbols=symbols,
+                    start_date=start_date,
+                    end_date=end_date,
+                    as_of=as_of,
+                )
+            except TypeError:
+                result = method(symbols, start_date, end_date)
+            except Exception as exc:
+                print(f"[DataManager] OCC adjustment query failed: {exc}")
+                continue
+            if isinstance(result, pd.DataFrame):
+                return result
+        return None
+
+    def get_option_history_quotes(
+        self, symbol, start_date=None, end_date=None, specified_sources=None,
+        interval="1m", full_session=True, refresh=False,
+    ):
+        """查询全天历史 NBBO；调用方显式选择该高容量研究接口。"""
+        names = self._split_source_names(specified_sources) if specified_sources else []
+        providers = []
+        for name in names:
+            try:
+                provider = self._provider_for_source(name)
+            except Exception:
+                continue
+            if provider is not None:
+                providers.append(provider)
+        if not providers:
+            providers = list(self._all_provider_instances())
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_option_history_quotes")
+            if method is None:
+                for name in ("theta_provider", "historical_provider"):
+                    child = self._explicit_provider_value(provider, name, None)
+                    method = self._explicit_provider_method(child, "get_option_history_quotes") if child is not None else None
+                    if method is not None:
+                        break
+            if method is None:
+                continue
+            try:
+                result = method(
+                    symbol, start_date, end_date, interval,
+                    full_session=full_session, refresh=refresh,
+                )
+            except TypeError:
+                result = method(symbol, start_date, end_date, interval)
+            except Exception as exc:
+                print(f"[DataManager] option history quotes failed for {symbol}: {exc}")
+                continue
+            if isinstance(result, pd.DataFrame) and not result.empty:
+                return result
+        return None
+
+    def get_option_history_trades(
+        self, symbol, start_date=None, end_date=None, specified_sources=None,
+        interval="1m", full_session=True, refresh=False,
+    ):
+        """查询全天历史成交；权限或接口不可用时返回 None。"""
+        names = self._split_source_names(specified_sources) if specified_sources else []
+        providers = []
+        for name in names:
+            try:
+                provider = self._provider_for_source(name)
+            except Exception:
+                continue
+            if provider is not None:
+                providers.append(provider)
+        if not providers:
+            providers = list(self._all_provider_instances())
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_option_history_trades")
+            if method is None:
+                for name in ("theta_provider", "historical_provider"):
+                    child = self._explicit_provider_value(provider, name, None)
+                    method = self._explicit_provider_method(child, "get_option_history_trades") if child is not None else None
+                    if method is not None:
+                        break
+            if method is None:
+                continue
+            try:
+                result = method(
+                    symbol, start_date, end_date, interval,
+                    full_session=full_session, refresh=refresh,
+                )
+            except TypeError:
+                result = method(symbol, start_date, end_date, interval)
+            except Exception as exc:
+                print(f"[DataManager] option history trades failed for {symbol}: {exc}")
+                continue
+            if isinstance(result, pd.DataFrame) and not result.empty:
+                return result
+        return None
+
+    def attach_market_inputs(
+        self, datas, symbols=None, start_date=None, end_date=None,
+        specified_sources=None, as_of=None, deadline=None,
+    ):
+        """把动态利率和可见分红输入附加到正股及期权行情。"""
+        frames = datas or {}
+        if not frames:
+            return frames
+        curve = self.get_rate_curve(
+            start_date=start_date, end_date=end_date,
+            specified_sources=specified_sources, as_of=as_of, deadline=deadline,
+        )
+        if curve is None or curve.empty:
+            return frames
+        if not any(
+            bool((getattr(frame, "attrs", {}) or {}).get("dividend_calendar_available", False))
+            for frame in frames.values()
+            if isinstance(frame, pd.DataFrame)
+        ):
+            try:
+                self.attach_dividend_calendar(
+                    frames,
+                    symbols=symbols or list(frames.keys()),
+                    start_date=start_date,
+                    end_date=end_date,
+                    specified_sources=specified_sources,
+                    as_of=as_of,
+                )
+            except Exception as exc:
+                print(f"[DataManager] dividend inputs unavailable: {exc}")
+        events_by_key = {}
+        for symbol, frame in frames.items():
+            attrs = dict(getattr(frame, "attrs", {}) or {})
+            events_by_key[self._symbol_underlying_key(symbol)] = tuple(
+                attrs.get("dividend_calendar", ()) or ()
+            )
+        for symbol, frame in frames.items():
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                continue
+            frame["risk_free_rate"] = align_rate_curve(frame.index, curve).to_numpy()
+            parsed = parse_option_symbol(str(symbol))
+            if parsed.get("option_type"):
+                key = self._symbol_underlying_key(symbol)
+                events = events_by_key.get(key, ())
+                expiry = pd.Series(pd.Timestamp(parsed.get("expiry")), index=frame.index)
+                # 期权 close 是期权权利金，不能当作正股 spot 计算股息率。
+                if "spot" in frame.columns:
+                    spot = pd.to_numeric(frame["spot"], errors="coerce")
+                    frame["dividend_yield"] = forward_dividend_yield_series(
+                        frame.index, expiry, spot, events,
+                    ).to_numpy()
+                else:
+                    frame["dividend_yield"] = float("nan")
+            attrs = dict(getattr(frame, "attrs", {}) or {})
+            attrs["risk_free_curve"] = curve.copy()
+            attrs["market_inputs_available"] = True
+            attrs["market_inputs_source"] = str(curve.attrs.get("source", "rates"))
+            frame.attrs = attrs
+        return frames
+
+    @staticmethod
+    def _symbol_underlying_key(symbol):
+        parsed = parse_option_symbol(str(symbol or ""))
+        raw = parsed.get("underlying") if parsed.get("option_type") else str(symbol or "")
+        from common.options.analytics import underlying_key
+        return underlying_key(raw)
+
+    def _attach_occ_contract_metadata(self, frame, symbol, providers, start_date=None, end_date=None):
+        """将 OCC 已确认的调整乘数写入期权行情，不把未知调整伪装成标准合约。"""
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_option_contract_metadata")
+            if method is None:
+                continue
+            try:
+                metadata = method(symbol, as_of=end_date)
+            except Exception as exc:
+                print(f"[DataManager] OCC metadata failed for {symbol}: {exc}")
+                continue
+            if not isinstance(metadata, dict):
+                continue
+            status = str(metadata.get("status", "unknown"))
+            frame.attrs["occ_adjustment_status"] = status
+            frame.attrs["occ_adjustment_source_id"] = metadata.get("source_id", "")
+            if status != "adjusted":
+                return
+            multiplier = pd.to_numeric(metadata.get("new_multiplier"), errors="coerce")
+            if pd.notna(multiplier) and float(multiplier) > 0:
+                frame["contract_multiplier"] = float(multiplier)
+                frame.attrs["contract_multiplier"] = float(multiplier)
+            for field in ("new_strike", "new_underlying", "adjustment_type", "effective_date"):
+                value = metadata.get(field)
+                if value is not None and not (isinstance(value, float) and pd.isna(value)):
+                    frame[f"occ_{field}"] = value
+            return
+
+    def get_dividend_calendar(
+        self,
+        symbols=None,
+        start_date: str = None,
+        end_date: str = None,
+        specified_sources: str = None,
+        as_of: str = None,
+        deadline: float = None,
+    ):
+        """通过选定 data_source 查询带公告日的除息事件。"""
+        if specified_sources:
+            providers = []
+            for name in self._split_source_names(specified_sources):
+                try:
+                    provider = self._provider_for_source(name)
+                except Exception as exc:
+                    print(f"Error: Failed to construct data source {name!r}: {exc}")
+                    continue
+                if provider is not None:
+                    providers.append(provider)
+        else:
+            providers = list(self._all_provider_instances())
+
+        for provider in providers:
+            method = self._explicit_provider_method(provider, "get_dividend_calendar")
+            declared = next(
+                (base.__dict__.get("get_dividend_calendar") for base in type(provider).__mro__
+                 if "get_dividend_calendar" in base.__dict__),
+                None,
+            )
+            if method is None or declared is BaseDataProvider.get_dividend_calendar:
+                continue
+            try:
+                signature = inspect.signature(method)
+                kwargs = {
+                    "symbols": symbols,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "as_of": as_of,
+                    "deadline": deadline,
+                }
+                if not any(item.kind == inspect.Parameter.VAR_KEYWORD for item in signature.parameters.values()):
+                    kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+                result = method(**kwargs)
+            except TypeError:
+                continue
+            except Exception as exc:
+                print(f"[DataManager] dividend calendar failed: {exc}")
+                continue
+            normalized = normalize_dividend_calendar(
+                result, symbols=symbols, start_date=start_date, end_date=end_date, as_of=as_of,
+            )
+            if normalized is None:
+                continue
+            if isinstance(result, pd.DataFrame) and not result.empty and normalized.empty:
+                print("[DataManager] dividend calendar contained no valid normalized events; treating it as unavailable.")
+                continue
+            attrs = dict(getattr(result, "attrs", {}) or {})
+            supported = bool(attrs.get(
+                "historical_as_of_supported", attrs.get("as_of_supported", False)
+            ))
+            current_supported = bool(attrs.get(
+                "current_snapshot_supported", attrs.get("as_of_supported", False)
+            ))
+            fields_ready = normalized.empty or (
+                normalized["announcement_date"].notna().all()
+                and pd.to_numeric(normalized["cash_per_share"], errors="coerce").map(
+                    lambda value: math.isfinite(float(value)) and float(value) > 0
+                    if pd.notna(value) else False
+                ).all()
+                and normalized["currency"].astype("string").fillna("").str.strip().ne("").all()
+            )
+            normalized.attrs.update(attrs)
+            normalized.attrs["as_of_supported"] = bool(supported and fields_ready)
+            normalized.attrs["current_snapshot_supported"] = bool(current_supported and fields_ready)
+            return normalized
+        return None
+
+    def attach_dividend_calendar(
+        self,
+        datas,
+        symbols=None,
+        start_date: str = None,
+        end_date: str = None,
+        specified_sources: str = None,
+        as_of: str = None,
+        deadline: float = None,
+    ):
+        """把带公告日的分红快照附加到行情 attrs。"""
+        from common.options.events import attach_dividend_calendar
+
+        events = self.get_dividend_calendar(
+            symbols=symbols,
+            start_date=start_date,
+            end_date=end_date,
+            specified_sources=specified_sources,
+            as_of=as_of,
+            deadline=deadline,
+        )
+        return attach_dividend_calendar(datas, events)
+
+    def prefetch_option_histories(
+        self,
+        symbols,
+        start_date,
+        end_date,
+        *,
+        specified_sources=None,
+        timeframe="Days",
+        compression=1,
+        refresh=False,
+    ):
+        """按到期日批量预取未缓存期权，并逐合约写入可复用行情缓存。"""
+        if (
+            not specified_sources
+            or not getattr(config, "CACHE_DATA", False)
+            or refresh
+            or getattr(self, "_live_mode", False)
+            or str(timeframe or "").strip().lower() not in {"", "days", "day", "d"}
+        ):
+            return 0
+        try:
+            if int(compression or 1) != 1:
+                return 0
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        option_symbols = [
+            str(symbol).strip().upper()
+            for symbol in symbols or []
+            if parse_option_symbol(str(symbol)).get("option_type")
+        ]
+        if len(option_symbols) < 2:
+            return 0
+        cache_root = self._cache_root_for_source(specified_sources)
+        provider = self._option_history_prefetch_provider(specified_sources)
+        if provider is None:
+            return 0
+        missing = []
+        for symbol in option_symbols:
+            cached = self._load_complete_cache(
+                symbol,
+                start_date,
+                end_date,
+                timeframe,
+                compression,
+                False,
+                require_option_quotes=self._provider_supports_historical_option_quotes(provider),
+                cache_root=cache_root,
+            )
+            if cached is None:
+                missing.append(symbol)
+        if len(missing) < 2:
+            return 0
+        saved = 0
+
+        def save_ready(symbol, frame):
+            nonlocal saved
+            self._cache_data(
+                frame, symbol, timeframe, compression, cache_root=cache_root,
+            )
+            saved += 1
+
+        method = self._explicit_provider_method(provider, "prefetch_option_histories")
+        try:
+            method(missing, start_date, end_date, on_ready=save_ready)
+        except Exception as exc:
+            print(f"[DataManager] option history batch prefetch failed; continuing per contract: {exc}")
+        return saved
 
 
     def _cache_roots(self):
         """只返回一个行情根。相对路径已锚定 run.py 同级，避免两份缓存混读。"""
         return [resolve_data_path(self.data_path)]
 
-    def _load_complete_cache(self, symbol, start_date, end_date, timeframe, compression, refresh):
+    def _load_complete_cache(
+        self, symbol, start_date, end_date, timeframe, compression, refresh,
+        require_option_quotes=False, expected_price_adjustment=None, cache_root=None,
+    ):
         """读取覆盖请求窗口的缓存；缺口或刷新请求均返回 None。"""
         if not getattr(config, 'CACHE_DATA', False) or refresh:
             return None
@@ -666,17 +1266,37 @@ class DataManager:
                 if is_intraday and end_date_only and expiry_compare is not None:
                     expiry_compare = expiry_compare.normalize()
                 if start_compare is not None and cache_min > start_compare:
-                    # 期权缓存起点可以晚于请求窗；未接到到期日的残段仍算缺口。
-                    if expiry_compare is None or cache_max < expiry_compare:
+                    # 股票缓存必须覆盖请求起点；期权合约上市晚于请求起点时，
+                    # 只需覆盖请求结束日（若请求结束日在到期日之后则裁到到期日）。
+                    if expiry_compare is None:
+                        return None
+                    required_end = expiry_compare
+                    if end_compare is not None and end_compare < expiry_compare:
+                        required_end = end_compare
+                    if cache_max < required_end:
                         return None
                 if end_compare is not None and cache_max < end_compare:
                     return None
+                if expected_price_adjustment:
+                    adjustment_column = "futu_price_adjustment_type"
+                    if adjustment_column not in frame.columns:
+                        return None
+                    requested_rows = pd.Series(True, index=frame.index)
+                    frame_index = pd.DatetimeIndex(index)
+                    if start_compare is not None:
+                        requested_rows &= frame_index >= start_compare
+                    if end_compare is not None:
+                        requested_rows &= frame_index <= end_compare
+                    selected = frame.loc[requested_rows, adjustment_column]
+                    expected = str(expected_price_adjustment).strip().upper()
+                    if selected.empty or not selected.astype("string").str.upper().eq(expected).all():
+                        return None
             except Exception as exc:
                 print(f"Invalid cache boundary for {symbol}: {exc}")
                 return None
             return frame
 
-        root = resolve_data_path(self.data_path)
+        root = resolve_data_path(cache_root or self.data_path)
         try:
             candidate = CsvDataProvider(root).get_data(
                 symbol,
@@ -692,7 +1312,7 @@ class DataManager:
         if candidate is None or candidate.empty:
             print(f"Cached data for {symbol} contains no finite OHLCV rows.")
             return None
-        if enrichment_retry_needed(candidate, symbol):
+        if enrichment_retry_needed(candidate, symbol, require_quotes=require_option_quotes):
             return None
         return covered(candidate)
 
@@ -705,6 +1325,8 @@ class DataManager:
             p for p in self.providers
             if p.__class__.__name__.replace('DataProvider', '').lower() != 'csv'
             and not bool(self._explicit_provider_value(p, 'HYBRID_ONLY', False))
+            and not bool(self._explicit_provider_value(p, 'AUXILIARY_ONLY', False))
+            and not bool(self._explicit_provider_value(p, 'EVENT_ONLY', False))
         ]
 
         return self._fetch_from_providers(
@@ -714,7 +1336,7 @@ class DataManager:
 
     def _fetch_from_providers(self, symbol, start_date, end_date, providers,
                               timeframe: str = 'Days', compression: int = 1,
-                              refresh: bool = False):
+                              refresh: bool = False, cache_root=None):
         """
         遍历给定的提供者列表获取数据。
         如果成功且来源不是CSV，则执行缓存。
@@ -752,7 +1374,9 @@ class DataManager:
                             and bool(getattr(self, '_live_mode', False))
                         )
                     ):
-                        self._cache_data(df, symbol, timeframe, compression)
+                        self._cache_data(
+                            df, symbol, timeframe, compression, cache_root=cache_root,
+                        )
 
                     return df
             except Exception as e:
@@ -760,11 +1384,12 @@ class DataManager:
                 continue
         return None
 
-    def _cache_data(self, df: pd.DataFrame, symbol: str, timeframe: str = 'Days', compression: int = 1):
+    def _cache_data(self, df: pd.DataFrame, symbol: str, timeframe: str = 'Days', compression: int = 1,
+                    cache_root=None):
         """将数据按时间索引与既有缓存合并后写入，避免分段下载覆盖历史。"""
         if not getattr(config, 'CACHE_DATA', False):
             return
-        root = resolve_data_path(self.data_path)
+        root = resolve_data_path(cache_root or self.data_path)
         CsvDataProvider.ensure_cache_dir(root)
         csv_filepath = CsvDataProvider.get_cache_filepath(root, symbol, timeframe, compression)
         temp_filepath = None

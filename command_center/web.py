@@ -340,8 +340,19 @@ class CommandCenterService:
         presets = list(self.catalog.presets)
         known_data_sources = {
             "gm", "futu", "tiingo", "akshare", "tushare", "sxsc_tushare",
-            "csv", "theta", "thetadata", "cboe", "ibkr", "hybrid", "theta+futu",
+            "csv", "theta", "thetadata", "cboe", "occ", "rates", "earnings",
+            "ibkr", "hybrid", "theta+futu",
         }
+        configured_aliases = getattr(config, "DATA_PROVIDER_ALIASES", {})
+        data_source_aliases = (
+            {
+                str(alias).strip().lower(): str(target).strip()
+                for alias, target in configured_aliases.items()
+                if str(alias).strip() and isinstance(target, str) and target.strip()
+            }
+            if isinstance(configured_aliases, Mapping) else {}
+        )
+        known_data_sources.update(data_source_aliases)
         profile_ids = {profile.profile_id for profile in self.catalog.profiles}
         return {
             "markets": sorted({item.market for item in presets} | {"自定义"}),
@@ -355,6 +366,7 @@ class CommandCenterService:
                     )
                 }
             ),
+            "data_source_aliases": data_source_aliases,
             "modes": [
                 {"id": "backtest", "title": "回测"},
                 {"id": "live", "title": "实盘"},

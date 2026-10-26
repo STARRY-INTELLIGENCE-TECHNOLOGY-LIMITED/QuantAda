@@ -85,6 +85,10 @@ class CboeDataProvider(BaseDataProvider):
 
         return cls._normalize_code(symbol) == "VIX"
 
+    def supports_symbol(self, symbol: str) -> bool:
+        """声明本 Provider 固定白名单覆盖范围，供组合源跳过无关取数。"""
+        return self._normalize_code(symbol) is not None
+
     @classmethod
     def supported_symbols(cls) -> tuple[str, ...]:
         """返回文档和选股器应使用的规范代码。"""

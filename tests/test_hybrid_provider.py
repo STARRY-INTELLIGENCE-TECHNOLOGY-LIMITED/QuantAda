@@ -54,6 +54,89 @@ def test_hybrid_provider_keeps_backtest_path_theta_only():
     assert futu.calls == 0
 
 
+def test_hybrid_provider_requests_unadjusted_underlying_history():
+    class Theta:
+        def get_data(self, *args):
+            raise AssertionError("正股历史不得回退到 ThetaData")
+
+    class Futu:
+        def __init__(self):
+            self.adjustment = None
+
+        def get_data(self, symbol, start_date, end_date, timeframe, compression,
+                     price_adjustment=None):
+            self.adjustment = price_adjustment
+            return pd.DataFrame(
+                {"open": [100.0], "high": [101.0], "low": [99.0],
+                 "close": [100.5], "volume": [1000.0]},
+                index=pd.to_datetime(["2026-10-22"]),
+            )
+
+    futu = Futu()
+    provider = HybridDataProvider(theta_provider=Theta(), futu_provider=futu)
+
+    result = provider.get_data("US.AAPL", "20261022", "20261022")
+
+    assert result is not None
+    assert futu.adjustment == "NONE"
+
+
+def test_hybrid_provider_forwards_dividend_calendar_to_futu_side():
+    expected = pd.DataFrame({
+        "symbol": ["US.AAPL"],
+        "ex_date": [pd.Timestamp("2026-09-14")],
+        "announcement_date": [pd.Timestamp("2026-09-01")],
+        "cash_per_share": [0.5],
+        "currency": ["USD"],
+    })
+
+    class Theta:
+        def get_data(self, *args):
+            return _historical_option_frame()
+
+    class Futu:
+        def get_dividend_calendar(self, **kwargs):
+            self.kwargs = kwargs
+            return expected
+
+    futu = Futu()
+    provider = HybridDataProvider(theta_provider=Theta(), futu_provider=futu)
+    result = provider.get_dividend_calendar(
+        symbols=["US.AAPL"], start_date="20260901", end_date="20261001", as_of="20260910",
+    )
+
+    assert result is expected
+    assert futu.kwargs["as_of"] == "20260910"
+
+
+def test_hybrid_provider_forwards_dividend_calendar_to_futu_side():
+    expected = pd.DataFrame({
+        "symbol": ["US.AAPL"],
+        "ex_date": [pd.Timestamp("2026-09-14")],
+        "announcement_date": [pd.Timestamp("2026-09-01")],
+        "cash_per_share": [0.5],
+        "currency": ["USD"],
+    })
+
+    class Theta:
+        def get_data(self, *args):
+            return _historical_option_frame()
+
+    class Futu:
+        def get_dividend_calendar(self, **kwargs):
+            self.kwargs = kwargs
+            return expected
+
+    futu = Futu()
+    provider = HybridDataProvider(theta_provider=Theta(), futu_provider=futu)
+    result = provider.get_dividend_calendar(
+        symbols=["US.AAPL"], start_date="20260901", end_date="20261001", as_of="20260910",
+    )
+
+    assert result is expected
+    assert futu.kwargs["as_of"] == "20260910"
+
+
 def test_hybrid_provider_merges_futu_live_quote_and_recomputes_ivp():
     class Theta:
         def __init__(self):
@@ -385,6 +468,7 @@ def _stock_frame():
             "low": [99.0],
             "close": [100.5],
             "volume": [1000.0],
+            "futu_price_adjustment_type": ["NONE"],
         },
         index=pd.date_range("2026-08-01", periods=1, tz="UTC"),
     )
@@ -396,7 +480,8 @@ def test_hybrid_provider_stock_history_uses_futu_not_theta():
             raise AssertionError("stock history must not fall back to Theta")
 
     class Futu:
-        def get_data(self, *args):
+        def get_data(self, *args, price_adjustment=None):
+            assert price_adjustment == "NONE"
             return _stock_frame()
 
     provider = HybridDataProvider(theta_provider=Theta(), futu_provider=Futu())
@@ -410,7 +495,8 @@ def test_hybrid_provider_live_stock_merges_futu_snapshot():
             raise AssertionError("live stock overlay must keep Futu history")
 
     class Futu:
-        def get_data(self, *args):
+        def get_data(self, *args, price_adjustment=None):
+            assert price_adjustment == "NONE"
             return _stock_frame()
 
         def get_market_snapshot(self, _symbols):
@@ -437,7 +523,8 @@ def test_hybrid_provider_live_stock_keeps_history_when_snapshot_stale():
             raise AssertionError("stale stock snapshot must not fall back to Theta")
 
     class Futu:
-        def get_data(self, *args):
+        def get_data(self, *args, price_adjustment=None):
+            assert price_adjustment == "NONE"
             return _stock_frame()
 
         def get_market_snapshot(self, _symbols):

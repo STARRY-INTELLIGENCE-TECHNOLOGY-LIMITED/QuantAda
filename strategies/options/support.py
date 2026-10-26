@@ -71,15 +71,17 @@ def finite_row_number(row, *names):
 
 
 def quote_snapshot(row):
-    """读取盘口、Greeks 和流动性字段；缺失 IVP 时记为 NaN。"""
+    """读取实际盘口、Greeks 和流动性字段，不把最后成交价伪装成 Bid/Ask。"""
     last = finite_row_number(row, "last", "close", "price")
     bid = finite_row_number(row, "bid", "bid_price")
     ask = finite_row_number(row, "ask", "ask_price")
+    bid_size = finite_row_number(row, "bid_size", "bid_volume")
+    ask_size = finite_row_number(row, "ask_size", "ask_volume")
     delta = finite_row_number(row, "delta", "option_delta")
-    if (not math.isfinite(ask) or ask <= 0) and last > 0:
-        ask = last
-    if (not math.isfinite(bid) or bid <= 0) and last > 0:
-        bid = last
+    underlying_spot = finite_row_number(row, "underlying_spot", "underlying_price", "spot")
+    has_nbbo = math.isfinite(bid) and bid > 0 and math.isfinite(ask) and ask >= bid
+    has_nbbo = has_nbbo and (not math.isfinite(bid_size) or bid_size > 0)
+    has_nbbo = has_nbbo and (not math.isfinite(ask_size) or ask_size > 0)
     open_interest = safe_number(row.get("open_interest", 0.0), 0.0)
     ivp = safe_number(row.get("iv_percentile", row.get("iv_rank", row.get("ivp"))))
     hv = safe_number(row.get("historical_volatility", row.get("hv", row.get("iv"))))
@@ -88,7 +90,11 @@ def quote_snapshot(row):
     return {
         "bid": bid,
         "ask": ask,
+        "has_nbbo": has_nbbo,
+        "bid_size": bid_size,
+        "ask_size": ask_size,
         "last": last,
+        "underlying_spot": underlying_spot,
         "delta": delta,
         "open_interest": open_interest if math.isfinite(open_interest) else 0.0,
         "iv_percentile": ivp,
@@ -348,21 +354,20 @@ def matches_chain_window(meta, quote, current_dt, params):
             return False
     bid = quote["bid"]
     ask = quote["ask"]
-    has_bid = math.isfinite(bid) and bid > 0
-    has_ask = math.isfinite(ask) and ask > 0
-    if not has_bid and not has_ask:
+    has_nbbo = quote.get(
+        "has_nbbo",
+        math.isfinite(bid) and bid > 0 and math.isfinite(ask) and ask >= bid,
+    )
+    if not has_nbbo:
         return False
-    if has_bid and has_ask:
-        if ask < bid:
-            return False
-        if quote["spread_pct"] > float(params.max_spread_pct):
-            return False
+    if ask < bid or quote["spread_pct"] > float(params.max_spread_pct):
+        return False
     return True
 
 
 
-def chain_window_reject_reason(meta, quote, current_dt, params):
-    """返回过滤原因；通过时返回空字符串。供实盘样例打印，不改变下单语义。"""
+def chain_window_reject_reason(meta, quote, current_dt, params, *, allow_ask_only=False):
+    """返回过滤原因；多头买入可接受有效 Ask 单边盘口，卖方仍需完整 NBBO。"""
     dte = dte_days(meta["expiry"], current_dt)
     if dte is None:
         return "dte_missing"
@@ -379,15 +384,30 @@ def chain_window_reject_reason(meta, quote, current_dt, params):
         return "iv_percentile"
     bid = quote["bid"]
     ask = quote["ask"]
-    has_bid = math.isfinite(bid) and bid > 0
-    has_ask = math.isfinite(ask) and ask > 0
-    if not has_bid and not has_ask:
+    if (
+        allow_ask_only
+        and math.isfinite(ask)
+        and ask > 0
+        and (not math.isfinite(bid) or bid == 0)
+    ):
+        ask_size = quote.get("ask_size")
+        try:
+            ask_size = float(ask_size)
+        except (TypeError, ValueError, OverflowError):
+            ask_size = float("nan")
+        if math.isfinite(ask_size) and ask_size <= 0:
+            return "quote_missing"
+        return ""
+    has_nbbo = quote.get(
+        "has_nbbo",
+        math.isfinite(bid) and bid > 0 and math.isfinite(ask) and ask >= bid,
+    )
+    if not has_nbbo:
         return "quote_missing"
-    if has_bid and has_ask:
-        if ask < bid:
-            return "crossed_quote"
-        if quote["spread_pct"] > float(params.max_spread_pct):
-            return "spread=%.3f" % quote["spread_pct"]
+    if ask < bid:
+        return "crossed_quote"
+    if quote["spread_pct"] > float(params.max_spread_pct):
+        return "spread=%.3f" % quote["spread_pct"]
     return ""
 
 

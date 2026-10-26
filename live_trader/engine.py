@@ -18,6 +18,7 @@ from common.live_process_supervisor import (
 )
 from common.live_execution_budget import (
     begin_live_run_budget,
+    get_live_run_deadline,
     live_run_budget_expired,
     sleep_with_live_run_budget,
 )
@@ -1416,6 +1417,19 @@ class LiveTrader:
                 )
             except Exception as exc:
                 print(f"[Engine Events] Earnings calendar unavailable; continuing without blackout data: {exc}")
+            try:
+                event_as_of = pd.Timestamp(getattr(context, "now", end_date))
+                self._data_manager.attach_dividend_calendar(
+                    frames,
+                    symbols=symbols,
+                    start_date=start_date,
+                    end_date=(event_as_of + pd.Timedelta(days=365)).strftime("%Y-%m-%d"),
+                    specified_sources=self._selected_data_source,
+                    as_of=event_as_of.strftime("%Y-%m-%d"),
+                    deadline=get_live_run_deadline(self.broker),
+                )
+            except Exception as exc:
+                print(f"[Engine Events] Dividend calendar unavailable; covered calls will fail closed: {exc}")
         return datas
 
     def _refresh_live_data(self, context):
@@ -1575,6 +1589,31 @@ class LiveTrader:
             else:
                 print(f"  Warning: No new data fetched for {symbol} during refresh.")
                 _mark_failed(symbol)
+
+        data_manager = getattr(self, "_data_manager", None)
+        if data_manager is not None and callable(
+            getattr(data_manager, "attach_dividend_calendar", None)
+        ):
+            if live_run_budget_expired(self.broker):
+                print("[Engine Events] Dividend calendar refresh skipped at the live run deadline.")
+            else:
+                try:
+                    frames = {
+                        feed._name: getattr(feed, "p", SimpleNamespace(dataname=None)).dataname
+                        for feed in data_feeds
+                    }
+                    event_as_of = pd.Timestamp(getattr(context, "now", now_ts))
+                    data_manager.attach_dividend_calendar(
+                        frames,
+                        symbols=list(frames),
+                        start_date=(event_as_of - pd.Timedelta(days=annual_factor)).strftime("%Y-%m-%d"),
+                        end_date=(event_as_of + pd.Timedelta(days=365)).strftime("%Y-%m-%d"),
+                        specified_sources=self._selected_data_source,
+                        as_of=event_as_of.strftime("%Y-%m-%d"),
+                        deadline=get_live_run_deadline(self.broker),
+                    )
+                except Exception as exc:
+                    print(f"[Engine Events] Dividend calendar refresh failed; covered calls will fail closed: {exc}")
 
         return {
             'total_feeds': total_feeds,

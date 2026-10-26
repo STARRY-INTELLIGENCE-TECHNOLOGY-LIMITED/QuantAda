@@ -1572,84 +1572,23 @@ class OptimizationJob:
             if shared_counter is not None:
                 shared_counter.close(unlink=True)
 
-    def _theta_history_provider(self):
-        """找到可批量拉期权历史的 Theta provider；没有时保持逐合约路径。"""
-        manager = getattr(self, "data_manager", None)
-        if manager is None:
-            return None
-        names = []
-        specified = getattr(getattr(self, "args", None), "data_source", None)
-        if specified:
-            names.append(specified)
-        names.extend(["theta+futu", "hybrid", "theta"])
-        seen = set()
-        for name in names:
-            key = str(name or "").strip().lower()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            getter = getattr(manager, "_provider_for_source", None)
-            provider = getter(key) if callable(getter) else None
-            if provider is None:
-                continue
-            theta = getattr(provider, "theta_provider", None) or provider
-            if hasattr(theta, "prefetch_option_histories"):
-                return theta
-        return None
-
     def _prefetch_option_history(self, symbols, start_date, end_date):
-        """把同一到期日的未缓存日线期权一次拉完，并在每个合约完成后立刻写 CSV。"""
-        if bool(getattr(self.args, "refresh", False)):
+        """把显式 Theta 组合中未缓存期权按到期日批量取数并落盘。"""
+        manager = getattr(self, "data_manager", None)
+        prefetch = getattr(manager, "prefetch_option_histories", None)
+        if not callable(prefetch):
             return
-        if not getattr(config, "CACHE_DATA", False):
-            return
-        timeframe = str(getattr(self.args, "timeframe", "Days") or "Days").strip().lower()
-        if timeframe not in {"", "days", "day", "d"}:
-            return
-        try:
-            if int(getattr(self.args, "compression", 1) or 1) != 1:
-                return
-        except (TypeError, ValueError, OverflowError):
-            return
-        provider = self._theta_history_provider()
-        if provider is None:
-            return
-        missing = []
-        for symbol in symbols or []:
-            cached = self.data_manager._load_complete_cache(
-                symbol,
-                start_date,
-                end_date,
-                self.args.timeframe,
-                self.args.compression,
-                False,
-            )
-            if cached is None:
-                missing.append(symbol)
-        if len(missing) < 2:
-            return
-        saved = 0
-
-        def on_ready(symbol, frame):
-            nonlocal saved
-            self.data_manager._cache_data(
-                frame,
-                symbol,
-                self.args.timeframe,
-                self.args.compression,
-            )
-            saved += 1
-            print(f"[Auto-Fetch] bulk cached {saved} {symbol}")
-
-        try:
-            provider.prefetch_option_histories(
-                missing,
-                start_date,
-                end_date,
-                on_ready=on_ready,
-            )
-        except Exception as exc:
-            print(f"[Auto-Fetch] bulk prefetch failed, continuing per contract: {exc}")
+        saved = prefetch(
+            symbols,
+            start_date,
+            end_date,
+            specified_sources=getattr(self.args, "data_source", None),
+            timeframe=getattr(self.args, "timeframe", "Days"),
+            compression=getattr(self.args, "compression", 1),
+            refresh=bool(getattr(self.args, "refresh", False)),
+        )
+        if saved:
+            print(f"[Auto-Fetch] bulk cached {saved} option histories")
 
     def _fetch_all_data(self):
         print("\n--- Fetching Data for Optimization ---")
@@ -1721,9 +1660,12 @@ class OptimizationJob:
         self._raw_data_fetch_range = (req_fetch_start, req_end)
 
         strategy_class = getattr(self, "strategy_class", None)
+        from common.options.universe import split_symbol_pool
+
+        source_symbols = list(getattr(self, "_source_symbols", self.target_symbols) or [])
+        event_symbols, _explicit_options = split_symbol_pool(source_symbols)
         if strategy_class is not None:
             from data_providers.option_universe import expand_option_universe
-            source_symbols = list(getattr(self, "_source_symbols", self.target_symbols) or [])
             self.target_symbols = expand_option_universe(
                 source_symbols,
                 strategy_class=strategy_class,
@@ -1857,13 +1799,25 @@ class OptimizationJob:
         try:
             self.data_manager.attach_earnings_calendar(
                 datas,
-                symbols=symbols,
+                symbols=event_symbols,
                 start_date=req_fetch_start,
                 end_date=req_end,
                 specified_sources=self.args.data_source,
             )
         except Exception as exc:
             print(f"[Events] Earnings calendar unavailable; continuing without blackout data: {exc}")
+        try:
+            event_as_of = pd.Timestamp(req_end)
+            self.data_manager.attach_dividend_calendar(
+                datas,
+                symbols=event_symbols,
+                start_date=req_fetch_start,
+                end_date=(event_as_of + pd.Timedelta(days=365)).strftime("%Y-%m-%d"),
+                specified_sources=self.args.data_source,
+                as_of=event_as_of.strftime("%Y-%m-%d"),
+            )
+        except Exception as exc:
+            print(f"[Events] Dividend calendar unavailable; covered calls will fail closed: {exc}")
         refuse_incomplete_training_universe(symbols, datas)
         return datas
 

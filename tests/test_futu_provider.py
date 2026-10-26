@@ -1,4 +1,5 @@
 import threading
+import time
 
 import pandas as pd
 
@@ -14,19 +15,23 @@ def test_futu_provider_priority_leaves_akshare_as_default_fallback():
 
 
 class FakeQuoteContext:
-    def __init__(self, history=None, option_chain=None, snapshot=None, basicinfo=None, earnings=None, earnings_history=None):
+    def __init__(self, history=None, option_chain=None, snapshot=None, basicinfo=None, earnings=None, earnings_history=None, dividends=None, rehab=None):
         self.history = history
         self.option_chain = option_chain
         self.snapshot = snapshot
         self.basicinfo = basicinfo
         self.earnings = earnings
         self.earnings_history = earnings_history
+        self.dividends = dividends
+        self.rehab = rehab
         self.history_calls = []
         self.option_chain_calls = []
         self.snapshot_calls = []
         self.basicinfo_calls = []
         self.earnings_calls = []
         self.earnings_history_calls = []
+        self.dividend_calls = []
+        self.rehab_calls = []
         self.closed = False
         self.timeout = None
 
@@ -56,6 +61,14 @@ class FakeQuoteContext:
     def get_financials_earnings_price_history(self, code):
         self.earnings_history_calls.append(code)
         return 0, self.earnings_history
+
+    def get_corporate_actions_dividends(self, code):
+        self.dividend_calls.append(code)
+        return 0, self.dividends
+
+    def get_rehab(self, code):
+        self.rehab_calls.append(code)
+        return 0, self.rehab
 
     def close(self):
         self.closed = True
@@ -93,6 +106,92 @@ def test_futu_earnings_calendar_prefers_historical_financial_report_history():
 
     assert list(result["event_date"]) == [pd.Timestamp("2024-02-01"), pd.Timestamp("2024-05-02")]
     assert context.earnings_history_calls == ["US.AAPL"]
+
+
+def test_futu_dividend_calendar_joins_rehab_cash_amount_to_published_event():
+    context = FakeQuoteContext(
+        dividends={"dividend_list": [{
+            "ex_date": "2026-09-14",
+            "pub_date": "2026-09-01",
+            "statement": "cash amount pending",
+            "currency": "USD",
+        }]},
+        rehab=pd.DataFrame({
+            "ex_div_date": ["2026-09-14"],
+            "per_cash_div": [0.50],
+        }),
+    )
+    provider = FutuDataProvider(quote_ctx=context)
+
+    result = provider.get_dividend_calendar(
+        symbols=["US.AAPL", "US.AAPL261016C00100000"],
+        start_date="20260901", end_date="20261001", as_of="20260910",
+    )
+
+    assert result is not None and len(result) == 1
+    assert result.iloc[0]["cash_per_share"] == 0.50
+    assert result.iloc[0]["announcement_date"] == pd.Timestamp("2026-09-01")
+    assert result.attrs["as_of_supported"] is False
+    assert result.attrs["historical_as_of_supported"] is False
+    assert result.attrs["current_snapshot_supported"] is True
+    assert context.dividend_calls == ["US.AAPL"]
+    assert context.rehab_calls == ["US.AAPL"]
+
+
+def test_futu_dividend_calendar_does_not_claim_pit_without_publication_date():
+    context = FakeQuoteContext(dividends=pd.DataFrame({
+        "ex_date": ["2026-09-14"],
+        "per_cash_div": [0.50],
+    }))
+    result = FutuDataProvider(quote_ctx=context).get_dividend_calendar(
+        symbols=["US.AAPL"], start_date="20260901", end_date="20261001",
+    )
+
+    assert result is not None and len(result) == 1
+    assert result.attrs["as_of_supported"] is False
+
+
+def test_futu_dividend_statement_supplies_cash_for_a_newly_announced_event():
+    context = FakeQuoteContext(
+        dividends={"dividend_list": [{
+            "ex_date": "2026-10-01",
+            "pub_date": "2026-09-15",
+            "statement": "1x0.75USD",
+        }]},
+        rehab=pd.DataFrame(),
+    )
+
+    result = FutuDataProvider(quote_ctx=context).get_dividend_calendar(
+        symbols=["US.AAPL"], start_date="20260901", end_date="20261015", as_of="20260920",
+    )
+
+    assert result.iloc[0]["cash_per_share"] == 0.75
+    assert result.iloc[0]["currency"] == "USD"
+    assert result.attrs["as_of_supported"] is False
+    assert result.attrs["current_snapshot_supported"] is True
+
+
+def test_futu_dividend_calendar_stops_starting_symbols_near_run_deadline():
+    class SlowDividendContext(FakeQuoteContext):
+        def get_corporate_actions_dividends(self, code):
+            self.dividend_calls.append(code)
+            time.sleep(0.2)
+            return 0, {"dividend_list": [{
+                "ex_date": "2026-10-01",
+                "pub_date": "2026-09-15",
+                "statement": "1x0.75USD",
+            }]}
+
+    context = SlowDividendContext()
+    result = FutuDataProvider(quote_ctx=context).get_dividend_calendar(
+        symbols=["US.AAPL", "US.MSFT"],
+        start_date="20260901", end_date="20261015", as_of="20260920",
+        deadline=time.monotonic() + 5.1,
+    )
+
+    assert context.dividend_calls == ["US.AAPL"]
+    assert result is not None and len(result) == 1
+    assert result.attrs["as_of_supported"] is False
 
 
 def _history_frame():
@@ -155,6 +254,21 @@ def test_futu_get_data_standardizes_history_and_preserves_metadata():
     assert kwargs['end'] == '2024-01-03'
     assert kwargs['autype'] == getattr(futu_module.AuType, 'QFQ', 'qfq')
     assert kwargs['max_count'] == 1000
+    assert result['futu_price_adjustment_type'].eq('QFQ').all()
+
+
+def test_futu_history_can_use_raw_prices_for_hybrid_option_research():
+    context = FakeQuoteContext(history=_history_frame())
+    provider = FutuDataProvider(quote_ctx=context)
+
+    result = provider.get_data(
+        'US.AAPL', start_date='20240101', end_date='20240103',
+        price_adjustment='NONE',
+    )
+
+    assert result is not None
+    assert result['futu_price_adjustment_type'].eq('NONE').all()
+    assert context.history_calls[0][1]['autype'] == getattr(futu_module.AuType, 'NONE', 'none')
 
 
 def test_futu_intraday_request_preserves_seconds_and_uses_native_period():

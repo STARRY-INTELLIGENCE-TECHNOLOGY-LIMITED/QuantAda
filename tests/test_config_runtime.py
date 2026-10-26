@@ -7,6 +7,10 @@ def test_config_facade_exports_public_subconfig_groups():
     assert config.LOT_SIZE == 1
     assert config.TIINGO_TOKEN == "your_token_here"
     assert config.THETADATA_TOKEN == "your_token_here"
+    assert hasattr(config, "SEC_USER_AGENT")
+    assert config.DATA_PROVIDER_ALIASES["theta_futu_sec"] == "thetadata+futu,sec"
+    assert config.DATA_PROVIDER_ALIASES["theta_futu_research"] == "thetadata+futu,sec,earnings,rates"
+    assert config.DATA_PROVIDER_ALIASES["us_options_research"] == "thetadata+futu,sec,cboe"
     assert config.ALARM_LEVEL == "INFO"
     assert config.IBKR_PORT == 7497
     assert config.GM_BROKER_ENVIRONMENTS["gm_broker"]["sim"]["schedule"] == "1d:14:45:00"
@@ -44,12 +48,12 @@ def test_run_main_overrides_futu_public_keys_like_other_config(monkeypatch, caps
             '--start_date',
             '20230101',
             '--config',
-            "{'FUTU_HOST': '192.0.2.10', 'FUTU_PORT': 22222, 'FUTU_RSA_KEY_PATH': 'key.pem'}",
+            "{'FUTU_HOST': '192.0.2.10', 'FUTU_PORT': 22222, 'FUTU_RSA_KEY_PATH': 'key.pem', 'SEC_USER_AGENT': 'QuantAda test test@example.com'}",
         ],
     )
     monkeypatch.setattr(config, 'DB_ENABLED', False, raising=False)
     monkeypatch.setattr(config, 'HTTP_LOG_URL', None, raising=False)
-    for name in ('FUTU_HOST', 'FUTU_PORT', 'FUTU_RSA_KEY_PATH'):
+    for name in ('FUTU_HOST', 'FUTU_PORT', 'FUTU_RSA_KEY_PATH', 'SEC_USER_AGENT'):
         monkeypatch.setattr(config, name, getattr(config, name))
     monkeypatch.setattr(run, 'run_backtest', lambda **kwargs: None)
 
@@ -58,10 +62,12 @@ def test_run_main_overrides_futu_public_keys_like_other_config(monkeypatch, caps
     assert config.FUTU_HOST == '192.0.2.10'
     assert config.FUTU_PORT == 22222
     assert config.FUTU_RSA_KEY_PATH == 'key.pem'
+    assert config.SEC_USER_AGENT == 'QuantAda test test@example.com'
     output = capsys.readouterr().out
     assert "[Config] Overriding FUTU_HOST = 192.0.2.10" in output
     assert "[Config] Overriding FUTU_PORT = 22222" in output
     assert "[Config] Overriding FUTU_RSA_KEY_PATH = key.pem" in output
+    assert "[Config] Overriding SEC_USER_AGENT = QuantAda test test@example.com" in output
 
 
 def test_run_main_prints_private_futu_unlock_value_in_internal_mode(monkeypatch, capsys):

@@ -64,6 +64,8 @@ OPTION_COLUMN_ALIASES = {
     "level": ("level", "zone", "buy_level", "valuation_level"),
     "method": ("method", "valuation_method", "model_method"),
     "review_anchor": ("review_anchor", "anchor", "next_review"),
+    "risk_free_rate": ("risk_free_rate", "risk_free", "sofr", "rate_3m"),
+    "dividend_yield": ("dividend_yield", "yield", "forward_dividend_yield"),
 }
 
 _OPTION_SYMBOL_RE = re.compile(
@@ -287,12 +289,21 @@ def black_scholes_series(
     dividend_yield=0.0,
 ) -> pd.Series:
     """按行计算 Black-Scholes 欧式期权理论价值。"""
-    risk_free = safe_number(risk_free_rate, 0.03)
-    dividend = safe_number(dividend_yield, 0.0)
+    def value_at(source, position, default):
+        if isinstance(source, pd.Series):
+            value = source.iloc[position] if position < len(source) else default
+        elif isinstance(source, (list, tuple, np.ndarray)):
+            value = source[position] if position < len(source) else default
+        else:
+            value = source
+        return safe_number(value, default)
+
     values = []
-    for current_date, s, k, expiry_date, right, sigma in zip(
+    for position, (current_date, s, k, expiry_date, right, sigma) in enumerate(zip(
         index, spot, strike, expiry, option_type, iv,
-    ):
+    )):
+        risk_free = value_at(risk_free_rate, position, 0.03)
+        dividend = value_at(dividend_yield, position, 0.0)
         s = safe_number(s)
         k = safe_number(k)
         sigma = safe_number(sigma)
@@ -491,6 +502,31 @@ def build_option_snapshot(
     model_iv = model_iv.where(model_iv > 0, explicit_iv)
     iv = explicit_iv.where(explicit_iv > 0, model_iv)
 
+    dynamic_rate = series_column(
+        dataframe, OPTION_COLUMN_ALIASES["risk_free_rate"], default=np.nan,
+    )
+    dynamic_dividend = series_column(
+        dataframe, OPTION_COLUMN_ALIASES["dividend_yield"], default=np.nan,
+    )
+    if dynamic_rate.isna().all():
+        curve = getattr(dataframe, "attrs", {}).get("risk_free_curve")
+        if curve is not None:
+            from common.options.market_inputs import align_rate_curve
+            dynamic_rate = align_rate_curve(index, curve)
+    elif getattr(dataframe, "attrs", {}).get("risk_free_curve") is not None:
+        from common.options.market_inputs import align_rate_curve
+        dynamic_rate = dynamic_rate.fillna(align_rate_curve(index, dataframe.attrs["risk_free_curve"]))
+    if dynamic_dividend.isna().all():
+        events = getattr(dataframe, "attrs", {}).get("dividend_calendar", ())
+        if events:
+            from common.options.market_inputs import forward_dividend_yield_series
+            dynamic_dividend = forward_dividend_yield_series(index, expiry, spot, events)
+    elif getattr(dataframe, "attrs", {}).get("dividend_calendar"):
+        from common.options.market_inputs import forward_dividend_yield_series
+        dynamic_dividend = dynamic_dividend.fillna(
+            forward_dividend_yield_series(index, expiry, spot, dataframe.attrs["dividend_calendar"])
+        )
+
     option_fair = series_column(
         dataframe,
         OPTION_COLUMN_ALIASES["option_fair_value"],
@@ -503,8 +539,10 @@ def build_option_snapshot(
         expiry,
         option_type,
         model_iv,
-        risk_free_rate=getattr(params, "risk_free_rate", 0.03),
-        dividend_yield=getattr(params, "dividend_yield", 0.0),
+        risk_free_rate=dynamic_rate.where(dynamic_rate.notna(), getattr(params, "risk_free_rate", 0.03)),
+        dividend_yield=dynamic_dividend.where(
+            dynamic_dividend.notna(), getattr(params, "dividend_yield", 0.0)
+        ),
     )
     model_value = option_fair.where(option_fair > 0, bs_fair)
     rolling_anchor = close.shift(1).rolling(

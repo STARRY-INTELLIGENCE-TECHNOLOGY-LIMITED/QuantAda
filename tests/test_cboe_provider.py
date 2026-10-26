@@ -92,6 +92,14 @@ def test_cboe_provider_rejects_unknown_symbols_and_intraday(monkeypatch):
     assert calls == []
 
 
+def test_cboe_symbol_capability_matches_only_the_fixed_whitelist():
+    provider = CboeDataProvider()
+    assert provider.supports_symbol("US.VIX")
+    assert provider.supports_symbol("VVIX.US")
+    assert not provider.supports_symbol("US.AAPL")
+    assert not provider.supports_symbol("US.SPY")
+
+
 def test_cboe_provider_exposes_canonical_symbols():
     symbols = CboeDataProvider.supported_symbols()
 

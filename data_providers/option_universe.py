@@ -262,7 +262,7 @@ def _cached_snapshot_for_as_of(
     as_of_text,
     step_days=DEFAULT_AS_OF_STEP_DAYS,
 ):
-    """精确命中 as_of；否则复用步长内最近的已缓存快照，忽略 live。"""
+    """精确命中 as_of；否则只复用步长内最近的历史快照，避免未来链泄漏。"""
     if not as_of_text or as_of_text == "live" or not cached_snapshots:
         return None
     if as_of_text in cached_snapshots:
@@ -282,7 +282,11 @@ def _cached_snapshot_for_as_of(
         cached_day = _parse_as_of_day(key)
         if pd.isna(cached_day):
             continue
-        delta = abs((cached_day - target).days)
+        # 历史 as_of 只能复用同日或更早的链；未来快照即使更近也会把
+        # 当时尚未可见的到期日/执行价带入回测，形成隐性前视。
+        if cached_day > target:
+            continue
+        delta = (target - cached_day).days
         if delta >= max_delta:
             continue
         if (
