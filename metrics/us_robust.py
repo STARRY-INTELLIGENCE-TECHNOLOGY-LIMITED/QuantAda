@@ -68,6 +68,19 @@ def _monthly_win_rate_from_strategy(strat):
     return sum(value > 0 for value in active_returns) / len(active_returns)
 
 
+def _compound_annual_return_pct(total_return_pct, years):
+    """把总收益百分比换成报表同口径的复合年化百分比。本金亏光时返回 -100。"""
+    total_return = total_return_pct / 100.0
+    if total_return <= -1.0:
+        return -100.0
+    if years <= 0.0:
+        return 0.0
+    annual_return = (1.0 + total_return) ** (1.0 / years) - 1.0
+    if not math.isfinite(annual_return):
+        return 0.0
+    return annual_return * 100.0
+
+
 def _fold_annual_returns(stats):
     """读取可选的滚动窗口年化收益列表。"""
     raw_values = stats.get("fold_annual_returns_pct")
@@ -90,6 +103,8 @@ def evaluate(stats, strat=None, args=None) -> float:
     基础输入使用当前优化器已有字段：
     ``total_return_pct``、``years``、``mdd``、``sharpe``、``calmar``、
     ``total_trades``、``profit_factor`` 和 ``monthly_win_rate``。
+    年化收益使用报表同口径的复合年化，不用总收益除以年数。
+    交易样本只设固定 8 笔软门槛，满额后不再因笔数加分，不要改成按年计算。
 
     可选字段用于后续增强：``sortino``、``benchmark_annual_return_pct``、
     ``annual_cost_pct``、``turnover_ratio``、``fold_annual_returns_pct``、
@@ -101,7 +116,7 @@ def evaluate(stats, strat=None, args=None) -> float:
 
     total_return_pct = _finite(stats.get("total_return_pct"), 0.0)
     years = max(_finite(stats.get("years"), 1.0), 0.25)
-    annual_return_pct = total_return_pct / years
+    annual_return_pct = _compound_annual_return_pct(total_return_pct, years)
 
     mdd = abs(_finite(stats.get("mdd"), 20.0))
     sharpe = _finite(stats.get("sharpe"), 0.0)
@@ -168,6 +183,9 @@ def evaluate(stats, strat=None, args=None) -> float:
     if worst_fold is not None and worst_fold < 0.0:
         score -= 0.10 * min(abs(worst_fold), 100.0)
 
+    # 总成交少于 8 笔时每少 1 笔扣 1.5 分，最多 12 分；达到 8 笔后多交易不加分。
+    # 不要改成每年 8 笔，也不要把 1.5 乘上年数。该系数只对应固定 8 笔缺口；按年放大后惩罚会盖过收益，并诱导更高换手。
+    # 多年长持仓显得年化过高，已由复合年化处理。不要恢复按年强制活跃度，该路线已删除。有界年化降权只属于 option_carry_robust。
     if total_trades < _MIN_SAMPLE_TRADES:
         score -= 1.5 * (_MIN_SAMPLE_TRADES - total_trades)
 

@@ -86,7 +86,9 @@ def test_evaluate_penalizes_short_horizon_when_annual_return_is_equal():
     long_stats = _base_stats()
     short_stats = _base_stats()
     long_stats.update({"total_return_pct": 60.0, "years": 2.0})
-    short_stats.update({"total_return_pct": 15.0, "years": 0.5})
+    # 两年总收益 60% 的复合年化，折成半年总收益后两边年化相同。
+    short_total = ((1.60 ** 0.5) ** 0.5 - 1.0) * 100.0
+    short_stats.update({"total_return_pct": short_total, "years": 0.5})
 
     assert evaluate(short_stats) < evaluate(long_stats)
 
@@ -110,3 +112,42 @@ def test_evaluate_handles_missing_and_nonfinite_fields():
 
     assert math.isfinite(score)
     assert score < 0.0
+
+
+def test_large_total_return_uses_compound_annual_not_simple_average():
+    simple_average = _base_stats()
+    simple_average.update({"total_return_pct": 200.0, "years": 2.0})
+    compound_match = _base_stats()
+    compound_match.update({"total_return_pct": 300.0, "years": 2.0})
+
+    assert evaluate(compound_match) > evaluate(simple_average)
+
+
+def test_profit_factor_bonus_stays_capped():
+    modest = _base_stats()
+    modest["profit_factor"] = 27.0
+    extreme = _base_stats()
+    extreme["profit_factor"] = 1000.0
+
+    assert evaluate(extreme) == evaluate(modest)
+
+
+def test_trade_sample_penalty_stops_at_eight_and_does_not_scale_with_years():
+    """多年低频但已满 8 笔时不得再按年加码；未满 8 笔只按固定缺口扣分。"""
+    held = _base_stats()
+    held.update({
+        "total_return_pct": 663.70,
+        "years": 5.0,
+        "total_trades": 10,
+        "mdd": 15.25,
+        "sharpe": 1.69,
+        "calmar": 3.29,
+        "profit_factor": 27.0,
+    })
+    active = dict(held)
+    active["total_trades"] = 40
+    empty = dict(held)
+    empty["total_trades"] = 0
+
+    assert evaluate(held) == evaluate(active)
+    assert evaluate(active) - evaluate(empty) == 12.0

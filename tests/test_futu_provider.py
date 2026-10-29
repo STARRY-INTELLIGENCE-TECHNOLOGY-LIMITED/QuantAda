@@ -344,6 +344,39 @@ def test_futu_provider_rebuilds_closed_quote_context_after_disconnect(monkeypatc
     assert provider._owns_quote_ctx is True
 
 
+def test_futu_provider_reconnects_on_invalid_connid(monkeypatch):
+    """旧句柄仍显示 READY 但返回 invalid connid 时应重建连接并重试。"""
+    created = []
+
+    class InvalidQuote(FakeQuoteContext):
+        status = 'READY'
+
+        def request_history_kline(self, code, **kwargs):
+            self.history_calls.append((code, kwargs))
+            return 1, 'invalid connid', None
+
+    class ReadyQuote(FakeQuoteContext):
+        status = 'READY'
+
+    stale = InvalidQuote()
+
+    def open_quote(**_kwargs):
+        fresh = ReadyQuote(history=_history_frame())
+        created.append(fresh)
+        return fresh
+
+    monkeypatch.setattr(futu_module, 'OpenQuoteContext', open_quote)
+    provider = FutuDataProvider(quote_ctx=stale)
+    provider._owns_quote_ctx = True
+
+    result = provider.get_data('US.AAPL', '20240101', '20240102')
+
+    assert result is not None and not result.empty
+    assert stale.closed is True
+    assert len(created) == 1
+    assert len(created[0].history_calls) == 1
+
+
 def test_futu_provider_does_not_spawn_parallel_context_threads_after_timeout(monkeypatch):
     """OpenD 构造超时后应等待原线程结束并进入短暂退避，不能并发创建连接。"""
     started = threading.Event()

@@ -382,7 +382,42 @@ class FutuDataProvider(BaseDataProvider):
             time.sleep(0.05)
         return not observed_status
 
-    def _request_history(self, code: str, start_date, end_date, ktype, autype):
+    def _invalidate_quote_context(self, context, detail=None):
+        """标记失效的 OpenD 行情句柄并释放本 Provider 自己创建的连接。"""
+        stale_context = None
+        owns_context = False
+        with self._context_lock:
+            if self._quote_ctx is not context:
+                return
+            stale_context = self._quote_ctx
+            owns_context = self._owns_quote_ctx
+            self._quote_ctx = None
+            self._owns_quote_ctx = False
+            self._quote_context_init_failed = False
+            self._quote_context_retry_at = 0.0
+        if owns_context and stale_context is not None:
+            try:
+                stale_context.close()
+            except Exception as exc:
+                print(f'[Futu] Failed to close invalid OpenD context: {exc}')
+        suffix = f': {detail}' if detail else ''
+        print(f'[Futu] OpenD quote context became invalid; reconnecting{suffix}')
+
+    @staticmethod
+    def _is_invalid_connid(value) -> bool:
+        """识别 OpenD 在断线后常见的失效连接标记。"""
+        text = str(value or '').strip().lower()
+        return 'invalid connid' in text or 'invalid conn id' in text
+
+    def _request_history(
+        self,
+        code: str,
+        start_date,
+        end_date,
+        ktype,
+        autype,
+        _reconnect_attempted: bool = False,
+    ):
         """按官方分页协议读取历史 K 线；期权优先使用普通历史接口。"""
         context = self._get_quote_context()
         if context is None:
@@ -469,6 +504,16 @@ class FutuDataProvider(BaseDataProvider):
             return None
         ret_code, data = response[0], response[1]
         if ret_code != RET_OK:
+            if self._is_invalid_connid(data) and not _reconnect_attempted:
+                self._invalidate_quote_context(context, data)
+                return self._request_history(
+                    code,
+                    start_date,
+                    end_date,
+                    ktype,
+                    autype,
+                    _reconnect_attempted=True,
+                )
             print(f"[Futu] History request rejected for {code}: {data}")
             return None
         return data
