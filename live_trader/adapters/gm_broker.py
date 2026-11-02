@@ -13,6 +13,7 @@ from alarms.manager import AlarmManager
 from common.live_execution_budget import resolve_live_run_budget_seconds
 from common.live_process_supervisor import (
     LiveWorkerFailureKind,
+    get_previous_live_worker_failure_kind,
     is_live_worker_process,
     is_live_worker_restart,
     report_live_worker_state,
@@ -1238,6 +1239,11 @@ class GmBrokerAdapter(BaseLiveBroker):
 
         launch_state = {
             'start_alarm_sent': bool(mode == MODE_LIVE and is_live_worker_restart()),
+            'connectivity_alarm_sent': bool(
+                mode == MODE_LIVE
+                and get_previous_live_worker_failure_kind()
+                is LiveWorkerFailureKind.CONNECTIVITY
+            ),
             'consecutive_init_failures': 0,
             'connectivity_log': None,
             'connectivity_failure_seen': False,
@@ -1309,6 +1315,7 @@ class GmBrokerAdapter(BaseLiveBroker):
                 launch_state['trade_disconnect_alarm'] = None
                 if not pending.get('sent'):
                     _runtime_print(f"[GM Warning] trade service recovered before IM alarm: {detail}")
+            launch_state['connectivity_alarm_sent'] = False
             if not launch_state.get('connectivity_failure_seen'):
                 return
             previous = launch_state.get('connectivity_log') or {}
@@ -1323,6 +1330,8 @@ class GmBrokerAdapter(BaseLiveBroker):
             launch_state['retry_quiet'] = False
             launch_state['retry_delay_seconds'] = _GM_AGGRESSIVE_RETRY_SECONDS
             launch_state['retry_wake_at'] = None
+            launch_state['connectivity_init_failed'] = False
+            launch_state['process_restart_delay_seconds'] = None
             session_state = {'shutdown_requested': False}
             last_market_data_error_log_at = None
             last_poll_status_log_at = None
@@ -1723,6 +1732,11 @@ class GmBrokerAdapter(BaseLiveBroker):
 
             def _defer_trade_disconnect_alarm(msg):
                 now_mono = time.monotonic()
+                report_live_worker_state(
+                    "gm_trade_service_unavailable",
+                    detail=msg,
+                    failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                )
                 pending = launch_state.get('trade_disconnect_alarm')
                 if isinstance(pending, dict):
                     pending['msg'] = msg
@@ -1748,6 +1762,11 @@ class GmBrokerAdapter(BaseLiveBroker):
                     pending['next_probe'] = now_mono + _GM_TRADE_DISCONNECT_ALARM_DELAY_SECONDS
                     if _trade_service_available():
                         launch_state['trade_disconnect_alarm'] = None
+                        launch_state['connectivity_alarm_sent'] = False
+                        report_live_worker_state(
+                            "gm_sdk_running",
+                            detail="GM trade service recovered",
+                        )
                         _runtime_print(
                             "[GM Warning] trade service recovered after IM alarm: "
                             f"{pending.get('msg')}"
@@ -1757,13 +1776,22 @@ class GmBrokerAdapter(BaseLiveBroker):
                     return
                 if _trade_service_available():
                     launch_state['trade_disconnect_alarm'] = None
+                    launch_state['connectivity_alarm_sent'] = False
+                    report_live_worker_state(
+                        "gm_sdk_running",
+                        detail="GM trade service recovered",
+                    )
                     _runtime_print(
                         f"[GM Warning] trade service recovered before IM alarm: {pending.get('msg')}"
                     )
                     return
                 pending['sent'] = True
                 pending['next_probe'] = now_mono + _GM_TRADE_DISCONNECT_ALARM_DELAY_SECONDS
-                AlarmManager().push_exception("GM Kernel Error", pending.get('msg'))
+                if launch_state.get('connectivity_alarm_sent'):
+                    _runtime_print("[GM Warning] Repeated trade disconnect alarm suppressed.")
+                else:
+                    AlarmManager().push_exception("GM Kernel Error", pending.get('msg'))
+                    launch_state['connectivity_alarm_sent'] = True
 
             def on_error(ctx, code, info):
                 msg = f"Code: {code}, Msg: {info}"
@@ -1810,8 +1838,9 @@ class GmBrokerAdapter(BaseLiveBroker):
                         "gm_trade_service_unavailable",
                         f"[GM Warning] {msg}",
                         quiet,
-                    ) and not quiet:
+                    ) and not quiet and not launch_state.get('connectivity_alarm_sent'):
                         AlarmManager().push_schedule_api_unavailable("GmBroker", msg)
+                        launch_state['connectivity_alarm_sent'] = True
                     return
 
                 _runtime_print(f"[GM Error] {msg}")
@@ -1913,6 +1942,12 @@ class GmBrokerAdapter(BaseLiveBroker):
                     launch_state['retry_quiet'] = quiet
                     launch_state['retry_delay_seconds'] = retry_delay
                     launch_state['retry_wake_at'] = wake_at
+                    launch_state['connectivity_init_failed'] = True
+                    launch_state['process_restart_delay_seconds'] = (
+                        min(_GM_QUIET_PROBE_SECONDS, max(0.0, float(retry_delay)))
+                        if quiet and wake_at is not None
+                        else _GM_QUIET_PROBE_SECONDS
+                    )
                     if quiet and wake_at is not None:
                         seconds_to_wake = max(
                             0.1,
@@ -1937,11 +1972,12 @@ class GmBrokerAdapter(BaseLiveBroker):
                         message,
                         quiet,
                     )
-                    if emitted:
+                    if emitted and not launch_state.get('connectivity_alarm_sent'):
                         AlarmManager().push_schedule_api_unavailable(
                             "GmBroker",
                             f"GM terminal init failed (Code: {status})",
                         )
+                        launch_state['connectivity_alarm_sent'] = True
                     _soft_reset_gm_sdk(
                         "init failure",
                         status=status,
@@ -2045,6 +2081,24 @@ class GmBrokerAdapter(BaseLiveBroker):
                     break  # 回测结束或正常退出
 
                 init_failures = int(launch_state.get('consecutive_init_failures', 0) or 0)
+                if (
+                    mode == MODE_LIVE
+                    and is_live_worker_process()
+                    and launch_state.get('connectivity_init_failed')
+                ):
+                    restart_delay = float(
+                        launch_state.get('process_restart_delay_seconds')
+                        or _GM_QUIET_PROBE_SECONDS
+                    )
+                    _runtime_print(
+                        f"[Phoenix] GM init failed; clean worker restart in {restart_delay:.0f}s."
+                    )
+                    time.sleep(restart_delay)
+                    request_live_worker_restart(
+                        "GM terminal init failed; supervisor will retry in a clean worker",
+                        failure_kind=LiveWorkerFailureKind.CONNECTIVITY,
+                    )
+
                 if mode == MODE_LIVE and init_failures >= 12:
                     _hard_reexec_current_process(
                         f"GM init failed {init_failures} consecutive times; SDK may be stuck after terminal startup"

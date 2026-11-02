@@ -1727,7 +1727,7 @@ def test_gm_launch_soft_resets_sdk_after_init_failure(monkeypatch, capsys):
     assert "GM SDK soft reset after init failure. status=1001" in captured.out
 
 
-def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeypatch, capsys):
+def test_gm_supervised_init_failure_restarts_clean_worker_after_bounded_probe(monkeypatch, capsys):
     import live_trader.adapters.gm_broker as gm_module
 
     fake_context = SimpleNamespace()
@@ -1748,7 +1748,6 @@ def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeyp
 
     def _sleep(seconds):
         sleep_calls.append(seconds)
-        raise StopPhoenix()
 
     monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
     monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
@@ -1762,11 +1761,17 @@ def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeyp
     monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
     monkeypatch.setattr(gm_module, "gmi_init", lambda: 1001, raising=False)
     monkeypatch.setattr(gm_module, "is_live_worker_process", lambda: True)
+
+    def _request_restart(*args, **kwargs):
+        restart_requests.append((args, kwargs))
+        raise StopPhoenix()
+
     monkeypatch.setattr(
         gm_module,
         "request_live_worker_restart",
-        lambda *args, **kwargs: restart_requests.append((args, kwargs)),
+        _request_restart,
     )
+    monkeypatch.setattr(gm_module, "get_previous_live_worker_failure_kind", lambda: None)
     monkeypatch.setattr(
         gm_module,
         "report_live_worker_state",
@@ -1797,11 +1802,80 @@ def test_gm_supervised_init_failure_quietly_probes_until_recovery_window(monkeyp
 
     captured = capsys.readouterr()
     assert sleep_calls == [123.0]
-    assert restart_requests == []
+    assert len(restart_requests) == 1
+    assert restart_requests[0][1]["failure_kind"] is gm_module.LiveWorkerFailureKind.CONNECTIVITY
     assert health_states[-1][0] == "gm_connectivity_quiet_wait"
     assert 895.0 <= health_states[-1][1].get("unhealthy_after_seconds", 0.0) <= 900.0
     assert health_states[-1][1].get("refresh_deadline") is True
+    assert "clean worker restart in 123s" in captured.out
     assert "quiet probe in 123s; aggressive recovery at" not in captured.out
+
+
+def test_gm_supervised_connectivity_restart_suppresses_repeated_init_alarm(monkeypatch):
+    import live_trader.adapters.gm_broker as gm_module
+
+    fake_context = SimpleNamespace()
+    restart_requests = []
+    sleep_calls = []
+    pushed = []
+
+    class StopPhoenix(BaseException):
+        pass
+
+    class DummyAlarm:
+        def push_schedule_api_unavailable(self, *args, **kwargs):
+            pushed.append((args, kwargs))
+
+        def push_exception(self, *args, **kwargs):
+            pushed.append((args, kwargs))
+
+    def _request_restart(*args, **kwargs):
+        restart_requests.append((args, kwargs))
+        raise StopPhoenix()
+
+    monkeypatch.setattr(gm_module, "MODE_LIVE", "live", raising=False)
+    monkeypatch.setattr(gm_module, "MODE_BACKTEST", "backtest", raising=False)
+    monkeypatch.setattr(gm_module, "context", fake_context, raising=False)
+    monkeypatch.setattr(gm_module, "set_token", lambda token: None, raising=False)
+    monkeypatch.setattr(gm_module, "set_serv_addr", lambda addr: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_strategy_id", lambda strategy_id: None, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_set_mode", lambda mode: None, raising=False)
+    monkeypatch.setattr(gm_module, "py_gmi_set_data_callback", lambda callback: None, raising=False)
+    monkeypatch.setattr(gm_module, "callback_controller", object(), raising=False)
+    monkeypatch.setattr(gm_module, "gmi_init", lambda: 1001, raising=False)
+    monkeypatch.setattr(gm_module, "gmi_close", lambda: None, raising=False)
+    monkeypatch.setattr(gm_module, "is_live_worker_process", lambda: True)
+    monkeypatch.setattr(
+        gm_module,
+        "get_previous_live_worker_failure_kind",
+        lambda: gm_module.LiveWorkerFailureKind.CONNECTIVITY,
+    )
+    monkeypatch.setattr(gm_module, "request_live_worker_restart", _request_restart)
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        gm_module,
+        "_resolve_gm_connectivity_retry",
+        lambda *args, **kwargs: (False, 10.0, None),
+    )
+    monkeypatch.setattr(gm_module, "AlarmManager", lambda: DummyAlarm(), raising=False)
+    monkeypatch.setattr("time.sleep", lambda seconds: sleep_calls.append(seconds))
+
+    with pytest.raises(StopPhoenix):
+        GmBrokerAdapter.launch(
+            {"token": "token", "strategy_id": "strategy-id"},
+            strategy_path="sample_strategy",
+            params={},
+        )
+
+    assert sleep_calls == [gm_module._GM_QUIET_PROBE_SECONDS]
+    assert pushed == []
+    assert len(restart_requests) == 1
+    assert restart_requests[0][1]["failure_kind"] is gm_module.LiveWorkerFailureKind.CONNECTIVITY
 
 
 def test_gm_launch_reexecs_after_repeated_init_failures(monkeypatch):
@@ -2504,6 +2578,7 @@ def test_gm_trade_disconnect_alarm_waits_five_minutes(monkeypatch, capsys):
     cash_ok = {"value": False}
     cash_calls = []
     exceptions = []
+    health_states = []
     poll_count = {"value": 0}
 
     class StopPhoenix(BaseException):
@@ -2562,6 +2637,11 @@ def test_gm_trade_disconnect_alarm_waits_five_minutes(monkeypatch, capsys):
     monkeypatch.setattr(time, "monotonic", lambda: clock["mono"])
     monkeypatch.setattr(gm_module, "get_cash", _cash, raising=False)
     _patch_gm_live_launch(monkeypatch, gm_module, fake_context, _poll, DummyAlarm)
+    monkeypatch.setattr(
+        gm_module,
+        "report_live_worker_state",
+        lambda state, **kwargs: health_states.append((state, kwargs)) or True,
+    )
 
     with pytest.raises(StopPhoenix):
         GmBrokerAdapter.launch(
@@ -2579,6 +2659,15 @@ def test_gm_trade_disconnect_alarm_waits_five_minutes(monkeypatch, capsys):
         ("GM Kernel Error", "Code: 1101, Msg: 交易消息服务断开 again"),
     ]
     assert cash_calls == [1300.0, 1600.0, 1900.0, 2200.0]
+    assert any(
+        state == "gm_trade_service_unavailable"
+        and kwargs.get("failure_kind") is gm_module.LiveWorkerFailureKind.CONNECTIVITY
+        for state, kwargs in health_states
+    )
+    assert any(
+        state == "gm_sdk_running" and kwargs.get("failure_kind") is None
+        for state, kwargs in health_states
+    )
 
 
 def test_gm_trade_disconnect_alarm_cancelled_when_service_recovers(monkeypatch, capsys):

@@ -108,6 +108,7 @@ def _env(name: str, required: bool = True, value_type: str = "str") -> EnvRef:
 
 
 _PROVIDER_CREDENTIALS = {
+    "eodhd": "EODHD_API_TOKEN",
     "tiingo": "TIINGO_TOKEN",
     "theta": "THETADATA_TOKEN",
     "thetadata": "THETADATA_TOKEN",
@@ -426,6 +427,14 @@ def _gm_environment_profiles() -> tuple[EnvironmentProfile, ...]:
                 "LOT_SIZE": _env("GLOBAL_LOT_SIZE", value_type="number"),
             },
             "历史风险字段使用 ThetaData，实盘当前行情使用 Futu；回测不会请求 Futu 实时快照。",
+        ),
+        EnvironmentProfile(
+            "eodhd",
+            "EOD Historical Data",
+            {
+                "EODHD_API_TOKEN": _env("EODHD_API_TOKEN"),
+                "LOT_SIZE": _env("GLOBAL_LOT_SIZE", value_type="number"),
+            },
         ),
         EnvironmentProfile(
             "tiingo",
@@ -987,6 +996,7 @@ def default_catalog(project_root=None, source_root=None) -> CommandCatalog:
         VariableSpec("DINGTALK_SECRET", "", "钉钉机器人加签密钥（可选）"),
         VariableSpec("TUSHARE_TOKEN", "", "Tushare Pro token"),
         VariableSpec("TIINGO_TOKEN", "", "Tiingo token"),
+        VariableSpec("EODHD_API_TOKEN", "", "EOD Historical Data API token"),
         VariableSpec("THETADATA_TOKEN", "", "ThetaData token"),
         VariableSpec("SEC_USER_AGENT", "", "SEC API application name and contact email"),
         VariableSpec("OCC_ACTIONS_URL", "", "OCC contract adjustment CSV/JSON URL"),

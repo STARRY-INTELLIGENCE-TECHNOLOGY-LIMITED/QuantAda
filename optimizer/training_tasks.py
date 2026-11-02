@@ -54,29 +54,6 @@ def _journal_snapshot(path, modified_ns, size):
     return read_study_metadata(path, with_trial_counts=True)
 
 
-@lru_cache(maxsize=128)
-def _terminal_header(path, modified_ns, size):
-    """旧任务没有保存完整指标列表时，从终端日志头部恢复，避免扫描长篇试验输出。"""
-    metrics = []
-    journal = None
-    budget = None
-    with Path(path).open(encoding="utf-8", errors="replace") as stream:
-        header = stream.read(1024 * 1024)
-    for line in header.splitlines():
-        target = re.search(r"PARAMETER OPTIMIZATION \(Target:\s*(.*?)\)", line)
-        if target:
-            metrics = [item.strip() for item in target.group(1).split(",") if item.strip()]
-        location = re.search(r"(?:Using JournalStorage|Training Journal):\s*(.+)$", line)
-        if location:
-            journal = re.split(r"[\\/]", location.group(1).strip().strip("\"'"))[-1]
-        inferred = re.search(r"Auto-inferred n_trials:\s*(\d+)", line)
-        if inferred:
-            budget = int(inferred.group(1))
-        if journal and "Starting Optimization (" in line:
-            break
-    return journal, metrics, budget
-
-
 def _summary_suffix_empty(text):
     """结束标记后的崩溃摘要没有训练结果，不能当成训练完毕。"""
     if any(marker in text for marker in (
@@ -316,14 +293,7 @@ def _apply_training_status(tasks, directory):
         task["training_status"] = _status_for_task(task, logs, counts[_journal_basename(task.get("journal"))])
 
 
-def _legacy_isolation_notice(complete, budget):
-    """没有口径标记时加载原 Study，已完成试验计入预算，控制台编号不从 0 重开。"""
-    budget_text = str(budget) if isinstance(budget, int) and budget >= 0 else "the saved budget"
-    return (
-        "No current configuration marker was recorded. Resume loads the original study; "
-        "{complete} completed trials count toward budget {budget}, and only unfinished combinations run. "
-        "Console Trial numbers match Journal trial_id and continue from the original study instead of starting at 0."
-    ).format(complete=int(complete), budget=budget_text)
+
 def _recorded_metrics(value):
     parsed = parse_recorded_value(value)
     if isinstance(parsed, str):
@@ -417,7 +387,6 @@ def list_training_tasks(journal_dir):
     """按最近更新时间倒序列出任务；同 Journal 的配置和窗口不同则分开。"""
     directory = Path(journal_dir).resolve()
     tasks = []
-    legacy_headers = None
     for path in sorted(directory.glob("optuna_*.log"), reverse=True):
         try:
             stat = path.stat()
@@ -446,31 +415,14 @@ def list_training_tasks(journal_dir):
                 continue
             attrs = dict(latest[-1]["attrs"])
             metrics = list(dict.fromkeys(group["metrics"]))
-            inferred_budget = None
-            if not metrics and len(contexts) == 1:
-                if legacy_headers is None:
-                    legacy_headers = {}
-                    terminal_dir = directory.parent / "optimizer"
-                    for terminal in sorted(terminal_dir.glob("optimizer_terminal_*.log"), key=lambda item: item.stat().st_mtime_ns, reverse=True):
-                        try:
-                            info = terminal.stat()
-                            journal, original_metrics, budget = _terminal_header(str(terminal), info.st_mtime_ns, info.st_size)
-                            if journal and original_metrics:
-                                previous_metrics, previous_budget = legacy_headers.get(journal, ([], None))
-                                legacy_headers[journal] = (
-                                    list(dict.fromkeys(previous_metrics + original_metrics)),
-                                    previous_budget if previous_budget is not None else budget,
-                                )
-                        except OSError:
-                            continue
-                original_metrics, inferred_budget = legacy_headers.get(path.name, ([], None))
-                if set(group["studies"]).intersection(original_metrics):
-                    metrics = list(original_metrics)
             metrics = list(dict.fromkeys(metrics + [metric for metric in group["studies"] if metric]))
             counts = {state: sum(study["trial_counts"][state] for study in latest) for state in TRIAL_STATES}
             budget = parse_recorded_value(attrs.get("_optimizer_target_trials"))
             if budget is None:
-                budget = parse_recorded_value(attrs.get("n_trials")) or inferred_budget
+                budget = parse_recorded_value(attrs.get("n_trials"))
+            current_version = attrs.get("_optimizer_worker_config_version") == WORKER_CONFIG_VERSION
+            if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"}:
+                current_version = current_version and bool(attrs.get("_optimizer_grid_signature"))
             task = {
                 "task_id": hashlib.sha256((str(path) + "\n" + key).encode("utf-8")).hexdigest()[:24],
                 "journal": str(path), "updated_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
@@ -486,18 +438,21 @@ def list_training_tasks(journal_dir):
                     str(study["attrs"].get("_optimizer_owner") or "").strip()
                     for study in latest if str(study["attrs"].get("_optimizer_owner") or "").strip()
                 )),
-                "recorded": attrs, "resumable": True, "reason": "",
+                "recorded": attrs,
+                "resumable": current_version,
+                "reason": "" if current_version else "Saved Study uses an incompatible optimizer version; start a new training run.",
                 "worker_config_version": attrs.get("_optimizer_worker_config_version"),
                 "training_status": _STATUS_UNFINISHED,
-                "notice": "" if attrs.get("_optimizer_worker_config_version") == WORKER_CONFIG_VERSION else
-                          _legacy_isolation_notice(counts.get("COMPLETE", 0), budget),
+                "notice": "" if current_version else
+                          "This historical Study is read-only and cannot be resumed by the current optimizer.",
             }
-            if not task["notice"] and not attrs.get("_optimizer_data_snapshot"):
-                task["notice"] = "No training data snapshot was recorded. Resume still loads the original study and counts completed trials. Data is prepared once and bound; a new empty study is not created."
+            if task["resumable"] and not task["notice"] and not attrs.get("_optimizer_data_snapshot"):
+                task["notice"] = "No training data snapshot was recorded. The current Study will prepare data once and bind a new snapshot before continuing."
             try:
                 if any(study["directions"] != [2] for study in latest):
                     raise ValueError("The saved task score direction does not match the training entry point")
-                build_resume_arguments(task)
+                if task["resumable"]:
+                    build_resume_arguments(task)
             except (ValueError, TypeError) as exc:
                 task.update(resumable=False, reason=str(exc))
             tasks.append(task)
@@ -513,6 +468,8 @@ def list_running_training_tasks(journal_dir):
     """只返回仍有可验证优化器主进程的任务。"""
     running = []
     for task in list_training_tasks(journal_dir):
+        if task.get("worker_config_version") != WORKER_CONFIG_VERSION or not task.get("resumable"):
+            continue
         verified = {
             owner: record
             for owner in task.get("owners", ())
@@ -628,7 +585,10 @@ def _prefer_richer_resume_target(tasks):
         }, sort_keys=True, default=str)
         groups.setdefault(key, []).append(task)
     for group in groups.values():
-        best = max(group, key=lambda task: finished_trial_count(task["trial_counts"]))
+        resumable = [task for task in group if task.get("resumable")]
+        if not resumable:
+            continue
+        best = max(resumable, key=lambda task: finished_trial_count(task["trial_counts"]))
         if finished_trial_count(best["trial_counts"]) <= 0 or not best.get("study_names"):
             continue
         for task in group:
@@ -642,6 +602,11 @@ def _prefer_richer_resume_target(tasks):
 def build_resume_arguments(task, extra_arguments=()):
     """恢复训练参数数组；不会恢复实盘入口、启动等待或强制刷新行情。"""
     attrs = task["recorded"]
+    if attrs.get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION:
+        raise ValueError("The saved Study uses an incompatible optimizer version; start a new training run.")
+    if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"} \
+            and not attrs.get("_optimizer_grid_signature"):
+        raise ValueError("The saved finite search Study has no current grid metadata; start a new training run.")
     strategy = str(attrs.get("strategy") or "").strip()
     if not strategy or strategy.startswith("-"):
         raise ValueError("The saved task has no valid strategy name")

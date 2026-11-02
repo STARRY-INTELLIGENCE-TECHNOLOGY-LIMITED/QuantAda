@@ -339,7 +339,7 @@ class CommandCenterService:
             )
         presets = list(self.catalog.presets)
         known_data_sources = {
-            "gm", "futu", "tiingo", "akshare", "tushare", "sxsc_tushare",
+            "gm", "futu", "eodhd", "tiingo", "akshare", "tushare", "sxsc_tushare",
             "csv", "theta", "thetadata", "cboe", "occ", "rates", "earnings",
             "ibkr", "hybrid", "theta+futu",
         }

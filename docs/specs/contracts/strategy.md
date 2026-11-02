@@ -115,3 +115,4 @@ for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"})
 6. 该模型不模拟提前指派、放弃行权、盘后价格、分红现金流、行权费用或拆股调整合约；不能当成完整美式期权结算模型。支持 `dividend_calendar` 的 Wheel 策略可用已公告分红在除息前最后一个正股交易日比较每股分红与 Call 时间价值，阻止新开或买平高指派风险短 Call；这只是风险缓解，不等于指派仿真或清算对账。
 7. 轮动按券商股票/期权持仓重新判阶段，不能推断股票来源；所有在途与缺报价持仓占用底层名额，已有股票卖 Call 不占第二个名额。卖 Call 必须足额股票覆盖，退出不受开仓 Delta/IVP/OI 过滤。
 8. 卖方候选开仓必须有未交叉的实际 Bid/Ask；多头买入可使用有效 Ask 单边盘口，但不能把 Last 填为 Ask。`quote_snapshot()` 保留 Last 作为成交参考，但不得填充缺失盘口。若 Provider 提供报价量且对应可执行一侧为零，该盘口不可执行。ThetaData 日线期权通过历史 Quote 接口取收盘前快照；缺 quote 时不应用 EOD OHLC 伪造 Bid/Ask。
+9. 日线期权的 EOD OHLC 可能为零或无成交；策略通过 `submit_option_order(..., price=...)` 传入 `option_limit_price()` 从当前可执行 Bid/Ask 得到的报价，回测 Broker 按该报价同步撮合并另加配置滑点，不能用零 `close` 覆盖它。`SELL_TO_OPEN` 缺少正的显式执行报价时失败关闭；实盘仍由券商适配器按自身限价语义提交。

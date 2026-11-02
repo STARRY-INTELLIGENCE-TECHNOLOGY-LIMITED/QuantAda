@@ -9,6 +9,7 @@ def test_config_facade_exports_public_subconfig_groups():
     assert config.THETADATA_TOKEN == "your_token_here"
     assert hasattr(config, "SEC_USER_AGENT")
     assert config.DATA_PROVIDER_ALIASES["theta_futu_sec"] == "thetadata+futu,sec"
+    assert config.DATA_PROVIDER_ALIASES["eodhd_theta_sec"] == "eodhd,theta,sec"
     assert config.DATA_PROVIDER_ALIASES["theta_futu_research"] == "thetadata+futu,sec,earnings,rates"
     assert config.DATA_PROVIDER_ALIASES["us_options_research"] == "thetadata+futu,sec,cboe"
     assert config.ALARM_LEVEL == "INFO"

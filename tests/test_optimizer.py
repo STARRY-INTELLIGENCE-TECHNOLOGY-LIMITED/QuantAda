@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 import optimizer.runtime as optimizer
+from optimizer.journal_metadata import WORKER_CONFIG_VERSION
 import common.process_elevation as process_elevation
 import common.terminal_log as terminal_log
 from common.runtime_command import format_cli_command
@@ -1265,7 +1266,7 @@ def test_optimizer_run_passes_gc_after_trial_to_single_process_optimize(monkeypa
         state = "complete"
 
     class DummyStudy:
-        user_attrs = {"_optimizer_worker_config_version": 1}
+        user_attrs = {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}
         trials = [DummyTrial()]
         best_params = {"lookback": 20}
         best_value = 1.23
@@ -1326,7 +1327,7 @@ def test_optimizer_run_uses_default_tpe_candidates_for_short_runs(monkeypatch):
         state = "complete"
 
     class DummyStudy:
-        user_attrs = {"_optimizer_worker_config_version": 1}
+        user_attrs = {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}
         trials = [DummyTrial()]
         best_params = {"lookback": 20}
         best_value = 1.23
@@ -1416,7 +1417,7 @@ def test_tpe_candidates_drop_only_for_spawn_payload_copy_long_runs():
 
 def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, capsys):
     class DummyStudy:
-        user_attrs = {"_optimizer_worker_config_version": 1}
+        user_attrs = {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}
         def optimize(self, *args, **kwargs):
             raise MemoryError("simulated sampler pressure")
 

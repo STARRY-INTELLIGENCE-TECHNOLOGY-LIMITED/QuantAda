@@ -27,7 +27,7 @@
 3. 把完整文本发给 AI，然后让 AI 直接改代码并验证。
 4. 最后用 `debug_fix/DEBUG_FIX_PROMPT.md` 做回归和稳定性检查。
 
-## 当前框架行为基线（2026-04）
+## 当前框架行为基线（2026-11-01）
 1. Broker/Engine 已切换为**无状态执行**：不再使用 `deferred`/`buffered` 队列保存历史买入意图。
 2. 买单拒绝后在同回调内**当场降级重提**（默认最多 10 次：前 5 次按 `LOT_SIZE` 线性降级，后 5 次按几何降级）；达到上限后放弃本 K，下一根 K 重新决策。
 3. 卖出侧遵循可卖仓位约束（A 股等 T+1 场景应基于 `sellable`/`available_now` 等字段），避免“仓位不足”反复拒单。
@@ -55,6 +55,8 @@
 25. 优化器 MainEval 主回测至少覆盖最近 3 年；如果训练+测试逻辑窗口更长，则覆盖完整训练+测试逻辑窗口。MainEval 与年度固定窗口应优先复用本轮已加载的 `raw_datas` 切片，切片前须把 tz-aware 索引转到 naive UTC；只有 MainEval 初始请求窗口确实未覆盖目标窗口时才允许补拉数据。窗口对齐应周期性打印进度，不为期权末根早于窗口结束逐条刷屏。
 26. 横截面排名策略需要推送分数排名时，调用 `self.publish_rankings(ranked_candidates, title="ranked_symbols", dt=current_dt)`；不要在策略里直接导入 `AlarmManager`。
 27. 单次实盘 `run` 从隔夜清理前共享一个 monotonic execution deadline：默认最多 600 秒，分钟/小时 schedule 或 `Minutes|Seconds` timeframe 自动取触发间隔的 80%。所有 live 等待、查询重试、数据恢复、撤单、拆单和 BUY 降级都必须在同一预算内；到期停止新动作但保留已受理/成交的部分结果，异步拒单不得借下一轮预算继续。SELL 等待需为最终处理预留时间，adapter SDK 调用必须自带有限超时；回测/优化不进入该机制。
+28. 有限离散参数空间统一用去重网格；小网格自动全覆盖，大网格按全局覆盖顺序分批，自动预算可以按改善证据有界扩展或缩减明显落后的区块。连续/混合空间先跑确定性 global pilot，再进入稳定种子的 TPE；Study 与最终运行概要记录唯一组合、重复数、预算和覆盖率。显式 `--n_trials` 始终为硬上限。
+29. 回测 MCP Server 使用 MCP 2025-11-25 stdio 协议并兼容旧版本协商；仅在最新版本下声明可选 Tasks。无认证/请求者隔离时不声明 tasks.list。MCP 只能访问受限的回测/优化 CLI，`--connect`、`--config`、UI、训练续传和终止始终拒绝；默认 CLI allowlist 只能进一步收窄，单次环境覆盖只接受有界数值库线程与编码变量。MCP Server 只用于可信本地 Host，不暴露为网络服务。改动 MCP 时读取 `docs/specs/contracts/mcp_backtest_server.md` 并运行 `tests/test_mcp_backtest_server.py`。
 
 ## 推荐阅读顺序
 1. 先读 `docs/specs/*` 中与你任务最相关的正式规范。

@@ -233,7 +233,6 @@ def test_snapshot_restore_reapplies_explicit_config(monkeypatch, tmp_path):
             "_optimizer_data_snapshot": {"id": "a" * 32, "sha256": "b" * 64},
         }}],
         "source_studies": [],
-        "incompatible": [],
     })
 
     def load_snapshot(_journal, _reference):
@@ -307,8 +306,8 @@ def _optimizer_harness(monkeypatch, tmp_path):
     return runtime, constructed
 
 
-def _seed_snapshot_journal(tmp_path, reference, *, own_snapshot=None):
-    """旧 Study 没有快照且试验更多；同 Journal 的薄 Study 持有可沿用快照。"""
+def _seed_snapshot_journal(tmp_path, reference, *, name="thin"):
+    """写入带当前版本快照的 Study，供续传加载本 Study 自己的快照。"""
     import optuna
     from test_optimizer_resume import _args, _write_study
 
@@ -318,15 +317,10 @@ def _seed_snapshot_journal(tmp_path, reference, *, own_snapshot=None):
         strategy=f"{__name__}.PlainStrategy", selection=None, symbols="AAA", metric="return",
         n_trials=2, study_journal=str(journal),
     )
-    old = _write_study(journal, "old", base, "return", config_version=None)
-    old.add_trial(optuna.trial.create_trial(value=1.0))
-    old.add_trial(optuna.trial.create_trial(value=2.0))
-    if own_snapshot is not None:
-        old.set_user_attr("_optimizer_data_snapshot", own_snapshot)
-    thin = _write_study(journal, "thin", base, "return")
-    thin.add_trial(optuna.trial.create_trial(value=3.0))
-    thin.set_user_attr("_optimizer_data_snapshot", reference)
-    del old, thin
+    study = _write_study(journal, name, base, "return")
+    study.add_trial(optuna.trial.create_trial(value=3.0))
+    study.set_user_attr("_optimizer_data_snapshot", reference)
+    del study
     return journal, base
 
 
@@ -341,8 +335,8 @@ def _study_attrs(directory, name):
     return found
 
 
-def test_fallback_snapshot_is_loaded_without_fetch(monkeypatch, tmp_path, capsys):
-    """没有快照的原 Study 必须实际加载同 Journal 快照，不能只打印复用后重新取数。"""
+def test_versioned_study_snapshot_is_loaded_without_fetch(monkeypatch, tmp_path, capsys):
+    """当前版本 Study 已有快照时必须加载自己的快照，不能重新取数。"""
     import config
     from optimizer.data_snapshot import save_training_snapshot
 
@@ -359,24 +353,23 @@ def test_fallback_snapshot_is_loaded_without_fetch(monkeypatch, tmp_path, capsys
     )
     journal, base = _seed_snapshot_journal(tmp_path, reference)
     assert runtime.run_optimizer_mode(base, ast.literal_eval(base.params), ast.literal_eval(base.risk_params), []) == 0
-    attrs = _study_attrs(journal.parent, "old")
+    attrs = _study_attrs(journal.parent, "thin")
     assert constructed == []
     assert attrs["_optimizer_data_snapshot"]["id"] == reference["id"]
-    assert attrs["_optimizer_reused_pre_snapshot"] is True
+    assert attrs.get("_optimizer_rebound_snapshot") is not True
     assert config.LOT_SIZE == 1
     assert config.ANNUAL_FACTOR == 360
     output = capsys.readouterr().out
-    assert f"Loaded sibling snapshot {reference['id']}" in output
-    assert "not treated as results of this snapshot" in output
-    assert "Reusing a snapshot already saved" not in output
+    assert f"Using validated data snapshot {reference['id']}" in output
+    assert "Loaded sibling snapshot" not in output
     assert "could not be loaded" not in output
     saved = [path.name for path in Path(str(journal) + ".snapshots").iterdir() if path.is_dir()]
     assert saved == [reference["id"]]
 
 
 @pytest.mark.parametrize("damage", ["missing", "corrupt"])
-def test_unreadable_fallback_snapshot_is_not_bound(monkeypatch, tmp_path, damage, capsys):
-    """沿用失败时不保留损坏引用，重新取数并绑定新快照。"""
+def test_unreadable_own_snapshot_is_rebound(monkeypatch, tmp_path, damage, capsys):
+    """本 Study 快照损坏时不保留损坏引用，重新取数并绑定新快照。"""
     from optimizer.data_snapshot import save_training_snapshot
 
     runtime, constructed = _optimizer_harness(monkeypatch, tmp_path)
@@ -397,15 +390,14 @@ def test_unreadable_fallback_snapshot_is_not_bound(monkeypatch, tmp_path, damage
         data = snapshot / "data.pkl"
         data.write_bytes(data.read_bytes() + b"corrupt")
     assert runtime.run_optimizer_mode(base, ast.literal_eval(base.params), ast.literal_eval(base.risk_params), []) == 0
-    attrs = _study_attrs(journal.parent, "old")
+    attrs = _study_attrs(journal.parent, "thin")
     bound = attrs["_optimizer_data_snapshot"]["id"]
     assert "dm" in constructed
     assert ("fetch", "AAA") in constructed
     assert bound != reference["id"]
-    assert attrs["_optimizer_reused_pre_snapshot"] is True
-    assert attrs.get("_optimizer_rebound_snapshot") is not True
+    assert attrs.get("_optimizer_rebound_snapshot") is True
     output = capsys.readouterr().out
-    assert "could not be loaded" in output
+    assert "snapshot" in output.lower()
     assert "Loaded sibling snapshot" not in output
     assert "skipping symbol selection and market fetch" not in output
     assert (Path(str(journal) + ".snapshots") / bound).is_dir()
@@ -435,7 +427,7 @@ def test_unreadable_own_snapshot_does_not_switch_to_sibling(monkeypatch, tmp_pat
         return {
             "journal": str(journal), "studies": {"return": "saved"},
             "matched": [{"name": "saved", "attrs": {"metric": "return", "_optimizer_data_snapshot": own}}],
-            "source_studies": [], "incompatible": [], "fallback_snapshot": sibling,
+            "source_studies": [],
         }
 
     monkeypatch.setattr(runtime, "resolve_study_plan", plan)
@@ -447,5 +439,40 @@ def test_unreadable_own_snapshot_does_not_switch_to_sibling(monkeypatch, tmp_pat
     assert attrs["_optimizer_rebound_snapshot"] is True
     output = capsys.readouterr().out
     assert "Training snapshot is unreadable" in output
+    assert "Loaded sibling snapshot" not in output
+    assert "skipping symbol selection and market fetch" not in output
+
+
+def test_study_without_snapshot_does_not_load_sibling_snapshot(monkeypatch, tmp_path, capsys):
+    """当前 Study 没有快照时重新取数，不改用同 Journal 其它 Study 的快照。"""
+    import optuna
+    from optimizer.data_snapshot import save_training_snapshot
+    from test_optimizer_resume import _args, _write_study
+
+    runtime, constructed = _optimizer_harness(monkeypatch, tmp_path)
+    journal = tmp_path / "data" / "optuna" / "optuna_batch.log"
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    base = _args(
+        strategy=f"{__name__}.PlainStrategy", selection=None, symbols="AAA", metric="return",
+        n_trials=1, study_journal=str(journal),
+    )
+    sibling = save_training_snapshot(journal, _context(), base, ["demo"], {"LOT_SIZE": 1, "ANNUAL_FACTOR": 252})
+    other = _write_study(journal, "other", base, "return")
+    other.add_trial(optuna.trial.create_trial(value=1.0))
+    other.set_user_attr("_optimizer_data_snapshot", sibling)
+    saved = _write_study(journal, "saved", base, "return")
+    saved.add_trial(optuna.trial.create_trial(value=1.0))
+    saved.add_trial(optuna.trial.create_trial(value=2.0))
+    del other, saved
+
+    assert runtime.run_optimizer_mode(base, ast.literal_eval(base.params), ast.literal_eval(base.risk_params), []) == 0
+    attrs = _study_attrs(journal.parent, "saved")
+    bound = attrs["_optimizer_data_snapshot"]["id"]
+    assert "dm" in constructed
+    assert ("fetch", "AAA") in constructed
+    assert bound != sibling["id"]
+    assert attrs.get("_optimizer_rebound_snapshot") is True
+    output = capsys.readouterr().out
+    assert "The current Study has no data snapshot" in output
     assert "Loaded sibling snapshot" not in output
     assert "skipping symbol selection and market fetch" not in output

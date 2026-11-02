@@ -49,11 +49,14 @@ class GeneratedCommand:
 
 def build_resume_command(task, variables, project_root, source_root=None):
     """恢复选中的历史训练，不用当前表单参数或档案默认值改写原评分配置。"""
-    arguments = build_resume_arguments(task)
     environ = {str(key): str(value) for key, value in variables.items()}
     if source_root:
         pythonpath = environ.get("PYTHONPATH") or os.environ.get("PYTHONPATH", "")
         environ["PYTHONPATH"] = os.pathsep.join(item for item in (str(source_root), pythonpath) if item)
+    if not task.get("resumable", True):
+        warning = str(task.get("notice") or task.get("reason") or "Saved Study is not resumable.")
+        return GeneratedCommand((), environ, {}, {}, {}, warnings=(warning,))
+    arguments = build_resume_arguments(task)
     # 续传使用普通文件锁；保留在工作台管理的子进程中，以便输出跟随和停止。
     environ.update(QUANTADA_DISABLE_AUTO_ELEVATE="1", QUANTADA_STUDY_NAME="", QUANTADA_STUDY_JOURNAL="")
     attrs = task["recorded"]
@@ -288,9 +291,17 @@ def build_command(
     compact_source = re.sub(
         r"\s*\+\s*", "+", str(preset.data_source or "").strip().lower()
     )
-    source_names = re.split(r"[,\s]+", compact_source) if compact_source else []
+    source_names = re.split(r"[,+\s]+", compact_source) if compact_source else []
     if preset.data_source:
         for source_name in source_names:
+            if source_name == "eodhd_theta_sec":
+                raw_config.setdefault("EODHD_API_TOKEN", _env("EODHD_API_TOKEN"))
+                raw_config.setdefault("THETADATA_TOKEN", _env("THETADATA_TOKEN"))
+                raw_config.setdefault("SEC_USER_AGENT", _env("SEC_USER_AGENT", required=False))
+                continue
+            if source_name == "sec":
+                raw_config.setdefault("SEC_USER_AGENT", _env("SEC_USER_AGENT", required=False))
+                continue
             credential_name = _PROVIDER_CREDENTIALS.get(
                 "theta"
                 if source_name in {"hybrid", "theta+futu", "futu+theta"}

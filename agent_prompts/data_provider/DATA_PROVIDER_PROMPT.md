@@ -46,6 +46,7 @@ def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
 15. P0 辅助数据源必须保持与 OHLCV 回退链隔离：`occ` 读取用户配置的 OCC 官方 CSV/JSON 调整归档，缺少可验证调整时返回 `unknown`，不得把调整期权静默当作 100 倍标准合约；`rates` 读取美国财政部日收益率曲线并缓存，研究代码可显式通过 DataManager 注入动态利率，Black-Scholes 缺失时才回退显式默认；`earnings` 只在每日快照带 `snapshot_date/visible_from` 时宣称 point-in-time，当前 Nasdaq 抓取必须标记不可用于历史 as-of。`DataManager.attach_market_inputs()` 不得由普通回测、优化或实盘启动自动调用，策略不能直接导入这些 Provider。
 16. P1 研究接口必须显式区分容量：`ThetaDataProvider.get_option_history_quotes()` 使用 regular-session 09:30--16:00 ET 1 分钟接口并按合约缓存全天 NBBO，默认日线窄窗口不能被隐式替换；`get_option_history_trades()` 仅在交易接口和订阅可用时返回成交，不得用报价或 OHLC 冒充。SEC Company Facts 可在同一原始 JSON 缓存上增加 filing-date 收入、利润、SBC、现金、债务、稀释股数和回购字段，缺失字段保留 NaN。
 17. 日线期权 EOD OHLC 不是 NBBO。若 Provider 能读取历史报价，应把报价和源时间戳作为独立字段对齐到交易日；不得把 close/last 补成 bid/ask。ThetaData 收盘报价使用 `option_history_quote` 的 1 分钟接口请求 15:59--16:00 ET 窄窗口，同到期日优先 wildcard 并按 31 天拆块。超时和确认无数据必须有不同缓存标记，候选新仓只接受实际未交叉 Bid/Ask。
+18. EODHD 是 US 股票/ETF 的 EOD 备用 Provider，不提供期权链、Greeks 或 NBBO。将 `US.TICKER` 映射为 EODHD `TICKER.US`，保留原始 `close`，不要用 adjusted close 对齐期权行权价。只支持 Days/Weeks/Months 原生周期且 compression=1。EODHD SDK 可选导入，令牌从 `EODHD_API_TOKEN` 环境变量或 `configs/providers.py` 读取；覆写 SDK 网络请求使用有限超时，日志不得泄漏令牌。HTTP 200 的 warning/error 对象和解析错误立即失败，不重试。`eodhd` 依赖作为可选 Provider 保持注释，使用前解除注释并安装 requirements。若提供分红事件，必须保留 `declarationDate`，缺失声明日、金额或币种时不得宣称历史点时。与 ThetaData 同时使用时由 EODHD 提供正股/分红历史、ThetaData 提供期权历史。
 
 ## 输出格式
 1. 输出完整 Python 文件代码。

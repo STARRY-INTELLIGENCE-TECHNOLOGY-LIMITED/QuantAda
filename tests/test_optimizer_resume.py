@@ -20,6 +20,7 @@ import config
 import optimizer.runtime as runtime
 from optimizer.study_resume import ensure_study_config_version, legacy_owner_running, resolve_study_plan, study_run_lock
 from optimizer.journal_metadata import WORKER_CONFIG_VERSION, isolate_study_journal, read_study_metadata, related_journal_paths, training_identity_hash
+from optimizer.search_policy import grid_signature
 
 
 def _args(**overrides):
@@ -46,6 +47,23 @@ def _write_study(path, name, args, metric="return", config_version=WORKER_CONFIG
         study.set_user_attr(key, str(metric if key == "metric" else value))
     if config_version is not None:
         study.set_user_attr("_optimizer_worker_config_version", config_version)
+        if config_version == WORKER_CONFIG_VERSION:
+            opt_space = ast.literal_eval(args.opt_params)
+            grid = {}
+            for param_name, spec in opt_space.items():
+                if spec.get("type") == "int":
+                    grid[param_name] = list(range(int(spec["low"]), int(spec["high"]) + 1, int(spec.get("step", 1))))
+                elif spec.get("type") == "float" and spec.get("step") is not None:
+                    count = int((float(spec["high"]) - float(spec["low"])) / float(spec["step"]) + 1e-10)
+                    grid[param_name] = [round(float(spec["low"]) + index * float(spec["step"]), 12) for index in range(count + 1)]
+                elif spec.get("type") == "categorical":
+                    grid[param_name] = list(spec.get("choices", []))
+                else:
+                    grid = None
+                    break
+            if grid:
+                study.set_user_attr("_optimizer_grid_signature", grid_signature(grid))
+                study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
     return study
 
 
@@ -79,7 +97,7 @@ def test_timestamp_named_batch_is_matched_and_missing_metrics_share_its_journal(
     assert len(plan["matched"]) == 1
 
 
-def test_unversioned_scores_are_loaded_by_name_and_not_relabeled(tmp_path):
+def test_unversioned_scores_are_ignored_and_new_plan_is_created(tmp_path):
     journal = tmp_path / "optuna_legacy.log"
     old = _write_study(journal, "old", _args(), config_version=None)
     old.add_trial(optuna.trial.create_trial(value=-43.0))
@@ -87,34 +105,24 @@ def test_unversioned_scores_are_loaded_by_name_and_not_relabeled(tmp_path):
     args = _args(start_date="20230924", end_date="20260924")
     plan = _plan(args, tmp_path, (None, None))
     assert journal.read_bytes() == before
-    assert plan["journal"] == str(journal)
-    assert plan["studies"]["return"] == "old"
-    assert plan["reused_pre_config"] is True
-    assert plan["incompatible"] == []
-    assert (args.start_date, args.end_date) == ("20230923", "20260923")
-    assert _plan(_args(), tmp_path)["studies"] == plan["studies"]
-    sharpe = _write_study(journal, plan["studies"]["sharpe"], _args(), "sharpe")
-    sharpe.add_trial(optuna.trial.create_trial(value=7.0))
-    resumed = _plan(_args(), tmp_path)
-    assert resumed["studies"]["return"] == "old"
-    assert resumed["studies"]["sharpe"] == plan["studies"]["sharpe"]
-    assert resumed["incompatible"] == []
+    assert plan["journal"] != str(journal)
+    assert plan["matched"] == []
+    assert (args.start_date, args.end_date) == ("20230924", "20260924")
+    assert _plan(_args(start_date="20230924", end_date="20260924"), tmp_path)["studies"] == plan["studies"]
     assert old.trials[0].value == -43.0
     assert "_optimizer_worker_config_version" not in old.user_attrs
 
 
-def test_explicit_unversioned_study_can_be_loaded_without_relabeling(tmp_path):
+def test_explicit_unversioned_study_is_rejected(tmp_path):
     journal = tmp_path / "optuna_legacy.log"
     old = _write_study(journal, "old", _args(), config_version=None)
     old.add_trial(optuna.trial.create_trial(value=99.0))
     before = journal.read_bytes()
-    plan = _plan(_args(study_name="old", study_journal=str(journal)), tmp_path)
-    assert plan["studies"]["return"] == "old"
+    with pytest.raises(ValueError, match="incompatible"):
+        _plan(_args(study_name="old", study_journal=str(journal)), tmp_path)
     assert journal.read_bytes() == before
-    ensure_study_config_version(old)
-    assert "_optimizer_worker_config_version" not in old.user_attrs
-    assert old.user_attrs["_optimizer_reused_pre_config_version"] is True
-    ensure_study_config_version(old)
+    with pytest.raises(ValueError, match="incompatible"):
+        ensure_study_config_version(old)
 
 
 def test_explicit_different_version_cannot_overwrite_existing_scores(tmp_path):
@@ -733,11 +741,10 @@ def test_richer_unversioned_study_beats_thin_versioned_fork(tmp_path):
     plan = _plan(_args(metric="return", study_journal=str(journal)), tmp_path)
     named = _plan(_args(metric="return", study_journal=str(journal), study_name="thin"), tmp_path)
 
-    assert plan["studies"]["return"] == "old"
-    assert plan["reused_pre_config"] is True
-    assert plan["fallback_snapshot"]["id"] == "a" * 32
-    assert named["studies"]["return"] == "old"
-    assert named["switched_to_richer"] is True
+    assert plan["studies"]["return"] == "thin"
+    assert "fallback_snapshot" not in plan
+    assert named["studies"]["return"] == "thin"
+    assert named["switched_to_richer"] is False
     assert "_optimizer_worker_config_version" not in old.user_attrs
 
 
@@ -765,7 +772,7 @@ def test_loaded_grid_study_does_not_revisit_finished_combinations(tmp_path):
     assert visited.issubset({trial.params["x"] for trial in completed})
 
 
-def test_optimizer_loads_unversioned_study_and_skips_visited_grid(monkeypatch, tmp_path):
+def test_optimizer_rejects_explicit_unversioned_study(monkeypatch, tmp_path):
     evaluated = []
     frame = pd.DataFrame({"close": [1.0, 1.1, 1.2]}, index=pd.date_range("2024-01-01", periods=3))
     context = {
@@ -800,17 +807,10 @@ def test_optimizer_loads_unversioned_study_and_skips_visited_grid(monkeypatch, t
     monkeypatch.setattr(OfflineJob, "_run_yearly_validation_backtests", lambda *a, **k: [])
     monkeypatch.setattr(runtime.sys, "argv", ["run.py"])
     args = _args(metric="return", n_trials=4, study_journal=str(journal))
-    assert runtime.run_optimizer_mode(args, ast.literal_eval(args.params), {}, ["AAA"]) == 0
-    assert visited.isdisjoint(evaluated)
-    assert len(evaluated) == 2
-    studies = read_study_metadata(journal)
-    assert [info["name"] for info in studies] == ["grid-study"]
+    assert runtime.run_optimizer_mode(args, ast.literal_eval(args.params), {}, ["AAA"]) == 1
+    assert evaluated == []
     loaded = optuna.load_study(study_name="grid-study", storage=_storage(journal))
-    assert "_optimizer_worker_config_version" not in loaded.user_attrs
-    assert loaded.user_attrs["_optimizer_reused_pre_config_version"] is True
-    completed = [trial for trial in loaded.trials if trial.state == optuna.trial.TrialState.COMPLETE]
-    assert len(completed) == 4
-    assert len({trial.params["x"] for trial in completed}) == 4
+    assert loaded.user_attrs.get("_optimizer_worker_config_version") is None
 
 
 def test_isolate_aligns_trial_id_with_console_number(tmp_path):

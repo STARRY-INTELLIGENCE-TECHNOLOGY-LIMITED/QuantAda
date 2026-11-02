@@ -17,11 +17,13 @@ class MCPClient:
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=None,
             text=True,
+            encoding="utf-8",
             bufsize=1,
         )
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._write_lock = threading.Lock()
         self._next_id = 1
         self._responses = {}
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
@@ -31,105 +33,113 @@ class MCPClient:
         if not self.proc.stdout:
             return
         for line in self.proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
             try:
-                msg = json.loads(line)
-            except Exception:
+                message = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            msg_id = msg.get("id")
+            msg_id = message.get("id")
             if msg_id is not None:
-                with self._lock:
-                    self._responses[msg_id] = msg
+                with self._condition:
+                    self._responses[msg_id] = message
+                    self._condition.notify_all()
 
     def _send(self, payload):
         if not self.proc.stdin:
-            raise RuntimeError("stdin closed")
-        self.proc.stdin.write(_json_line(payload) + "\n")
-        self.proc.stdin.flush()
+            raise RuntimeError("MCP server stdin is closed")
+        with self._write_lock:
+            self.proc.stdin.write(_json_line(payload) + "\n")
+            self.proc.stdin.flush()
 
-    def request(self, method, params=None):
-        with self._lock:
+    def request(self, method, params=None, timeout=30):
+        with self._condition:
             msg_id = self._next_id
             self._next_id += 1
-        req = {"jsonrpc": "2.0", "id": msg_id, "method": method}
+        request = {"jsonrpc": "2.0", "id": msg_id, "method": method}
         if params is not None:
-            req["params"] = params
-        self._send(req)
-        # 简单的阻塞等待。
-        start = time.time()
-        while time.time() - start < 10:
-            with self._lock:
-                if msg_id in self._responses:
-                    return self._responses.pop(msg_id)
-            time.sleep(0.05)
-        raise TimeoutError(f"timeout waiting for {method}")
+            request["params"] = params
+        self._send(request)
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while msg_id not in self._responses:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"timed out waiting for {method}")
+                self._condition.wait(timeout=remaining)
+            response = self._responses.pop(msg_id)
+        if "error" in response:
+            raise RuntimeError(f"{method} failed: {response['error']}")
+        return response.get("result", {})
 
     def notify(self, method, params=None):
-        req = {"jsonrpc": "2.0", "method": method}
+        message = {"jsonrpc": "2.0", "method": method}
         if params is not None:
-            req["params"] = params
-        self._send(req)
+            message["params"] = params
+        self._send(message)
 
     def close(self):
         if self.proc.stdin:
             try:
                 self.proc.stdin.close()
-            except Exception:
+            except OSError:
                 pass
-        try:
+        if self.proc.poll() is None:
             self.proc.terminate()
-        except Exception:
-            pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=5)
 
 
 def main():
-    # 示例：MCP_BACKTEST_SERVER_CMD="python -m mcp_backtest_server"。
     cmd_str = os.getenv("MCP_BACKTEST_SERVER_CMD", "python -m mcp_backtest_server")
-    cmd = shlex.split(cmd_str, posix=(os.name != "nt"))
-    client = MCPClient(cmd)
-
-    # 初始化。
-    print(client.request("initialize", {"protocolVersion": "2025-03-26"}))
-    client.notify("notifications/initialized")
-
-    # 列出工具。
-    print(client.request("tools/list"))
-
-    # 启动一次回测 run（示例参数）。
-    run_args = {
-        "name": "backtest_run",
-        "arguments": {
-            "args": ["sample_macd_cross_strategy", "--symbols=SHSE.600519", "--start_date=20240101"],
-            "max_runtime_sec": 120,
-        },
-    }
-    run_resp = client.request("tools/call", run_args)
-    print(run_resp)
-
-    # 轮询状态。
-    job = None
+    client = MCPClient(shlex.split(cmd_str, posix=(os.name != "nt")))
     try:
-        content = run_resp["result"]["content"][0]["text"]
-        job = json.loads(content).get("job")
-    except Exception:
-        job = None
+        initialized = client.request(
+            "initialize",
+            {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "quantada-example-client", "version": "1.0.0"},
+            },
+        )
+        print(json.dumps(initialized, ensure_ascii=False, indent=2))
+        client.notify("notifications/initialized")
+        print(json.dumps(client.request("tools/list"), ensure_ascii=False, indent=2))
 
-    if job:
-        job_id = job["id"]
+        created = client.request(
+            "tools/call",
+            {
+                "name": "backtest_run",
+                "arguments": {
+                    "args": [
+                        "sample_macd_cross_strategy",
+                        "--symbols=SHSE.600519",
+                        "--start_date=20240101",
+                        "--no_plot",
+                    ],
+                    "max_runtime_sec": 3600,
+                },
+                "task": {"ttl": 2 * 60 * 60 * 1000},
+            },
+        )
+        task_id = created["task"]["taskId"]
+        print(f"Task accepted: {task_id} job={created['task']['jobId']}")
+
         while True:
-            status_resp = client.request(
-                "tools/call",
-                {"name": "backtest_status", "arguments": {"job_id": job_id}},
+            task = client.request("tasks/get", {"taskId": task_id})
+            print(
+                f"Task {task_id}: {task['status']} "
+                f"{task.get('statusMessage', '')}"
             )
-            payload = json.loads(status_resp["result"]["content"][0]["text"])
-            print(payload)
-            if payload["job"]["status"] in ("done", "failed", "canceled"):
+            if task["status"] in {"completed", "failed", "cancelled"}:
                 break
-            time.sleep(1)
+            time.sleep(max(0.1, task.get("pollInterval", 1000) / 1000.0))
 
-    client.close()
+        result = client.request("tasks/result", {"taskId": task_id}, timeout=3600)
+        print(json.dumps(result.get("structuredContent", result), ensure_ascii=False, indent=2))
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":

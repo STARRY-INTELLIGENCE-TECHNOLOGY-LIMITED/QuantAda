@@ -129,17 +129,15 @@ def test_task_versions_have_separate_progress_and_show_isolation_notice(tmp_path
     assert current["notice"] == ""
     assert legacy["trial_counts"]["COMPLETE"] == 1
     assert legacy["trial_counts"]["FAIL"] == 1
-    assert "1 completed trials count toward budget 4" in legacy["notice"]
-    assert "budget 4" in legacy["notice"]
-    assert "instead of starting at 0" in legacy["notice"]
-    assert "does not count" not in legacy["notice"]
-    assert "trial_id" in legacy["notice"]
+    assert "read-only" in legacy["notice"]
+    assert legacy["resumable"] is False
+    assert "incompatible optimizer version" in legacy["reason"]
     assert current["task_id"] != legacy["task_id"]
     assert build_resume_command(legacy, {}, tmp_path).warnings == (legacy["notice"],)
     answers = iter(["2", "q"])
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
     assert choose_training_task([current, legacy]) is None
-    assert legacy["notice"] in capsys.readouterr().out
+    assert legacy["reason"] in capsys.readouterr().out
 
 
 def test_progress_counts_waiting_retries_and_ignores_invalid_terminal_updates(tmp_path):
@@ -189,7 +187,7 @@ def test_task_restores_most_recent_budget_and_workers_across_metrics(tmp_path):
     assert argv[argv.index("--n_jobs") + 1] == "2"
 
 
-def test_legacy_task_recovers_unstarted_metrics_from_its_terminal_header(tmp_path):
+def test_legacy_task_does_not_recover_unstarted_metrics_from_terminal_header(tmp_path):
     journal = _write_task(tmp_path / "optuna" / "optuna_old.log", metrics=None, config_version=None)
     terminal = tmp_path / "optimizer" / "optimizer_terminal_old.log"
     terminal.parent.mkdir()
@@ -201,8 +199,9 @@ def test_legacy_task_recovers_unstarted_metrics_from_its_terminal_header(tmp_pat
         encoding="utf-8",
     )
     task = list_training_tasks(journal.parent)[0]
-    assert task["metrics"] == ["return", "sharpe", "calmar"]
-    assert task["n_trials"] == 2160
+    assert task["metrics"] == ["return"]
+    assert task["n_trials"] is None
+    assert task["resumable"] is False
 
 
 @pytest.mark.parametrize("execution_price", ["close", "next_open"])
@@ -733,7 +732,7 @@ def test_web_task_log_pages_the_selected_journal_and_rejects_unknown_tasks(tmp_p
         service.training_task_log({"train_resume": "missing"})
 
 
-def test_thinner_fork_resume_points_at_the_richer_study(tmp_path):
+def test_incompatible_fork_is_not_used_as_a_resume_anchor(tmp_path):
     path = _write_task(tmp_path / "optuna_versions.log", config_version=None, name="old")
     with path.open("a", encoding="utf-8") as stream:
         events = [{"op_code": 0, "study_name": "thin", "directions": [2]}]
@@ -748,8 +747,8 @@ def test_thinner_fork_resume_points_at_the_richer_study(tmp_path):
     tasks = list_training_tasks(tmp_path)
     thin = next(task for task in tasks if "thin" in task["study_names"])
     argv = build_resume_arguments(thin)
-    assert argv[argv.index("--study_name") + 1] == "old"
-    assert "more completed trials" in thin["notice"]
+    assert argv[argv.index("--study_name") + 1] == "thin"
+    assert thin["resumable"] is True
 
 
 

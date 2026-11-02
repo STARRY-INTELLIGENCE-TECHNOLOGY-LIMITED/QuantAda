@@ -179,6 +179,24 @@ def print_run_summary(
     print(f"Metrics completed:  {completed_metrics}")
     print(f"Metrics failed:     {failed_metrics}")
     print(f"Completed trials:   {completed_trials}")
+    audits = [
+        (format_metric_label(report), report.get("search_audit") or {})
+        for report in final_reports
+        if report.get("search_audit")
+    ]
+    if audits:
+        print("Search coverage:")
+        for label, audit in audits:
+            coverage = audit.get("coverage")
+            coverage_text = "n/a" if coverage is None else f"{float(coverage) * 100:.2f}%"
+            print(
+                f"  {label}: unique={audit.get('unique', 0)} "
+                f"finished={audit.get('finished', 0)} "
+                f"duplicates={audit.get('duplicates', 0)} "
+                f"coverage={coverage_text} "
+                f"target={audit.get('target_trials', 'n/a')} "
+                f"max={audit.get('max_target_trials', 'n/a')}"
+            )
     print(f"MainEval reports:   {main_eval_count}")
     print(f"TestSet reports:    {test_count}")
     print(f"Yearly reports:     {yearly_count}")

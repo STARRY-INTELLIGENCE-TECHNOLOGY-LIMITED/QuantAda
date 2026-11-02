@@ -17,24 +17,30 @@ from optimizer.journal_metadata import WORKER_CONFIG_VERSION, batch_journal_path
 
 
 def ensure_study_config_version(study):
-    """空白 Study 登记当前口径。已有试验但没有标记时允许加载，不把旧评分改标成当前口径。"""
+    """只允许当前运行口径；旧 Study 必须显式新建。"""
     version = study.user_attrs.get("_optimizer_worker_config_version")
     if version == WORKER_CONFIG_VERSION:
         return
+    get_trials = getattr(study, "get_trials", None)
+    trials = get_trials(deepcopy=False) if callable(get_trials) else list(getattr(study, "trials", ()) or ())
+    if trials:
+        raise ValueError(
+            f"Study {study.study_name} uses an incompatible worker configuration version {version!r}; "
+            f"current version is {WORKER_CONFIG_VERSION}. Use a new --study_name or Journal."
+        )
     if version is not None:
         raise ValueError(
             f"Study {study.study_name} has an incompatible worker configuration version; "
-            "use a new --study_name or omit --study_name for automatic isolation."
+            "use a new --study_name or Journal."
         )
-    if study.get_trials(deepcopy=False):
-        if not study.user_attrs.get("_optimizer_reused_pre_config_version"):
-            study.set_user_attr("_optimizer_reused_pre_config_version", True)
-        return
     study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
 
 
 class RetryAwareGridSampler(GridSampler):
     """重试记录不消耗新的网格槽位，也不因旧 FAIL 已占满网格而提前停止重试。"""
+
+    def __init__(self, search_space, seed=None):
+        super().__init__(search_space, seed=seed)
 
     def before_trial(self, study, trial):
         if "grid_id" in trial.system_attrs or "fixed_params" in trial.system_attrs:
@@ -56,6 +62,50 @@ class RetryAwareGridSampler(GridSampler):
         if any(item.number != trial.number and "failed_trial" in item.system_attrs for item in pending):
             return
         return super().after_trial(study, trial, state, values)
+
+
+class AdaptiveGridSampler(RetryAwareGridSampler):
+    """在稳定网格编号上只领取当前仍活跃的区块。"""
+
+    def __init__(self, search_space, active_grid_ids=None, seed=None):
+        super().__init__(search_space, seed=seed)
+        all_ids = set(range(self._n_min_trials))
+        self._active_grid_ids = all_ids if active_grid_ids is None else {
+            int(value) for value in active_grid_ids if int(value) in all_ids
+        }
+
+    def _get_unvisited_grid_ids(self, study):
+        all_unvisited = super()._get_unvisited_grid_ids(study)
+        return [grid_id for grid_id in all_unvisited if grid_id in self._active_grid_ids]
+
+    def before_trial(self, study, trial):
+        attrs = getattr(trial, "system_attrs", {}) or {}
+        if "grid_id" in attrs or "fixed_params" in attrs or "failed_trial" in attrs:
+            return super().before_trial(study, trial)
+
+        target_grids = self._get_unvisited_grid_ids(study)
+        if not target_grids:
+            # 活跃格子已用尽时直接停止，不再把已访问组合分配给新 trial。
+            study.stop()
+            study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
+            study._storage.set_trial_system_attr(trial._trial_id, "_adaptive_grid_exhausted", True)
+            return
+        logical_number = sum(
+            item.number < trial.number and "failed_trial" not in item.system_attrs
+            for item in study.get_trials(deepcopy=False)
+        )
+        if logical_number in target_grids:
+            grid_id = int(logical_number)
+        else:
+            grid_id = int(target_grids[int(trial._trial_id) % len(target_grids)])
+        study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
+        study._storage.set_trial_system_attr(trial._trial_id, "grid_id", grid_id)
+
+    def sample_independent(self, study, trial, param_name, param_distribution):
+        """耗尽标记的 trial 在采样时剪枝，避免复用已访问格子。"""
+        if trial.system_attrs.get("_adaptive_grid_exhausted"):
+            raise optuna.TrialPruned("Adaptive grid has no unvisited combinations left.")
+        return super().sample_independent(study, trial, param_name, param_distribution)
 
 
 def prepare_trial_resume(study, storage):
@@ -97,25 +147,15 @@ def _snapshot_key(study):
     return str(ref)
 
 
-def _version_reusable(study):
-    return study["attrs"].get("_optimizer_worker_config_version") in (None, WORKER_CONFIG_VERSION)
-
-
 def select_resume_studies(source_studies, metrics, requested_name):
     """同一身份加载已完成更多的 Study，供 create_study(load_if_exists=True) 跳过已探索参数。"""
     named = next((study for study in source_studies if study["name"] == requested_name), None) if requested_name else None
-    if named is not None and not _version_reusable(named):
-        raise ValueError(
-            "The requested Study has an incompatible worker configuration version; "
-            "use a new --study_name or omit --study_name for automatic isolation."
-        )
-    reusable = [study for study in source_studies if _version_reusable(study)]
-    incompatible = [study for study in source_studies if not _version_reusable(study)]
+    reusable = list(source_studies)
     groups = {}
     for study in reusable:
         groups.setdefault(_snapshot_key(study), []).append(study)
     if not groups:
-        return [], incompatible, False, None
+        return [], False
 
     def group_finished(key):
         return sum(finished_trial_count(study.get("trial_counts")) for study in groups[key])
@@ -132,15 +172,6 @@ def select_resume_studies(source_studies, metrics, requested_name):
             chosen_key = preferred
         elif preferred in groups and chosen_key != preferred:
             switched = True
-    fallback_snapshot = None
-    if chosen_key == "":
-        donor = next((key for key in ranked if key), "")
-        if donor:
-            fallback_snapshot = next(
-                study["attrs"].get("_optimizer_data_snapshot")
-                for study in groups[donor]
-                if study["attrs"].get("_optimizer_data_snapshot")
-            )
     matched = []
     for metric in metrics:
         options = [study for study in groups[chosen_key] if study["attrs"].get("metric") == metric]
@@ -149,13 +180,28 @@ def select_resume_studies(source_studies, metrics, requested_name):
         matched.append(max(options, key=lambda study: (
             finished_trial_count(study.get("trial_counts")),
             -study.get("_recency", 0),
-            study["attrs"].get("_optimizer_worker_config_version") == WORKER_CONFIG_VERSION,
         )))
-    covered = {study["attrs"].get("metric") for study in matched}
-    incompatible = [study for study in incompatible if study["attrs"].get("metric") not in covered]
     for study in source_studies:
         study.pop("_recency", None)
-    return matched, incompatible, switched, fallback_snapshot
+    return matched, switched
+
+
+def _is_finite_search_space(opt_params_def):
+    """判断搜索空间是否必须带当前网格签名。"""
+    if not opt_params_def:
+        return False
+    for spec in opt_params_def.values():
+        if not isinstance(spec, dict):
+            return False
+        p_type = spec.get("type")
+        if p_type == "int":
+            continue
+        if p_type == "float" and spec.get("step") is not None:
+            continue
+        if p_type == "categorical":
+            continue
+        return False
+    return True
 
 
 def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics, log_dir, requested_window):
@@ -163,6 +209,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
     values = dict(vars(args), params=fixed_params, opt_params=opt_params_def, risk_params=risk_params)
     identity = study_identity(values)
     identity_hash = training_identity_hash(values)
+    finite_search_space = _is_finite_search_space(opt_params_def)
     identity_json = json.dumps(identity, sort_keys=True, ensure_ascii=False, default=str)
     requested_name = str(getattr(args, "study_name", None) or os.environ.get("QUANTADA_STUDY_NAME", "")).strip()
     requested_journal = str(getattr(args, "study_journal", None) or os.environ.get("QUANTADA_STUDY_JOURNAL", "")).strip()
@@ -208,6 +255,31 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
         anchored_snapshot = anchor["attrs"].get("_optimizer_data_snapshot") if anchor else None
         for study in reversed(studies):
             attrs = study["attrs"]
+            if attrs.get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION:
+                if requested_name and study["name"] == requested_name:
+                    raise ValueError(
+                        f"Study {study['name']} uses an incompatible worker configuration version; "
+                        "use a new --study_name or Journal."
+                    )
+                continue
+            if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"} \
+                    and not attrs.get("_optimizer_grid_signature"):
+                if requested_name and study["name"] == requested_name:
+                    raise ValueError(
+                        f"Study {study['name']} has no current finite grid metadata; "
+                        "use a new --study_name or Journal."
+                    )
+                continue
+            if finite_search_space and (
+                attrs.get("_optimizer_search_policy") not in {"exhaustive_grid", "adaptive_grid"}
+                or not attrs.get("_optimizer_grid_signature")
+            ):
+                if requested_name and study["name"] == requested_name:
+                    raise ValueError(
+                        f"Study {study['name']} has no current finite grid metadata; "
+                        "use a new --study_name or Journal."
+                    )
+                continue
             metric = attrs.get("metric")
             if inspecting_requested:
                 required_identity = set(identity) - ({"symbols"} if identity["selection"] else set())
@@ -248,6 +320,13 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
                 candidates.append(study)
             elif requested_name and study["name"] == requested_name:
                 raise ValueError(f"Study {study['name']} has a different training configuration or window")
+        if inspecting_requested and not candidates and any(
+            study["attrs"].get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION
+            for study in studies
+        ):
+            raise ValueError(
+                f"Requested Journal {path} contains an incompatible Study; use a new Journal."
+            )
         if candidates:
             selected_path = path
             selected_window = (candidates[0]["attrs"]["start_date"], candidates[0]["attrs"]["end_date"])
@@ -274,6 +353,16 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
                 if study["name"] in seen:
                     continue
                 attrs = study["attrs"]
+                if attrs.get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION:
+                    continue
+                if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"} \
+                        and not attrs.get("_optimizer_grid_signature"):
+                    continue
+                if finite_search_space and (
+                    attrs.get("_optimizer_search_policy") not in {"exhaustive_grid", "adaptive_grid"}
+                    or not attrs.get("_optimizer_grid_signature")
+                ):
+                    continue
                 if attrs.get("metric") not in metrics:
                     continue
                 required = set(identity) - ({"symbols"} if identity["selection"] else set())
@@ -327,7 +416,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
                 selected_path = requested_path
                 break
     source_studies = matched
-    matched, incompatible, switched, fallback_snapshot = select_resume_studies(source_studies, metrics, requested_name)
+    matched, switched = select_resume_studies(source_studies, metrics, requested_name)
     # 只有已有 Journal 且训练身份冲突时才派生独立文件；新路径和刷新都保留用户指定路径。
     if not matched and requested_journal and not requested_name and not refreshing and identity_conflict:
         strategy_tag = re.sub(r"[^A-Za-z0-9_]+", "_", str(identity["strategy"] or "optimizer").split(".")[-1])[:40]
@@ -359,10 +448,8 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
             study_names[metric] = f"{base_name}__{suffix}_{metric_hash}"
     return {
         "journal": str(selected_path), "studies": study_names, "matched": matched, "source_studies": source_studies,
-        "incompatible": incompatible, "identity_hash": identity_hash, "reused_pre_config": any(
-            study["attrs"].get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION for study in matched
-        ),
-        "switched_to_richer": switched, "fallback_snapshot": fallback_snapshot,
+        "identity_hash": identity_hash,
+        "switched_to_richer": switched,
     }
 
 

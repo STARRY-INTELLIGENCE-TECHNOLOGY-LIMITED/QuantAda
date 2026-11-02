@@ -45,7 +45,7 @@
 16. 长时间多指标训练跨越交易日时，必须确认日期推断只执行一次；bootstrap、每个 metric Job、spawn worker 的 `start_date/end_date` 必须完全一致。用模拟时钟推进日期验证，不能只检查单个 Study。
 17. Optuna 为避免 trial_id 冲突而拆分的专属 Journal 仍属于同一个 `_optimizer_batch_journal` 批次。任务列表须合并其 COMPLETE/FAIL/RUNNING/WAITING 计数和指标；恢复命令指向批次主 Journal 并锚定 Study，不能把 Ctrl-C 后的拆分文件显示成第二个训练任务。验证原任务和拆分 Journal 的回放。
 18. `--n_jobs -1` 的恢复不能把 WAITING retry 固定为父进程 `n_jobs=1`。有可用 JournalStorage 和 worker 时，恢复队列应并行领取固定参数 trial；验证同一批次失败链、原网格槽位和未完成预算不被新采样污染。
-19. 训练身份必须有稳定参数 hash。参数不同即使命中旧批次 Journal 或锁文件，也要派生独立 Journal；相同 hash 才幂等跳过重复启动。测试固定参数、搜索空间、风险参数和配置覆盖的变化，以及已有无 hash 旧 Study 的兼容恢复。
+19. 训练身份必须有稳定参数 hash。参数不同即使命中当前批次 Journal 或锁文件，也要派生独立 Journal；相同 hash 才幂等跳过重复启动。测试固定参数、搜索空间、风险参数和配置覆盖的变化；缺少 hash 或当前运行口径的旧 Study 只读并拒绝续传。
 
 ## 输出格式
 1. `根因`

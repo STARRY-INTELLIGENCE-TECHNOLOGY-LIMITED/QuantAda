@@ -15,6 +15,9 @@ TIINGO_TOKEN = 'your_token_here'
 # Thetadata API 令牌；未配置时 Provider 会安全跳过。
 THETADATA_TOKEN = 'your_token_here'
 
+# EOD Historical Data API 令牌；未配置时 Provider 会安全跳过。
+EODHD_API_TOKEN = os.getenv('EODHD_API_TOKEN', '').strip()
+
 # SEC 公共数据接口要求 User-Agent 标明应用和可联系邮箱；未设置时跳过在线请求。
 SEC_USER_AGENT = os.getenv('SEC_USER_AGENT', 'QuantAda@starryint.hk').strip()
 
@@ -43,6 +46,7 @@ DATA_PROVIDER_COMPOSITIONS = {
 DATA_PROVIDER_ALIASES = {
     # 核心回测只加载行情与 V/W；高容量/辅助源通过显式接口调用。
     'theta_futu_sec': 'thetadata+futu,sec',
+    'eodhd_theta_sec': 'eodhd,theta,sec',
     'theta_futu_cboe': 'thetadata+futu,cboe',
     'theta_futu_research': 'thetadata+futu,sec,earnings,rates',
     'us_options_research': 'thetadata+futu,sec,cboe',

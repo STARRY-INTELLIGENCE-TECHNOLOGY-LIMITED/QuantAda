@@ -223,6 +223,7 @@ def test_default_catalog_exposes_notification_and_provider_credentials() -> None
         "WECOM_WEBHOOK",
         "TUSHARE_TOKEN",
         "TIINGO_TOKEN",
+        "EODHD_API_TOKEN",
         "THETADATA_TOKEN",
         "SEC_USER_AGENT",
     } <= names
@@ -238,6 +239,54 @@ def test_default_catalog_exposes_notification_and_provider_credentials() -> None
     assert "GLOBAL_WECOM_WEBHOOK" not in names
     variable_order = [item.name for item in catalog.variables]
     assert variable_order.index("WECOM_WEBHOOK") < variable_order.index("DINGTALK_WEBHOOK")
+
+
+def test_eodhd_provider_command_maps_api_token_from_environment():
+    catalog = default_catalog()
+    preset = CommandPreset(
+        preset_id="eodhd_research",
+        title="EODHD research",
+        market="期权",
+        mode="backtest",
+        strategy="strategies.sample_macd_cross_strategy.SampleMACDCrossStrategy",
+        data_source="eodhd_theta_sec",
+    )
+
+    generated = build_command(
+        catalog,
+        preset,
+        {
+            "EODHD_API_TOKEN": "eodhd-test-token",
+            "THETADATA_TOKEN": "theta-test-token",
+            "SEC_USER_AGENT": "QuantAda research person@example.com",
+        },
+        Path("."),
+    )
+    config_value = generated.argv[generated.argv.index("--config") + 1]
+
+    assert "EODHD_API_TOKEN" in config_value
+    assert "eodhd-test-token" in config_value
+    assert "THETADATA_TOKEN" in config_value
+    assert "SEC_USER_AGENT" in config_value
+
+    combined = build_command(
+        catalog,
+        CommandPreset(
+            "eodhd-plus", "EODHD plus", "期权", "backtest",
+            "strategies.sample_macd_cross_strategy",
+            data_source="eodhd+theta+sec",
+        ),
+        {
+            "EODHD_API_TOKEN": "eodhd-test-token",
+            "THETADATA_TOKEN": "theta-test-token",
+            "SEC_USER_AGENT": "QuantAda research person@example.com",
+        },
+        Path("."),
+    )
+    combined_config = combined.argv[combined.argv.index("--config") + 1]
+    assert "EODHD_API_TOKEN" in combined_config
+    assert "THETADATA_TOKEN" in combined_config
+    assert "SEC_USER_AGENT" in combined_config
 
     global_generated = build_command(
         catalog,

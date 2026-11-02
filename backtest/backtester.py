@@ -413,12 +413,38 @@ class BacktraderStrategyWrapper(bt.Strategy):
         )
         from common.options.risk import compute_option_margin
 
+        try:
+            from common.options.analytics import parse_option_symbol
+            is_option_feed = bool(parse_option_symbol(getattr(data, "_name", "")).get("option_type"))
+        except Exception:
+            is_option_feed = False
+        if not is_option_feed:
+            dataframe = getattr(getattr(data, "p", None), "dataname", None)
+            is_option_feed = isinstance(dataframe, pd.DataFrame) and any(
+                name in dataframe.columns
+                for name in ("option_type", "right", "cp", "put_call")
+            )
+
+        try:
+            quote_execution_price = float(price) if price is not None else None
+        except (TypeError, ValueError, OverflowError):
+            quote_execution_price = None
+        if is_option_feed and (
+            quote_execution_price is None
+            or not math.isfinite(quote_execution_price)
+            or quote_execution_price <= 0
+        ):
+            self._last_order_target_skip_reason = 'option_quote_unavailable'
+            return None
+
         def annotate(order, **extra):
             if order is None:
                 return None
             payload = {
                 "option_order_effect": effect,
             }
+            if is_option_feed and quote_execution_price is not None:
+                payload["option_execution_price"] = quote_execution_price
             for key in ("option_spread_id", "option_spread_leg"):
                 value = kwargs.get(key)
                 if value is not None:
@@ -1190,6 +1216,36 @@ class SignalLoggingBroker(bt.brokers.BackBroker):
 
     def _try_exec_market(self, order, popen, phigh, plow):
         """次日开盘按实际可用现金当场缩减超额买单，避免整笔保证金拒单。"""
+        quote_price = order.info.get('option_execution_price')
+        if quote_price is not None:
+            try:
+                quote_price = float(quote_price)
+            except (TypeError, ValueError, OverflowError):
+                order.reject(self)
+                return
+            if not math.isfinite(quote_price) or quote_price <= 0:
+                order.reject(self)
+                return
+            if self.p.coc and order.info.get('coc', True):
+                dtcoc = order.created.dt
+            else:
+                if not self.p.coo and order.data.datetime[0] <= order.created.dt:
+                    return
+                dtcoc = None
+            if order.isbuy():
+                execution_price = self._slip_up(
+                    float('inf'), quote_price, doslip=self.p.slip_open,
+                )
+            else:
+                execution_price = self._slip_down(
+                    0.0, quote_price, doslip=self.p.slip_open,
+                )
+            if execution_price is None:
+                order.reject(self)
+                return
+            self._execute(order, ago=0, price=execution_price, dtcoc=dtcoc)
+            return
+
         if (
             getattr(self, "execution_price", "close") != "next_open"
             or not order.isbuy()

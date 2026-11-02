@@ -11,6 +11,8 @@ import pandas as pd
 import pytest
 
 from optimizer.runtime import OptimizationJob, _optimize_worker_entry
+from optimizer.journal_metadata import WORKER_CONFIG_VERSION
+from optimizer.search_policy import grid_signature
 from optimizer.study_resume import RetryAwareGridSampler, prepare_trial_resume
 from strategies.base_strategy import BaseStrategy
 
@@ -34,7 +36,9 @@ def _study(tmp_path, size=4):
         study_name="retry-test", direction="maximize", storage=storage,
         sampler=optuna.samplers.GridSampler({"x": list(range(size))}),
     )
-    study.set_user_attr("_optimizer_worker_config_version", 1)
+    study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
+    study.set_user_attr("_optimizer_grid_signature", grid_signature({"x": list(range(size))}))
+    study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
     return study, storage, path
 
 
@@ -233,7 +237,9 @@ def _resume_job(path, study_name, objective, n_jobs=1):
 def _seed_completion_gap(tmp_path):
     """1 个完成和 3 个确定性失败；目标预算 3，剩余额度小于失败数。"""
     study, storage, path = _study(tmp_path, size=6)
-    study.set_user_attr("_optimizer_worker_config_version", 1)
+    study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
+    study.set_user_attr("_optimizer_grid_signature", grid_signature({"x": list(range(6))}))
+    study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
 
     def fail_once(trial):
         trial.suggest_int("x", 0, 5)
@@ -334,7 +340,7 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
     assert captured["calls"][0]["progress"] is captured["calls"][1]["progress"]
     assert [call["metric_label"] for call in captured["calls"]] == ["Metric 2/3 return"] * 2
     assert [call["future_remaining"] for call in captured["calls"]] == [2, 2]
-    assert captured["calls"][0]["counter"] is not captured["calls"][1]["counter"]
+    assert captured["calls"][0]["counter"] is captured["calls"][1]["counter"]
     assert captured["calls"][1]["started_at"] >= captured["calls"][0]["started_at"]
     assert result["trials_completed"] == 3
     assert sum(value in failed for value in seen) == 3

@@ -228,6 +228,7 @@ def test_data_manager_normalizes_platform_source_aliases():
     assert DataManager._split_source_names("theta + futu") == ["hybrid"]
     assert DataManager._split_source_names("theta+futu,cboe") == ["hybrid", "cboe"]
     assert DataManager._split_source_names("theta_futu_sec") == ["hybrid", "sec"]
+    assert DataManager._split_source_names("eodhd_theta_sec") == ["eodhd", "theta", "sec"]
     assert DataManager._split_source_names("theta_futu_research") == ["hybrid", "sec", "earnings", "rates"]
     assert DataManager._split_source_names("theta_futu_sec,cboe") == ["hybrid", "sec", "cboe"]
     assert DataManager._split_source_names("us_options_research") == ["hybrid", "sec", "cboe"]

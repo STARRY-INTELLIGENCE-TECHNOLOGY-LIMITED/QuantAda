@@ -46,7 +46,7 @@ Configuration is split by responsibility. `config.py` lists the `configs` submod
 | Configuration file | Main settings | Purpose |
 | --- | --- | --- |
 | `config.py` | `LOT_SIZE`, `DATA_PATH`, `LOG`, `PRINT_PLAN`, `KEEP_OVERNIGHT_ORDERS` | Framework, backtest, and common execution |
-| `configs/providers.py` | `TUSHARE_TOKEN`, `SXSC_TUSHARE_TOKEN`, `TIINGO_TOKEN`, `THETADATA_TOKEN`, `SEC_USER_AGENT`, `OCC_ACTIONS_URL/PATH`, `EARNINGS_ARCHIVE_PATH`, `DATA_PROVIDER_COMPOSITIONS`, `DATA_PROVIDER_ALIASES` | Historical providers, valuation, contract adjustments, point-in-time earnings, and compositions |
+| `configs/providers.py` | `TUSHARE_TOKEN`, `SXSC_TUSHARE_TOKEN`, `TIINGO_TOKEN`, `THETADATA_TOKEN`, `EODHD_API_TOKEN`, `SEC_USER_AGENT`, `OCC_ACTIONS_URL/PATH`, `EARNINGS_ARCHIVE_PATH`, `DATA_PROVIDER_COMPOSITIONS`, `DATA_PROVIDER_ALIASES` | Historical providers, valuation, contract adjustments, point-in-time earnings, and compositions |
 | `configs/futu.py` | `FUTU_HOST`, `FUTU_PORT`, `FUTU_RSA_KEY_PATH`, account/trading keys, `FUTU_BROKER_ENVIRONMENTS` | Futu OpenD quote and official trading connection; an empty RSA path means plaintext protocol; normal config references unlock credentials through `FUTU_TRADE_PASSWORD_ENV` or `FUTU_TRADE_PASSWORD_MD5_ENV`, while private Command Center profiles may store a local credential |
 | `configs/alarms.py` | `ALARMS_ENABLED`, `DINGTALK_WEBHOOK`, `DINGTALK_SECRET`, `WECOM_WEBHOOK`, `ALARM_LEVEL` | Alarm channels |
 | `configs/gm.py` | `GM_TOKEN`, `GM_BROKER_ENVIRONMENTS` | GM broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['gm_broker']`) |
@@ -79,6 +79,8 @@ Futu can also provide dividend events with publication dates for Wheel strategie
 Provider compositions are declared in `configs/providers.py` under `DATA_PROVIDER_COMPOSITIONS`. The core `theta_futu_sec` alias loads only market data and SEC V/W; `theta_futu_research` adds point-in-time earnings and Treasury rates; `us_options_research` adds CBOE. OCC adjustment files and full-session NBBO remain explicit research calls, so ordinary training does not expand network or cache cost. For ETFs or issuers without SEC valuation, use `theta_futu_cboe`; explicitly adding `sec` blocks the price proxy when no SEC snapshot exists.
 
 Cboe's official daily index CSVs are available through the `cboe` Provider by symbol, such as `US.VIX`, `US.VIX3M`, `US.VVIX`, and `US.SKEW`. The complete code list, field semantics, and `close-only` limitations are documented in [`docs/specs/contracts/cboe_provider.md`](docs/specs/contracts/cboe_provider.md).
+
+If Futu historical-kline quota is unavailable, use `eodhd_theta_sec` for historical Wheel research: EODHD supplies US equity EOD data and declaration-date dividends, ThetaData supplies historical option chains/quotes, and SEC supplies filing-date V. Uncomment the optional `eodhd` line in `requirements.txt`, install requirements, and inject `EODHD_API_TOKEN` through the environment. EODHD supports stock/ETF daily, weekly, and monthly bars only; it does not provide option chains or live quotes. See [`docs/specs/contracts/eodhd_provider.md`](docs/specs/contracts/eodhd_provider.md).
 
 Point-in-time fundamentals for eligible U.S. common stocks can be added with the `sec` auxiliary source, for example `--data_source=theta+futu,sec`. SEC Company Facts supplies filed 10-K/10-Q cash flows, capital expenditures, and diluted shares; QuantAda rebuilds TTM FCFE by filing date and computes V, while the strategy derives W using its explicit `w_multiple`. Raw SEC JSON and enriched market-cache columns are cached; estimates expire after 200 days. Set `SEC_USER_AGENT` to an application identifier and a real contact email before requesting SEC data. ETFs, financial companies, and issuers without sufficient facts have no SEC valuation; the source does not substitute a price proxy.
 ### 4. Basic Backtest
@@ -149,7 +151,7 @@ Tasks are listed by most recent update, ten per page. Use `n` / `p` to browse or
 The list also shows training status from the display section at the end of the matching terminal log. The journal filename must match; a window or snapshot written on the log must match the task too. A log with neither discriminator is not applied to every task that shares one journal file. Markers do not finish a task when the suffix is an empty crash summary, such as no metric result or both metrics and trials completed being zero; those logs are skipped. A missing end marker means incomplete. Incomplete tasks can still be resumed.
 After selecting a task, enter `l` to page through that task's matching terminal log. It does not open another task's log, and it opens at the end. Use `n` / `p` to move, `h` / `e` / `m` to jump to the first, last, or middle page, `s` for the analysis section, `g 3` for page 3, and `b` to return. The web workspace **View log** button provides the same paging.
 Resume prefers the saved data, selection, option universe, and train/test snapshot across dates. Only tasks with complete training metadata, including execution timing, can be resumed. Older records missing required fields remain visible for review but are not resumed. The details provide a copyable fresh-data command that removes study bindings and adds `--refresh` to rerun selection, fetch data, and train independently. Omitted dates are inferred at launch; explicit dates can be edited manually.
-Tasks without the current worker configuration version are loaded by their original study name. Completed trials count toward the budget, and only unfinished combinations run. Console Trial numbers match that study's journal trial_id and continue from the study instead of starting at 0. If the same batch contains a study with more completed trials, resume loads that study so explored parameters are not discarded.
+Tasks without the current worker configuration version, finite-grid metadata, or other required metadata are read-only and cannot be resumed or counted toward a new budget. Start a new Study name or Journal for a fresh run. Current Study trial numbers match the Journal trial_id.
 
 ### 7. Connect to Live Trading or Simulation
 
@@ -188,6 +190,12 @@ set PYTHONPATH=C:\path\to\QuantAda;C:\path\to\MyProject
 python run.py my_strategies.my_cool_strategy.MyCoolStrategy
 python run.py my_strategies.my_cool_strategy --selection=my_selectors.my_selector
 ```
+
+### 9. MCP Agent Backtest Integration
+
+The repository includes a local stdio backtest MCP server: `python -m mcp_backtest_server`. It supports MCP `2025-11-25` with backward version negotiation, and `backtest_run` can use native MCP Tasks for long-running jobs. Live connections, arbitrary `--config`, and training resume/kill entry points are rejected. CLI flags and per-call environment overrides use conservative allowlists.
+
+The MCP server runs child processes with the local user's permissions and has no authentication or per-user isolation. Connect only a trusted local MCP host; do not expose it as a network service. Configuration, task TTL, and examples are documented in [`mcp_backtest_server/README.md`](mcp_backtest_server/README.md), with the formal contract in [`docs/specs/contracts/mcp_backtest_server.md`](docs/specs/contracts/mcp_backtest_server.md).
 
 ## Core Design
 

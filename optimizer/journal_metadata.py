@@ -10,8 +10,8 @@ import re
 
 
 TRIAL_STATES = ("RUNNING", "COMPLETE", "PRUNED", "FAIL", "WAITING")
-# 新 Study 登记此口径。没有标记的历史 Study 按原名加载，不把旧评分改标成当前口径。
-WORKER_CONFIG_VERSION = 1
+# 训练 Journal 的运行口径版本。版本变化后不兼容旧 Study，避免旧评分和新调度语义混用。
+WORKER_CONFIG_VERSION = 2
 
 
 def finished_trial_count(counts):
@@ -91,7 +91,7 @@ def read_study_metadata(path, *, with_trial_counts=False):
                 if removed:
                     names.discard(removed["name"])
             elif operation == 2 and record["study_id"] in studies:
-                # 续传会改写旧 Study 的参数快照；排序必须反映最近写入，而非创建先后。
+                # 当前 Study 的参数快照可能在续传校验时更新；排序必须反映最近写入，而非创建先后。
                 study = studies.pop(record["study_id"])
                 study["attrs"].update(record["user_attr"])
                 studies[record["study_id"]] = study
