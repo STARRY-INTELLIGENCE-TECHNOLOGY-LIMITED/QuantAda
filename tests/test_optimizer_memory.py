@@ -16,8 +16,133 @@ import pytest
 
 import config
 import optimizer.runtime as optimizer
+from optimizer.memory_policy import (
+    per_worker_bytes,
+    read_available_memory,
+    resolve_memory_worker_count,
+    usable_memory_bytes,
+    windows_physical_and_swap,
+)
+import optimizer.memory_policy as memory_policy
+from optimizer.search_policy import recommended_pilot_count
 from backtest.backtester import Backtester
 from strategies.base_strategy import BaseStrategy
+
+
+_GB = 1024 ** 3
+
+
+def test_windows_commit_limit_is_not_added_to_physical_again():
+    physical, swap = windows_physical_and_swap(int(11.8 * _GB), int(22.8 * _GB))
+    assert physical + swap == int(22.8 * _GB)
+    usable = usable_memory_bytes(physical, swap)
+    assert usable < int(22.8 * _GB)
+    assert usable > physical * 0.90
+
+
+def test_windows_psutil_commit_is_converted_to_pagefile(monkeypatch):
+    monkeypatch.setattr(memory_policy, "_windows_memory", lambda: None)
+    monkeypatch.setattr(
+        memory_policy,
+        "_psutil_memory",
+        lambda: (int(11.8 * _GB), int(22.8 * _GB)),
+    )
+    monkeypatch.setattr(memory_policy.os, "name", "nt")
+    monkeypatch.setattr(memory_policy.sys, "platform", "win32")
+
+    physical, swap = read_available_memory()
+    expected = windows_physical_and_swap(int(11.8 * _GB), int(22.8 * _GB))
+    assert (physical, swap) == expected
+
+
+def test_memory_policy_limits_payload_copy_workers():
+    assert resolve_memory_worker_count(
+        13,
+        2 * _GB,
+        shared_memory=False,
+        available_bytes=4 * _GB,
+    ) == 1
+    shared = resolve_memory_worker_count(
+        13,
+        2 * _GB,
+        shared_memory=True,
+        available_bytes=16 * _GB,
+    )
+    assert 1 <= shared <= 13
+    assert shared == min(13, usable_memory_bytes(16 * _GB, 0) // per_worker_bytes(2 * _GB, True))
+
+
+def test_pilot_count_follows_10d_and_ignores_hardware():
+    assert recommended_pilot_count(21762, 15) == 150
+    assert recommended_pilot_count(8, 15) == 8
+    assert recommended_pilot_count(21762, 1) == 16
+    assert recommended_pilot_count(21762, 80) == 512
+
+
+def test_memory_reserve_ratio_is_configurable(monkeypatch):
+    monkeypatch.setattr(config, "OPTIMIZER_MEMORY_RESERVE_RATIO", 0.50)
+    assert resolve_memory_worker_count(
+        13,
+        1 * _GB,
+        shared_memory=False,
+        available_bytes=4 * _GB,
+    ) == 1
+
+    monkeypatch.setattr(config, "OPTIMIZER_MEMORY_RESERVE_RATIO", 0.05)
+    workers = resolve_memory_worker_count(
+        13,
+        1 * _GB,
+        shared_memory=False,
+        available_bytes=4 * _GB,
+    )
+    assert workers == min(13, usable_memory_bytes(4 * _GB, 0) // per_worker_bytes(1 * _GB, False))
+
+
+def test_cpu_worker_count_for_16c_and_32c(monkeypatch):
+    monkeypatch.setattr(optimizer.OptimizationJob, "_get_total_cpu_cores", staticmethod(lambda: 16))
+    assert optimizer.OptimizationJob._resolve_worker_count(-1) == 13
+    monkeypatch.setattr(optimizer.OptimizationJob, "_get_total_cpu_cores", staticmethod(lambda: 32))
+    assert optimizer.OptimizationJob._resolve_worker_count(-1) == 27
+    assert optimizer.OptimizationJob._resolve_worker_count(31) == 31
+
+
+def test_worker_budget_for_windows_16c32g_and_linux_32c128g():
+    """16C32G Windows 大行情必须降并发；32C128G 显式 31 worker 在共享行情下发满。"""
+    windows_copy = resolve_memory_worker_count(
+        13,
+        2 * _GB,
+        shared_memory=False,
+        available_bytes=12 * _GB,
+        swap_bytes=8 * _GB,
+    )
+    assert 1 <= windows_copy <= 6
+
+    windows_small = resolve_memory_worker_count(
+        13,
+        50 * 1024 ** 2,
+        shared_memory=False,
+        available_bytes=12 * _GB,
+        swap_bytes=8 * _GB,
+    )
+    assert windows_small == 13
+
+    linux_shared = resolve_memory_worker_count(
+        31,
+        4 * _GB,
+        shared_memory=True,
+        available_bytes=110 * _GB,
+        swap_bytes=8 * _GB,
+    )
+    assert linux_shared == 31
+
+    linux_heavy = resolve_memory_worker_count(
+        31,
+        8 * _GB,
+        shared_memory=True,
+        available_bytes=110 * _GB,
+        swap_bytes=8 * _GB,
+    )
+    assert linux_heavy == 31
 
 
 def _wait_for_forced_shutdown(marker):

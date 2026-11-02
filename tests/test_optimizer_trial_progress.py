@@ -163,6 +163,21 @@ def _spawn_add(progress, amount):
     return progress["counter"].add(amount)
 
 
+def test_finish_counters_reset_to_zero():
+    counter = TrialFinishCounter()
+    counter.add(4)
+    counter.reset()
+    assert counter.read() == 0
+
+    shared = SharedFinishCounter.create()
+    try:
+        shared.add(3)
+        shared.reset()
+        assert shared.read() == 0
+    finally:
+        shared.close(unlink=True)
+
+
 def test_shared_counter_reaches_spawn_worker():
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor

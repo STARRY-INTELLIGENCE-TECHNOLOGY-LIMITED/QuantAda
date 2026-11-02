@@ -498,6 +498,69 @@ def test_evaluate_trial_params_passes_monthly_win_rate_to_metric(monkeypatch):
     assert captured["monthly_win_rate"] == 2.0 / 3.0
 
 
+def test_evaluate_trial_params_plugin_error_is_fail(monkeypatch):
+    class DummyAnalyzer:
+        def get_analysis(self):
+            return {
+                "total": {"total": 2},
+                "won": {"total": 1, "pnl": {"total": 10.0}},
+                "lost": {"pnl": {"total": -4.0}},
+                "max": {"drawdown": 3.0},
+            }
+
+    class DummyAnalyzers:
+        def getbyname(self, _name):
+            return DummyAnalyzer()
+
+    class DummyDataDatetime:
+        def datetime(self, idx):
+            return pd.Timestamp("2024-12-31").to_pydatetime() if idx == 0 else pd.Timestamp("2024-01-01").to_pydatetime()
+
+    class DummyData:
+        datetime = DummyDataDatetime()
+
+        def __len__(self):
+            return 2
+
+    class DummyStrat:
+        data = DummyData()
+        analyzers = DummyAnalyzers()
+
+    class DummyBacktester:
+        def __init__(self, **kwargs):
+            self.results = []
+
+        def run(self):
+            self.results = [DummyStrat()]
+
+        def get_custom_metric(self, metric_name):
+            return 0.01
+
+    def broken_metric(stats, strat=None, args=None):
+        raise RuntimeError("plugin exploded")
+
+    monkeypatch.setattr(optimizer, "Backtester", DummyBacktester)
+    monkeypatch.setattr(optimizer, "get_metric_function", lambda metric: broken_metric)
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.train_datas = {"AAPL": object()}
+    job.strategy_class = object()
+    job.train_range = ("20240101", "20241231")
+    job.args = SimpleNamespace(
+        cash=100000.0,
+        commission=0.0,
+        slippage=0.0,
+        timeframe="Days",
+        compression=1,
+        metric="broken_plugin",
+    )
+    job.risk_control_classes = []
+    job.risk_params = {}
+
+    with pytest.raises(optimizer.TrialEvaluationError, match="plugin exploded"):
+        job._evaluate_trial_params(current_params={"lookback": 20})
+
+
 def test_slice_datas_keeps_fixed_warmup_rows_before_logical_start():
     job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
     job.warmup_days = optimizer.OptimizationJob.DEFAULT_WARMUP_DAYS

@@ -10,12 +10,21 @@ import numpy as np
 
 # 自动预算只在未显式指定 --n_trials 时生效，避免改变用户明确给出的硬上限。
 EXHAUSTIVE_GRID_MAX_COMBINATIONS = 4096
+# Optuna GridSampler 会在构造时物化完整笛卡尔积；超过该值改用内存有界的 TPE。
+GRID_SAMPLER_MAX_COMBINATIONS = 100_000
 AUTO_MAX_TRIALS = 100000
 AUTO_MAX_MULTIPLIER = 4
+# 自动预算至少挖到初始复杂度预算的 2 倍，再按改善决定是否继续。
+AUTO_MIN_MULTIPLIER = 2
 AUTO_BATCH_MIN = 16
 AUTO_BATCH_MAX = 256
 GLOBAL_PILOT_MIN = 16
-GLOBAL_PILOT_MAX = 64
+GLOBAL_PILOT_MAX = 512
+# Latin hypercube / GP 常用的 10d 初始设计规模。
+PILOT_DIM_MULTIPLIER = 10
+GRID_BLOCK_MIN_SAMPLES = 8
+EXTEND_PATIENCE = 2
+EXTEND_IMPROVEMENT_RATIO = 0.005
 
 
 def grid_signature(grid_search_space):
@@ -65,14 +74,96 @@ def finite_grid_size(grid_search_space):
     return int(size)
 
 
+def grid_sampler_is_safe(grid_size):
+    """判断有限网格是否可以安全交给 Optuna GridSampler 物化。"""
+    try:
+        size = int(grid_size)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return 0 < size <= GRID_SAMPLER_MAX_COMBINATIONS
+
+
+def finite_axis_size(config):
+    """返回有限离散轴的档位数；连续、非法或空轴返回 None。"""
+    if not isinstance(config, dict):
+        return None
+    p_type = config.get("type")
+    if p_type == "int":
+        try:
+            low = int(config["low"])
+            high = int(config["high"])
+            step = max(1, int(config.get("step", 1) or 1))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if high < low:
+            return None
+        return (high - low) // step + 1
+    if p_type == "float" and config.get("step") is not None:
+        try:
+            low = float(config["low"])
+            high = float(config["high"])
+            step = float(config["step"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+        if high < low or not math.isfinite(step) or step <= 0:
+            return None
+        return int(math.floor((high - low) / step + 1e-10)) + 1
+    if p_type == "categorical":
+        choices = config.get("choices", [])
+        if not isinstance(choices, (list, tuple)) or not choices:
+            return None
+        return len(choices)
+    return None
+
+
+def finite_search_space_size(opt_params_def):
+    """返回全部有限离散轴的笛卡尔积大小；含连续轴或非法轴时返回 None。"""
+    if not opt_params_def:
+        return None
+    size = 1
+    for spec in opt_params_def.values():
+        axis_size = finite_axis_size(spec)
+        if not axis_size:
+            return None
+        size *= int(axis_size)
+    return size
+
+
+def _discrete_axis_value(config, index):
+    """按与网格展开相同的离散语义取第 index 档，不物化整轴。"""
+    p_type = config.get("type")
+    slot = int(index)
+    if p_type == "int":
+        low = int(config["low"])
+        step = max(1, int(config.get("step", 1) or 1))
+        return low + slot * step
+    if p_type == "float":
+        low = float(config["low"])
+        step = float(config["step"])
+        return round(low + slot * step, 12)
+    if p_type == "categorical":
+        return list(config.get("choices", []))[slot]
+    return config.get("value")
+
+
+def recommended_pilot_count(target_trials, dimensions):
+    """按 10d 规则给出全局 pilot 数；只依赖维度和目标预算，与硬件无关。"""
+    target = max(1, int(target_trials))
+    dims = max(1, int(dimensions))
+    return min(target, GLOBAL_PILOT_MAX, max(GLOBAL_PILOT_MIN, dims * PILOT_DIM_MULTIPLIER))
+
+
 def _parameter_bucket(value, config):
     """把参数压到四个粗粒度区间，供区块诊断使用。"""
     if config.get("type") == "categorical":
         choices = list(config.get("choices", []))
+        if not choices:
+            return 0
         try:
-            return min(3, choices.index(value))
+            index = choices.index(value)
         except ValueError:
             return 0
+        return min(3, int(index * 4 / len(choices)))
 
     try:
         low = float(config.get("low", value))
@@ -88,19 +179,64 @@ def _parameter_bucket(value, config):
     return min(3, int(ratio * 4.0))
 
 
+def _numeric_level_count(config):
+    """按离散档位数衡量数值参数，不用 high-low 原始跨度。"""
+    p_type = config.get("type")
+    if p_type == "int":
+        try:
+            low = int(config["low"])
+            high = int(config["high"])
+            step = max(1, int(config.get("step", 1) or 1))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return 1
+        if high < low:
+            low, high = high, low
+        return (high - low) // step + 1
+    if p_type == "float":
+        try:
+            low = float(config.get("low", 0.0))
+            high = float(config.get("high", low))
+        except (TypeError, ValueError, OverflowError):
+            return 1
+        if high < low:
+            low, high = high, low
+        if abs(high - low) <= 1e-12:
+            return 1
+        step = config.get("step")
+        try:
+            step = float(step) if step is not None else None
+        except (TypeError, ValueError, OverflowError):
+            step = None
+        if step is not None and math.isfinite(step) and step > 0:
+            return int(math.floor((high - low) / step + 1e-10)) + 1
+        # 连续浮点仍参与四桶分区，虚拟档位只用于挑选区块轴。
+        return 32
+    return 1
+
+
+def _parameter_cardinality(config):
+    """返回区块轴所用的离散档位数；网格重建时可带 _levels。"""
+    if not isinstance(config, dict):
+        return 1
+    levels = config.get("_levels")
+    if levels is not None:
+        try:
+            return max(1, int(levels))
+        except (TypeError, ValueError, OverflowError):
+            return 1
+    p_type = config.get("type")
+    if p_type == "categorical":
+        return max(1, len(config.get("choices", [])))
+    if p_type in {"int", "float"}:
+        return max(1, _numeric_level_count(config))
+    return 1
+
+
 def _block_dimensions(opt_params_def):
+    """选出档位最多的两个参数作为粗粒度区块轴。"""
     candidates = []
     for name, config in (opt_params_def or {}).items():
-        p_type = config.get("type")
-        if p_type == "categorical":
-            cardinality = len(config.get("choices", []))
-        elif p_type in {"int", "float"}:
-            try:
-                cardinality = abs(float(config.get("high", 0)) - float(config.get("low", 0)))
-            except (TypeError, ValueError):
-                cardinality = 1
-        else:
-            cardinality = 1
+        cardinality = _parameter_cardinality(config)
         if cardinality > 1:
             candidates.append((float(cardinality), str(name)))
     candidates.sort(key=lambda item: (-item[0], item[1]))
@@ -153,23 +289,56 @@ def summarise_trials(trials, opt_params_def, finite_size=None):
     }
 
 
-def _grid_values(config):
-    """按目标函数相同的离散语义展开单个参数。"""
-    p_type = config.get("type")
-    if p_type == "int":
-        low = int(config["low"])
-        high = int(config["high"])
-        step = max(1, int(config.get("step", 1) or 1))
-        return list(range(low, high + 1, step))
-    if p_type == "float" and config.get("step") is not None:
-        low = float(config["low"])
-        high = float(config["high"])
-        step = float(config["step"])
-        count = int(math.floor((high - low) / step + 1e-10))
-        return [round(low + index * step, 12) for index in range(count + 1)]
-    if p_type == "categorical":
-        return list(config.get("choices", []))
-    return None
+def _discrete_pilot_indexes(axis_size, count, rng):
+    """按轴索引生成 pilot 档位：样本不少于档位数时循环均衡，否则用含端点的 Latin 层。"""
+    size = int(axis_size)
+    count = int(count)
+    if size <= 0 or count <= 0:
+        return []
+    if count == 1:
+        return [size // 2]
+    if count >= size:
+        return [int(index) for index in rng.permutation(np.arange(count) % size)]
+    values_u = np.arange(count, dtype=float) / float(count - 1)
+    rng.shuffle(values_u)
+    indexes = np.clip(np.round(values_u * (size - 1)).astype(int), 0, size - 1)
+    return [int(index) for index in indexes]
+
+
+def extend_history_record(summary, current_target):
+    """把自动扩预算的批次摘要收成可写入 Journal 的记录。"""
+    coverage = summary.get("coverage")
+    best = summary.get("best")
+    try:
+        coverage = None if coverage is None else float(coverage)
+    except (TypeError, ValueError, OverflowError):
+        coverage = None
+    try:
+        best = None if best is None else float(best)
+    except (TypeError, ValueError, OverflowError):
+        best = None
+    return {
+        "target": int(current_target),
+        "best": best,
+        "coverage": coverage,
+        "finished": int(summary.get("finished") or 0),
+        "unique": int(summary.get("unique") or 0),
+    }
+
+
+def restore_extend_history(raw_history):
+    """从 Study 元数据恢复扩预算历史；非法项丢弃。"""
+    restored = []
+    if not isinstance(raw_history, list):
+        return restored
+    for item in raw_history:
+        if not isinstance(item, dict) or item.get("target") is None:
+            continue
+        try:
+            restored.append(extend_history_record(item, item["target"]))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return restored
 
 
 def build_global_pilot(opt_params_def, count, seed):
@@ -179,16 +348,18 @@ def build_global_pilot(opt_params_def, count, seed):
     names = list(opt_params_def)
     count = int(count)
     rng = np.random.default_rng(int(seed) % (2**32))
-    strata = np.arange(count, dtype=float) + 0.5
     points = []
     shuffled = {}
     for name in names:
-        values = _grid_values(opt_params_def[name])
-        if values:
-            indexes = rng.permutation(count) % len(values)
-            shuffled[name] = [values[int(index)] for index in indexes]
-            continue
         config = opt_params_def[name]
+        axis_size = finite_axis_size(config)
+        if axis_size:
+            # 按轴索引取样，超长离散轴不必先展开成完整列表。
+            shuffled[name] = [
+                _discrete_axis_value(config, index)
+                for index in _discrete_pilot_indexes(axis_size, count, rng)
+            ]
+            continue
         if config.get("type") == "float":
             try:
                 low = float(config["low"])
@@ -198,24 +369,19 @@ def build_global_pilot(opt_params_def, count, seed):
                 continue
             if high < low:
                 low, high = high, low
-            values_u = strata.copy()
-            rng.shuffle(values_u)
-            shuffled[name] = [round(low + (high - low) * u / count, 12) for u in values_u]
+            if count == 1:
+                shuffled[name] = [round((low + high) / 2.0, 12)]
+            else:
+                # 含端点的 Latin 层：i/(n-1) 覆盖 low 与 high，各维独立打乱。
+                values_u = np.arange(count, dtype=float) / float(count - 1)
+                rng.shuffle(values_u)
+                shuffled[name] = [round(low + (high - low) * float(u), 12) for u in values_u]
         else:
             shuffled[name] = [config.get("value") for _ in range(count)]
 
     for index in range(count):
         params = {name: shuffled[name][index] for name in names}
         points.append(params)
-    if count > 1:
-        points[0] = {
-            name: (_grid_values(config)[0] if _grid_values(config) else config.get("low", config.get("value")))
-            for name, config in opt_params_def.items()
-        }
-        points[-1] = {
-            name: (_grid_values(config)[-1] if _grid_values(config) else config.get("high", config.get("value")))
-            for name, config in opt_params_def.items()
-        }
     unique = []
     seen = set()
     for params in points:
@@ -264,23 +430,44 @@ def build_trial_plan(initial_budget, finite_size=None, explicit=False):
     }
 
 
-def should_extend(history, summary, target, max_target):
-    """首批没有对照时允许扩一次；最近一批没有明显改善时停止。"""
+def should_extend(history, summary, target, max_target, initial=None, patience=EXTEND_PATIENCE):
+    """分阶段扩展：先挖到初始预算的 2 倍，再在 2 倍之后连续两批无明显改善时停止。"""
     if int(target) >= int(max_target):
         return False
     coverage = summary.get("coverage")
     if coverage is not None and coverage >= 0.95:
         return False
-    if len(history) < 2:
+    try:
+        initial_budget = int(initial) if initial is not None else None
+    except (TypeError, ValueError):
+        initial_budget = None
+    milestone = None
+    if initial_budget:
+        milestone = min(int(max_target), initial_budget * AUTO_MIN_MULTIPLIER)
+        if int(target) < milestone:
+            return True
+    records = list(history or [])
+    if milestone is not None and any(item.get("target") is not None for item in records):
+        records = [
+            item for item in records
+            if item.get("target") is not None and int(item["target"]) >= milestone
+        ]
+    if len(records) < 2:
         return True
-    previous = history[-2]
-    current = summary.get("best")
-    before = previous.get("best")
-    if current is None or before is None:
-        return False
-    scale = max(1e-9, abs(float(before)), abs(float(current)))
-    improvement = float(current) - float(before)
-    return improvement > max(1e-9, scale * 0.005)
+    flats = 0
+    for index in range(len(records) - 1, 0, -1):
+        current = records[index].get("best")
+        before = records[index - 1].get("best")
+        if current is None or before is None:
+            return False
+        scale = max(1e-9, abs(float(before)), abs(float(current)))
+        improvement = float(current) - float(before)
+        if improvement > max(1e-9, scale * EXTEND_IMPROVEMENT_RATIO):
+            break
+        flats += 1
+        if flats >= int(patience):
+            return False
+    return True
 
 
 def grid_block_ids(grid_search_space, seed=0):
@@ -303,6 +490,7 @@ def grid_block_ids(grid_search_space, seed=0):
                 "type": "float" if any(isinstance(value, (float, np.floating)) for value in values) else "int",
                 "low": min(values),
                 "high": max(values),
+                "_levels": len(values),
             }
         else:
             configs[name] = {"type": "categorical", "choices": values}
@@ -312,8 +500,45 @@ def grid_block_ids(grid_search_space, seed=0):
     }
 
 
-def shrink_grid_blocks(study, grid_search_space, active_ids, seed=0, min_samples=4):
-    """根据保守的区块上置信界缩减尚未执行的网格。"""
+# 双侧 95% t 临界值，按自由度从低到高。查找时用不超过当前 df 的最大临界值，避免档顶把小样本估松。
+_T_CRIT_95 = (
+    (1, 12.706),
+    (2, 4.303),
+    (3, 3.182),
+    (4, 2.776),
+    (5, 2.571),
+    (6, 2.447),
+    (7, 2.365),
+    (8, 2.306),
+    (9, 2.262),
+    (10, 2.228),
+    (12, 2.179),
+    (15, 2.131),
+    (20, 2.086),
+    (30, 2.042),
+    (60, 2.000),
+    (120, 1.980),
+)
+
+
+def _t_crit_95(df):
+    """双侧 95% t 临界值。小样本使用对应 df 的精确值，不用档顶更小的 t。"""
+    try:
+        degrees = int(df)
+    except (TypeError, ValueError):
+        return 12.706
+    if degrees <= 1:
+        return 12.706
+    previous = 12.706
+    for cutoff, value in _T_CRIT_95:
+        if degrees < cutoff:
+            return previous
+        previous = value
+    return 1.960
+
+
+def shrink_grid_blocks(study, grid_search_space, active_ids, seed=0, min_samples=GRID_BLOCK_MIN_SAMPLES):
+    """用区块 t 上界对比最优区块 t 下界，只丢掉明显劣势且尚未执行的格子。"""
     if not grid_search_space or not active_ids:
         return set(active_ids or ()), []
     block_by_grid = grid_block_ids(grid_search_space, seed=seed)
@@ -339,22 +564,27 @@ def shrink_grid_blocks(study, grid_search_space, active_ids, seed=0, min_samples
         return active_ids, []
     all_values = [value for values in grouped.values() for value in values]
     incumbent = max(all_values)
-    scale = max(1e-9, float(np.std(all_values)), abs(float(incumbent)) * 0.02)
+    best_block = max(grouped, key=lambda block: max(grouped[block]))
+    best_values = grouped[best_block]
+    if len(best_values) < int(min_samples) or len(best_values) <= 1:
+        return active_ids, []
+    best_mean = float(np.mean(best_values))
+    best_stderr = float(np.std(best_values, ddof=1)) / math.sqrt(len(best_values))
+    best_lower = best_mean - _t_crit_95(len(best_values) - 1) * best_stderr
+    spread = float(np.std(all_values, ddof=1)) if len(all_values) > 1 else 0.0
+    scale = max(1e-9, spread, abs(float(incumbent)) * 0.02)
+    margin = max(scale * 0.5, 1e-9)
     abandoned = []
     for block, values in grouped.items():
-        if len(values) < int(min_samples):
+        if block == best_block or len(values) < int(min_samples) or len(values) <= 1:
             continue
         mean = float(np.mean(values))
-        stderr = float(np.std(values)) / math.sqrt(len(values))
-        upper = mean + 1.96 * stderr
-        if upper < incumbent - max(scale * 0.5, 1e-9):
+        stderr = float(np.std(values, ddof=1)) / math.sqrt(len(values))
+        upper = mean + _t_crit_95(len(values) - 1) * stderr
+        if upper < best_lower - margin:
             abandoned.append(block)
     if not abandoned:
         return active_ids, []
-    best_blocks = {
-        block for block, values in grouped.items() if values and max(values) >= incumbent
-    }
-    abandoned = [block for block in abandoned if block not in best_blocks]
     if len(abandoned) >= len(grouped):
         abandoned = abandoned[:-1]
     abandoned_set = set(abandoned)

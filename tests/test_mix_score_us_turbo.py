@@ -23,9 +23,9 @@ def test_evaluate_applies_consistency_penalty_from_stats():
 
     score = evaluate(stats)
 
-    # 基础分：30*2 + 60/10 + 10 bonus = 76。
-    # 惩罚分：-10 * ((0.40 - 0.20) / 0.40) = -5。
-    assert score == pytest.approx(71.0)
+    compound = ((1.6 ** 0.5) - 1.0) * 100.0
+    # 基础分：复合年化 * 2 + 60/10 + 10 bonus；月度胜率 20% 再扣 5 分。
+    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0 - 5.0)
 
 
 def test_evaluate_normalizes_percentage_monthly_win_rate():
@@ -34,7 +34,8 @@ def test_evaluate_normalizes_percentage_monthly_win_rate():
 
     score = evaluate(stats)
 
-    assert score == pytest.approx(71.0)
+    compound = ((1.6 ** 0.5) - 1.0) * 100.0
+    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0 - 5.0)
 
 
 def test_evaluate_treats_non_finite_monthly_win_rate_as_zero():
@@ -43,7 +44,30 @@ def test_evaluate_treats_non_finite_monthly_win_rate_as_zero():
 
     score = evaluate(stats)
 
-    assert score == pytest.approx(66.0)
+    compound = ((1.6 ** 0.5) - 1.0) * 100.0
+    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0 - 10.0)
+
+
+def test_evaluate_keeps_account_rank_when_drawdown_or_trades_are_weak():
+    strong = _base_stats()
+    strong["total_return_pct"] = 120.0
+    strong["mdd"] = 30.0
+    strong["safe_mdd"] = 30.0
+    strong["total_trades"] = 8
+    strong["monthly_win_rate"] = 0.60
+
+    weak = _base_stats()
+    weak["total_return_pct"] = 8.0
+    weak["mdd"] = 5.0
+    weak["safe_mdd"] = 5.0
+    weak["monthly_win_rate"] = 0.60
+
+    strong_score = evaluate(strong)
+    weak_score = evaluate(weak)
+
+    assert strong_score > weak_score
+    assert strong_score != -20.0
+    assert weak_score != -20.0
 
 
 def test_evaluate_falls_back_to_monthly_analyzer_when_stat_missing():
@@ -63,4 +87,5 @@ def test_evaluate_falls_back_to_monthly_analyzer_when_stat_missing():
 
     score = evaluate(stats, strat=strat)
 
-    assert score == pytest.approx(76.0)
+    compound = ((1.6 ** 0.5) - 1.0) * 100.0
+    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0)

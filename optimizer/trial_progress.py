@@ -35,6 +35,10 @@ class TrialFinishCounter:
         with self._lock:
             return int(self._value)
 
+    def reset(self):
+        with self._lock:
+            self._value = 0
+
     @property
     def value(self):
         return self.read()
@@ -101,6 +105,14 @@ class SharedFinishCounter:
             return int(self._closed_value)
         with _exclusive_lock(self.lock_path):
             return self._raw()
+
+    def reset(self):
+        if self._shm is None:
+            self._closed_value = 0
+            return
+        with _exclusive_lock(self.lock_path):
+            self._shm.buf[:8] = (0).to_bytes(8, "little")
+            self._closed_value = 0
 
     @property
     def value(self):

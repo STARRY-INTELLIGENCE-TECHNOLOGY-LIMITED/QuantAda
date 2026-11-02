@@ -18,7 +18,13 @@ import pytest
 
 import config
 import optimizer.runtime as runtime
-from optimizer.study_resume import ensure_study_config_version, legacy_owner_running, resolve_study_plan, study_run_lock
+from optimizer.study_resume import (
+    _is_finite_search_space,
+    ensure_study_config_version,
+    legacy_owner_running,
+    resolve_study_plan,
+    study_run_lock,
+)
 from optimizer.journal_metadata import WORKER_CONFIG_VERSION, isolate_study_journal, read_study_metadata, related_journal_paths, training_identity_hash
 from optimizer.search_policy import grid_signature
 
@@ -74,6 +80,15 @@ def _plan(args, directory, window=None):
         args, ast.literal_eval(args.params), ast.literal_eval(args.opt_params),
         ast.literal_eval(args.risk_params), args.metric.split(","), directory, window,
     )
+
+
+def test_oversized_finite_space_uses_tpe_resume_policy():
+    space = {
+        "x": {"type": "int", "low": 0, "high": 200, "step": 1},
+        "y": {"type": "int", "low": 0, "high": 600, "step": 1},
+    }
+
+    assert _is_finite_search_space(space) is False
 
 
 @pytest.fixture(autouse=True)
@@ -205,6 +220,71 @@ def test_explicit_snapshot_anchor_restores_all_metrics_of_selected_data(tmp_path
     assert selected["studies"] == {"return": "old_return", "sharpe": "old_sharpe"}
     latest = _plan(_args(), tmp_path)
     assert latest["studies"] == {"return": "new_return", "sharpe": "new_sharpe"}
+
+
+def test_filtered_opt_params_match_study_identity_from_grouped_cli(tmp_path):
+    filtered = {"x": {"type": "int", "low": 0, "high": 5}}
+    grouped = {
+        "test_strategy.Strategy": filtered,
+        "OtherStrategy": {"y": {"type": "int", "low": 1, "high": 3}},
+    }
+    args = _args(opt_params=repr(grouped))
+    journal = tmp_path / "optuna_batch.log"
+    study = _write_study(journal, "existing", args)
+    study.set_user_attr("params", ast.literal_eval(args.params))
+    study.set_user_attr("opt_params", filtered)
+    study.set_user_attr("risk_params", ast.literal_eval(args.risk_params))
+    study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
+    study.set_user_attr("_optimizer_grid_signature", grid_signature({"x": list(range(6))}))
+    plan = resolve_study_plan(
+        args, ast.literal_eval(args.params), filtered, ast.literal_eval(args.risk_params),
+        args.metric.split(","), tmp_path, (args.start_date, args.end_date),
+    )
+    assert plan["matched"]
+    assert plan["studies"]["return"] == "existing"
+
+
+def test_study_persists_resolved_opt_params_not_cli_group_map(tmp_path):
+    filtered = {"x": {"type": "int", "low": 0, "high": 2}}
+    grouped = {
+        "dummy": filtered,
+        "Other": {"y": {"type": "int", "low": 0, "high": 8}},
+    }
+    path = str(tmp_path / "identity.log")
+    args = SimpleNamespace(
+        n_jobs=1, n_trials=1, auto_launch_dashboard=False, shared_journal_log_file=path,
+        study_name="identity-filtered", strategy="dummy", metric="return",
+        cash=100000.0, commission=0.0, slippage=0.0, timeframe="Days", compression=1,
+        start_date="20240101", end_date="20240103", opt_params=repr(grouped),
+        params="{'contracts': 1}", risk_params="{}", selection=None, symbols="AAA",
+        data_source="csv", execution_price="close", risk=None, config="{}",
+        train_roll_period=None, test_roll_period=None, train_ratio=None,
+        train_period=None, test_period=None, study_journal=None,
+    )
+    job = runtime.OptimizationJob.__new__(runtime.OptimizationJob)
+    job.args = args
+    job.fixed_params = {"contracts": 1}
+    job.opt_params_def = filtered
+    job.risk_params = {}
+    job._indicator_cache = {}
+    job.test_datas = {}
+    job.test_range = (None, None)
+    job.strategy_class = SimpleNamespace(option_universe=None)
+    job._requested_metrics = ["return"]
+    job._future_metric_finished_counts = ()
+    job._total_finished_before = 0
+    job._resume_exclusive = True
+    job.objective = lambda trial: float(trial.suggest_int("x", 0, 2))
+    job._run_main_eval_backtest = lambda params: None
+    job._run_test_set_backtest = lambda params, verbose=False: None
+    job._run_yearly_validation_backtests = lambda params: []
+    job.run()
+    loaded = optuna.load_study(
+        study_name="identity-filtered",
+        storage=_storage(path),
+    )
+    assert loaded.user_attrs["opt_params"] == filtered
+    assert loaded.user_attrs["params"] == {"contracts": 1}
 
 
 def test_training_identity_hash_separates_parameter_variants_and_journals(tmp_path):
@@ -641,6 +721,59 @@ def test_multi_metric_groups_keep_one_window_when_wall_clock_crosses_days(monkey
     assert infer_calls == [0]
     assert len(windows) == 4  # 1 bootstrap + 3 metric jobs
     assert {window[1:] for window in windows} == {("20230921", "20260921")}
+
+
+def test_training_combinations_infer_window_once_when_wall_clock_crosses_days(monkeypatch, tmp_path):
+    windows = []
+    infer_calls = []
+    context = {
+        "strategy_class": SimpleNamespace(option_universe=("PUT",)), "risk_control_classes": [],
+        "data_manager": None, "target_symbols": ["AAA"], "source_symbols": ["AAA"],
+        "raw_datas": {}, "train_datas": {}, "test_datas": {},
+        "train_range": ("20240101", "20240103"), "test_range": (None, None),
+        "warmup_days": 0, "window_data_cache": {}, "indicator_cache": {},
+        "raw_data_fetch_range": ("20240101", "20240103"), "snapshot_frozen": True,
+    }
+
+    class ComboWindowJob:
+        def __init__(self, args, fixed_params, opt_params_def, risk_params, shared_context=None):
+            windows.append((args.strategy, args.start_date, args.end_date))
+            self.args = args
+            self.target_symbols = ["AAA"]
+            self.train_range = context["train_range"]
+            self.test_range = context["test_range"]
+
+        @staticmethod
+        def _resolve_worker_count(value):
+            return 1
+
+        @classmethod
+        def build_optuna_name_tag(cls, **kwargs):
+            return "combo-window-test"
+
+        def export_shared_context(self):
+            return context
+
+        def run(self):
+            return None
+
+    def infer_once(args):
+        infer_calls.append(len(infer_calls))
+        day = "20260921" if len(infer_calls) == 1 else f"2026092{1 + len(infer_calls)}"
+        args.start_date = "20230921"
+        args.end_date = day
+
+    monkeypatch.setattr(runtime, "OptimizationJob", ComboWindowJob)
+    monkeypatch.setattr(runtime, "infer_omitted_backtest_window", infer_once)
+    monkeypatch.setattr(runtime.process_elevation, "request_optimizer_elevation_if_needed", lambda *_: False)
+    monkeypatch.setattr(runtime.sys, "argv", ["run.py"])
+    monkeypatch.setattr(config, "DATA_PATH", str(tmp_path / "data"))
+    args = _args(strategy="strategy_a,strategy_b", start_date=None, end_date=None, metric="return", n_trials=1)
+
+    assert runtime.run_optimizer_mode(args, ast.literal_eval(args.params), {}, ["AAA"]) == 0
+    assert infer_calls == [0]
+    assert {window[1:] for window in windows} == {("20230921", "20260921")}
+    assert [window[0] for window in windows] == ["strategy_a", "strategy_a", "strategy_b", "strategy_b"]
 
 
 def test_keyboard_interrupt_stops_remaining_metrics_and_preserves_trials(monkeypatch, tmp_path):

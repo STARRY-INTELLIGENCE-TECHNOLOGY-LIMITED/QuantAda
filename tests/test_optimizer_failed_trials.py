@@ -13,7 +13,7 @@ import pytest
 from optimizer.runtime import OptimizationJob, _optimize_worker_entry
 from optimizer.journal_metadata import WORKER_CONFIG_VERSION
 from optimizer.search_policy import grid_signature
-from optimizer.study_resume import RetryAwareGridSampler, prepare_trial_resume
+from optimizer.study_resume import RetryAwareGridSampler, prepare_trial_resume, requeue_running_trials
 from strategies.base_strategy import BaseStrategy
 
 
@@ -116,6 +116,21 @@ def test_failed_retry_chain_queues_only_its_leaf_and_recovers_running_retry(tmp_
     assert len(study.trials) == 5
     assert OptimizationJob._remaining_trial_budget(study, 3) == 0
     assert prepare_trial_resume(study, storage) == (0, 0)
+
+
+def test_requeue_running_trials_does_not_retry_failures(tmp_path):
+    study, storage, _ = _study(tmp_path, size=3)
+    running = study.ask()
+    running.suggest_int("x", 0, 2)
+    failed = study.ask()
+    failed.suggest_int("x", 0, 2)
+    study.tell(failed, state=optuna.trial.TrialState.FAIL)
+
+    assert requeue_running_trials(study, storage) == 1
+    assert study.trials[0].state == optuna.trial.TrialState.WAITING
+    assert study.trials[1].state == optuna.trial.TrialState.FAIL
+    assert requeue_running_trials(study, storage) == 0
+    assert prepare_trial_resume(study, storage) == (0, 1)
 
 
 def test_failure_before_sampling_recovers_original_grid_slot(tmp_path):
@@ -349,6 +364,40 @@ def test_multiprocess_resume_drains_waiting_before_splitting_new_trials(monkeypa
     output = capsys.readouterr().out
     assert "Resume queue phase: waiting=3, requested_n_jobs=2, resolved_workers=2, actual_workers=2" in output
     assert "new-trial phase worker budget=2" in output
+
+
+def test_successful_resume_queue_resets_progress_counter_before_new_trials(monkeypatch, tmp_path):
+    path, study_name, failed, storage = _seed_completion_gap(tmp_path)
+    captured = {"calls": []}
+
+    def objective(trial):
+        return float(trial.suggest_int("x", 0, 5))
+
+    def fake_parallel(self, n_jobs, n_trials, log_file, **kwargs):
+        progress = kwargs.get("trial_progress")
+        captured["calls"].append({
+            "n_trials": n_trials,
+            "finished_before": progress["finished_before"] if progress is not None else None,
+            "counter": progress["counter"].read() if progress is not None else None,
+        })
+        resumed = optuna.load_study(
+            study_name=study_name, storage=storage, sampler=RetryAwareGridSampler({"x": list(range(6))}),
+        )
+        resumed.optimize(objective, n_trials=n_trials)
+
+    monkeypatch.setattr(
+        OptimizationJob, "_resolve_worker_count", classmethod(lambda cls, requested: max(1, int(requested))),
+    )
+    monkeypatch.setattr(OptimizationJob, "_run_multiprocess_optimization", fake_parallel)
+    job = _resume_job(path, study_name, objective, n_jobs=2)
+    job.args.n_trials = 6
+    job.run()
+
+    assert captured["calls"][0]["n_trials"] == 3
+    assert captured["calls"][0]["finished_before"] == 1
+    assert captured["calls"][1]["n_trials"] == 2
+    assert captured["calls"][1]["finished_before"] == 4
+    assert captured["calls"][1]["counter"] == 0
 
 
 def test_leftover_waiting_is_drained_by_parent_before_new_trials(monkeypatch, tmp_path):

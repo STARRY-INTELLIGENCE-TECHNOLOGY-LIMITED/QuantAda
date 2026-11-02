@@ -14,6 +14,7 @@ import optuna
 from optuna.samplers import GridSampler
 
 from optimizer.journal_metadata import WORKER_CONFIG_VERSION, batch_journal_path, finished_trial_count, read_study_metadata, related_journal_paths, study_identity, training_identity_hash
+from optimizer.search_policy import finite_search_space_size, grid_sampler_is_safe
 
 
 def ensure_study_config_version(study):
@@ -76,36 +77,62 @@ class AdaptiveGridSampler(RetryAwareGridSampler):
 
     def _get_unvisited_grid_ids(self, study):
         all_unvisited = super()._get_unvisited_grid_ids(study)
-        return [grid_id for grid_id in all_unvisited if grid_id in self._active_grid_ids]
+        return sorted(grid_id for grid_id in all_unvisited if grid_id in self._active_grid_ids)
 
     def before_trial(self, study, trial):
         attrs = getattr(trial, "system_attrs", {}) or {}
         if "grid_id" in attrs or "fixed_params" in attrs or "failed_trial" in attrs:
             return super().before_trial(study, trial)
 
-        target_grids = self._get_unvisited_grid_ids(study)
-        if not target_grids:
-            # 活跃格子已用尽时直接停止，不再把已访问组合分配给新 trial。
-            study.stop()
-            study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
-            study._storage.set_trial_system_attr(trial._trial_id, "_adaptive_grid_exhausted", True)
-            return
-        logical_number = sum(
-            item.number < trial.number and "failed_trial" not in item.system_attrs
-            for item in study.get_trials(deepcopy=False)
-        )
-        if logical_number in target_grids:
-            grid_id = int(logical_number)
-        else:
-            grid_id = int(target_grids[int(trial._trial_id) % len(target_grids)])
-        study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
-        study._storage.set_trial_system_attr(trial._trial_id, "grid_id", grid_id)
+        skipped = set()
+        trial_id = trial._trial_id
+        while True:
+            target_grids = [
+                grid_id for grid_id in self._get_unvisited_grid_ids(study) if grid_id not in skipped
+            ]
+            if not target_grids:
+                # 活跃格子已用尽时直接停止，不再把已访问组合分配给新 trial。
+                study.stop()
+                study._storage.set_trial_system_attr(trial_id, "search_space", self._search_space)
+                study._storage.set_trial_system_attr(trial_id, "_adaptive_grid_exhausted", True)
+                return
+            logical_number = sum(
+                item.number < trial.number and "failed_trial" not in item.system_attrs
+                for item in study.get_trials(deepcopy=False)
+            )
+            if logical_number in target_grids:
+                grid_id = int(logical_number)
+            else:
+                # 缩格后继续按剩余全局编号从小到大领取，不依赖 set 迭代顺序。
+                grid_id = int(min(target_grids))
+            study._storage.set_trial_system_attr(trial_id, "search_space", self._search_space)
+            study._storage.set_trial_system_attr(trial_id, "grid_id", grid_id)
+            # 并行抢号时较小 trial_id 留下，其余改领下一个未访问格子。
+            rivals = [
+                item._trial_id
+                for item in study._storage.get_all_trials(study._study_id, deepcopy=False)
+                if item._trial_id != trial_id and item.system_attrs.get("grid_id") == grid_id
+            ]
+            if not rivals or min(rivals) > trial_id:
+                return
+            skipped.add(grid_id)
 
     def sample_independent(self, study, trial, param_name, param_distribution):
         """耗尽标记的 trial 在采样时剪枝，避免复用已访问格子。"""
         if trial.system_attrs.get("_adaptive_grid_exhausted"):
             raise optuna.TrialPruned("Adaptive grid has no unvisited combinations left.")
         return super().sample_independent(study, trial, param_name, param_distribution)
+
+
+def requeue_running_trials(study, storage):
+    """把中断留下的 RUNNING 改回 WAITING，供本轮继续领取。"""
+    state = optuna.trial.TrialState
+    running_count = 0
+    for trial in study.get_trials(deepcopy=False):
+        if trial.state == state.RUNNING:
+            storage.set_trial_state_values(trial._trial_id, state.WAITING)
+            running_count += 1
+    return running_count
 
 
 def prepare_trial_resume(study, storage):
@@ -187,21 +214,8 @@ def select_resume_studies(source_studies, metrics, requested_name):
 
 
 def _is_finite_search_space(opt_params_def):
-    """判断搜索空间是否必须带当前网格签名。"""
-    if not opt_params_def:
-        return False
-    for spec in opt_params_def.values():
-        if not isinstance(spec, dict):
-            return False
-        p_type = spec.get("type")
-        if p_type == "int":
-            continue
-        if p_type == "float" and spec.get("step") is not None:
-            continue
-        if p_type == "categorical":
-            continue
-        return False
-    return True
+    """判断搜索空间是否使用可物化网格并必须带当前网格签名。"""
+    return grid_sampler_is_safe(finite_search_space_size(opt_params_def))
 
 
 def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics, log_dir, requested_window):
