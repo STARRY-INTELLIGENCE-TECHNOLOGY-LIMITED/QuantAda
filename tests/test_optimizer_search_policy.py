@@ -1,20 +1,25 @@
-import optuna
-import pytest
+import json
 from types import SimpleNamespace
 
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION
+import numpy as np
+import optuna
+import pytest
+
 from optimizer.reporting import print_run_summary
 from optimizer.runtime import OptimizationJob, TrialEvaluationError
-from optimizer.study_resume import AdaptiveGridSampler
+from optimizer.study_resume import AdaptiveGridSampler, BlockConstrainedTPESampler
 from optimizer.search_policy import (
     EXHAUSTIVE_GRID_MAX_COMBINATIONS,
     GRID_SAMPLER_MAX_COMBINATIONS,
     _block_dimensions,
     _parameter_bucket,
     _t_crit_95,
+    build_block_balanced_pilot,
     build_global_pilot,
     build_trial_plan,
     block_key,
+    decode_block_keys,
+    encode_block_keys,
     extend_history_record,
     finite_axis_size,
     finite_grid_size,
@@ -23,10 +28,15 @@ from optimizer.search_policy import (
     grid_sampler_is_safe,
     grid_signature,
     parameter_key,
+    possible_block_keys,
     recommended_pilot_count,
+    repair_params_to_active_blocks,
     restore_extend_history,
     should_extend,
     shrink_grid_blocks,
+    shrink_param_blocks,
+    spread_pilot_count,
+    stabilize_block_keys,
     summarise_trials,
 )
 
@@ -190,23 +200,15 @@ def test_adaptive_grid_sampler_keeps_global_grid_ids_unique():
     assert set(grid_ids).issubset({0, 1, 2})
 
 
-def test_should_extend_mines_to_2x_then_stops_after_two_flat_batches():
-    first = {"best": 1.0, "coverage": 0.2, "target": 16}
-    second = {"best": 1.001, "coverage": 0.3, "target": 24}
-    at_2x = {"best": 1.001, "coverage": 0.35, "target": 32}
-    post1 = {"best": 1.001, "coverage": 0.36, "target": 40}
-    post2 = {"best": 1.001, "coverage": 0.37, "target": 48}
-    improved = {"best": 1.02, "coverage": 0.4, "target": 40}
+def test_should_extend_stops_at_coverage_or_max():
+    low = {"best": 1.0, "coverage": 0.2}
+    covered = {"best": 1.0, "coverage": 0.95}
+    unknown = {"best": 1.0, "coverage": None}
 
-    assert should_extend([first], first, target=16, max_target=64, initial=16) is True
-    assert should_extend([first, second], second, target=24, max_target=64, initial=16) is True
-    assert should_extend([first, second, at_2x], at_2x, target=32, max_target=64, initial=16) is True
-    assert should_extend([first, second, at_2x, post1], post1, target=40, max_target=64, initial=16) is True
-    assert should_extend([first, second, at_2x, post1, post2], post2, target=48, max_target=64, initial=16) is False
-    assert should_extend([first, at_2x, improved], improved, target=40, max_target=64, initial=16) is True
-    assert should_extend([first, {"best": None, "target": 32}], {"best": None, "target": 32}, target=32, max_target=64, initial=16) is True
-    assert should_extend([at_2x, {"best": None, "target": 40}], {"best": None, "target": 40}, target=40, max_target=64, initial=16) is False
-    assert should_extend([first], first, target=64, max_target=64, initial=16) is False
+    assert should_extend(low, target=16, max_target=64) is True
+    assert should_extend(unknown, target=48, max_target=64) is True
+    assert should_extend(covered, target=16, max_target=64) is False
+    assert should_extend(low, target=64, max_target=64) is False
 
 
 def test_adaptive_grid_sampler_never_falls_back_to_abandoned_ids():
@@ -555,7 +557,7 @@ def test_tpe_batch_without_finished_trials_stops_metric():
     assert 8 < calls["n"] <= 16
 
 
-def test_explicit_budget_also_starts_with_global_pilot():
+def test_explicit_budget_also_starts_with_block_spread():
     class FakeStudy:
         def __init__(self):
             self.trials = []
@@ -572,7 +574,7 @@ def test_explicit_budget_also_starts_with_global_pilot():
     job.opt_params_def = {"threshold": {"type": "float", "low": 0.0, "high": 1.0}}
     study = FakeStudy()
 
-    inserted = job._enqueue_global_pilot(study, target_trials=8, sampler_seed=17)
+    inserted = job._enqueue_block_spread(study, target_trials=8, sampler_seed=17)
 
     assert inserted == 8
     assert len(study.queued) == 8
@@ -611,9 +613,9 @@ def test_extend_history_round_trips_through_journal_records():
     assert restored[0]["target"] == 32
     assert restored[0]["best"] == pytest.approx(1.25)
     assert restored[1]["target"] == 40
-    assert should_extend(restored, restored[-1], target=40, max_target=64, initial=16) is True
+    assert should_extend(restored[-1], 40, 64) is True
     restored.append(extend_history_record({"best": 1.25, "coverage": 0.41, "finished": 48}, 48))
-    assert should_extend(restored, restored[-1], target=48, max_target=64, initial=16) is False
+    assert should_extend(restored[-1], 64, 64) is False
 
 
 def _search_job(args, space, objective):
@@ -637,26 +639,19 @@ def _search_job(args, space, objective):
     return job
 
 
-def test_auto_budget_resume_does_not_extend_after_patience_stop(tmp_path):
+def test_auto_budget_resume_continues_to_max_without_percent_stop(tmp_path):
     from optuna.storages import JournalStorage
     from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 
-    path = str(tmp_path / "patience.log")
+    path = str(tmp_path / "continue-max.log")
     storage = JournalStorage(JournalFileBackend(path, lock_obj=JournalFileOpenLock(path)))
     study = optuna.create_study(
-        study_name="patience-stop", direction="maximize", storage=storage,
+        study_name="continue-max", direction="maximize", storage=storage,
     )
-    study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
-    study.set_user_attr("_optimizer_search_policy", "global_pilot_tpe")
+    study.set_user_attr("_optimizer_search_policy", "block_spread_tpe")
     study.set_user_attr("_optimizer_initial_trials", 16)
     study.set_user_attr("_optimizer_target_trials", 48)
     study.set_user_attr("_optimizer_max_trials", 64)
-    study.set_user_attr("_optimizer_extend_history", [
-        extend_history_record({"best": 1.0, "coverage": None, "finished": 16}, 16),
-        extend_history_record({"best": 1.001, "coverage": None, "finished": 32}, 32),
-        extend_history_record({"best": 1.001, "coverage": None, "finished": 40}, 40),
-        extend_history_record({"best": 1.001, "coverage": None, "finished": 48}, 48),
-    ])
     for index in range(48):
         study.add_trial(optuna.trial.create_trial(
             value=1.001,
@@ -672,7 +667,7 @@ def test_auto_budget_resume_does_not_extend_after_patience_stop(tmp_path):
 
     args = SimpleNamespace(
         n_jobs=1, n_trials=None, auto_launch_dashboard=False,
-        shared_journal_log_file=path, study_name="patience-stop",
+        shared_journal_log_file=path, study_name="continue-max",
         metric="sharpe", strategy="dummy", cash=100000.0, commission=0.0,
         slippage=0.0, timeframe="Days", compression=1, study_journal=None,
     )
@@ -680,11 +675,11 @@ def test_auto_budget_resume_does_not_extend_after_patience_stop(tmp_path):
     job._estimate_n_trials = lambda: 16
     result = job.run()
 
-    assert calls["n"] == 0
-    assert result["search_audit"]["finished"] == 48
-    assert result["search_audit"]["target_trials"] == 48
-    loaded = optuna.load_study(study_name="patience-stop", storage=storage)
-    assert loaded.user_attrs["_optimizer_target_trials"] == 48
+    assert calls["n"] == 16
+    assert result["search_audit"]["finished"] == 64
+    assert result["search_audit"]["target_trials"] == 64
+    loaded = optuna.load_study(study_name="continue-max", storage=storage)
+    assert loaded.user_attrs["_optimizer_target_trials"] == 64
 
 
 def test_single_process_resume_keeps_shrunk_active_grid_ids(tmp_path):
@@ -698,7 +693,6 @@ def test_single_process_resume_keeps_shrunk_active_grid_ids(tmp_path):
         study_name="shrunk-grid", direction="maximize", storage=storage,
         sampler=AdaptiveGridSampler(space, active_grid_ids={0, 1}, seed=0),
     )
-    study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
     study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
     study.set_user_attr("_optimizer_grid_signature", grid_signature(space))
     study.set_user_attr("_optimizer_active_grid_ids", [0, 1])
@@ -722,3 +716,232 @@ def test_single_process_resume_keeps_shrunk_active_grid_ids(tmp_path):
     grid_ids = [trial.system_attrs.get("grid_id") for trial in complete]
     assert set(grid_ids) <= {0, 1}
     assert len(complete) == 2
+
+
+def test_spread_pilot_count_covers_blocks_before_tpe():
+    assert spread_pilot_count(4695, 15, 16) == 256
+    assert spread_pilot_count(8, 1, 4) == 8
+    assert spread_pilot_count(20, 1, 4) == 20
+
+
+def test_block_balanced_pilot_covers_all_blocks_without_materializing_huge_axis():
+    space = {
+        "x": {"type": "int", "low": 0, "high": 10**9, "step": 1},
+        "y": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1},
+    }
+    keys = possible_block_keys(space)
+    points = build_block_balanced_pilot(space, 32, seed=3)
+    covered = {block_key(item, space) for item in points}
+
+    assert len(keys) == 16
+    assert covered == set(keys)
+    assert min(item["x"] for item in points) == 0
+    assert max(item["x"] for item in points) == 10**9
+    assert encode_block_keys(keys) == encode_block_keys(decode_block_keys(encode_block_keys(keys)))
+
+
+def test_repair_params_rotates_active_blocks_by_trial_number():
+    space = {
+        "x": {"type": "float", "low": 0.0, "high": 1.0},
+        "y": {"type": "float", "low": 0.0, "high": 1.0},
+    }
+    active = [(("x", 0), ("y", 0)), (("x", 3), ("y", 3))]
+    first = repair_params_to_active_blocks(
+        {"x": 0.9, "y": 0.9}, space, active, rng=np.random.default_rng(1), trial_number=0,
+    )
+    second = repair_params_to_active_blocks(
+        {"x": 0.05, "y": 0.05}, space, active, rng=np.random.default_rng(2), trial_number=1,
+    )
+
+    assert block_key(first, space) == (("x", 0), ("y", 0))
+    assert block_key(second, space) == (("x", 3), ("y", 3))
+    assert first["x"] < 0.25
+    assert second["x"] >= 0.75
+
+
+def test_repair_params_spreads_inside_target_block():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    active = [(("x", 0),)]
+    points = [
+        repair_params_to_active_blocks(
+            {"x": 0.9}, space, active, rng=np.random.default_rng(seed), trial_number=0,
+        )["x"]
+        for seed in range(24)
+    ]
+
+    assert all(0.0 <= value < 0.25 for value in points)
+    assert len({round(value, 8) for value in points}) > 1
+
+
+def test_repair_small_discrete_stays_in_target_block():
+    space = {"x": {"type": "int", "low": 0, "high": 4, "step": 1}}
+    active = [(("x", 1),)]
+    points = [
+        repair_params_to_active_blocks(
+            {"x": 4}, space, active, rng=np.random.default_rng(seed), trial_number=0,
+        )
+        for seed in range(80)
+    ]
+
+    assert all(block_key(item, space) == (("x", 1),) for item in points)
+    assert {item["x"] for item in points} == {1}
+
+
+def test_repair_float_step_stays_in_target_block():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1}}
+    active = [(("x", 1),)]
+    points = [
+        repair_params_to_active_blocks(
+            {"x": 0.9}, space, active, rng=np.random.default_rng(seed), trial_number=0,
+        )
+        for seed in range(80)
+    ]
+
+    assert all(block_key(item, space) == (("x", 1),) for item in points)
+    assert {item["x"] for item in points} <= {0.3, 0.4}
+
+
+def test_block_balanced_pilot_small_int_stays_in_assigned_blocks():
+    space = {
+        "lookback": {"type": "int", "low": 5, "high": 25, "step": 5},
+        "weight": {"type": "float", "low": 0.0, "high": 1.0},
+    }
+    points = build_block_balanced_pilot(space, 32, seed=7)
+
+    assert points
+    assert all(block_key(item, space) in set(possible_block_keys(space)) for item in points)
+    assert {block_key(item, space) for item in points} == set(possible_block_keys(space))
+
+
+def test_block_balanced_pilot_reuses_other_axes_when_unique_lhc_is_short():
+    space = {
+        "mode": {"type": "categorical", "choices": ["a", "b"]},
+        "side": {"type": "categorical", "choices": ["left", "right"]},
+    }
+    points = build_block_balanced_pilot(space, 12, seed=4)
+
+    assert points
+    assert all("mode" in item and "side" in item for item in points)
+
+
+def test_shrink_param_blocks_keeps_best_and_abandons_separated_blocks():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1}}
+    study = optuna.create_study(direction="maximize")
+    for value, score in [(0.0, 0.0), (0.05, 0.1), (0.1, 0.0), (0.15, 0.05),
+                         (0.2, 0.1), (0.25, 0.0), (0.3, 0.05), (0.35, 0.1),
+                         (0.9, 10.0), (0.92, 9.8), (0.94, 10.2), (0.96, 9.9),
+                         (0.98, 10.1), (1.0, 9.7), (0.91, 10.0), (0.93, 9.6)]:
+        study.add_trial(optuna.trial.create_trial(
+            value=score,
+            params={"x": value},
+            distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0, step=0.01)},
+        ))
+
+    remaining, abandoned = shrink_param_blocks(study, space, min_samples=4)
+    remaining_buckets = {key[0][1] for key in remaining if key}
+    abandoned_buckets = {key[0][1] for key in abandoned if key}
+
+    assert 3 in remaining_buckets
+    assert 0 in abandoned_buckets
+    assert 0 not in remaining_buckets
+
+
+def test_active_block_order_is_stable_across_set_iteration():
+    shuffled = [(("x", 3), ("y", 1)), (("x", 0), ("y", 0)), (("x", 2), ("y", 2))]
+    reversed_keys = list(reversed(shuffled))
+    as_set = set(shuffled)
+
+    assert stabilize_block_keys(shuffled) == stabilize_block_keys(reversed_keys)
+    assert stabilize_block_keys(shuffled) == stabilize_block_keys(as_set)
+    assert stabilize_block_keys(shuffled)[0] == (("x", 0), ("y", 0))
+
+
+def test_shrink_param_blocks_returns_stable_remaining_order():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.1}}
+    study = optuna.create_study(direction="maximize")
+    remaining, _abandoned = shrink_param_blocks(study, space, min_samples=4)
+
+    assert remaining == stabilize_block_keys(possible_block_keys(space))
+
+
+def test_block_constrained_tpe_sorts_active_blocks():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    shuffled = [(("x", 3),), (("x", 0),), (("x", 2),), (("x", 1),)]
+    sampler = BlockConstrainedTPESampler(
+        seed=1, n_startup_trials=4, opt_params_def=space, active_blocks=shuffled,
+    )
+
+    assert sampler._active_blocks == tuple(stabilize_block_keys(shuffled))
+    sampler.set_active_blocks(list(reversed(shuffled)))
+    assert sampler._active_blocks == tuple(stabilize_block_keys(shuffled))
+
+
+def test_block_constrained_tpe_repairs_into_active_block():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    sampler = BlockConstrainedTPESampler(
+        seed=1, n_startup_trials=4, opt_params_def=space,
+        active_blocks=[(("x", 0),)],
+    )
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+    for index in range(4):
+        study.add_trial(optuna.trial.create_trial(
+            value=float(index),
+            params={"x": 0.05 * index},
+            distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0)},
+        ))
+    study.optimize(lambda trial: float(trial.suggest_float("x", 0.0, 1.0)), n_trials=3)
+    new_trials = study.trials[4:]
+    assert new_trials
+    assert all(block_key(trial.params, space) == (("x", 0),) for trial in new_trials)
+
+
+def test_block_constrained_tpe_constant_liar_stores_repaired_params():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    sampler = BlockConstrainedTPESampler(
+        seed=1, n_startup_trials=4, constant_liar=True, opt_params_def=space,
+        active_blocks=[(("x", 0),)],
+    )
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+    for index in range(4):
+        study.add_trial(optuna.trial.create_trial(
+            value=float(index),
+            params={"x": 0.05 * index},
+            distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0)},
+        ))
+    trial = study.ask()
+    value = trial.suggest_float("x", 0.0, 1.0)
+    stored = json.loads(
+        study._storage.get_trial_system_attrs(trial._trial_id).get("tpe:relative_params:0") or "{}"
+    )
+
+    assert block_key({"x": value}, space) == (("x", 0),)
+    assert stored.get("x") == value
+    study.tell(trial, value)
+
+
+def test_constant_score_runs_to_max_budget(tmp_path):
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+
+    path = str(tmp_path / "to-max.log")
+    calls = {"n": 0}
+
+    def objective(trial):
+        calls["n"] += 1
+        trial.suggest_float("x", 0.0, 1.0)
+        return 1.0
+
+    args = SimpleNamespace(
+        n_jobs=1, n_trials=None, auto_launch_dashboard=False,
+        shared_journal_log_file=path, study_name="to-max",
+        metric="sharpe", strategy="dummy", cash=100000.0, commission=0.0,
+        slippage=0.0, timeframe="Days", compression=1, study_journal=None,
+    )
+    job = _search_job(args, {"x": {"type": "float", "low": 0.0, "high": 1.0}}, objective)
+    job._estimate_n_trials = lambda: 16
+    result = job.run()
+
+    assert result["search_audit"]["finished"] == 64
+    assert result["search_audit"]["target_trials"] == 64
+    assert result["search_audit"]["max_target_trials"] == 64
+    assert calls["n"] == 64

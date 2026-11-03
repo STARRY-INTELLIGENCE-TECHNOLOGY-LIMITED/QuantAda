@@ -10,8 +10,6 @@ import re
 
 
 TRIAL_STATES = ("RUNNING", "COMPLETE", "PRUNED", "FAIL", "WAITING")
-# 训练 Journal 的运行口径版本。版本变化后不兼容旧 Study，避免旧评分和新调度语义混用。
-WORKER_CONFIG_VERSION = 2
 
 
 def finished_trial_count(counts):

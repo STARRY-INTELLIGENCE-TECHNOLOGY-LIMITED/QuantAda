@@ -200,7 +200,7 @@ def test_worker_entry_rewrites_trial_log_without_opening_real_journal(monkeypatc
     from optimizer import runtime as optimizer
 
     class DummyStudy:
-        user_attrs = {"_optimizer_worker_config_version": 1}
+        user_attrs = {}
 
         def optimize(self, *args, **kwargs):
             logging.getLogger("optuna.study.study").info(_FINISHED.format(number=12))
@@ -209,9 +209,14 @@ def test_worker_entry_rewrites_trial_log_without_opening_real_journal(monkeypatc
     monkeypatch.setattr(optimizer, "JournalStorage", lambda backend: object())
     monkeypatch.setattr(optimizer, "JournalFileBackendCls", lambda log_file, **kwargs: object())
     monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
-    monkeypatch.setattr(optimizer, "ensure_study_config_version", lambda study: None)
-    monkeypatch.setattr(optimizer, "TPESampler", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
-    monkeypatch.setattr(optimizer.OptimizationJob, "from_worker_payload", lambda payload: SimpleNamespace(objective=lambda trial: 1.0))
+    monkeypatch.setattr(
+        optimizer.OptimizationJob,
+        "from_worker_payload",
+        lambda payload: SimpleNamespace(
+            objective=lambda trial: 1.0,
+            _make_tpe_sampler=lambda *args, **kwargs: SimpleNamespace(),
+        ),
+    )
     monkeypatch.setattr(optimizer.OptimizationJob, "_cleanup_shared_segments", lambda handles, unlink=False: None)
     monkeypatch.setattr(optimizer, "get_optimizer_terminal_log_path", lambda: None)
 

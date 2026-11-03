@@ -14,7 +14,7 @@ import urllib.request
 
 import pytest
 
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION, read_study_metadata
+from optimizer.journal_metadata import read_study_metadata
 from common.terminal_log import OPTIMIZER_AI_ANALYSIS_END_MARKER, OPTIMIZER_AI_ANALYSIS_START_MARKER
 from optimizer.training_tasks import (
     _DISPLAY_TAIL_BYTES,
@@ -50,13 +50,11 @@ def _recorded(**changes):
     return recorded
 
 
-def _write_task(path, *, attributes=None, metrics=("return", "sharpe"), timestamp=1000, name="saved", config_version=WORKER_CONFIG_VERSION):
+def _write_task(path, *, attributes=None, metrics=("return", "sharpe"), timestamp=1000, name="saved"):
     path.parent.mkdir(parents=True, exist_ok=True)
     attrs = attributes or _recorded()
     records = [{"op_code": 0, "study_name": name, "directions": [2]}]
     records.extend({"op_code": 2, "study_id": 0, "user_attr": {key: value}} for key, value in attrs.items())
-    if config_version is not None:
-        records.append({"op_code": 2, "study_id": 0, "user_attr": {"_optimizer_worker_config_version": config_version}})
     if metrics is not None:
         records.append({"op_code": 2, "study_id": 0, "user_attr": {"_optimizer_metrics": list(metrics)}})
         records.append({"op_code": 2, "study_id": 0, "user_attr": {"_optimizer_target_trials": 4}})
@@ -109,37 +107,6 @@ def test_same_batch_studies_in_dedicated_journals_are_one_resume_task(tmp_path):
     assert argv[argv.index("--study_journal") + 1] == str(batch)
 
 
-def test_task_versions_have_separate_progress_and_show_isolation_notice(tmp_path, monkeypatch, capsys):
-    from command_center.generator import build_resume_command
-
-    path = _write_task(tmp_path / "optuna_versions.log", config_version=None)
-    with path.open("a", encoding="utf-8") as stream:
-        events = [{"op_code": 0, "study_name": "current", "directions": [2]}]
-        events.extend({"op_code": 2, "study_id": 1, "user_attr": {key: value}} for key, value in _recorded().items())
-        events.extend([
-            {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}},
-            {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_metrics": ["return", "sharpe"]}},
-            {"op_code": 4, "study_id": 1, "state": 1, "datetime_start": None},
-        ])
-        stream.writelines(json.dumps(event) + "\n" for event in events)
-    current, legacy = list_training_tasks(tmp_path)
-    assert current["worker_config_version"] == WORKER_CONFIG_VERSION
-    assert current["trial_counts"]["COMPLETE"] == 1
-    assert current["trial_counts"]["FAIL"] == 0
-    assert current["notice"] == ""
-    assert legacy["trial_counts"]["COMPLETE"] == 1
-    assert legacy["trial_counts"]["FAIL"] == 1
-    assert "read-only" in legacy["notice"]
-    assert legacy["resumable"] is False
-    assert "incompatible optimizer version" in legacy["reason"]
-    assert current["task_id"] != legacy["task_id"]
-    assert build_resume_command(legacy, {}, tmp_path).warnings == (legacy["notice"],)
-    answers = iter(["2", "q"])
-    monkeypatch.setattr("builtins.input", lambda _: next(answers))
-    assert choose_training_task([current, legacy]) is None
-    assert legacy["reason"] in capsys.readouterr().out
-
-
 def test_progress_counts_waiting_retries_and_ignores_invalid_terminal_updates(tmp_path):
     path = _write_task(tmp_path / "optuna_task.log")
     with path.open("a", encoding="utf-8") as stream:
@@ -175,7 +142,6 @@ def test_task_restores_most_recent_budget_and_workers_across_metrics(tmp_path):
         events.extend({"op_code": 2, "study_id": 1, "user_attr": {key: value}}
                       for key, value in _recorded(metric="sharpe", n_trials=4).items())
         events.extend([
-            {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}},
             {"op_code": 2, "study_id": 0, "user_attr": {"_optimizer_target_trials": 10}},
             {"op_code": 2, "study_id": 0, "user_attr": {"n_jobs": "2"}},
         ])
@@ -185,23 +151,6 @@ def test_task_restores_most_recent_budget_and_workers_across_metrics(tmp_path):
     argv = build_resume_arguments(task)
     assert task["n_trials"] == 10
     assert argv[argv.index("--n_jobs") + 1] == "2"
-
-
-def test_legacy_task_does_not_recover_unstarted_metrics_from_terminal_header(tmp_path):
-    journal = _write_task(tmp_path / "optuna" / "optuna_old.log", metrics=None, config_version=None)
-    terminal = tmp_path / "optimizer" / "optimizer_terminal_old.log"
-    terminal.parent.mkdir()
-    terminal.write_text(
-        ">>> Mode: PARAMETER OPTIMIZATION (Target: return,sharpe,calmar) <<<\n"
-        f"[Optimizer] Using JournalStorage: {journal}\n"
-        "[Optimizer] Auto-inferred n_trials: 2160 (entropy-complexity model)\n"
-        "--- Starting Optimization (2160 trials, 13 parallel jobs) ---\n",
-        encoding="utf-8",
-    )
-    task = list_training_tasks(journal.parent)[0]
-    assert task["metrics"] == ["return"]
-    assert task["n_trials"] is None
-    assert task["resumable"] is False
 
 
 @pytest.mark.parametrize("execution_price", ["close", "next_open"])
@@ -222,7 +171,7 @@ def test_resume_arguments_restore_training_context_and_skip_startup_schedule(tmp
 
 
 def test_missing_execution_price_disables_task_resume(tmp_path):
-    """旧任务保留在列表中供查阅，但缺少成交口径时不得生成续传命令。"""
+    """缺少成交口径的任务不得生成续传命令。"""
     attrs = _recorded()
     del attrs["execution_price"]
     path = _write_task(tmp_path / "optuna_missing_execution.log", attributes=attrs)
@@ -733,12 +682,11 @@ def test_web_task_log_pages_the_selected_journal_and_rejects_unknown_tasks(tmp_p
 
 
 def test_incompatible_fork_is_not_used_as_a_resume_anchor(tmp_path):
-    path = _write_task(tmp_path / "optuna_versions.log", config_version=None, name="old")
+    path = _write_task(tmp_path / "optuna_versions.log", name="old")
     with path.open("a", encoding="utf-8") as stream:
         events = [{"op_code": 0, "study_name": "thin", "directions": [2]}]
         events.extend({"op_code": 2, "study_id": 1, "user_attr": {key: value}} for key, value in _recorded().items())
         events.extend([
-            {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}},
             {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_metrics": ["return", "sharpe"]}},
             {"op_code": 4, "study_id": 1, "state": 1, "datetime_start": None},
             {"op_code": 4, "study_id": 0, "state": 1, "datetime_start": None},
@@ -758,7 +706,6 @@ def _append_window(path, *, name, start_date, end_date, snapshot_id):
     records = [{"op_code": 0, "study_name": name, "directions": [2]}]
     records.extend({"op_code": 2, "study_id": 1, "user_attr": {key: value}} for key, value in attrs.items())
     records.extend([
-        {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}},
         {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_metrics": ["return", "sharpe"]}},
         {"op_code": 2, "study_id": 1, "user_attr": {"_optimizer_target_trials": 4}},
     ])

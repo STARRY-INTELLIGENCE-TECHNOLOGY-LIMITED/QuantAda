@@ -5,7 +5,6 @@ import pandas as pd
 import pytest
 
 import optimizer.runtime as optimizer
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION
 import common.process_elevation as process_elevation
 import common.terminal_log as terminal_log
 from common.runtime_command import format_cli_command
@@ -96,9 +95,6 @@ class _DummyOptimizationJob:
         metrics = _sample_metrics(start="20230101", end="20251231")
         metrics["trade_micro_attribution_report"] = _sample_trade_attribution_report()
         return metrics
-
-    def _run_recent_3y_backtest(self, params):
-        return self._run_main_eval_backtest(params)
 
     def _run_test_set_backtest(self, params, verbose=False):
         metrics = _sample_metrics(start="20250101", end="20250331")
@@ -1329,7 +1325,7 @@ def test_optimizer_run_passes_gc_after_trial_to_single_process_optimize(monkeypa
         state = "complete"
 
     class DummyStudy:
-        user_attrs = {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}
+        user_attrs = {}
         trials = [DummyTrial()]
         best_params = {"lookback": 20}
         best_value = 1.23
@@ -1344,7 +1340,7 @@ def test_optimizer_run_passes_gc_after_trial_to_single_process_optimize(monkeypa
 
     monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
     monkeypatch.setattr(optimizer.optuna.trial, "TrialState", DummyTrialState)
-    monkeypatch.setattr(optimizer, "TPESampler", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
+    monkeypatch.setattr(optimizer, "BlockConstrainedTPESampler", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
 
     job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
     job.args = SimpleNamespace(
@@ -1390,7 +1386,7 @@ def test_optimizer_run_uses_default_tpe_candidates_for_short_runs(monkeypatch):
         state = "complete"
 
     class DummyStudy:
-        user_attrs = {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}
+        user_attrs = {}
         trials = [DummyTrial()]
         best_params = {"lookback": 20}
         best_value = 1.23
@@ -1407,7 +1403,7 @@ def test_optimizer_run_uses_default_tpe_candidates_for_short_runs(monkeypatch):
 
     monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
     monkeypatch.setattr(optimizer.optuna.trial, "TrialState", DummyTrialState)
-    monkeypatch.setattr(optimizer, "TPESampler", fake_sampler)
+    monkeypatch.setattr(optimizer, "BlockConstrainedTPESampler", fake_sampler)
 
     job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
     job.args = SimpleNamespace(
@@ -1480,7 +1476,7 @@ def test_tpe_candidates_drop_only_for_spawn_payload_copy_long_runs():
 
 def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, capsys):
     class DummyStudy:
-        user_attrs = {"_optimizer_worker_config_version": WORKER_CONFIG_VERSION}
+        user_attrs = {}
         def optimize(self, *args, **kwargs):
             raise MemoryError("simulated sampler pressure")
 
@@ -1490,6 +1486,9 @@ def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, cap
         def _release_memory_pressure(self):
             DummyJob.released = True
 
+        def _make_tpe_sampler(self, *args, **kwargs):
+            return SimpleNamespace()
+
         @staticmethod
         def objective(trial):
             return 1.0
@@ -1498,7 +1497,6 @@ def test_optimize_worker_entry_returns_early_on_memory_pressure(monkeypatch, cap
     monkeypatch.setattr(optimizer, "JournalStorage", lambda backend: object())
     monkeypatch.setattr(optimizer, "JournalFileBackendCls", lambda log_file, **kwargs: object())
     monkeypatch.setattr(optimizer.optuna, "create_study", lambda **kwargs: DummyStudy())
-    monkeypatch.setattr(optimizer, "TPESampler", lambda **kwargs: SimpleNamespace(kwargs=kwargs))
     monkeypatch.setattr(optimizer.OptimizationJob, "from_worker_payload", lambda payload: DummyJob())
     monkeypatch.setattr(optimizer.OptimizationJob, "_cleanup_shared_segments", lambda handles, unlink=False: None)
 

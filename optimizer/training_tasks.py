@@ -15,7 +15,7 @@ from common.terminal_log import (
 )
 from common.process_tree import optimizer_owner_process
 from optimizer.journal_metadata import (
-    WORKER_CONFIG_VERSION, TRIAL_STATES, finished_trial_count, parse_recorded_value, read_study_metadata, study_identity,
+    TRIAL_STATES, finished_trial_count, parse_recorded_value, read_study_metadata, study_identity,
 )
 
 
@@ -319,7 +319,6 @@ def _batch_task_key(task):
     window = [task.get("start_date"), task.get("end_date")]
     return json.dumps({
         "batch": batch, "identity": identity, "window": window,
-        "worker_config_version": task.get("worker_config_version"),
         "snapshot": _task_snapshot_id(task),
     }, sort_keys=True, default=str), batch
 
@@ -402,8 +401,7 @@ def list_training_tasks(journal_dir):
             window = [None if identity["train_roll_period"] else attrs.get("start_date"), attrs.get("end_date")]
             context = {"identity": identity, "window": window}
             contexts.add(json.dumps(context, sort_keys=True, default=str))
-            key = json.dumps({**context, "worker_config_version": attrs.get("_optimizer_worker_config_version"),
-                              "data_snapshot": attrs.get("_optimizer_data_snapshot")}, sort_keys=True, default=str)
+            key = json.dumps({**context, "data_snapshot": attrs.get("_optimizer_data_snapshot")}, sort_keys=True, default=str)
             group = groups.setdefault(key, {"studies": {}, "metrics": []})
             metric = str(attrs.get("metric") or "").strip()
             group["studies"].pop(metric, None)
@@ -420,9 +418,12 @@ def list_training_tasks(journal_dir):
             budget = parse_recorded_value(attrs.get("_optimizer_target_trials"))
             if budget is None:
                 budget = parse_recorded_value(attrs.get("n_trials"))
-            current_version = attrs.get("_optimizer_worker_config_version") == WORKER_CONFIG_VERSION
-            if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"}:
-                current_version = current_version and bool(attrs.get("_optimizer_grid_signature"))
+            resumable = True
+            reason = ""
+            if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"} \
+                    and not attrs.get("_optimizer_grid_signature"):
+                resumable = False
+                reason = "The saved finite search Study has no current grid metadata; start a new training run."
             task = {
                 "task_id": hashlib.sha256((str(path) + "\n" + key).encode("utf-8")).hexdigest()[:24],
                 "journal": str(path), "updated_at": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
@@ -439,14 +440,12 @@ def list_training_tasks(journal_dir):
                     for study in latest if str(study["attrs"].get("_optimizer_owner") or "").strip()
                 )),
                 "recorded": attrs,
-                "resumable": current_version,
-                "reason": "" if current_version else "Saved Study uses an incompatible optimizer version; start a new training run.",
-                "worker_config_version": attrs.get("_optimizer_worker_config_version"),
+                "resumable": resumable,
+                "reason": reason,
                 "training_status": _STATUS_UNFINISHED,
-                "notice": "" if current_version else
-                          "This historical Study is read-only and cannot be resumed by the current optimizer.",
+                "notice": "",
             }
-            if task["resumable"] and not task["notice"] and not attrs.get("_optimizer_data_snapshot"):
+            if task["resumable"] and not attrs.get("_optimizer_data_snapshot"):
                 task["notice"] = "No training data snapshot was recorded. The current Study will prepare data once and bind a new snapshot before continuing."
             try:
                 if any(study["directions"] != [2] for study in latest):
@@ -459,16 +458,14 @@ def list_training_tasks(journal_dir):
     tasks = _merge_batch_tasks(tasks)
     _apply_training_status(tasks, directory)
     _prefer_richer_resume_target(tasks)
-    return sorted(tasks, key=lambda task: (
-        -task["updated_ns"], task["worker_config_version"] != WORKER_CONFIG_VERSION, task["task_id"],
-    ))
+    return sorted(tasks, key=lambda task: (-task["updated_ns"], task["task_id"]))
 
 
 def list_running_training_tasks(journal_dir):
     """只返回仍有可验证优化器主进程的任务。"""
     running = []
     for task in list_training_tasks(journal_dir):
-        if task.get("worker_config_version") != WORKER_CONFIG_VERSION or not task.get("resumable"):
+        if not task.get("resumable"):
             continue
         verified = {
             owner: record
@@ -602,8 +599,6 @@ def _prefer_richer_resume_target(tasks):
 def build_resume_arguments(task, extra_arguments=()):
     """恢复训练参数数组；不会恢复实盘入口、启动等待或强制刷新行情。"""
     attrs = task["recorded"]
-    if attrs.get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION:
-        raise ValueError("The saved Study uses an incompatible optimizer version; start a new training run.")
     if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"} \
             and not attrs.get("_optimizer_grid_signature"):
         raise ValueError("The saved finite search Study has no current grid metadata; start a new training run.")
@@ -633,8 +628,7 @@ def build_resume_arguments(task, extra_arguments=()):
         arguments.append("--no_plot")
     arguments.extend(("--metric", ",".join(task["metrics"]), "--study_journal", task["journal"]))
     anchor = task.get("resume_anchor")
-    if not anchor and (attrs.get("_optimizer_worker_config_version") == WORKER_CONFIG_VERSION
-            and attrs.get("_optimizer_data_snapshot") and task.get("study_names")):
+    if not anchor and attrs.get("_optimizer_data_snapshot") and task.get("study_names"):
         anchor = task["study_names"][0]
     if anchor:
         arguments.extend(("--study_name", anchor))

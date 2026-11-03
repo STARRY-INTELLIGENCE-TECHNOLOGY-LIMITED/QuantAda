@@ -11,7 +11,6 @@ import pandas as pd
 import pytest
 
 from optimizer.runtime import OptimizationJob, _optimize_worker_entry
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION
 from optimizer.search_policy import grid_signature
 from optimizer.study_resume import RetryAwareGridSampler, prepare_trial_resume, requeue_running_trials
 from strategies.base_strategy import BaseStrategy
@@ -36,7 +35,6 @@ def _study(tmp_path, size=4):
         study_name="retry-test", direction="maximize", storage=storage,
         sampler=optuna.samplers.GridSampler({"x": list(range(size))}),
     )
-    study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
     study.set_user_attr("_optimizer_grid_signature", grid_signature({"x": list(range(size))}))
     study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
     return study, storage, path
@@ -252,7 +250,6 @@ def _resume_job(path, study_name, objective, n_jobs=1):
 def _seed_completion_gap(tmp_path):
     """1 个完成和 3 个确定性失败；目标预算 3，剩余额度小于失败数。"""
     study, storage, path = _study(tmp_path, size=6)
-    study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
     study.set_user_attr("_optimizer_grid_signature", grid_signature({"x": list(range(6))}))
     study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
 

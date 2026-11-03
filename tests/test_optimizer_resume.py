@@ -20,12 +20,11 @@ import config
 import optimizer.runtime as runtime
 from optimizer.study_resume import (
     _is_finite_search_space,
-    ensure_study_config_version,
     legacy_owner_running,
     resolve_study_plan,
     study_run_lock,
 )
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION, isolate_study_journal, read_study_metadata, related_journal_paths, training_identity_hash
+from optimizer.journal_metadata import isolate_study_journal, read_study_metadata, related_journal_paths, training_identity_hash
 from optimizer.search_policy import grid_signature
 
 
@@ -47,29 +46,26 @@ def _storage(path):
     return JournalStorage(JournalFileBackend(str(path), lock_obj=JournalFileOpenLock(str(path))))
 
 
-def _write_study(path, name, args, metric="return", config_version=WORKER_CONFIG_VERSION):
+def _write_study(path, name, args, metric="return"):
     study = optuna.create_study(storage=_storage(path), study_name=name, direction="maximize", load_if_exists=True)
     for key, value in vars(args).items():
         study.set_user_attr(key, str(metric if key == "metric" else value))
-    if config_version is not None:
-        study.set_user_attr("_optimizer_worker_config_version", config_version)
-        if config_version == WORKER_CONFIG_VERSION:
-            opt_space = ast.literal_eval(args.opt_params)
-            grid = {}
-            for param_name, spec in opt_space.items():
-                if spec.get("type") == "int":
-                    grid[param_name] = list(range(int(spec["low"]), int(spec["high"]) + 1, int(spec.get("step", 1))))
-                elif spec.get("type") == "float" and spec.get("step") is not None:
-                    count = int((float(spec["high"]) - float(spec["low"])) / float(spec["step"]) + 1e-10)
-                    grid[param_name] = [round(float(spec["low"]) + index * float(spec["step"]), 12) for index in range(count + 1)]
-                elif spec.get("type") == "categorical":
-                    grid[param_name] = list(spec.get("choices", []))
-                else:
-                    grid = None
-                    break
-            if grid:
-                study.set_user_attr("_optimizer_grid_signature", grid_signature(grid))
-                study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
+    opt_space = ast.literal_eval(args.opt_params)
+    grid = {}
+    for param_name, spec in opt_space.items():
+        if spec.get("type") == "int":
+            grid[param_name] = list(range(int(spec["low"]), int(spec["high"]) + 1, int(spec.get("step", 1))))
+        elif spec.get("type") == "float" and spec.get("step") is not None:
+            count = int((float(spec["high"]) - float(spec["low"])) / float(spec["step"]) + 1e-10)
+            grid[param_name] = [round(float(spec["low"]) + index * float(spec["step"]), 12) for index in range(count + 1)]
+        elif spec.get("type") == "categorical":
+            grid[param_name] = list(spec.get("choices", []))
+        else:
+            grid = None
+            break
+    if grid:
+        study.set_user_attr("_optimizer_grid_signature", grid_signature(grid))
+        study.set_user_attr("_optimizer_search_policy", "adaptive_grid")
     return study
 
 
@@ -110,53 +106,6 @@ def test_timestamp_named_batch_is_matched_and_missing_metrics_share_its_journal(
     assert plan["studies"]["return"] == name
     assert plan["studies"]["sharpe"] != name
     assert len(plan["matched"]) == 1
-
-
-def test_unversioned_scores_are_ignored_and_new_plan_is_created(tmp_path):
-    journal = tmp_path / "optuna_legacy.log"
-    old = _write_study(journal, "old", _args(), config_version=None)
-    old.add_trial(optuna.trial.create_trial(value=-43.0))
-    before = journal.read_bytes()
-    args = _args(start_date="20230924", end_date="20260924")
-    plan = _plan(args, tmp_path, (None, None))
-    assert journal.read_bytes() == before
-    assert plan["journal"] != str(journal)
-    assert plan["matched"] == []
-    assert (args.start_date, args.end_date) == ("20230924", "20260924")
-    assert _plan(_args(start_date="20230924", end_date="20260924"), tmp_path)["studies"] == plan["studies"]
-    assert old.trials[0].value == -43.0
-    assert "_optimizer_worker_config_version" not in old.user_attrs
-
-
-def test_explicit_unversioned_study_is_rejected(tmp_path):
-    journal = tmp_path / "optuna_legacy.log"
-    old = _write_study(journal, "old", _args(), config_version=None)
-    old.add_trial(optuna.trial.create_trial(value=99.0))
-    before = journal.read_bytes()
-    with pytest.raises(ValueError, match="incompatible"):
-        _plan(_args(study_name="old", study_journal=str(journal)), tmp_path)
-    assert journal.read_bytes() == before
-    with pytest.raises(ValueError, match="incompatible"):
-        ensure_study_config_version(old)
-
-
-def test_explicit_different_version_cannot_overwrite_existing_scores(tmp_path):
-    journal = tmp_path / "optuna_legacy.log"
-    old = _write_study(journal, "old", _args(), config_version=WORKER_CONFIG_VERSION + 1)
-    old.add_trial(optuna.trial.create_trial(value=99.0))
-    before = journal.read_bytes()
-    with pytest.raises(ValueError, match="configuration version"):
-        _plan(_args(study_name="old", study_journal=str(journal)), tmp_path)
-    with pytest.raises(ValueError, match="configuration version"):
-        ensure_study_config_version(old)
-    assert journal.read_bytes() == before
-
-
-def test_blank_study_can_be_initialized_with_current_config_version(tmp_path):
-    study = optuna.create_study(storage=_storage(tmp_path / "empty.log"), study_name="blank")
-    ensure_study_config_version(study)
-    ensure_study_config_version(study)
-    assert study.user_attrs["_optimizer_worker_config_version"] == WORKER_CONFIG_VERSION
 
 
 def test_implicit_dates_keep_existing_window_across_days(tmp_path):
@@ -520,7 +469,11 @@ def test_running_job_is_skipped_before_fetching_data(monkeypatch, tmp_path, caps
     directory = Path(config.DATA_PATH) / "optuna"
     directory.mkdir(parents=True)
     path = directory / "optuna_legacy.log"
-    _write_study(path, "old", _args())
+    study = _write_study(path, "old", _args())
+    study.set_user_attr(
+        "_optimizer_owner",
+        f"optimizer_RUN{datetime.datetime.now():%Y%m%d-%H%M%S}_{os.getpid()}",
+    )
     monkeypatch.setattr(runtime, "legacy_owner_running", lambda name, **kwargs: True)
     monkeypatch.setattr(runtime.process_elevation, "request_optimizer_elevation_if_needed", lambda *_: False)
     monkeypatch.setattr(runtime.OptimizationJob, "__init__", lambda *a, **k: pytest.fail("must not fetch data"))
@@ -589,7 +542,7 @@ def test_repeated_multi_metric_command_reuses_trials_and_tops_up_budget(monkeypa
     if legacy_scores:
         legacy_path = Path(config.DATA_PATH) / "optuna" / "optuna_legacy.log"
         legacy_path.parent.mkdir(parents=True)
-        legacy = _write_study(legacy_path, "legacy-score", _args(strategy="other.Strategy"), config_version=None)
+        legacy = _write_study(legacy_path, "legacy-score", _args(strategy="other.Strategy"))
         legacy.add_trial(optuna.trial.create_trial(value=9999.0))
     interrupted = None
     for step, (budget, expected) in enumerate(((2, 4), (2, 4), (4, 8), (4, 8))):
@@ -601,8 +554,7 @@ def test_repeated_multi_metric_command_reuses_trials_and_tops_up_budget(monkeypa
                 path for path in (Path(config.DATA_PATH) / "optuna").glob("*.log")
                 if path.name != "optuna_legacy.log"
             )
-            name = next(info["name"] for info in read_study_metadata(journal)
-                        if info["attrs"].get("_optimizer_worker_config_version") == WORKER_CONFIG_VERSION)
+            name = next(info["name"] for info in read_study_metadata(journal))
             study = optuna.load_study(
                 study_name=name, storage=_storage(journal), sampler=optuna.samplers.GridSampler({"x": list(range(6))}),
             )
@@ -616,7 +568,6 @@ def test_repeated_multi_metric_command_reuses_trials_and_tops_up_budget(monkeypa
         assert len(journals) == 3
         assert len(legacy.trials) == 1
         assert legacy.best_value == 9999.0
-        assert "_optimizer_worker_config_version" not in legacy.user_attrs
         journals = [path for path in journals if path != legacy_path]
     assert len(journals) == 2
     assert future_counts == [
@@ -862,28 +813,9 @@ def test_live_cli_keeps_date_inference_when_unused_optimizer_flags_are_present(m
     assert captured["end_date"] == "20260923"
 
 
-def test_richer_unversioned_study_beats_thin_versioned_fork(tmp_path):
-    journal = tmp_path / "optuna_batch.log"
-    old = _write_study(journal, "old", _args(metric="return"), "return", config_version=None)
-    old.add_trial(optuna.trial.create_trial(value=1.0))
-    old.add_trial(optuna.trial.create_trial(value=2.0))
-    thin = _write_study(journal, "thin", _args(metric="return"), "return")
-    thin.add_trial(optuna.trial.create_trial(value=3.0))
-    thin.set_user_attr("_optimizer_data_snapshot", {"id": "a" * 32, "sha256": "b" * 64})
-
-    plan = _plan(_args(metric="return", study_journal=str(journal)), tmp_path)
-    named = _plan(_args(metric="return", study_journal=str(journal), study_name="thin"), tmp_path)
-
-    assert plan["studies"]["return"] == "thin"
-    assert "fallback_snapshot" not in plan
-    assert named["studies"]["return"] == "thin"
-    assert named["switched_to_richer"] is False
-    assert "_optimizer_worker_config_version" not in old.user_attrs
-
-
 def test_loaded_grid_study_does_not_revisit_finished_combinations(tmp_path):
     journal = tmp_path / "optuna_grid.log"
-    seeded = _write_study(journal, "grid-study", _args(metric="return"), "return", config_version=None)
+    seeded = _write_study(journal, "grid-study", _args(metric="return"), "return")
     sampler = optuna.samplers.GridSampler({"x": list(range(6))})
     study = optuna.load_study(study_name=seeded.study_name, storage=_storage(journal), sampler=sampler)
 
@@ -903,47 +835,6 @@ def test_loaded_grid_study_does_not_revisit_finished_combinations(tmp_path):
     assert len(completed) == 4
     assert len({trial.params["x"] for trial in completed}) == 4
     assert visited.issubset({trial.params["x"] for trial in completed})
-
-
-def test_optimizer_rejects_explicit_unversioned_study(monkeypatch, tmp_path):
-    evaluated = []
-    frame = pd.DataFrame({"close": [1.0, 1.1, 1.2]}, index=pd.date_range("2024-01-01", periods=3))
-    context = {
-        "strategy_class": SimpleNamespace(option_universe=("PUT",)), "risk_control_classes": [],
-        "data_manager": None, "target_symbols": ["AAA"], "raw_datas": {"AAA": frame},
-        "train_datas": {"AAA": frame}, "test_datas": {}, "train_range": ("20240101", "20240103"),
-        "test_range": (None, None),
-    }
-
-    class OfflineJob(runtime.OptimizationJob):
-        def __init__(self, args, fixed_params, opt_params_def, risk_params, shared_context=None):
-            super().__init__(args, fixed_params, opt_params_def, risk_params, shared_context=shared_context or context)
-
-        def _evaluate_trial_params(self, params):
-            evaluated.append(params["x"])
-            return float(params["x"])
-
-    journal = Path(config.DATA_PATH) / "optuna" / "optuna_grid.log"
-    journal.parent.mkdir(parents=True)
-    seeded = _write_study(journal, "grid-study", _args(metric="return"), "return", config_version=None)
-    seeded_sampler = optuna.samplers.GridSampler({"x": list(range(6))})
-    seeded_study = optuna.load_study(study_name="grid-study", storage=_storage(journal), sampler=seeded_sampler)
-    seeded_study.optimize(lambda trial: float(trial.suggest_int("x", 0, 5)), n_trials=2)
-    visited = {trial.params["x"] for trial in seeded_study.trials}
-    del seeded_study, seeded
-
-    monkeypatch.setattr(runtime, "OptimizationJob", OfflineJob)
-    monkeypatch.setattr(runtime, "get_class_from_name", lambda *a, **k: context["strategy_class"])
-    monkeypatch.setattr(runtime.process_elevation, "request_optimizer_elevation_if_needed", lambda *_: False)
-    monkeypatch.setattr(OfflineJob, "_launch_dashboard", lambda *a, **k: None)
-    monkeypatch.setattr(OfflineJob, "_run_main_eval_backtest", lambda *a, **k: None)
-    monkeypatch.setattr(OfflineJob, "_run_yearly_validation_backtests", lambda *a, **k: [])
-    monkeypatch.setattr(runtime.sys, "argv", ["run.py"])
-    args = _args(metric="return", n_trials=4, study_journal=str(journal))
-    assert runtime.run_optimizer_mode(args, ast.literal_eval(args.params), {}, ["AAA"]) == 1
-    assert evaluated == []
-    loaded = optuna.load_study(study_name="grid-study", storage=_storage(journal))
-    assert loaded.user_attrs.get("_optimizer_worker_config_version") is None
 
 
 def test_isolate_aligns_trial_id_with_console_number(tmp_path):

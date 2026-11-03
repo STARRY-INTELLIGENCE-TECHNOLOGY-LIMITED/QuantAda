@@ -9,32 +9,18 @@ import os
 from pathlib import Path
 import re
 
+import numpy as np
 import pandas as pd
 import optuna
-from optuna.samplers import GridSampler
+from optuna.samplers import GridSampler, TPESampler
 
-from optimizer.journal_metadata import WORKER_CONFIG_VERSION, batch_journal_path, finished_trial_count, read_study_metadata, related_journal_paths, study_identity, training_identity_hash
-from optimizer.search_policy import finite_search_space_size, grid_sampler_is_safe
-
-
-def ensure_study_config_version(study):
-    """只允许当前运行口径；旧 Study 必须显式新建。"""
-    version = study.user_attrs.get("_optimizer_worker_config_version")
-    if version == WORKER_CONFIG_VERSION:
-        return
-    get_trials = getattr(study, "get_trials", None)
-    trials = get_trials(deepcopy=False) if callable(get_trials) else list(getattr(study, "trials", ()) or ())
-    if trials:
-        raise ValueError(
-            f"Study {study.study_name} uses an incompatible worker configuration version {version!r}; "
-            f"current version is {WORKER_CONFIG_VERSION}. Use a new --study_name or Journal."
-        )
-    if version is not None:
-        raise ValueError(
-            f"Study {study.study_name} has an incompatible worker configuration version; "
-            "use a new --study_name or Journal."
-        )
-    study.set_user_attr("_optimizer_worker_config_version", WORKER_CONFIG_VERSION)
+from optimizer.journal_metadata import batch_journal_path, finished_trial_count, read_study_metadata, related_journal_paths, study_identity, training_identity_hash
+from optimizer.search_policy import (
+    finite_search_space_size,
+    grid_sampler_is_safe,
+    repair_params_to_active_blocks,
+    stabilize_block_keys,
+)
 
 
 class RetryAwareGridSampler(GridSampler):
@@ -122,6 +108,70 @@ class AdaptiveGridSampler(RetryAwareGridSampler):
         if trial.system_attrs.get("_adaptive_grid_exhausted"):
             raise optuna.TrialPruned("Adaptive grid has no unvisited combinations left.")
         return super().sample_independent(study, trial, param_name, param_distribution)
+
+
+class BlockConstrainedTPESampler(TPESampler):
+    """TPE 提议后按试验编号在活跃块间轮转；已落在目标块则保留，否则只修正两个区块轴。"""
+
+    # 与 Optuna TPESampler.constant_liar 写入的相对参数键保持一致。
+    _RELATIVE_PARAMS_KEY = "tpe:relative_params"
+    _RELATIVE_PARAMS_CHUNK = 2045
+
+    def __init__(self, *args, opt_params_def=None, active_blocks=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._opt_params_def = opt_params_def or {}
+        self.set_active_blocks(active_blocks)
+
+    def set_active_blocks(self, active_blocks):
+        """更新当前仍允许采样的粗粒度区块；顺序稳定，不随 set 迭代变化。"""
+        if active_blocks is None:
+            self._active_blocks = None
+            return
+        self._active_blocks = tuple(stabilize_block_keys(active_blocks))
+
+    def infer_relative_search_space(self, study, trial):
+        if not self._active_blocks:
+            return super().infer_relative_search_space(study, trial)
+        space = {}
+        use_trial_cache = self._multivariate or not self._constant_liar
+        for name, distribution in self._search_space.calculate(study, use_trial_cache).items():
+            if distribution.single():
+                continue
+            space[name] = distribution
+        return space
+
+    def _store_relative_params(self, study, trial, params):
+        """把最终采样点写入 constant_liar 可见的相对参数，避免并行 worker 读到未修复点。"""
+        params_str = json.dumps(params)
+        chunk = self._RELATIVE_PARAMS_CHUNK
+        for index in range(0, len(params_str), chunk):
+            study._storage.set_trial_system_attr(
+                trial._trial_id,
+                f"{self._RELATIVE_PARAMS_KEY}:{index // chunk}",
+                params_str[index:index + chunk],
+            )
+
+    def sample_relative(self, study, trial, search_space):
+        if not search_space:
+            return {}
+        params = dict(self._sample_relative(study, trial, search_space) or {})
+        for name, distribution in search_space.items():
+            if name not in params:
+                params[name] = TPESampler.sample_independent(
+                    self, study, trial, name, distribution,
+                )
+        if self._active_blocks:
+            rng = np.random.default_rng((int(getattr(trial, "number", 0)) + 1) * 10007)
+            params = repair_params_to_active_blocks(
+                params,
+                self._opt_params_def,
+                self._active_blocks,
+                rng,
+                trial_number=getattr(trial, "number", 0),
+            )
+        if params and self._constant_liar:
+            self._store_relative_params(study, trial, params)
+        return params
 
 
 def requeue_running_trials(study, storage):
@@ -269,13 +319,6 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
         anchored_snapshot = anchor["attrs"].get("_optimizer_data_snapshot") if anchor else None
         for study in reversed(studies):
             attrs = study["attrs"]
-            if attrs.get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION:
-                if requested_name and study["name"] == requested_name:
-                    raise ValueError(
-                        f"Study {study['name']} uses an incompatible worker configuration version; "
-                        "use a new --study_name or Journal."
-                    )
-                continue
             if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"} \
                     and not attrs.get("_optimizer_grid_signature"):
                 if requested_name and study["name"] == requested_name:
@@ -325,7 +368,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
             start = str(attrs.get("start_date", ""))
             end = str(attrs.get("end_date", ""))
             compatible = compatible and start not in {"", "None"} and end not in {"", "None"}
-            # 滚动窗口由 end 和周期决定；旧版本有时把预热起点回写到 start_date。
+            # 滚动窗口由 end 和周期决定，不比较 start_date。
             if start_filter and not identity["train_roll_period"]:
                 compatible = compatible and pd.Timestamp(start) == pd.Timestamp(str(start_filter))
             if end_filter:
@@ -334,13 +377,6 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
                 candidates.append(study)
             elif requested_name and study["name"] == requested_name:
                 raise ValueError(f"Study {study['name']} has a different training configuration or window")
-        if inspecting_requested and not candidates and any(
-            study["attrs"].get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION
-            for study in studies
-        ):
-            raise ValueError(
-                f"Requested Journal {path} contains an incompatible Study; use a new Journal."
-            )
         if candidates:
             selected_path = path
             selected_window = (candidates[0]["attrs"]["start_date"], candidates[0]["attrs"]["end_date"])
@@ -367,8 +403,6 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
                 if study["name"] in seen:
                     continue
                 attrs = study["attrs"]
-                if attrs.get("_optimizer_worker_config_version") != WORKER_CONFIG_VERSION:
-                    continue
                 if attrs.get("_optimizer_search_policy") in {"exhaustive_grid", "adaptive_grid"} \
                         and not attrs.get("_optimizer_grid_signature"):
                     continue
@@ -438,8 +472,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
     if selected_window:
         args.start_date, args.end_date = selected_window
     digest = hashlib.sha256(json.dumps(
-        {"identity": identity, "identity_hash": identity_hash, "window": [str(pd.Timestamp(args.start_date)), str(pd.Timestamp(args.end_date))],
-         "worker_config_version": WORKER_CONFIG_VERSION},
+        {"identity": identity, "identity_hash": identity_hash, "window": [str(pd.Timestamp(args.start_date)), str(pd.Timestamp(args.end_date))]},
         sort_keys=True, ensure_ascii=False, default=str,
     ).encode("utf-8")).hexdigest()[:20]
     strategy_tag = re.sub(r"[^A-Za-z0-9_]+", "_", str(identity["strategy"] or "optimizer").split(".")[-1])[:40]
@@ -468,7 +501,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
 
 
 def legacy_owner_running(study_name, workers_only=False):
-    """查询旧名称或新所有者记录；新命令由进程锁管父进程，本函数补查 Windows 遗留 worker。"""
+    """按 `_optimizer_owner` 补查 Windows 遗留 worker；父进程互斥由 Journal 进程锁负责。"""
     match = re.search(r"_RUN(\d{8}-\d{6})_(\d+)$", study_name)
     if not match:
         return False

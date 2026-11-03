@@ -307,7 +307,7 @@ def _optimizer_harness(monkeypatch, tmp_path):
 
 
 def _seed_snapshot_journal(tmp_path, reference, *, name="thin"):
-    """写入带当前版本快照的 Study，供续传加载本 Study 自己的快照。"""
+    """写入带快照引用的 Study，供续传加载本 Study 自己的快照。"""
     import optuna
     from test_optimizer_resume import _args, _write_study
 
@@ -335,8 +335,8 @@ def _study_attrs(directory, name):
     return found
 
 
-def test_versioned_study_snapshot_is_loaded_without_fetch(monkeypatch, tmp_path, capsys):
-    """当前版本 Study 已有快照时必须加载自己的快照，不能重新取数。"""
+def test_study_snapshot_is_loaded_without_fetch(monkeypatch, tmp_path, capsys):
+    """已有快照的 Study 必须加载自己的快照，不能重新取数。"""
     import config
     from optimizer.data_snapshot import save_training_snapshot
 

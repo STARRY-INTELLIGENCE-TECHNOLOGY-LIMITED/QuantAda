@@ -32,7 +32,7 @@ from multiprocessing import shared_memory
 import numpy as np
 import optuna
 import pandas as pd
-from optuna.samplers import TPESampler
+
 
 import config
 from backtest.backtester import Backtester
@@ -52,7 +52,7 @@ from data_providers.manager import DataManager
 from stock_selectors.runtime import run_selectors
 from optimizer.study_resume import (
     AdaptiveGridSampler,
-    ensure_study_config_version,
+    BlockConstrainedTPESampler,
     legacy_owner_running,
     prepare_trial_resume,
     requeue_running_trials,
@@ -98,16 +98,22 @@ from optimizer.result_file import (
 from optimizer.training_matrix import expand_training_matrix
 from optimizer.opt_param_space import _looks_like_param_spec, resolve_opt_params
 from optimizer.search_policy import (
-    build_global_pilot,
+    build_block_balanced_pilot,
     build_trial_plan,
+    decode_block_keys,
+    encode_block_keys,
     extend_history_record,
     finite_search_space_size,
     grid_sampler_is_safe,
     grid_signature,
     parameter_key,
+    possible_block_keys,
     recommended_pilot_count,
     restore_extend_history,
     shrink_grid_blocks,
+    shrink_param_blocks,
+    spread_pilot_count,
+    stabilize_block_keys,
     summarise_trials,
     should_extend,
 )
@@ -477,7 +483,7 @@ def _run_optimizer_mode_impl(
     plan = resolve_study_plan(args, fixed_params, opt_p_def, risk_params, metrics_list, log_dir, requested_window)
     for study_info in plan["source_studies"]:
         owner = study_info["attrs"].get("_optimizer_owner")
-        if legacy_owner_running(owner or study_info["name"], workers_only=bool(owner)):
+        if owner and legacy_owner_running(owner, workers_only=True):
             print(f"[Optimizer] Study is already running: {study_info['name']}; duplicate launch skipped.")
             return 0
     if not run_scope.enter_context(study_run_lock(plan["journal"])):
@@ -1018,8 +1024,30 @@ class OptimizationJob:
             if config.get("type") in {"int", "float", "categorical"}
         )
 
-    def _enqueue_global_pilot(self, study, target_trials, sampler_seed):
-        """为 TPE 空间登记一次全局覆盖试验点。"""
+    def _enqueue_block_pilot(self, study, count, sampler_seed, active_blocks=None, tag="spread"):
+        """按粗粒度区块登记覆盖试验点；已有相同参数则跳过。"""
+        if int(count) <= 0 or not self.opt_params_def:
+            return 0
+        pilot = build_block_balanced_pilot(
+            self.opt_params_def, int(count), sampler_seed, active_blocks=active_blocks,
+        )
+        seen = set()
+        inserted = 0
+        for params in pilot:
+            key = parameter_key(params)
+            if key in seen:
+                continue
+            study.enqueue_trial(
+                params,
+                user_attrs={"_optimizer_block_pilot": tag},
+                skip_if_exists=True,
+            )
+            seen.add(key)
+            inserted += 1
+        return inserted
+
+    def _enqueue_block_spread(self, study, target_trials, sampler_seed):
+        """新 Study 登记一次区块均衡铺开；已有试验时不重复登记。"""
         if target_trials <= 0 or not self.opt_params_def:
             return 0
         get_trials = getattr(study, "get_trials", None)
@@ -1027,25 +1055,32 @@ class OptimizationJob:
         if existing:
             return 0
         dimensions = max(1, self._search_dimensions())
-        pilot_count = recommended_pilot_count(int(target_trials), dimensions)
-        pilot = build_global_pilot(self.opt_params_def, pilot_count, sampler_seed)
-        seen = set()
-        inserted = 0
-        for params in pilot:
-            key = parameter_key(params)
-            if key in seen:
-                continue
-            study.enqueue_trial(params, user_attrs={"_optimizer_global_pilot": True}, skip_if_exists=True)
-            seen.add(key)
-            inserted += 1
+        block_keys = possible_block_keys(self.opt_params_def)
+        pilot_count = spread_pilot_count(int(target_trials), dimensions, len(block_keys))
+        inserted = self._enqueue_block_pilot(
+            study, pilot_count, sampler_seed, active_blocks=None, tag="spread",
+        )
         if inserted:
-            study.set_user_attr("_optimizer_global_pilot_count", inserted)
-            study.set_user_attr("_optimizer_global_pilot_seed", int(sampler_seed))
+            study.set_user_attr("_optimizer_spread_count", inserted)
+            study.set_user_attr("_optimizer_spread_seed", int(sampler_seed))
             print(
-                f"[Optimizer] Global pilot queued: {inserted} coverage trials "
-                f"(dimensions={dimensions}, rule=10d)."
+                f"[Optimizer] Block spread queued: {inserted} coverage trials "
+                f"(dimensions={dimensions}, blocks={len(block_keys)}, rule=block-balanced)."
             )
         return inserted
+
+    def _make_tpe_sampler(self, sampler_seed, n_startup, n_ei_candidates=None, active_blocks=None):
+        """构造可按活跃块约束的 TPE 采样器。"""
+        return BlockConstrainedTPESampler(
+            constant_liar=True,
+            seed=int(sampler_seed),
+            n_startup_trials=int(n_startup),
+            n_ei_candidates=(
+                self.TPE_DEFAULT_N_EI_CANDIDATES if n_ei_candidates is None else int(n_ei_candidates)
+            ),
+            opt_params_def=self.opt_params_def,
+            active_blocks=active_blocks,
+        )
 
     @staticmethod
     def _finished_trial_count(study):
@@ -1493,6 +1528,7 @@ class OptimizationJob:
         progress_target=None,
         progress_finished_before=0,
         trial_progress=None,
+        active_blocks=None,
     ):
         if not log_file:
             raise RuntimeError("Multi-process mode requires a shared JournalStorage log file.")
@@ -1643,6 +1679,7 @@ class OptimizationJob:
                             grid_sampler_seed=grid_sampler_seed,
                             tpe_n_startup_trials=tpe_n_startup_trials,
                             trial_progress=trial_progress,
+                            active_blocks=active_blocks,
                         )
                     )
             finally:
@@ -3039,12 +3076,6 @@ class OptimizationJob:
 
         return metrics
 
-    def _run_recent_3y_backtest(self, final_params):
-        """
-        为仍使用旧方法名的调用方保留兼容别名。
-        """
-        return self._run_main_eval_backtest(final_params)
-
     def _run_test_set_backtest(self, final_params, verbose=False):
         """
         对训练集外测试窗口执行自动回测，并返回核心指标用于多指标汇总对比。
@@ -3211,8 +3242,8 @@ class OptimizationJob:
                 elif shared_journal_log_file:
                     print("\n[Warning] JournalStorage unavailable. Dashboard persistence disabled for this run.")
 
-        # 2. 确定搜索空间和预算。显式 --n_trials 始终是硬上限，自动预算允许
-        # 在全局覆盖和收敛改善仍然存在时按批次扩展。
+        # 2. 确定搜索空间和预算。显式 --n_trials 始终是硬上限，自动预算按批
+        # 挖到覆盖率 95% 或初始预算的 4 倍 / 全局安全上限。
         explicit_budget = getattr(self.args, "n_trials", None) is not None
         initial_trials = self.args.n_trials
         if initial_trials is None:
@@ -3229,7 +3260,7 @@ class OptimizationJob:
         if grid_size and not grid_sampler_is_safe(grid_size):
             print(
                 "[Optimizer] Finite grid is too large for GridSampler: "
-                f"combinations={grid_size}; using global pilot plus memory-bounded TPE region mining."
+                f"combinations={grid_size}; using block-balanced spread, shrink, then TPE."
             )
             grid_search_space = None
         trial_plan = build_trial_plan(initial_trials, grid_size, explicit=explicit_budget)
@@ -3248,13 +3279,8 @@ class OptimizationJob:
             )
             sampler = AdaptiveGridSampler(grid_search_space, seed=0)
         else:
-            # 连续或混合空间先由全局 pilot 覆盖，再交给确定性 TPE。
-            sampler = TPESampler(
-                constant_liar=True,
-                seed=sampler_seed,
-                n_startup_trials=tpe_startup_trials,
-                n_ei_candidates=self.TPE_DEFAULT_N_EI_CANDIDATES,
-            )
+            # 连续或混合空间先按区块均衡铺开，再交给带块约束的 TPE。
+            sampler = self._make_tpe_sampler(sampler_seed, tpe_startup_trials)
 
         # 2. 创建 Study (包裹 try-except 以捕获 Windows 权限错误)
         try:
@@ -3266,7 +3292,6 @@ class OptimizationJob:
                 sampler=sampler,
             )
 
-            ensure_study_config_version(study)
             if grid_search_space:
                 expected_grid_signature = grid_signature(grid_search_space)
                 existing_grid_signature = study.user_attrs.get("_optimizer_grid_signature")
@@ -3336,7 +3361,7 @@ class OptimizationJob:
             study.set_user_attr(
                 "_optimizer_search_policy",
                 "exhaustive_grid" if trial_plan["exhaustive"] else (
-                    "adaptive_grid" if grid_search_space else "global_pilot_tpe"
+                    "adaptive_grid" if grid_search_space else "block_spread_tpe"
                 ),
             )
             if grid_size is not None:
@@ -3378,7 +3403,7 @@ class OptimizationJob:
             study.set_user_attr(
                 "_optimizer_search_policy",
                 "exhaustive_grid" if trial_plan["exhaustive"] else (
-                    "adaptive_grid" if grid_search_space else "global_pilot_tpe"
+                    "adaptive_grid" if grid_search_space else "block_spread_tpe"
                 ),
             )
             if grid_size is not None:
@@ -3390,7 +3415,7 @@ class OptimizationJob:
             if running_count or failed_count:
                 print(f"[Optimizer] Resume trials: requeued_running={running_count}, queued_failed_retries={failed_count}.")
         if not grid_search_space:
-            inserted_pilot = self._enqueue_global_pilot(study, target_trials, sampler_seed)
+            inserted_pilot = self._enqueue_block_spread(study, target_trials, sampler_seed)
             if inserted_pilot:
                 tpe_startup_trials = int(inserted_pilot)
                 if hasattr(study.sampler, "_n_startup_trials"):
@@ -3437,6 +3462,20 @@ class OptimizationJob:
         if grid_search_space:
             study.sampler = AdaptiveGridSampler(
                 grid_search_space, active_grid_ids=active_grid_ids, seed=0,
+            )
+        active_blocks = None
+        if not grid_search_space:
+            recorded_blocks = decode_block_keys(study.user_attrs.get("_optimizer_active_blocks"))
+            if recorded_blocks is not None:
+                active_blocks = recorded_blocks
+            recorded_spread = study.user_attrs.get("_optimizer_spread_count")
+            if recorded_spread:
+                try:
+                    tpe_startup_trials = int(recorded_spread)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+            study.sampler = self._make_tpe_sampler(
+                sampler_seed, tpe_startup_trials, active_blocks=active_blocks,
             )
         adaptive_budget = bool(trial_plan["adaptive"] and not explicit_budget)
         batch_size = int(trial_plan["batch"])
@@ -3541,6 +3580,7 @@ class OptimizationJob:
                 progress_target=None,
                 progress_finished_before=finished_before,
                 trial_progress=progress,
+                active_blocks=encode_block_keys(active_blocks) if active_blocks is not None else None,
             )
             self._workers_stopped_early = bool(stopped)
 
@@ -3583,6 +3623,7 @@ class OptimizationJob:
                     ),
                     progress_finished_before=finished_count,
                     trial_progress=progress if shared_counter is not None else None,
+                    active_blocks=encode_block_keys(active_blocks) if active_blocks is not None else None,
                 )
                 self._workers_stopped_early = bool(stopped)
                 return
@@ -3626,13 +3667,7 @@ class OptimizationJob:
             record = extend_history_record(summary, current_target)
             sampler_history.append(record)
             study.set_user_attr("_optimizer_extend_history", list(sampler_history))
-            if not should_extend(
-                sampler_history,
-                summary,
-                current_target,
-                max_target_trials,
-                initial=initial_trials,
-            ):
+            if not should_extend(summary, current_target, max_target_trials):
                 print(
                     f"[Optimizer] Adaptive budget stopped at {current_target} trials "
                     f"(max={max_target_trials})."
@@ -3652,6 +3687,31 @@ class OptimizationJob:
             )
             return updated_target
 
+        def apply_param_block_shrink():
+            nonlocal active_blocks
+            remaining, abandoned = shrink_param_blocks(
+                study, self.opt_params_def, active_blocks,
+            )
+            active_blocks = stabilize_block_keys(remaining)
+            first_shrink = not study.user_attrs.get("_optimizer_spread_done")
+            study.set_user_attr("_optimizer_active_blocks", encode_block_keys(active_blocks))
+            study.set_user_attr("_optimizer_spread_done", True)
+            sampler = getattr(study, "sampler", None)
+            updater = getattr(sampler, "set_active_blocks", None)
+            if callable(updater):
+                updater(active_blocks)
+            else:
+                study.sampler = self._make_tpe_sampler(
+                    sampler_seed, tpe_startup_trials, active_blocks=active_blocks,
+                )
+            if abandoned:
+                print(
+                    f"[Optimizer] Shrunk {len(abandoned)} dominated search blocks; "
+                    f"active_blocks={len(active_blocks)}."
+                )
+            elif first_shrink:
+                print(f"[Optimizer] Block spread ready; active_blocks={len(active_blocks)}.")
+
         waiting_phase_label = "Queued trial phase"
         if queued_resume_trials:
             waiting_trials = [
@@ -3661,9 +3721,10 @@ class OptimizationJob:
             if any("failed_trial" in getattr(trial, "system_attrs", {}) for trial in waiting_trials) or finished_trials:
                 waiting_phase_label = "Resume queue phase"
             elif waiting_trials and all(
-                getattr(trial, "user_attrs", {}).get("_optimizer_global_pilot") for trial in waiting_trials
+                getattr(trial, "user_attrs", {}).get("_optimizer_block_pilot") == "spread"
+                for trial in waiting_trials
             ):
-                waiting_phase_label = "Global pilot phase"
+                waiting_phase_label = "Block spread phase"
 
         try:
             with installed_trial_progress(progress):
@@ -3680,6 +3741,10 @@ class OptimizationJob:
                         f"[Optimizer] {waiting_phase_label} finished; "
                         f"new-trial phase worker budget={resolved_workers}."
                     )
+
+                if not grid_search_space and not study.user_attrs.get("_optimizer_spread_done"):
+                    if self._finished_trial_count(study) > 0:
+                        apply_param_block_shrink()
 
                 current_target = int(target_trials)
                 while True:
@@ -3713,16 +3778,34 @@ class OptimizationJob:
                         batch_count = min(batch_count, len(unstarted_active))
                     finished_before = self._finished_trial_count(study)
                     trial_records_before = len(getattr(study, "trials", []))
-                    run_new_batch(batch_count, current_target, finished_before)
+                    try:
+                        run_new_batch(batch_count, current_target, finished_before)
+                    except MemoryError as exc:
+                        self._release_memory_pressure()
+                        current_workers = getattr(self, "_memory_worker_override", None) or resolved_workers
+                        self._memory_worker_override = max(1, int(current_workers) // 2)
+                        self._workers_stopped_early = True
+                        print(
+                            f"\n[Optimizer] Batch hit memory pressure: {exc}. "
+                            f"Next batch will cap workers at {self._memory_worker_override}."
+                        )
+                    pressure_batch = bool(getattr(self, "_workers_stopped_early", False))
                     recover_interrupted_workers()
                     drain_waiting_trials()
                     finished_after = self._finished_trial_count(study)
                     trial_records_after = len(getattr(study, "trials", []))
-                    if trial_records_after <= trial_records_before:
-                        print("[Optimizer] Study produced no new trial record; stopping this metric.")
-                        break
-                    if finished_after == finished_before and active_grid_ids is None:
-                        # TPE 路径上 FAIL 不占预算；本批没有 COMPLETE/PRUNED 时停止，避免无限开新组合。
+                    no_new_records = trial_records_after <= trial_records_before
+                    no_finished = finished_after == finished_before and active_grid_ids is None
+                    if no_new_records or no_finished:
+                        if pressure_batch and int(getattr(self, "_memory_worker_override", 1) or 1) > 1:
+                            print(
+                                "[Optimizer] Memory-interrupted batch produced no finished trials; "
+                                "continuing remaining budget with fewer workers."
+                            )
+                            continue
+                        if no_new_records:
+                            print("[Optimizer] Study produced no new trial record; stopping this metric.")
+                            break
                         print(
                             "[Optimizer] Batch produced no completed or pruned trials; "
                             "stopping this metric."
@@ -3755,6 +3838,8 @@ class OptimizationJob:
                                 f"[Optimizer] Shrunk {len(abandoned)} dominated grid blocks; "
                                 f"active_grid_ids={len(active_grid_ids)}."
                             )
+                    elif grid_search_space is None:
+                        apply_param_block_shrink()
 
                     summary = summarise_trials(
                         getattr(study, "trials", []),
@@ -3817,6 +3902,7 @@ class OptimizationJob:
             "target_trials": study.user_attrs.get("_optimizer_target_trials"),
             "max_target_trials": study.user_attrs.get("_optimizer_max_trials"),
             "policy": study.user_attrs.get("_optimizer_search_policy"),
+            "active_blocks": study.user_attrs.get("_optimizer_active_blocks"),
         }
         try:
             study.set_user_attr("_optimizer_search_audit", search_audit_report)
@@ -3914,6 +4000,7 @@ def _optimize_worker_entry(
     grid_sampler_seed=None,
     tpe_n_startup_trials=None,
     trial_progress=None,
+    active_blocks=None,
 ):
     """
     多进程子进程入口：每个 worker 连接同一个 Study，执行固定 trial 配额。
@@ -3948,6 +4035,7 @@ def _optimize_worker_entry(
             worker_payload["train_datas"] = restored_train_datas
 
         storage = JournalStorage(JournalFileBackendCls(log_file, lock_obj=JournalFileOpenLock(log_file)))
+        job = OptimizationJob.from_worker_payload(worker_payload)
         if grid_search_space:
             sampler = AdaptiveGridSampler(
                 grid_search_space,
@@ -3955,16 +4043,12 @@ def _optimize_worker_entry(
                 seed=0 if grid_sampler_seed is None else grid_sampler_seed,
             )
         else:
-            if tpe_n_ei_candidates is None:
-                tpe_n_ei_candidates = OptimizationJob.TPE_DEFAULT_N_EI_CANDIDATES
-            tpe_kwargs = dict(
-                constant_liar=True,
-                seed=sampler_seed,
+            sampler = job._make_tpe_sampler(
+                sampler_seed,
+                10 if tpe_n_startup_trials is None else tpe_n_startup_trials,
                 n_ei_candidates=tpe_n_ei_candidates,
+                active_blocks=decode_block_keys(active_blocks) if active_blocks is not None else None,
             )
-            if tpe_n_startup_trials is not None:
-                tpe_kwargs["n_startup_trials"] = int(tpe_n_startup_trials)
-            sampler = TPESampler(**tpe_kwargs)
 
         study = optuna.create_study(
             direction='maximize',
@@ -3973,9 +4057,6 @@ def _optimize_worker_entry(
             load_if_exists=True,
             sampler=sampler,
         )
-        ensure_study_config_version(study)
-
-        job = OptimizationJob.from_worker_payload(worker_payload)
         try:
             with installed_trial_progress(trial_progress):
                 study.optimize(
