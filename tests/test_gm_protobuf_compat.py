@@ -1,5 +1,9 @@
 """GM 的 protobuf label 兼容不得破坏旧版 FieldDescriptor 构造器。"""
 
+import os
+import subprocess
+import sys
+
 from configs.gm import install_protobuf_field_label_compat
 
 
@@ -52,3 +56,15 @@ def test_new_protobuf_internal_label_is_not_collapsed_to_optional():
     install_protobuf_field_label_compat(FieldDescriptor)
     assert FieldDescriptor(2).label == 2
     assert FieldDescriptor(3).label == 3
+
+
+def test_gm_config_reads_standard_environment_token():
+    environment = os.environ.copy()
+    environment["GM_TOKEN"] = "profile-token|127.0.0.1:7001"
+    output = subprocess.check_output(
+        [sys.executable, "-c", "import config; print(config.GM_TOKEN)"],
+        env=environment,
+        text=True,
+    )
+
+    assert output.strip() == "profile-token|127.0.0.1:7001"

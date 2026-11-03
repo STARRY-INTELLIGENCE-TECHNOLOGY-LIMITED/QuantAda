@@ -53,8 +53,8 @@ except Exception:
     pass
 
 
-# GM SDK Token，支持 ``token|host:port`` 格式；连接环境中的 token 优先用于实盘启动。
-GM_TOKEN = 'your_token_here|host:port'
+# GM SDK Token，支持 ``token|host:port`` 格式；设置 GM_TOKEN 环境变量时优先读取。
+GM_TOKEN = os.environ.get('GM_TOKEN', '').strip() or 'your_token_here|host:port'
 
 # GM Broker 的连接环境；连接命令保持 ``--connect=gm_broker:sim`` 兼容。
 GM_BROKER_ENVIRONMENTS = {
