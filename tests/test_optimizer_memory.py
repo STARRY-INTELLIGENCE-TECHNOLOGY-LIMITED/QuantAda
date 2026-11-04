@@ -76,7 +76,7 @@ def test_pilot_count_follows_10d_and_ignores_hardware():
     assert recommended_pilot_count(21762, 15) == 150
     assert recommended_pilot_count(8, 15) == 8
     assert recommended_pilot_count(21762, 1) == 16
-    assert recommended_pilot_count(21762, 80) == 512
+    assert recommended_pilot_count(21762, 80) == 800
 
 
 def test_memory_reserve_ratio_is_configurable(monkeypatch):

@@ -11,6 +11,9 @@ from optimizer.study_resume import AdaptiveGridSampler, BlockConstrainedTPESampl
 from optimizer.search_policy import (
     EXHAUSTIVE_GRID_MAX_COMBINATIONS,
     GRID_SAMPLER_MAX_COMBINATIONS,
+    SEARCH_PHASE_MESH,
+    SEARCH_PHASE_TPE,
+    SEARCH_POLICY_VERSION,
     _block_dimensions,
     _parameter_bucket,
     _t_crit_95,
@@ -27,17 +30,34 @@ from optimizer.search_policy import (
     grid_block_ids,
     grid_sampler_is_safe,
     grid_signature,
+    is_huge_finite_space,
+    next_mesh_stall_waves,
     parameter_key,
     possible_block_keys,
     recommended_pilot_count,
+    remaining_capped_count,
     repair_params_to_active_blocks,
     restore_extend_history,
+    search_policy_version_compatible,
     should_extend,
     shrink_grid_blocks,
     shrink_param_blocks,
     spread_pilot_count,
     stabilize_block_keys,
     summarise_trials,
+    auto_max_multiplier,
+    block_axis_layers,
+    should_nest_layer,
+    should_use_tpe,
+    needs_axis_screen,
+    screen_pilot_count,
+    build_screened_axis_layers,
+    rank_axes_by_sensitivity,
+    robustify_trial_score,
+    yearly_returns_from_monthly,
+    _dominated_blocks,
+    select_revisit_blocks,
+    top_k_mean,
 )
 
 
@@ -124,6 +144,175 @@ def test_large_finite_space_keeps_a_bounded_adaptive_budget():
     assert plan["batch"] <= 256
 
 
+def test_auto_max_multiplier_grows_with_dimension_and_huge_space():
+    assert auto_max_multiplier(3) == 4
+    assert auto_max_multiplier(15) == 5
+    assert auto_max_multiplier(15, finite_size=10**15) == 8
+    plan = build_trial_plan(4031, finite_size=10**15, explicit=False, dimensions=13)
+    assert plan["max_target"] == 4031 * 8
+
+
+def test_block_axis_layers_split_high_dimensional_space():
+    space = {
+        "a": {"type": "int", "low": 0, "high": 100, "step": 1},
+        "b": {"type": "int", "low": 0, "high": 80, "step": 1},
+        "c": {"type": "int", "low": 0, "high": 60, "step": 1},
+        "d": {"type": "int", "low": 0, "high": 40, "step": 1},
+        "e": {"type": "float", "low": 0.0, "high": 1.0},
+    }
+    layers = block_axis_layers(space)
+    assert len(layers[0]) == 3
+    assert len(layers) == 2
+    assert should_nest_layer(4, 16, 0, 2) is True
+    assert should_nest_layer(8, 16, 0, 2) is True
+    assert should_nest_layer(9, 16, 0, 2) is False
+    assert should_nest_layer(16, 16, 0, 2) is False
+    assert should_nest_layer(4, 16, 1, 2) is False
+    seven = {name: {"type": "float", "low": 0.0, "high": 1.0} for name in "abcdefg"}
+    assert len(block_axis_layers(seven)) == 2
+    assert should_use_tpe(0, 2) is False
+    assert should_use_tpe(0, 2, stall_waves=2) is True
+    assert should_use_tpe(1, 2) is True
+
+
+def _full_year_months(year, rate):
+    return {int(year) * 100 + month: rate for month in range(1, 13)}
+
+
+def test_robustify_trial_score_haircuts_uneven_years():
+    even = robustify_trial_score(10.0, [0.2, 0.2, 0.2])
+    uneven = robustify_trial_score(10.0, [0.8, -0.4, 0.2])
+    assert even == pytest.approx(10.0)
+    assert uneven < even
+    two_full = yearly_returns_from_monthly({
+        **_full_year_months(2024, 0.1),
+        **_full_year_months(2025, 0.1),
+    })
+    assert len(two_full) == 2
+    assert two_full[0] == pytest.approx(1.1 ** 12 - 1.0)
+
+
+def test_robustify_ignores_incomplete_calendar_years():
+    import datetime
+
+    stubbed = yearly_returns_from_monthly({
+        202401: 0.8,
+        **_full_year_months(2025, 0.01),
+        202601: -0.5,
+    })
+    dated = {
+        datetime.date(2024, month, 1): 0.01 for month in range(1, 13)
+    }
+    dated.update({datetime.date(2025, month, 1): 0.01 for month in range(1, 13)})
+    dated[datetime.date(2026, 1, 1)] = -0.5
+    assert len(stubbed) == 1
+    assert robustify_trial_score(10.0, stubbed) == pytest.approx(10.0)
+    assert yearly_returns_from_monthly({202401: 0.1, 202402: 0.1, 202501: -0.5}) == []
+    assert len(yearly_returns_from_monthly(dated)) == 2
+
+
+def test_robustify_trial_score_makes_negative_scores_worse():
+    stable_loss = robustify_trial_score(-4.0, [-0.1, -0.1])
+    uneven_loss = robustify_trial_score(-4.0, [0.8, -0.4, -0.2])
+    assert stable_loss == pytest.approx(-4.0)
+    assert uneven_loss < -4.0
+    assert robustify_trial_score(10.0, [-0.1, -0.1]) == pytest.approx(10.0)
+    positive_mean_negative_score = robustify_trial_score(-2.0, [0.4, 0.1])
+    assert positive_mean_negative_score < -2.0
+
+
+def test_dominated_blocks_anchor_on_mean_not_max():
+    grouped = {
+        "lucky": [10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "steady": [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0],
+        "bad": [-2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0],
+    }
+    abandoned = _dominated_blocks(grouped)
+    assert "bad" in abandoned
+    assert "steady" not in abandoned
+
+
+def test_rank_axes_prefers_sensitive_split():
+    class Trial:
+        def __init__(self, params, value):
+            self.params = params
+            self.value = value
+            self.state = SimpleNamespace(name="COMPLETE")
+
+    space = {
+        "noise": {"type": "int", "low": 0, "high": 20, "step": 1},
+        "signal": {"type": "float", "low": 0.0, "high": 1.0},
+    }
+    trials = []
+    for index in range(16):
+        signal = 0.1 if index < 8 else 0.9
+        trials.append(Trial({"noise": index, "signal": signal}, 1.0 if signal < 0.5 else 8.0))
+    ranked = rank_axes_by_sensitivity(trials, space)
+    assert ranked[0] == "signal"
+
+
+def test_top_k_mean_ignores_single_lucky_outlier():
+    assert top_k_mean([1, 1, 1, 1, 10], k=4) == pytest.approx(3.25)
+    assert top_k_mean([1, 1, 1, 1, 10], k=4) < 10
+
+
+def test_select_revisit_blocks_picks_highest_upper_abandoned():
+    grouped = {
+        "keep": [5.0] * 8,
+        "near": [3.5] * 8,
+        "far": [-2.0] * 8,
+    }
+    abandoned = ["near", "far"]
+    revisit = select_revisit_blocks(grouped, abandoned, limit=1)
+    assert revisit == ["near"]
+
+
+def test_repair_revisit_quota_lands_in_abandoned_block():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    active = [(("x", 3),)]
+    revisit = [(("x", 0),)]
+    point = repair_params_to_active_blocks(
+        {"x": 0.9}, space, active, rng=np.random.default_rng(1), trial_number=9,
+        revisit_blocks=revisit,
+    )
+    kept = repair_params_to_active_blocks(
+        {"x": 0.9}, space, active, rng=np.random.default_rng(1), trial_number=8,
+        revisit_blocks=revisit,
+    )
+    assert block_key(point, space) == (("x", 0),)
+    assert block_key(kept, space) == (("x", 3),)
+
+
+def test_needs_axis_screen_only_when_more_than_one_layer():
+    small = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    wide = {name: {"type": "float", "low": 0.0, "high": 1.0} for name in "abcd"}
+    assert needs_axis_screen(small) is False
+    assert needs_axis_screen(wide) is True
+    assert screen_pilot_count(4000, 15) == 120
+
+
+def test_shrink_restores_revisit_block_when_scores_recover():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    keep = (("x", 3),)
+    near = (("x", 0),)
+
+    class Trial:
+        def __init__(self, params, value):
+            self.params = params
+            self.value = value
+            self.state = SimpleNamespace(name="COMPLETE")
+
+    trials = [Trial({"x": 0.9}, 5.0) for _ in range(8)]
+    trials.extend(Trial({"x": 0.05}, 5.0) for _ in range(8))
+    study = SimpleNamespace(trials=trials)
+    remaining, abandoned = shrink_param_blocks(
+        study, space, active_blocks=[keep], revisit_blocks=[near],
+    )
+    assert keep in remaining
+    assert near in remaining
+    assert near not in abandoned
+
+
 def test_global_pilot_is_deterministic_and_contains_boundaries():
     space = {
         "threshold": {"type": "float", "low": 0.1, "high": 0.9},
@@ -171,6 +360,15 @@ def test_trial_summary_reports_unique_coverage_and_duplicates():
         {"x": {"type": "int", "low": 0, "high": 2}},
         finite_size=3,
     )
+    space = {"x": {"type": "int", "low": 0, "high": 2}}
+    keep = block_key({"x": 1}, space)
+    other = block_key({"x": 2}, space)
+    active_only = summarise_trials(
+        study.trials, space, finite_size=3, active_blocks=[keep],
+    )
+    assert keep != other
+    assert active_only["n_blocks"] == 1
+    assert active_only["ready_blocks"] == 0
 
     assert finite_grid_size({"x": [0, 1, 2]}) == 3
     assert summary["finished"] == 3
@@ -178,6 +376,50 @@ def test_trial_summary_reports_unique_coverage_and_duplicates():
     assert summary["duplicates"] == 1
     assert summary["coverage"] == 2 / 3
     assert summary["best"] == 3.0
+    assert summary["n_blocks"] == 2
+    assert summary["ready_blocks"] == 0
+    assert "layer" in summary
+
+
+def test_summarise_trials_counts_only_active_blocks():
+    space = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    study = optuna.create_study(direction="maximize")
+    keep = (("x", 3),)
+    dropped = (("x", 0),)
+    for _ in range(8):
+        study.add_trial(optuna.trial.create_trial(
+            value=5.0,
+            params={"x": 0.9},
+            distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0)},
+        ))
+    for _ in range(8):
+        study.add_trial(optuna.trial.create_trial(
+            value=-1.0,
+            params={"x": 0.05},
+            distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0)},
+        ))
+
+    observed = summarise_trials(study.trials, space)
+    active_only = summarise_trials(study.trials, space, active_blocks=[keep])
+
+    assert block_key({"x": 0.9}, space) == keep
+    assert block_key({"x": 0.05}, space) == dropped
+    assert observed["n_blocks"] == 2
+    assert observed["ready_blocks"] == 2
+    assert active_only["n_blocks"] == 1
+    assert active_only["ready_blocks"] == 1
+
+
+def test_huge_finite_space_omits_cartesian_coverage():
+    assert is_huge_finite_space(GRID_SAMPLER_MAX_COMBINATIONS) is False
+    assert is_huge_finite_space(GRID_SAMPLER_MAX_COMBINATIONS + 1) is True
+    summary = summarise_trials(
+        [],
+        {"x": {"type": "int", "low": 0, "high": 2}},
+        finite_size=GRID_SAMPLER_MAX_COMBINATIONS + 1,
+    )
+    assert summary["coverage"] is None
+    assert summary["finite_size"] == GRID_SAMPLER_MAX_COMBINATIONS + 1
 
 
 def test_adaptive_grid_sampler_keeps_global_grid_ids_unique():
@@ -209,6 +451,62 @@ def test_should_extend_stops_at_coverage_or_max():
     assert should_extend(unknown, target=48, max_target=64) is True
     assert should_extend(covered, target=16, max_target=64) is False
     assert should_extend(low, target=64, max_target=64) is False
+
+
+def test_should_extend_stops_huge_space_when_unique_and_best_stagnate():
+    summary = {"best": 2.0, "top_k_mean": 2.0, "coverage": None, "unique": 90, "finished": 80}
+    history = [
+        {"best": 2.0, "top_k_mean": 2.0, "unique": 90, "finished": 48},
+        {"best": 2.0, "top_k_mean": 2.0, "unique": 90, "finished": 64},
+    ]
+    growing = {"best": 2.5, "top_k_mean": 2.5, "coverage": None, "unique": 120, "finished": 80}
+    lucky = {"best": 9.0, "top_k_mean": 2.0, "coverage": None, "unique": 90, "finished": 80}
+
+    assert should_extend(summary, target=80, max_target=256, history=history) is False
+    assert should_extend(growing, target=80, max_target=256, history=history) is True
+    assert should_extend(lucky, target=80, max_target=256, history=history) is False
+    assert should_extend(summary, target=80, max_target=256, history=[]) is True
+
+
+def test_should_extend_requires_two_consecutive_tpe_batches():
+    improved = [
+        {"best": 1.0, "top_k_mean": 1.0, "finished": 48, "phase": SEARCH_PHASE_TPE},
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 64, "phase": SEARCH_PHASE_TPE},
+    ]
+    one_flat = {"best": 2.0, "top_k_mean": 2.0, "coverage": None, "finished": 80}
+    assert should_extend(one_flat, 80, 256, history=improved, peak_phase=True) is True
+
+    two_flat_history = improved + [
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 80, "phase": SEARCH_PHASE_TPE},
+    ]
+    two_flat = {"best": 2.0, "top_k_mean": 2.0, "coverage": None, "finished": 96}
+    assert should_extend(two_flat, 96, 256, history=two_flat_history, peak_phase=True) is False
+
+
+def test_should_extend_ignores_mesh_history_during_tpe():
+    mesh_history = [
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 48, "phase": SEARCH_PHASE_MESH},
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 64, "phase": SEARCH_PHASE_MESH},
+    ]
+    summary = {"best": 2.0, "top_k_mean": 2.0, "coverage": None, "finished": 80}
+    assert should_extend(summary, 80, 256, history=mesh_history, peak_phase=True) is True
+    assert should_extend(summary, 80, 256, history=mesh_history, can_focus=True) is True
+
+    mixed = mesh_history + [
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 80, "phase": SEARCH_PHASE_TPE},
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 96, "phase": SEARCH_PHASE_TPE},
+    ]
+    tpe_flat = {"best": 2.0, "top_k_mean": 2.0, "coverage": None, "finished": 112}
+    assert should_extend(tpe_flat, 112, 256, history=mixed, peak_phase=True) is False
+
+
+def test_should_extend_legacy_history_without_phase_counts_as_tpe():
+    history = [
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 48},
+        {"best": 2.0, "top_k_mean": 2.0, "finished": 64},
+    ]
+    summary = {"best": 2.0, "top_k_mean": 2.0, "coverage": None, "finished": 80}
+    assert should_extend(summary, 80, 256, history=history, peak_phase=True) is False
 
 
 def test_adaptive_grid_sampler_never_falls_back_to_abandoned_ids():
@@ -345,10 +643,10 @@ def test_block_dimensions_use_discrete_levels_not_raw_range():
         "profit_take": {"type": "float", "low": 0.4, "high": 0.6, "step": 0.1},
     }
 
-    assert _block_dimensions(space) == ["threshold", "lookback"]
+    assert _block_dimensions(space) == ["threshold", "lookback", "profit_take"]
     low = block_key({"lookback": 5, "threshold": 0.0, "profit_take": 0.4}, space)
     high = block_key({"lookback": 20, "threshold": 1.0, "profit_take": 0.6}, space)
-    assert len(low) == 2
+    assert len(low) == 3
     assert low != high
 
 
@@ -607,12 +905,22 @@ def test_invalid_finite_search_space_fails_with_value_error(space):
 
 
 def test_extend_history_round_trips_through_journal_records():
-    record = extend_history_record({"best": 1.25, "coverage": 0.4, "finished": 32, "unique": 30}, 32)
-    restored = restore_extend_history([record, {"target": "bad"}, "skip", {"target": 40, "best": 1.25}])
+    record = extend_history_record(
+        {"best": 1.25, "coverage": 0.4, "finished": 32, "unique": 30}, 32,
+        phase=SEARCH_PHASE_MESH,
+    )
+    restored = restore_extend_history([
+        record,
+        {"target": "bad"},
+        "skip",
+        {"target": 40, "best": 1.25, "phase": SEARCH_PHASE_TPE},
+    ])
 
     assert restored[0]["target"] == 32
     assert restored[0]["best"] == pytest.approx(1.25)
+    assert restored[0]["phase"] == SEARCH_PHASE_MESH
     assert restored[1]["target"] == 40
+    assert restored[1]["phase"] == SEARCH_PHASE_TPE
     assert should_extend(restored[-1], 40, 64) is True
     restored.append(extend_history_record({"best": 1.25, "coverage": 0.41, "finished": 48}, 48))
     assert should_extend(restored[-1], 64, 64) is False
@@ -719,9 +1027,11 @@ def test_single_process_resume_keeps_shrunk_active_grid_ids(tmp_path):
 
 
 def test_spread_pilot_count_covers_blocks_before_tpe():
-    assert spread_pilot_count(4695, 15, 16) == 256
+    assert spread_pilot_count(4695, 15, 16) == 1174
     assert spread_pilot_count(8, 1, 4) == 8
     assert spread_pilot_count(20, 1, 4) == 20
+    assert spread_pilot_count(512, 8, 64) == 512
+    assert spread_pilot_count(4031, 13, 16) == 1008
 
 
 def test_block_balanced_pilot_covers_all_blocks_without_materializing_huge_axis():
@@ -757,6 +1067,24 @@ def test_repair_params_rotates_active_blocks_by_trial_number():
     assert block_key(second, space) == (("x", 3), ("y", 3))
     assert first["x"] < 0.25
     assert second["x"] >= 0.75
+    deep = {
+        "w": {"type": "float", "low": 0.0, "high": 1.0},
+        "x": {"type": "float", "low": 0.0, "high": 1.0},
+        "y": {"type": "float", "low": 0.0, "high": 1.0},
+        "z": {"type": "float", "low": 0.0, "high": 1.0},
+    }
+    parent = [(("w", 0), ("x", 0), ("y", 0))]
+    locked = repair_params_to_active_blocks(
+        {"w": 0.9, "x": 0.9, "y": 0.9, "z": 0.1},
+        deep,
+        [(("z", 3),)],
+        rng=np.random.default_rng(4),
+        trial_number=1,
+        lock_stack=[{"layer": 0, "blocks": parent}],
+        layer=1,
+    )
+    assert block_key(locked, deep, layer=0) == parent[0]
+    assert locked["z"] >= 0.75
 
 
 def test_repair_params_spreads_inside_target_block():
@@ -883,6 +1211,7 @@ def test_block_constrained_tpe_repairs_into_active_block():
         active_blocks=[(("x", 0),)],
     )
     study = optuna.create_study(direction="maximize", sampler=sampler)
+    study.set_user_attr("_optimizer_search_policy_version", SEARCH_POLICY_VERSION)
     for index in range(4):
         study.add_trial(optuna.trial.create_trial(
             value=float(index),
@@ -902,6 +1231,7 @@ def test_block_constrained_tpe_constant_liar_stores_repaired_params():
         active_blocks=[(("x", 0),)],
     )
     study = optuna.create_study(direction="maximize", sampler=sampler)
+    study.set_user_attr("_optimizer_search_policy_version", SEARCH_POLICY_VERSION)
     for index in range(4):
         study.add_trial(optuna.trial.create_trial(
             value=float(index),
@@ -919,7 +1249,45 @@ def test_block_constrained_tpe_constant_liar_stores_repaired_params():
     study.tell(trial, value)
 
 
-def test_constant_score_runs_to_max_budget(tmp_path):
+def test_incompatible_policy_version_does_not_repair_tpe_points(monkeypatch):
+    called = {"n": 0}
+
+    def tracked(params, *args, **kwargs):
+        called["n"] += 1
+        return params
+
+    monkeypatch.setattr("optimizer.study_resume.repair_params_to_active_blocks", tracked)
+    space = {name: {"type": "float", "low": 0.0, "high": 1.0} for name in "xyzw"}
+    old_blocks = [(("x", 0), ("y", 0))]
+    sampler = BlockConstrainedTPESampler(
+        seed=1, n_startup_trials=4, opt_params_def=space, active_blocks=old_blocks,
+    )
+    study = optuna.create_study(direction="maximize", sampler=sampler)
+    study.set_user_attr("_optimizer_active_blocks", encode_block_keys(old_blocks))
+    for index in range(4):
+        study.add_trial(optuna.trial.create_trial(
+            value=float(index),
+            params={"x": 0.9, "y": 0.9, "z": 0.9, "w": 0.9},
+            distributions={
+                "x": optuna.distributions.FloatDistribution(0.0, 1.0),
+                "y": optuna.distributions.FloatDistribution(0.0, 1.0),
+                "z": optuna.distributions.FloatDistribution(0.0, 1.0),
+                "w": optuna.distributions.FloatDistribution(0.0, 1.0),
+            },
+        ))
+    study.optimize(
+        lambda trial: float(
+            trial.suggest_float("x", 0.0, 1.0)
+            + trial.suggest_float("y", 0.0, 1.0)
+            + trial.suggest_float("z", 0.0, 1.0)
+            + trial.suggest_float("w", 0.0, 1.0)
+        ),
+        n_trials=3,
+    )
+    assert called["n"] == 0
+
+
+def test_constant_score_stops_when_best_stagnates(tmp_path):
     from optuna.storages import JournalStorage
     from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
 
@@ -941,7 +1309,146 @@ def test_constant_score_runs_to_max_budget(tmp_path):
     job._estimate_n_trials = lambda: 16
     result = job.run()
 
-    assert result["search_audit"]["finished"] == 64
-    assert result["search_audit"]["target_trials"] == 64
+    storage = JournalStorage(JournalFileBackend(path, lock_obj=JournalFileOpenLock(path)))
+    loaded = optuna.load_study(study_name="to-max", storage=storage)
+    history = restore_extend_history(loaded.user_attrs.get("_optimizer_extend_history"))
+
+    assert result["search_audit"]["finished"] == 48
+    assert result["search_audit"]["target_trials"] == 48
     assert result["search_audit"]["max_target_trials"] == 64
-    assert calls["n"] == 64
+    assert calls["n"] == 48
+    assert history
+    assert all(item.get("phase") == SEARCH_PHASE_TPE for item in history)
+
+
+def test_mesh_stall_resets_after_shrink_or_nest():
+    assert next_mesh_stall_waves(0, nested=False, abandoned=[]) == 1
+    assert next_mesh_stall_waves(1, nested=False, abandoned=[]) == 2
+    assert next_mesh_stall_waves(2, nested=False, abandoned=[(("x", 0),)]) == 0
+    assert next_mesh_stall_waves(2, nested=True, abandoned=[]) == 0
+    assert search_policy_version_compatible(SEARCH_POLICY_VERSION) is True
+    assert search_policy_version_compatible(None) is False
+    assert search_policy_version_compatible(1) is False
+    assert remaining_capped_count(512, 40) == 40
+    assert remaining_capped_count(12, None) == 12
+
+
+def test_block_spread_respects_remaining_budget():
+    class FakeStudy:
+        def __init__(self):
+            self.trials = []
+            self.queued = []
+            self.attrs = {}
+
+        def enqueue_trial(self, params, **kwargs):
+            self.queued.append(dict(params))
+
+        def set_user_attr(self, key, value):
+            self.attrs[key] = value
+
+    job = OptimizationJob.__new__(OptimizationJob)
+    job.opt_params_def = {"threshold": {"type": "float", "low": 0.0, "high": 1.0}}
+    study = FakeStudy()
+
+    inserted = job._enqueue_block_spread(
+        study, target_trials=64, sampler_seed=17, remaining_budget=5,
+    )
+
+    assert inserted <= 5
+    assert len(study.queued) <= 5
+
+
+def test_tpe_startup_aligns_to_finished_count():
+    job = OptimizationJob.__new__(OptimizationJob)
+    job.opt_params_def = {"x": {"type": "float", "low": 0.0, "high": 1.0}}
+    study = optuna.create_study(direction="maximize")
+    for index in range(12):
+        study.add_trial(optuna.trial.create_trial(
+            value=float(index),
+            params={"x": index / 12.0},
+            distributions={"x": optuna.distributions.FloatDistribution(0.0, 1.0)},
+        ))
+    study.sampler = job._make_tpe_sampler(1, n_startup=4)
+    aligned = job._align_tpe_startup(study, 4)
+    assert aligned == 12
+    assert study.sampler._n_startup_trials == 12
+
+
+def test_first_shrink_on_strong_signal_does_not_crash_and_drops_blocks():
+    def objective(trial):
+        value = trial.suggest_float("x", 0.0, 1.0)
+        return 8.0 if value >= 0.75 else -1.0
+
+    args = SimpleNamespace(
+        n_jobs=1, n_trials=64, auto_launch_dashboard=False,
+        shared_journal_log_file=None, study_name="strong-signal-shrink",
+        metric="sharpe", strategy="dummy", cash=100000.0, commission=0.0,
+        slippage=0.0, timeframe="Days", compression=1, study_journal=None,
+    )
+    job = _search_job(args, {"x": {"type": "float", "low": 0.0, "high": 1.0}}, objective)
+    result = job.run()
+
+    assert result is not None
+    assert result["search_audit"]["finished"] >= 32
+    active = decode_block_keys(result["search_audit"].get("active_blocks"))
+    assert active is not None
+    assert len(active) < 4
+    assert (("x", 3),) in active
+
+
+def test_old_study_without_policy_version_does_not_rewrite_layers(tmp_path):
+    from optuna.storages import JournalStorage
+    from optuna.storages.journal import JournalFileBackend, JournalFileOpenLock
+
+    path = str(tmp_path / "legacy-policy.log")
+    storage = JournalStorage(JournalFileBackend(path, lock_obj=JournalFileOpenLock(path)))
+    study = optuna.create_study(
+        study_name="legacy-policy", direction="maximize", storage=storage,
+    )
+    study.set_user_attr("_optimizer_search_policy", "block_spread_tpe")
+    study.set_user_attr("_optimizer_initial_trials", 8)
+    study.set_user_attr("_optimizer_target_trials", 8)
+    study.set_user_attr("_optimizer_max_trials", 8)
+    study.set_user_attr(
+        "_optimizer_active_blocks",
+        encode_block_keys([(("x", 0), ("y", 0))]),
+    )
+    for index in range(4):
+        study.add_trial(optuna.trial.create_trial(
+            value=1.0,
+            params={"x": index / 4.0, "y": 0.1, "z": 0.2, "w": 0.3},
+            distributions={
+                "x": optuna.distributions.FloatDistribution(0.0, 1.0),
+                "y": optuna.distributions.FloatDistribution(0.0, 1.0),
+                "z": optuna.distributions.FloatDistribution(0.0, 1.0),
+                "w": optuna.distributions.FloatDistribution(0.0, 1.0),
+            },
+        ))
+
+    def objective(trial):
+        return float(
+            trial.suggest_float("x", 0.0, 1.0)
+            + trial.suggest_float("y", 0.0, 1.0)
+            + trial.suggest_float("z", 0.0, 1.0)
+            + trial.suggest_float("w", 0.0, 1.0)
+        )
+
+    space = {name: {"type": "float", "low": 0.0, "high": 1.0} for name in "xyzw"}
+    args = SimpleNamespace(
+        n_jobs=1, n_trials=8, auto_launch_dashboard=False,
+        shared_journal_log_file=path, study_name="legacy-policy",
+        metric="sharpe", strategy="dummy", cash=100000.0, commission=0.0,
+        slippage=0.0, timeframe="Days", compression=1, study_journal=None,
+    )
+    job = _search_job(args, space, objective)
+    result = job.run()
+    loaded = optuna.load_study(study_name="legacy-policy", storage=storage)
+
+    assert result is not None
+    assert loaded.user_attrs.get("_optimizer_search_policy_version") is None
+    assert loaded.user_attrs.get("_optimizer_axis_layers") is None
+    assert loaded.user_attrs.get("_optimizer_axis_screen_done") in (None, False)
+    assert loaded.user_attrs.get("_optimizer_active_blocks") == encode_block_keys(
+        [(("x", 0), ("y", 0))],
+    )
+    assert result["search_audit"]["finished"] >= 8

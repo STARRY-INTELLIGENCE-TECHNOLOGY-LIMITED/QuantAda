@@ -16,9 +16,13 @@ from optuna.samplers import GridSampler, TPESampler
 
 from optimizer.journal_metadata import batch_journal_path, finished_trial_count, read_study_metadata, related_journal_paths, study_identity, training_identity_hash
 from optimizer.search_policy import (
+    decode_axis_layers,
+    decode_block_keys,
+    decode_lock_stack,
     finite_search_space_size,
     grid_sampler_is_safe,
     repair_params_to_active_blocks,
+    search_policy_version_compatible,
     stabilize_block_keys,
 )
 
@@ -111,7 +115,7 @@ class AdaptiveGridSampler(RetryAwareGridSampler):
 
 
 class BlockConstrainedTPESampler(TPESampler):
-    """TPE 提议后按试验编号在活跃块间轮转；已落在目标块则保留，否则只修正两个区块轴。"""
+    """TPE 提议后按试验编号在活跃块间轮转；已落在目标块则保留，否则只修正区块轴。"""
 
     # 与 Optuna TPESampler.constant_liar 写入的相对参数键保持一致。
     _RELATIVE_PARAMS_KEY = "tpe:relative_params"
@@ -130,6 +134,9 @@ class BlockConstrainedTPESampler(TPESampler):
         self._active_blocks = tuple(stabilize_block_keys(active_blocks))
 
     def infer_relative_search_space(self, study, trial):
+        attrs = getattr(study, "user_attrs", None) or {}
+        if not search_policy_version_compatible(attrs.get("_optimizer_search_policy_version")):
+            return super().infer_relative_search_space(study, trial)
         if not self._active_blocks:
             return super().infer_relative_search_space(study, trial)
         space = {}
@@ -160,15 +167,29 @@ class BlockConstrainedTPESampler(TPESampler):
                 params[name] = TPESampler.sample_independent(
                     self, study, trial, name, distribution,
                 )
-        if self._active_blocks:
-            rng = np.random.default_rng((int(getattr(trial, "number", 0)) + 1) * 10007)
-            params = repair_params_to_active_blocks(
-                params,
-                self._opt_params_def,
-                self._active_blocks,
-                rng,
-                trial_number=getattr(trial, "number", 0),
-            )
+        attrs = getattr(study, "user_attrs", None) or {}
+        if search_policy_version_compatible(attrs.get("_optimizer_search_policy_version")):
+            lock_stack = decode_lock_stack(attrs.get("_optimizer_lock_stack"))
+            try:
+                layer = int(attrs.get("_optimizer_block_layer") or 0)
+            except (TypeError, ValueError):
+                layer = 0
+            recorded_active = decode_block_keys(attrs.get("_optimizer_active_blocks"))
+            active = recorded_active if recorded_active is not None else self._active_blocks
+            revisit = decode_block_keys(attrs.get("_optimizer_revisit_blocks")) or []
+            if active or lock_stack or revisit:
+                rng = np.random.default_rng((int(getattr(trial, "number", 0)) + 1) * 10007)
+                params = repair_params_to_active_blocks(
+                    params,
+                    self._opt_params_def,
+                    active,
+                    rng,
+                    trial_number=getattr(trial, "number", 0),
+                    lock_stack=lock_stack,
+                    layer=layer,
+                    axis_layers=decode_axis_layers(attrs.get("_optimizer_axis_layers")),
+                    revisit_blocks=revisit,
+                )
         if params and self._constant_liar:
             self._store_relative_params(study, trial, params)
         return params

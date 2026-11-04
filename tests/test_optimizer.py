@@ -494,6 +494,86 @@ def test_evaluate_trial_params_passes_monthly_win_rate_to_metric(monkeypatch):
     assert captured["monthly_win_rate"] == 2.0 / 3.0
 
 
+def test_evaluate_trial_params_haircuts_two_complete_years(monkeypatch):
+    from optimizer.search_policy import robustify_trial_score, yearly_returns_from_monthly
+
+    monthly_returns = {}
+    monthly_returns.update({f"2024-{month:02d}": 0.10 for month in range(1, 13)})
+    monthly_returns.update({f"2025-{month:02d}": -0.04 for month in range(1, 13)})
+
+    class DummyAnalyzer:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def get_analysis(self):
+            return self.payload
+
+    class DummyAnalyzers:
+        def getbyname(self, name):
+            if name == "tradeanalyzer":
+                return DummyAnalyzer(
+                    {
+                        "total": {"total": 30},
+                        "won": {"total": 18, "pnl": {"total": 1200.0}},
+                        "lost": {"pnl": {"total": -600.0}},
+                    }
+                )
+            if name == "drawdown":
+                return DummyAnalyzer({"max": {"drawdown": 10.0}})
+            if name == "timereturn_monthly":
+                return DummyAnalyzer(monthly_returns)
+            return DummyAnalyzer({})
+
+    class DummyDataDatetime:
+        def datetime(self, idx):
+            return pd.Timestamp("2025-12-31").to_pydatetime() if idx == 0 else pd.Timestamp("2024-01-01").to_pydatetime()
+
+    class DummyData:
+        datetime = DummyDataDatetime()
+
+        def __len__(self):
+            return 2
+
+    class DummyStrat:
+        data = DummyData()
+        analyzers = DummyAnalyzers()
+
+    class DummyBacktester:
+        def __init__(self, **kwargs):
+            self.results = []
+
+        def run(self):
+            self.results = [DummyStrat()]
+
+        def get_custom_metric(self, metric_name):
+            return 0.0
+
+    monkeypatch.setattr(optimizer, "Backtester", DummyBacktester)
+    monkeypatch.setattr(optimizer, "get_metric_function", lambda metric: (lambda stats, strat=None, args=None: 10.0))
+
+    job = optimizer.OptimizationJob.__new__(optimizer.OptimizationJob)
+    job.train_datas = {"AAPL": object()}
+    job.strategy_class = object()
+    job.train_range = ("20240101", "20251231")
+    job.args = SimpleNamespace(
+        cash=100000.0,
+        commission=0.0003,
+        slippage=0.0001,
+        timeframe="Days",
+        compression=1,
+        metric="mix_score_us_turbo",
+    )
+    job.risk_control_classes = []
+    job.risk_params = {}
+
+    got = job._evaluate_trial_params(current_params={"lookback": 20})
+    expected = robustify_trial_score(10.0, yearly_returns_from_monthly(monthly_returns))
+
+    assert len(yearly_returns_from_monthly(monthly_returns)) == 2
+    assert expected < 10.0
+    assert got == pytest.approx(expected)
+
+
 def test_evaluate_trial_params_plugin_error_is_fail(monkeypatch):
     class DummyAnalyzer:
         def get_analysis(self):

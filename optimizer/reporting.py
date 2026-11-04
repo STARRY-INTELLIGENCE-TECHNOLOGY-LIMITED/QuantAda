@@ -189,10 +189,19 @@ def print_run_summary(
         for label, audit in audits:
             coverage = audit.get("coverage")
             coverage_text = "n/a" if coverage is None else f"{float(coverage) * 100:.2f}%"
+            blocks = audit.get("n_blocks")
+            blocks_text = "" if blocks is None else f"blocks={blocks} "
+            ready = audit.get("ready_blocks")
+            ready_text = "" if ready is None else f"ready={ready} "
+            layer = audit.get("layer")
+            layer_text = "" if layer is None else f"layer={layer} "
+            phase = audit.get("phase")
+            phase_text = "" if not phase else f"phase={phase} "
             print(
                 f"  {label}: unique={audit.get('unique', 0)} "
                 f"finished={audit.get('finished', 0)} "
                 f"duplicates={audit.get('duplicates', 0)} "
+                f"{blocks_text}{ready_text}{layer_text}{phase_text}"
                 f"coverage={coverage_text} "
                 f"target={audit.get('target_trials', 'n/a')} "
                 f"max={audit.get('max_target_trials', 'n/a')}"

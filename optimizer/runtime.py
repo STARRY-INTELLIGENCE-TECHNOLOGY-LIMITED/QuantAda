@@ -98,10 +98,32 @@ from optimizer.result_file import (
 from optimizer.training_matrix import expand_training_matrix
 from optimizer.opt_param_space import _looks_like_param_spec, resolve_opt_params
 from optimizer.search_policy import (
+    AUTO_BATCH_MAX,
+    AUTO_BATCH_MIN,
+    GRID_BLOCK_MIN_SAMPLES,
+    MESH_STALL_WAVES,
+    SEARCH_PHASE_MESH,
+    SEARCH_PHASE_TPE,
+    SEARCH_POLICY_VERSION,
+    SPREAD_DIM_MULTIPLIER,
+    block_axis_layers,
     build_block_balanced_pilot,
+    build_global_pilot,
+    build_screened_axis_layers,
+    build_sensitive_axis_layers,
+    collect_revisit_blocks,
+    needs_axis_screen,
+    next_mesh_stall_waves,
+    remaining_capped_count,
+    screen_pilot_count,
+    search_policy_version_compatible,
+    decode_axis_layers,
+    encode_axis_layers,
     build_trial_plan,
     decode_block_keys,
+    decode_lock_stack,
     encode_block_keys,
+    encode_lock_stack,
     extend_history_record,
     finite_search_space_size,
     grid_sampler_is_safe,
@@ -112,7 +134,11 @@ from optimizer.search_policy import (
     restore_extend_history,
     shrink_grid_blocks,
     shrink_param_blocks,
+    robustify_trial_score,
+    should_nest_layer,
+    should_use_tpe,
     spread_pilot_count,
+    yearly_returns_from_monthly,
     stabilize_block_keys,
     summarise_trials,
     should_extend,
@@ -1004,10 +1030,8 @@ class OptimizationJob:
             n_trials = int(n_trials)
         except (TypeError, ValueError):
             n_trials = 0
-
         if shared_memory_enabled or n_trials < cls.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD:
             return cls.TPE_DEFAULT_N_EI_CANDIDATES
-
         scale = max(1.0, n_trials / float(cls.TPE_PAYLOAD_COPY_TRIAL_THRESHOLD))
         candidates = int(round(cls.TPE_DEFAULT_N_EI_CANDIDATES / max(1.0, math.log2(scale) + 1.0)))
         return max(cls.TPE_PAYLOAD_COPY_MIN_N_EI_CANDIDATES, candidates)
@@ -1019,17 +1043,25 @@ class OptimizationJob:
         return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
 
     def _search_dimensions(self):
+        params = getattr(self, "opt_params_def", None) or {}
         return sum(
-            1 for config in self.opt_params_def.values()
-            if config.get("type") in {"int", "float", "categorical"}
+            1 for config in params.values()
+            if isinstance(config, dict) and config.get("type") in {"int", "float", "categorical"}
         )
 
-    def _enqueue_block_pilot(self, study, count, sampler_seed, active_blocks=None, tag="spread"):
+    def _enqueue_block_pilot(
+        self, study, count, sampler_seed, active_blocks=None, tag="spread",
+        lock_stack=None, layer=0,
+    ):
         """按粗粒度区块登记覆盖试验点；已有相同参数则跳过。"""
         if int(count) <= 0 or not self.opt_params_def:
             return 0
+        recorded_layers = decode_axis_layers(
+            getattr(study, "user_attrs", {}).get("_optimizer_axis_layers")
+        ) if study is not None else None
         pilot = build_block_balanced_pilot(
             self.opt_params_def, int(count), sampler_seed, active_blocks=active_blocks,
+            lock_stack=lock_stack, layer=layer, axis_layers=recorded_layers,
         )
         seen = set()
         inserted = 0
@@ -1046,17 +1078,64 @@ class OptimizationJob:
             inserted += 1
         return inserted
 
-    def _enqueue_block_spread(self, study, target_trials, sampler_seed):
-        """新 Study 登记一次区块均衡铺开；已有试验时不重复登记。"""
-        if target_trials <= 0 or not self.opt_params_def:
+    def _enqueue_axis_screen(self, study, target_trials, sampler_seed):
+        """可变轴超过一层时，先登记全局 Latin 做主效应筛选。"""
+        if int(target_trials) <= 0 or not self.opt_params_def:
+            return 0
+        if not needs_axis_screen(self.opt_params_def):
+            return 0
+        if study.user_attrs.get("_optimizer_axis_screen_done"):
             return 0
         get_trials = getattr(study, "get_trials", None)
         existing = get_trials(deepcopy=False) if callable(get_trials) else list(getattr(study, "trials", ()) or ())
         if existing:
             return 0
         dimensions = max(1, self._search_dimensions())
-        block_keys = possible_block_keys(self.opt_params_def)
-        pilot_count = spread_pilot_count(int(target_trials), dimensions, len(block_keys))
+        count = remaining_capped_count(
+            screen_pilot_count(int(target_trials), dimensions), int(target_trials),
+        )
+        if count <= 0:
+            return 0
+        points = build_global_pilot(self.opt_params_def, count, sampler_seed)
+        seen = set()
+        inserted = 0
+        for params in points:
+            key = parameter_key(params)
+            if key in seen:
+                continue
+            study.enqueue_trial(
+                params,
+                user_attrs={"_optimizer_block_pilot": "screen"},
+                skip_if_exists=True,
+            )
+            seen.add(key)
+            inserted += 1
+        if inserted:
+            print(
+                f"[Optimizer] Axis screen queued: {inserted} global pilots "
+                f"(dimensions={dimensions})."
+            )
+        return inserted
+
+    def _enqueue_block_spread(self, study, target_trials, sampler_seed, remaining_budget=None):
+        """新 Study 登记一次区块均衡铺开；筛选试验不阻止铺开。"""
+        if target_trials <= 0 or not self.opt_params_def:
+            return 0
+        if getattr(study, "user_attrs", {}) and study.user_attrs.get("_optimizer_spread_count"):
+            return 0
+        get_trials = getattr(study, "get_trials", None)
+        existing = get_trials(deepcopy=False) if callable(get_trials) else list(getattr(study, "trials", ()) or ())
+        if any(getattr(trial, "user_attrs", {}).get("_optimizer_block_pilot") == "spread" for trial in existing):
+            return 0
+        dimensions = max(1, self._search_dimensions())
+        recorded = decode_axis_layers(getattr(study, "user_attrs", {}).get("_optimizer_axis_layers"))
+        block_keys = possible_block_keys(self.opt_params_def, axis_layers=recorded)
+        desired = spread_pilot_count(int(target_trials), dimensions, len(block_keys))
+        if remaining_budget is None:
+            remaining_budget = int(target_trials)
+        pilot_count = remaining_capped_count(desired, remaining_budget)
+        if pilot_count <= 0:
+            return 0
         inserted = self._enqueue_block_pilot(
             study, pilot_count, sampler_seed, active_blocks=None, tag="spread",
         )
@@ -1082,6 +1161,19 @@ class OptimizationJob:
             active_blocks=active_blocks,
         )
 
+    def _align_tpe_startup(self, study, tpe_startup_trials):
+        """进入 TPE 时把 n_startup_trials 对齐到已完成试验数。"""
+        finished = self._finished_trial_count(study)
+        try:
+            current = int(tpe_startup_trials)
+        except (TypeError, ValueError, OverflowError):
+            current = 0
+        aligned = max(current, int(finished))
+        sampler = getattr(study, "sampler", None)
+        if sampler is not None and hasattr(sampler, "_n_startup_trials"):
+            sampler._n_startup_trials = aligned
+        return aligned
+
     @staticmethod
     def _finished_trial_count(study):
         finished_states = {
@@ -1102,7 +1194,9 @@ class OptimizationJob:
         if not start_date:
             return start_date
 
-        ts = pd.to_datetime(str(start_date)) - pd.DateOffset(days=self.warmup_days)
+        ts = pd.to_datetime(str(start_date)) - pd.DateOffset(
+            days=getattr(self, "warmup_days", self.DEFAULT_WARMUP_DAYS)
+        )
         text = str(start_date)
         return ts.strftime('%Y-%m-%d %H:%M:%S') if ':' in text else ts.strftime('%Y%m%d')
 
@@ -1512,6 +1606,44 @@ class OptimizationJob:
             return
 
         self._completed_trial_cache[params_key] = score_val
+
+    def _enqueue_local_block_spread(self, study, sampler_seed, active_blocks, remaining_budget=None):
+        """缩块后对存活块补一轮局部 Latin；同一活跃块集合只登记一次。"""
+        if not active_blocks or study is None:
+            return 0
+        signature = encode_block_keys(active_blocks)
+        if study.user_attrs.get("_optimizer_local_spread_blocks") == signature:
+            return 0
+        dimensions = max(1, self._search_dimensions())
+        remaining = AUTO_BATCH_MAX if remaining_budget is None else max(0, int(remaining_budget))
+        if remaining <= 0:
+            return 0
+        count = remaining_capped_count(
+            max(
+                len(active_blocks) * int(GRID_BLOCK_MIN_SAMPLES),
+                dimensions * int(SPREAD_DIM_MULTIPLIER),
+                int(AUTO_BATCH_MIN),
+            ),
+            remaining,
+        )
+        if count <= 0:
+            return 0
+        inserted = self._enqueue_block_pilot(
+            study,
+            count,
+            int(sampler_seed) + len(active_blocks) + 1,
+            active_blocks=active_blocks,
+            tag="local",
+            lock_stack=decode_lock_stack(study.user_attrs.get("_optimizer_lock_stack")),
+            layer=int(study.user_attrs.get("_optimizer_block_layer") or 0),
+        )
+        study.set_user_attr("_optimizer_local_spread_blocks", signature)
+        if inserted:
+            print(
+                f"[Optimizer] Local block spread queued: {inserted} trials "
+                f"in {len(active_blocks)} active blocks."
+            )
+        return inserted
 
     def _run_multiprocess_optimization(
         self,
@@ -2533,19 +2665,25 @@ class OptimizationJob:
         return 1, True
 
     def _evaluate_trial_params(self, current_params):
+        """在训练窗上回测并打分；测试集和年度窗不进入目标函数。"""
+        return self._run_scored_backtest(
+            current_params, self.train_datas, self.train_range[0], self.train_range[1],
+        )
+
+    def _run_scored_backtest(self, current_params, datas, start_date, end_date):
         import math
-        if not self.train_datas:
+        if not datas:
             return -9999.0
 
         bt_instance = None
         strat = None
         try:
             bt_instance = Backtester(
-                datas=self.train_datas,
+                datas=datas,
                 strategy_class=self.strategy_class,
                 params=current_params,
-                start_date=self.train_range[0],
-                end_date=self.train_range[1],
+                start_date=start_date,
+                end_date=end_date,
                 cash=self.args.cash,
                 commission=self.args.commission,
                 slippage=self.args.slippage,
@@ -2566,6 +2704,7 @@ class OptimizationJob:
             if (
                 getattr(getattr(self, "strategy_class", None), "option_universe", None)
                 and not getattr(self, "_train_datas_prepared", False)
+                and datas is self.train_datas
             ):
                 prepared_datas = getattr(bt_instance, "_prepared_datas", None)
                 if isinstance(prepared_datas, dict) and prepared_datas:
@@ -2613,8 +2752,9 @@ class OptimizationJob:
 
                 # 月度胜率用于一致性评分。过滤零收益月份，避免现金空转月污染。
                 monthly_win_rate = 0.0
+                monthly_returns = {}
                 try:
-                    monthly_returns = strat.analyzers.getbyname('timereturn_monthly').get_analysis()
+                    monthly_returns = strat.analyzers.getbyname('timereturn_monthly').get_analysis() or {}
                     active_monthly_returns = []
                     for monthly_return in monthly_returns.values():
                         try:
@@ -2670,7 +2810,7 @@ class OptimizationJob:
                 if metric_val == -999.0 and self.args.metric == 'sharpe':
                     ret = bt_instance.get_custom_metric('return')
                     metric_val = ret * 0.1 if ret > 0 else ret
-                return metric_val
+                return robustify_trial_score(metric_val, yearly_returns_from_monthly(monthly_returns))
 
             # 触发插件化的复合打分 (全域动态路由)
             else:
@@ -2686,7 +2826,9 @@ class OptimizationJob:
                     if final_score is None or math.isnan(final_score) or math.isinf(final_score):
                         return -100.0
 
-                    return float(final_score)
+                    return robustify_trial_score(
+                        float(final_score), yearly_returns_from_monthly(monthly_returns),
+                    )
 
                 except MemoryError:
                     self._release_memory_pressure()
@@ -3242,8 +3384,8 @@ class OptimizationJob:
                 elif shared_journal_log_file:
                     print("\n[Warning] JournalStorage unavailable. Dashboard persistence disabled for this run.")
 
-        # 2. 确定搜索空间和预算。显式 --n_trials 始终是硬上限，自动预算按批
-        # 挖到覆盖率 95% 或初始预算的 4 倍 / 全局安全上限。
+        # 2. 确定搜索空间和预算。显式 --n_trials 始终是硬上限；自动预算按批
+        # 挖到覆盖率 95%、TPE 停滞或初始预算的 4–8 倍 / 全局安全上限。
         explicit_budget = getattr(self.args, "n_trials", None) is not None
         initial_trials = self.args.n_trials
         if initial_trials is None:
@@ -3263,7 +3405,14 @@ class OptimizationJob:
                 f"combinations={grid_size}; using block-balanced spread, shrink, then TPE."
             )
             grid_search_space = None
-        trial_plan = build_trial_plan(initial_trials, grid_size, explicit=explicit_budget)
+        focus_layers = max(1, len(block_axis_layers(self.opt_params_def)))
+        trial_plan = build_trial_plan(
+            initial_trials,
+            grid_size,
+            explicit=explicit_budget,
+            dimensions=self._search_dimensions(),
+            n_layers=focus_layers,
+        )
         target_trials = int(trial_plan["target"])
         max_target_trials = int(trial_plan["max_target"])
         sampler_seed = self._resolve_sampler_seed(self.args.study_name, grid_search_space)
@@ -3414,19 +3563,46 @@ class OptimizationJob:
             running_count, failed_count = prepare_trial_resume(study, storage)
             if running_count or failed_count:
                 print(f"[Optimizer] Resume trials: requeued_running={running_count}, queued_failed_retries={failed_count}.")
-        if not grid_search_space:
-            inserted_pilot = self._enqueue_block_spread(study, target_trials, sampler_seed)
-            if inserted_pilot:
-                tpe_startup_trials = int(inserted_pilot)
-                if hasattr(study.sampler, "_n_startup_trials"):
-                    study.sampler._n_startup_trials = tpe_startup_trials
+        get_existing_trials = getattr(study, "get_trials", None)
+        existing_trials_now = (
+            get_existing_trials(deepcopy=False)
+            if callable(get_existing_trials)
+            else list(getattr(study, "trials", ()) or ())
+        )
+        freeze_search_geometry = bool(existing_trials_now) and not search_policy_version_compatible(
+            getattr(study, "user_attrs", {}).get("_optimizer_search_policy_version")
+        )
+        if not existing_trials_now:
+            study.set_user_attr("_optimizer_search_policy_version", SEARCH_POLICY_VERSION)
+        elif freeze_search_geometry:
+            print(
+                "[Optimizer] Search policy version mismatch or missing; "
+                "continuing remaining trials without changing block layers."
+            )
+        if not grid_search_space and not freeze_search_geometry:
+            if needs_axis_screen(self.opt_params_def) and not study.user_attrs.get("_optimizer_axis_screen_done"):
+                inserted_screen = self._enqueue_axis_screen(study, target_trials, sampler_seed)
+                if inserted_screen:
+                    tpe_startup_trials = int(inserted_screen)
+                    if hasattr(study.sampler, "_n_startup_trials"):
+                        study.sampler._n_startup_trials = tpe_startup_trials
+            else:
+                remaining_for_spread = self._remaining_trial_budget(study, target_trials)
+                inserted_pilot = self._enqueue_block_spread(
+                    study, target_trials, sampler_seed, remaining_budget=remaining_for_spread,
+                )
+                if inserted_pilot:
+                    tpe_startup_trials = int(inserted_pilot)
+                    if hasattr(study.sampler, "_n_startup_trials"):
+                        study.sampler._n_startup_trials = tpe_startup_trials
         finished_states = {
             getattr(trial_state, name, None)
             for name in ("COMPLETE", "PRUNED")
         }
         finished_states.discard(None)
         target_trials = int(target_trials)
-        progress_target = (
+        focusing_search = (grid_search_space is None) and bool(trial_plan["adaptive"] and not explicit_budget)
+        progress_target = target_trials if focusing_search else (
             max_target_trials
             if trial_plan["adaptive"] and not explicit_budget
             else target_trials
@@ -3465,9 +3641,10 @@ class OptimizationJob:
             )
         active_blocks = None
         if not grid_search_space:
-            recorded_blocks = decode_block_keys(study.user_attrs.get("_optimizer_active_blocks"))
-            if recorded_blocks is not None:
-                active_blocks = recorded_blocks
+            if not freeze_search_geometry:
+                recorded_blocks = decode_block_keys(study.user_attrs.get("_optimizer_active_blocks"))
+                if recorded_blocks is not None:
+                    active_blocks = recorded_blocks
             recorded_spread = study.user_attrs.get("_optimizer_spread_count")
             if recorded_spread:
                 try:
@@ -3477,6 +3654,31 @@ class OptimizationJob:
             study.sampler = self._make_tpe_sampler(
                 sampler_seed, tpe_startup_trials, active_blocks=active_blocks,
             )
+        block_layer = 0
+        lock_stack = []
+        axis_layers = block_axis_layers(self.opt_params_def)
+        mesh_stall_waves = 0
+        if grid_search_space is None:
+            try:
+                block_layer = int(study.user_attrs.get("_optimizer_block_layer") or 0)
+            except (TypeError, ValueError):
+                block_layer = 0
+            lock_stack = decode_lock_stack(study.user_attrs.get("_optimizer_lock_stack"))
+            recorded_layers = decode_axis_layers(study.user_attrs.get("_optimizer_axis_layers"))
+            if recorded_layers:
+                axis_layers = recorded_layers
+            try:
+                mesh_stall_waves = int(study.user_attrs.get("_optimizer_mesh_stall_waves") or 0)
+            except (TypeError, ValueError):
+                mesh_stall_waves = 0
+            if freeze_search_geometry:
+                mesh_stall_waves = max(mesh_stall_waves, MESH_STALL_WAVES)
+            else:
+                study.set_user_attr("_optimizer_block_layer", block_layer)
+                study.set_user_attr("_optimizer_lock_stack", encode_lock_stack(lock_stack))
+                study.set_user_attr("_optimizer_axis_layers", encode_axis_layers(axis_layers))
+                study.set_user_attr("_optimizer_mesh_stall_waves", mesh_stall_waves)
+            focus_layers = max(1, len(axis_layers) if axis_layers else focus_layers)
         adaptive_budget = bool(trial_plan["adaptive"] and not explicit_budget)
         batch_size = int(trial_plan["batch"])
         sampler_history = restore_extend_history(study.user_attrs.get("_optimizer_extend_history"))
@@ -3649,38 +3851,73 @@ class OptimizationJob:
             if running:
                 print(f"[Optimizer] Requeued {running} interrupted running trials for this metric.")
 
-        def drain_waiting_trials():
+        def count_waiting_trials():
             if waiting_state is None:
-                return
-            leftover = sum(
+                return 0
+            return sum(
                 1
                 for trial in getattr(study, "trials", [])
                 if getattr(trial, "state", None) == waiting_state
             )
-            if leftover:
-                print(f"[Optimizer] Draining {leftover} waiting trials on the parent process.")
-                run_queued_resume_trials(leftover)
+
+        def drain_waiting_trials(phase_label="Queued trial phase"):
+            """按每批最多 256 并行领取 WAITING；无进展时再由父进程排空本批。"""
+            if waiting_state is None:
+                return
+            while True:
+                leftover = count_waiting_trials()
+                if leftover <= 0:
+                    return
+                batch = min(leftover, AUTO_BATCH_MAX)
+                before = leftover
+                run_parallel_queued_resume_trials(batch, phase_label)
+                recover_interrupted_workers()
+                after = count_waiting_trials()
+                if after >= before:
+                    print(f"[Optimizer] Draining {batch} waiting trials on the parent process.")
+                    run_queued_resume_trials(batch)
+                    if count_waiting_trials() >= after:
+                        return
 
         def maybe_extend_target(summary, current_target):
             if not adaptive_budget:
                 return None
-            record = extend_history_record(summary, current_target)
-            sampler_history.append(record)
-            study.set_user_attr("_optimizer_extend_history", list(sampler_history))
-            if not should_extend(summary, current_target, max_target_trials):
+            can_focus = (
+                grid_search_space is None
+                and not freeze_search_geometry
+                and not should_use_tpe(block_layer, focus_layers, mesh_stall_waves)
+            )
+            peak_phase = grid_search_space is None and (
+                freeze_search_geometry
+                or should_use_tpe(block_layer, focus_layers, mesh_stall_waves)
+            )
+            if not should_extend(
+                summary, current_target, max_target_trials,
+                history=sampler_history, can_focus=can_focus, peak_phase=peak_phase,
+            ):
                 print(
                     f"[Optimizer] Adaptive budget stopped at {current_target} trials "
                     f"(max={max_target_trials})."
                 )
                 return None
+            record_phase = SEARCH_PHASE_TPE if peak_phase else (
+                SEARCH_PHASE_MESH if can_focus else None
+            )
+            record = extend_history_record(summary, current_target, phase=record_phase)
+            sampler_history.append(record)
+            study.set_user_attr("_optimizer_extend_history", list(sampler_history))
             extension = min(batch_size, max_target_trials - current_target)
             if extension <= 0:
                 return None
             updated_target = current_target + extension
-            self._total_target_trials = max_target_trials * len(
+            self._total_target_trials = updated_target * len(
+                getattr(self, "_requested_metrics", [self.args.metric])
+            ) if focusing_search else max_target_trials * len(
                 getattr(self, "_requested_metrics", [self.args.metric])
             )
             study.set_user_attr("_optimizer_target_trials", updated_target)
+            if progress:
+                progress["target_trials"] = updated_target
             print(
                 f"[Optimizer] Adaptive budget extended: target={updated_target}/"
                 f"{max_target_trials}."
@@ -3688,11 +3925,21 @@ class OptimizationJob:
             return updated_target
 
         def apply_param_block_shrink():
-            nonlocal active_blocks
+            nonlocal active_blocks, block_layer, lock_stack, tpe_startup_trials
+            nonlocal axis_layers, mesh_stall_waves, focus_layers
+            previous_active = set(active_blocks or ())
+            recorded_revisit = decode_block_keys(study.user_attrs.get("_optimizer_revisit_blocks")) or []
             remaining, abandoned = shrink_param_blocks(
                 study, self.opt_params_def, active_blocks,
+                lock_stack=lock_stack, layer=block_layer, axis_layers=axis_layers,
+                revisit_blocks=recorded_revisit,
             )
+            restored = [block for block in remaining if previous_active and block not in previous_active]
             active_blocks = stabilize_block_keys(remaining)
+            if restored:
+                print(
+                    f"[Optimizer] Restored {len(restored)} revisited blocks after upper bound recovered."
+                )
             first_shrink = not study.user_attrs.get("_optimizer_spread_done")
             study.set_user_attr("_optimizer_active_blocks", encode_block_keys(active_blocks))
             study.set_user_attr("_optimizer_spread_done", True)
@@ -3704,13 +3951,88 @@ class OptimizationJob:
                 study.sampler = self._make_tpe_sampler(
                     sampler_seed, tpe_startup_trials, active_blocks=active_blocks,
                 )
-            if abandoned:
-                print(
-                    f"[Optimizer] Shrunk {len(abandoned)} dominated search blocks; "
-                    f"active_blocks={len(active_blocks)}."
+            def persist_revisit(abandoned_blocks):
+                revisit = []
+                if should_use_tpe(block_layer, focus_layers, mesh_stall_waves) and abandoned_blocks:
+                    revisit = collect_revisit_blocks(
+                        study, self.opt_params_def, abandoned_blocks,
+                        lock_stack=lock_stack, layer=block_layer, axis_layers=axis_layers,
+                    ) or []
+                study.set_user_attr("_optimizer_revisit_blocks", encode_block_keys(revisit))
+                if revisit:
+                    print(f"[Optimizer] TPE revisit quota on {len(revisit)} near-miss blocks.")
+
+            possible = possible_block_keys(
+                self.opt_params_def, layer=block_layer, axis_layers=axis_layers,
+            )
+            nested = should_nest_layer(len(active_blocks or ()), len(possible), block_layer, focus_layers)
+            mesh_stall_waves = next_mesh_stall_waves(
+                mesh_stall_waves, nested=nested, abandoned=abandoned,
+            )
+            if nested:
+                lock_stack = list(lock_stack) + [{"layer": block_layer, "blocks": list(active_blocks or ())}]
+                axis_layers = build_sensitive_axis_layers(
+                    self.opt_params_def, getattr(study, "trials", []), current_layers=axis_layers,
                 )
-            elif first_shrink:
-                print(f"[Optimizer] Block spread ready; active_blocks={len(active_blocks)}.")
+                focus_layers = max(1, len(axis_layers))
+                block_layer += 1
+                if block_layer >= focus_layers:
+                    block_layer = focus_layers - 1
+                active_blocks = stabilize_block_keys(
+                    possible_block_keys(
+                        self.opt_params_def, layer=block_layer, axis_layers=axis_layers,
+                    )
+                )
+                study.set_user_attr("_optimizer_block_layer", block_layer)
+                study.set_user_attr("_optimizer_lock_stack", encode_lock_stack(lock_stack))
+                study.set_user_attr("_optimizer_active_blocks", encode_block_keys(active_blocks))
+                study.set_user_attr("_optimizer_axis_layers", encode_axis_layers(axis_layers))
+                study.set_user_attr("_optimizer_mesh_stall_waves", mesh_stall_waves)
+                study.set_user_attr("_optimizer_local_spread_blocks", None)
+                print(
+                    f"[Optimizer] Nested focus layer={block_layer + 1}/{focus_layers}; "
+                    f"parent_blocks={len(lock_stack[-1]['blocks'])}; "
+                    f"child_blocks={len(active_blocks)}."
+                )
+                if should_use_tpe(block_layer, focus_layers, mesh_stall_waves):
+                    tpe_startup_trials = self._align_tpe_startup(study, tpe_startup_trials)
+                    study.sampler = self._make_tpe_sampler(
+                        sampler_seed, tpe_startup_trials, active_blocks=active_blocks,
+                    )
+                remaining_budget = self._remaining_trial_budget(study, current_target)
+                if self._enqueue_local_block_spread(
+                    study, sampler_seed, active_blocks, remaining_budget=remaining_budget,
+                ):
+                    drain_waiting_trials("Local block spread phase")
+                persist_revisit([])
+            else:
+                study.set_user_attr("_optimizer_mesh_stall_waves", mesh_stall_waves)
+                if abandoned:
+                    print(
+                        f"[Optimizer] Shrunk {len(abandoned)} dominated search blocks; "
+                        f"active_blocks={len(active_blocks)}."
+                    )
+                    remaining_budget = self._remaining_trial_budget(study, current_target)
+                    if self._enqueue_local_block_spread(
+                        study, sampler_seed, active_blocks, remaining_budget=remaining_budget,
+                    ):
+                        drain_waiting_trials("Local block spread phase")
+                elif first_shrink:
+                    print(f"[Optimizer] Block spread ready; active_blocks={len(active_blocks)}.")
+                if (
+                    should_use_tpe(block_layer, focus_layers, mesh_stall_waves)
+                    and mesh_stall_waves >= MESH_STALL_WAVES
+                    and block_layer < max(0, focus_layers - 1)
+                ):
+                    tpe_startup_trials = self._align_tpe_startup(study, tpe_startup_trials)
+                    study.sampler = self._make_tpe_sampler(
+                        sampler_seed, tpe_startup_trials, active_blocks=active_blocks,
+                    )
+                    print(
+                        f"[Optimizer] Mesh stalled at layer={block_layer + 1}; "
+                        "switching to TPE on surviving blocks."
+                    )
+                persist_revisit(abandoned)
 
         waiting_phase_label = "Queued trial phase"
         if queued_resume_trials:
@@ -3728,11 +4050,10 @@ class OptimizationJob:
 
         try:
             with installed_trial_progress(progress):
+                current_target = int(target_trials)
                 if queued_resume_trials:
-                    run_parallel_queued_resume_trials(queued_resume_trials, waiting_phase_label)
-                    recover_interrupted_workers()
-                    drain_waiting_trials()
-                    n_trials = self._remaining_trial_budget(study, target_trials)
+                    drain_waiting_trials(waiting_phase_label)
+                    n_trials = self._remaining_trial_budget(study, current_target)
                     if n_trials > 0:
                         finished_after_resume = self._finished_trial_count(study)
                         sync_progress_baseline(finished_after_resume)
@@ -3742,11 +4063,41 @@ class OptimizationJob:
                         f"new-trial phase worker budget={resolved_workers}."
                     )
 
-                if not grid_search_space and not study.user_attrs.get("_optimizer_spread_done"):
-                    if self._finished_trial_count(study) > 0:
+                if not grid_search_space and not freeze_search_geometry:
+                    finished_now = self._finished_trial_count(study)
+                    if (
+                        finished_now > 0
+                        and needs_axis_screen(self.opt_params_def)
+                        and not study.user_attrs.get("_optimizer_axis_screen_done")
+                    ):
+                        axis_layers = build_screened_axis_layers(
+                            self.opt_params_def, getattr(study, "trials", []),
+                        )
+                        focus_layers = max(1, len(axis_layers))
+                        study.set_user_attr("_optimizer_axis_screen_done", True)
+                        study.set_user_attr("_optimizer_axis_layers", encode_axis_layers(axis_layers))
+                        print(
+                            f"[Optimizer] Axis screen selected {len(axis_layers)} layer(s); "
+                            f"layer0={axis_layers[0]}."
+                        )
+                        remaining_for_spread = self._remaining_trial_budget(study, current_target)
+                        inserted_pilot = self._enqueue_block_spread(
+                            study, target_trials, sampler_seed,
+                            remaining_budget=remaining_for_spread,
+                        )
+                        if inserted_pilot:
+                            drain_waiting_trials("Block spread phase")
+                            tpe_startup_trials = self._align_tpe_startup(study, tpe_startup_trials)
+                    if (
+                        not study.user_attrs.get("_optimizer_spread_done")
+                        and self._finished_trial_count(study) > 0
+                        and (
+                            study.user_attrs.get("_optimizer_spread_count")
+                            or not needs_axis_screen(self.opt_params_def)
+                        )
+                    ):
                         apply_param_block_shrink()
 
-                current_target = int(target_trials)
                 while True:
                     remaining = self._remaining_trial_budget(study, current_target)
                     if remaining <= 0:
@@ -3754,6 +4105,9 @@ class OptimizationJob:
                             getattr(study, "trials", []),
                             self.opt_params_def,
                             finite_size=grid_size,
+                            layer=block_layer,
+                            axis_layers=axis_layers,
+                            active_blocks=None if freeze_search_geometry else active_blocks,
                         )
                         updated_target = maybe_extend_target(summary, current_target)
                         if updated_target is None:
@@ -3779,7 +4133,26 @@ class OptimizationJob:
                     finished_before = self._finished_trial_count(study)
                     trial_records_before = len(getattr(study, "trials", []))
                     try:
-                        run_new_batch(batch_count, current_target, finished_before)
+                        mesh_phase = (
+                            grid_search_space is None
+                            and not freeze_search_geometry
+                            and not should_use_tpe(block_layer, focus_layers, mesh_stall_waves)
+                        )
+                        if mesh_phase:
+                            inserted = self._enqueue_block_pilot(
+                                study, min(batch_count, AUTO_BATCH_MAX),
+                                sampler_seed + block_layer + 17,
+                                active_blocks=active_blocks, tag="focus",
+                                lock_stack=lock_stack, layer=block_layer,
+                            )
+                            if inserted:
+                                drain_waiting_trials("Block focus phase")
+                            else:
+                                tpe_startup_trials = self._align_tpe_startup(study, tpe_startup_trials)
+                                run_new_batch(batch_count, current_target, finished_before)
+                        else:
+                            tpe_startup_trials = self._align_tpe_startup(study, tpe_startup_trials)
+                            run_new_batch(batch_count, current_target, finished_before)
                     except MemoryError as exc:
                         self._release_memory_pressure()
                         current_workers = getattr(self, "_memory_worker_override", None) or resolved_workers
@@ -3812,7 +4185,7 @@ class OptimizationJob:
                         )
                         break
 
-                    if active_grid_ids is not None and adaptive_budget:
+                    if active_grid_ids is not None and adaptive_budget and not freeze_search_geometry:
                         active_grid_ids, abandoned = shrink_grid_blocks(
                             study,
                             grid_search_space,
@@ -3838,20 +4211,31 @@ class OptimizationJob:
                                 f"[Optimizer] Shrunk {len(abandoned)} dominated grid blocks; "
                                 f"active_grid_ids={len(active_grid_ids)}."
                             )
-                    elif grid_search_space is None:
+                    elif grid_search_space is None and not freeze_search_geometry:
                         apply_param_block_shrink()
 
                     summary = summarise_trials(
                         getattr(study, "trials", []),
                         self.opt_params_def,
                         finite_size=grid_size,
+                        layer=block_layer,
+                        axis_layers=axis_layers,
+                        active_blocks=None if freeze_search_geometry else active_blocks,
                     )
                     if summary["finished"] != finished_after:
                         finished_after = summary["finished"]
+                    phase = (
+                        "tpe"
+                        if should_use_tpe(block_layer, focus_layers, mesh_stall_waves)
+                        else "mesh"
+                    )
                     print(
                         "[Optimizer] Search coverage: "
                         f"finished={summary['finished']} unique={summary['unique']} "
                         f"duplicates={summary['duplicates']} "
+                        f"blocks={summary.get('n_blocks', 0)} "
+                        f"ready={summary.get('ready_blocks', 0)} "
+                        f"layer={block_layer} phase={phase} "
                         f"coverage={summary['coverage'] if summary['coverage'] is not None else 'n/a'}"
                     )
                     remaining = self._remaining_trial_budget(study, current_target)
@@ -3892,6 +4276,9 @@ class OptimizationJob:
             getattr(study, "trials", []),
             self.opt_params_def,
             finite_size=grid_size,
+            layer=block_layer,
+            axis_layers=axis_layers,
+            active_blocks=None if freeze_search_geometry else active_blocks,
         )
         search_audit_report = {
             "finished": search_audit["finished"],
@@ -3899,6 +4286,16 @@ class OptimizationJob:
             "duplicates": search_audit["duplicates"],
             "finite_size": search_audit["finite_size"],
             "coverage": search_audit["coverage"],
+            "top_k_mean": search_audit.get("top_k_mean"),
+            "n_blocks": search_audit.get("n_blocks"),
+            "ready_blocks": search_audit.get("ready_blocks"),
+            "min_block_n": search_audit.get("min_block_n"),
+            "layer": search_audit.get("layer"),
+            "phase": (
+                "tpe"
+                if should_use_tpe(block_layer, focus_layers, mesh_stall_waves)
+                else "mesh"
+            ),
             "target_trials": study.user_attrs.get("_optimizer_target_trials"),
             "max_target_trials": study.user_attrs.get("_optimizer_max_trials"),
             "policy": study.user_attrs.get("_optimizer_search_policy"),
