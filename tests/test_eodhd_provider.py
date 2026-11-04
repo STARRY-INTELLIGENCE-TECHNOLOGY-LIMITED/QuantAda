@@ -122,6 +122,9 @@ def test_eodhd_provider_rejects_invalid_or_empty_responses():
 def test_bounded_eodhd_sdk_request_uses_timeout_and_keeps_token_out_of_logs(monkeypatch):
     import data_providers.eodhd_provider as module
 
+    if module._BoundedEODHDClient is None:
+        pytest.skip("eodhd SDK is required")
+
     calls = []
 
     class Response:
