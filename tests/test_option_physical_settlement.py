@@ -93,6 +93,12 @@ def test_physical_settlement_rejects_intraday_approximation():
         engine._init_broker()
 
 
+def test_physical_settlement_rejects_partial_daily_cutoff():
+    engine = Backtester({}, HoldPut, timeframe="Day:14:45:00", verbose=False, enable_plot=False)
+    with pytest.raises(ValueError, match="Day cutoff bars are not official closing prices"):
+        engine._init_broker()
+
+
 def test_next_open_rejects_option_settlement_path(monkeypatch):
     with pytest.raises(ValueError, match="unsupported for option strategies"):
         Backtester(

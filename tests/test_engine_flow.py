@@ -2117,6 +2117,61 @@ def test_refresh_live_data_rebases_window_for_daily(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("execution_price", "expected_end"),
+    [
+        ("close", "2026-02-10 14:45:00"),
+        ("next_open", "2026-02-09 14:45:00"),
+    ],
+)
+def test_live_daily_cutoff_passes_timestamp_end_to_history_provider(
+    monkeypatch, execution_price, expected_end,
+):
+    """实盘 Day:14:45 必须把取数终点传到 cutoff，不能退回整日边界。"""
+    import live_trader.engine as engine_module
+
+    class RecordingDataProvider(DummyDataProvider):
+        def __init__(self):
+            super().__init__()
+            self.history_calls = []
+
+        def get_history(self, symbol, start_date, end_date, timeframe="Days", compression=1):
+            self.history_calls.append((start_date, end_date, timeframe, compression))
+            return super().get_history(symbol, start_date, end_date, timeframe, compression)
+
+    monkeypatch.setattr(config, "ANNUAL_FACTOR", 5)
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, RecordingDataProvider),
+    )
+    monkeypatch.setattr(
+        engine_module,
+        "get_class_from_name",
+        lambda class_name, paths: DummyHeartbeatStrategy,
+    )
+
+    cfg = {
+        "strategy_name": "DummyHeartbeatStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "timeframe": "Day:14:45:00",
+        "execution_price": execution_price,
+        "params": {},
+    }
+    context = MockContext(now=datetime(2026, 2, 10, 14, 45, 0))
+    engine = LiveTrader(cfg)
+    engine.init(context)
+    engine._refresh_live_data(context)
+
+    calls = engine.data_provider.history_calls
+    assert len(calls) >= 2
+    assert calls[0][1] == expected_end
+    assert calls[1][1] == expected_end
+    assert calls[1][2] == "Day:14:45:00"
+
+
 def test_live_run_skips_when_any_refresh_failed_and_risk_not_checked(monkeypatch):
     """
     实盘刷新质量门控:

@@ -176,7 +176,7 @@ python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_s
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
 ```
 
-`execution_price=next_open` 当前只支持日线股票/ETF 路径；应把 schedule 放在下一交易日开盘附近，并且只使用上一交易日完整信号。期权策略请使用 `close`，避免期权报价日、到期结算和开盘成交日错位。
+`execution_price=next_open` 支持日线或 `Day:HH:MM[:SS]` 截止日线股票/ETF 路径；应把 schedule 放在下一交易日开盘附近，并且只使用上一交易日已完成的信号。期权策略请使用 `close`，避免期权报价日、到期结算和开盘成交日错位。
 
 `sample_macd_cross_strategy` 依赖 Backtrader 指标和 `broker.buy()`，只适用于本地回测/优化，不要用于 `--connect`。
 

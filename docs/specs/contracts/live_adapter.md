@@ -12,7 +12,7 @@
 5. `theta+futu` 混合数据源由 `data_providers.HybridDataProvider` 负责；其 Futu 当前快照只在 LiveTrader 实盘模式启用，回测/优化不得触发实时 Futu 请求。
 6. 用户显式传入的 `data_source` 是策略行情链路的唯一合同。Broker 不得因自身交易平台自动追加另一个 Provider；未显式指定时才使用平台默认数据源。
 7. 实盘未显式指定 `data_source` 时，`LiveTrader` 应按交易平台解析并尝试其原生实时 Provider（IB/IBKR 使用 `ibkr`，Futu 使用 `futu`）；该默认选择不得扩散到回测/优化的实时请求路径。
-8. `execution_price=next_open` 当前仅支持日线股票/ETF；分钟、周线、月线和期权策略必须显式失败关闭，避免未完成周期、报价日和物理交割日错位。
+8. `execution_price=next_open` 支持完整日线和 `Day:HH:MM[:SS]` 截止日线的股票/ETF；分钟、周线、月线和期权策略必须显式失败关闭，避免未完成周期、报价日和物理交割日错位。
 
 ## 2. 券商最小契约
 1. 必须遵守 `live_trader/adapters/base_broker.py`

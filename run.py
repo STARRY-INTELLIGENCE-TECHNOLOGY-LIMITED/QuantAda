@@ -12,6 +12,7 @@ import optimizer
 from optimizer.runtime import infer_omitted_backtest_window
 from optimizer.trial_progress import progress_eta
 from common.loader import get_class_from_name, pascal_to_snake
+from common.timeframe import parse_daily_cutoff
 from common.detached_process import spawn_detached_python
 from common.process_tree import stop_optimizer_owners
 from common.live_process_supervisor import (
@@ -44,6 +45,12 @@ def _ui_browser_available() -> bool:
 def _normalize_timeframe(value: str) -> str:
     """把命令行/UI 常见周期别名统一为引擎接受的名称。"""
     text = str(value or '').strip().lower()
+    try:
+        cutoff = parse_daily_cutoff(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    if cutoff is not None:
+        return f"Day:{cutoff:%H:%M:%S}"
     aliases = {
         'd': 'Days', 'day': 'Days', 'days': 'Days', '1d': 'Days',
         'w': 'Weeks', 'week': 'Weeks', 'weeks': 'Weeks', '1w': 'Weeks',
@@ -58,7 +65,7 @@ def _normalize_timeframe(value: str) -> str:
         return aliases[text]
     except KeyError:
         raise argparse.ArgumentTypeError(
-            'timeframe 必须是 Days/Weeks/Months/Minutes/Seconds 或其常见别名'
+            'timeframe 必须是 Days/Weeks/Months/Minutes/Seconds、Day:HH:MM[:SS] 或其常见别名'
         ) from None
 
 
@@ -313,8 +320,15 @@ def _run_main():
     parser.add_argument('--risk_params', type=str, default='{}',
                         help="风控参数 (JSON字符串, 例如: \"{\'stop_loss\': 0.05}\")")
     bt_timeframes = ['Days', 'Weeks', 'Months', 'Minutes', 'Seconds']
-    parser.add_argument('--timeframe', type=_normalize_timeframe, default='Days', choices=bt_timeframes,
-                        help=f"K线时间维度 (默认: Days). 支持: {', '.join(bt_timeframes)}")
+    parser.add_argument(
+        '--timeframe',
+        type=_normalize_timeframe,
+        default='Days',
+        help=(
+            f"K线时间维度 (默认: Days). 支持: {', '.join(bt_timeframes)}；"
+            "以及 Day:HH:MM[:SS]（按每天截至该时刻的分钟 K 聚合）"
+        ),
+    )
     parser.add_argument('--compression', type=int, default=1,
                         help="K线时间周期 (默认: 1). 结合 timeframe, 例如 30 Minutes")
     parser.add_argument(

@@ -1,4 +1,5 @@
 import os
+import re
 
 import pandas as pd
 
@@ -41,7 +42,8 @@ class CsvDataProvider(BaseDataProvider):
         if timeframe == "Days" and compression == 1:
             tf_str = ""
         else:
-            tf_str = f"_{timeframe}_{compression}"
+            safe_timeframe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(timeframe))
+            tf_str = f"_{safe_timeframe}_{compression}"
 
         csv_filename = f"{symbol.replace('.', '_')}{tf_str}.csv"
         return os.path.join(CsvDataProvider.resolve_cache_dir(data_path), csv_filename)

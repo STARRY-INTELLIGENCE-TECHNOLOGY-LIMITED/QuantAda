@@ -34,6 +34,8 @@ def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
 3. 如需缓存，遵循 `DataManager` 的缓存流程，不在此处重复造轮子。
 4. 日期入参兼容 `YYYYMMDD` 与标准时间字符串。
 5. 日内场景要正确处理 `timeframe='Minutes'|'Seconds'` 和 `compression`；时间参数保留到秒，避免把秒/分钟级增量请求扩成整年明细。
+5a. 框架支持 `timeframe='Day:HH:MM[:SS]'`（也接受 `Days:` 别名）：DataManager 会请求 `Minutes/1`，cutoff 为整 5 分钟时可使用原生 `Minutes/5` 并按本地交易日聚合至 cutoff，包含 cutoff K 线；默认 `Days` 仍使用完整日线。Provider 返回分钟数据时不得混入 cutoff 之后的 K 线，未出现行情的交易日不得补空 K 线。请求起止覆盖偏差超过 3 个自然日时 DataManager 必须拒绝，截止日线缓存必须覆盖完整请求窗口。
+5b. AkShare 分钟场景必须调用 `stock_zh_a_hist_min_em`/`fund_etf_hist_min_em`；若服务端只返回最近窗口，Provider/DataManager 必须标记或拒绝不完整历史，不能静默回测。
 6. SDK/网络请求必须使用有限超时；秒级请求的单次超时应明显短于周期。瞬时失败默认总尝试 5 次，作为模块常量而非配置项。外汇/币市等 24x7 数据不得强制使用常规交易时段过滤。
 7. Provider-specific 的连接配置放在 `configs/<name>.py`，由 Provider 直接读取；需要用户调整的配置键随 `config.py` 对应责任域的 `import *` 一起平铺，避免额外命名空间和重复 CLI 白名单。入口不使用目录扫描；若 SDK 支持可选加密，空密钥路径应表示关闭加密，不另设重复开关。核心 alias `theta_futu_sec` 只加载 `thetadata+futu,sec`；高容量辅助源必须通过显式研究接口或 `theta_futu_research` 选择。DataManager 在命令、回测、优化、option chain 与辅助事件查询入口统一展开，保持配置顺序，嵌套循环时报错。命令工作台会显示别名并按展开后的 Provider 显示凭据变量。
 8. Provider 使用的第三方 SDK 应采用可选导入；缺少 SDK 时不能阻断其他数据源，并应明确指引用户解除 `requirements.txt` 对应依赖行的注释后重新执行 `python -m pip install -r requirements.txt`。Futu 事件合约期权历史 K 线可在统一接口失败时回退 `request_history_event_contract_kline`，合约乘数只能来自行情元数据，不能写死。

@@ -1,5 +1,6 @@
 from datetime import datetime
 import os
+import time
 
 # GM SDK 的旧版 protobuf 生成代码与新版 C++ 实现不兼容；历史行情仍可用纯 Python
 # 实现运行。该环境变量必须在导入 gm.api 前设置。
@@ -10,11 +11,15 @@ from common.live_runtime import dependency_install_hint
 
 try:
     from gm.api import history, set_token, current, set_serv_addr
+    try:
+        from gm.api import set_option
+    except ImportError:
+        set_option = None
 except Exception as e:
     print(dependency_install_hint('gm', e))
-    history = set_token = current = set_serv_addr = None
+    history = set_token = current = set_serv_addr = set_option = None
 
-from .base_provider import BaseDataProvider
+from .base_provider import BaseDataProvider, REQUEST_ATTEMPTS
 import config
 
 
@@ -83,8 +88,54 @@ class GmDataProvider(BaseDataProvider):
             if end_date is None:
                 end_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            df = history(symbol=symbol, frequency=freq, start_time=start_date, end_time=end_date,
-                         fields='open,high,low,close,volume,eob', adjust=1, df=True)
+            if timeframe in {'Minutes', 'Seconds'} and start_date:
+                # 长窗口分段取数，避免 SDK 单次截断；每段复权终点保持一致。
+                if set_option:
+                    set_option(max_wait_time=1000 if timeframe == 'Seconds' else 10000)
+                request_start = pd.Timestamp(start_date)
+                request_end = pd.Timestamp(end_date)
+                if request_start.tzinfo is not None:
+                    request_start = request_start.tz_convert('Asia/Shanghai').tz_localize(None)
+                if request_end.tzinfo is not None:
+                    request_end = request_end.tz_convert('Asia/Shanghai').tz_localize(None)
+                if len(str(end_date).strip()) <= 10:
+                    request_end += pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                frames = []
+                cursor = request_start
+                # 秒 K 的时间块按周期缩小，单块不扩成整年高频明细。
+                chunk_span = pd.Timedelta(days=14) if timeframe == 'Minutes' else pd.Timedelta(hours=1)
+                while cursor <= request_end:
+                    chunk_end = min(cursor.normalize() + chunk_span - pd.Timedelta(seconds=1), request_end)
+                    if chunk_end < cursor:
+                        chunk_end = min(cursor + chunk_span - pd.Timedelta(seconds=1), request_end)
+                    for attempt in range(REQUEST_ATTEMPTS):
+                        try:
+                            chunk = history(
+                                symbol=symbol, frequency=freq,
+                                start_time=cursor.strftime('%Y-%m-%d %H:%M:%S'),
+                                end_time=chunk_end.strftime('%Y-%m-%d %H:%M:%S'),
+                                fields='open,high,low,close,volume,eob', adjust=1,
+                                adjust_end_time=request_end.strftime('%Y-%m-%d %H:%M:%S'), df=True,
+                            )
+                            if chunk is None:
+                                raise RuntimeError('GM history returned None')
+                            break
+                        except Exception as exc:
+                            # 认证失败重试无益；不把已下载的半个窗口当作完整行情。
+                            if getattr(exc, 'code', None) in {1000, 2002} or any(
+                                f'"status": {code}' in str(exc) for code in (1000, 2002)
+                            ):
+                                raise
+                            if attempt + 1 == REQUEST_ATTEMPTS:
+                                raise
+                            time.sleep(0.2 * (attempt + 1))
+                    if not chunk.empty:
+                        frames.append(chunk)
+                    cursor = chunk_end + pd.Timedelta(seconds=1)
+                df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+            else:
+                df = history(symbol=symbol, frequency=freq, start_time=start_date, end_time=end_date,
+                             fields='open,high,low,close,volume,eob', adjust=1, df=True)
 
             # 2. 清洗历史数据
             if not df.empty:
@@ -125,6 +176,7 @@ class GmDataProvider(BaseDataProvider):
             df['openinterest'] = 0
             df = df[['open', 'high', 'low', 'close', 'volume', 'openinterest']]
             df.sort_index(inplace=True)
+            df = df[~df.index.duplicated(keep='last')]
 
             return df
 

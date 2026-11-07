@@ -18,6 +18,7 @@ from backtest.reporting import format_backtest_results_report
 from backtest.trade_attribution import format_trade_micro_attribution_report
 from common import log, runtime_command, runtime_notifications
 from common.order_quantity import align_quantity_down, normalize_quantity_step
+from common.timeframe import parse_daily_cutoff
 
 
 def _extract_contract_multiplier(data) -> float:
@@ -1359,8 +1360,11 @@ class Backtester:
         self.compression = compression
         if execution_price not in {'close', 'next_open'}:
             raise ValueError("execution_price must be close or next_open")
-        if execution_price == 'next_open' and (timeframe != 'Days' or int(compression or 1) != 1):
-            raise ValueError("execution_price=next_open currently requires daily bars with compression=1")
+        if execution_price == 'next_open' and (
+            (timeframe != 'Days' and parse_daily_cutoff(timeframe) is None)
+            or int(compression or 1) != 1
+        ):
+            raise ValueError("execution_price=next_open requires daily or Day:HH:MM bars with compression=1")
         if execution_price == 'next_open':
             from common.options.analytics import parse_option_symbol
 
@@ -1389,6 +1393,8 @@ class Backtester:
 
     def _get_bt_timeframe(self, timeframe_str: str) -> int:
         """将字符串时间维度映射到backtrader的TimeFrame枚举值"""
+        if parse_daily_cutoff(timeframe_str) is not None:
+            return bt.TimeFrame.Days
         mapping = {
             'Days': bt.TimeFrame.Days,
             'Weeks': bt.TimeFrame.Weeks,
@@ -1561,8 +1567,16 @@ class Backtester:
     def _init_broker(self):
         settlement = getattr(self.strategy_class, "option_settlement", None)
         if settlement is not None:
-            if settlement != "physical" or self.timeframe != bt.TimeFrame.Days or self.compression != 1:
-                raise ValueError("Physical option settlement requires daily bars with compression=1")
+            if (
+                settlement != "physical"
+                or self.timeframe != bt.TimeFrame.Days
+                or parse_daily_cutoff(self.timeframe_str) is not None
+                or self.compression != 1
+            ):
+                raise ValueError(
+                    "Physical option settlement requires full daily bars with compression=1; "
+                    "Day cutoff bars are not official closing prices"
+                )
             self.cerebro.broker.physical_option_settlement = True
             self.cerebro.broker.option_settlement_events = []
         self.cerebro.broker.execution_price = self.execution_price

@@ -167,7 +167,7 @@ python run.py sample_auto_rebalance_strategy --connect=futu_broker:real --data_s
 python run.py sample_auto_rebalance_strategy --connect=futu_broker:real_event --data_source=futu --symbols=SHSE.600519
 ```
 
-`next_open` currently supports daily stock/ETF paths only. Schedule the run near the next session open and use only the previous session's complete signal; option strategies should use `close` to avoid quote-date and settlement-date mismatches.
+`next_open` supports complete daily or `Day:HH:MM[:SS]` cutoff stock/ETF paths. Schedule the run near the next session open and use only the previous session's completed signal; option strategies should use `close` to avoid quote-date and settlement-date mismatches.
 
 `sample_macd_cross_strategy` depends on Backtrader indicators and `broker.buy()`, so it is backtest/optimizer only. Do not launch it with `--connect`.
 

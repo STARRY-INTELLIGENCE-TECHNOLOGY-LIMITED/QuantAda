@@ -18,6 +18,8 @@ from common.options.analytics import parse_option_symbol
 from common.options.events import normalize_dividend_calendar, normalize_earnings_calendar
 from common.options.data_safety import sanitize_market_dataframe
 from common.options.market_inputs import align_rate_curve, forward_dividend_yield_series
+from common.timeframe import parse_daily_cutoff
+from .daily_cutoff import load_daily_cutoff
 
 
 _PLATFORM_DEFAULT_SOURCES = {
@@ -478,6 +480,12 @@ class DataManager:
         - 如果指定了 specified_sources，则按指定顺序尝试。
         - 否则，执行默认的责任链逻辑（带增量更新）。
         """
+        cutoff = parse_daily_cutoff(timeframe)
+        if cutoff is not None:
+            return load_daily_cutoff(
+                self, symbol, start_date, end_date, specified_sources, cutoff, compression, refresh,
+            )
+
         origin = "fetch"
         final_df = None
         valuation_providers = []

@@ -67,3 +67,4 @@ def test_run_normalizes_common_timeframe_aliases():
     assert run._normalize_timeframe("1d") == "Days"
     assert run._normalize_timeframe("m") == "Minutes"
     assert run._normalize_timeframe("1mo") == "Months"
+    assert run._normalize_timeframe("day:14:45:00") == "Day:14:45:00"

@@ -27,6 +27,7 @@ from common.log import extract_order_execution_dt, format_dt, warning as log_war
 from common.order_quantity import format_quantity, quantity_number
 from common.options.data_safety import sanitize_market_dataframe
 from common.options.risk_watchdog import OptionRiskWatchdog
+from common.timeframe import parse_daily_cutoff
 from data_providers.manager import DataManager, normalize_source_name, resolve_platform_default_source
 from live_trader.adapters.base_broker import BaseLiveBroker
 from live_trader.option_fill_payoff import collect_option_fill_payoff_summary
@@ -340,8 +341,11 @@ class LiveTrader:
         execution_price = self.config.get('execution_price', 'close')
         timeframe = self.config.get('timeframe', 'Days')
         compression = self.config.get('compression', 1)
-        if execution_price == 'next_open' and (timeframe != 'Days' or int(compression or 1) != 1):
-            raise ValueError("execution_price=next_open currently requires daily bars with compression=1")
+        if execution_price == 'next_open' and (
+            (timeframe != 'Days' and parse_daily_cutoff(timeframe) is None)
+            or int(compression or 1) != 1
+        ):
+            raise ValueError("execution_price=next_open requires daily or Day:HH:MM bars with compression=1")
         if execution_price == 'next_open' and (
             getattr(self.strategy_class, 'option_universe', None) is not None
             or getattr(self.strategy_class, 'option_settlement', None)
@@ -788,7 +792,7 @@ class LiveTrader:
             elif timeframe == 'Seconds':
                 next_expected = context.now + pd.Timedelta(seconds=compression)
                 next_expected_str = next_expected.strftime('%Y-%m-%d %H:%M:%S')
-            elif timeframe == 'Days':
+            elif timeframe == 'Days' or parse_daily_cutoff(timeframe) is not None:
                 next_expected = context.now + pd.Timedelta(days=compression)
                 # 日线通常只精确到天，但为了美观也格式化
                 next_expected_str = next_expected.strftime('%Y-%m-%d %H:%M:%S')
@@ -1324,6 +1328,7 @@ class LiveTrader:
             getattr(config, 'ANNUAL_FACTOR', 252),
         )
         is_intraday = timeframe in {'Minutes', 'Seconds'}
+        has_daily_cutoff = parse_daily_cutoff(timeframe) is not None
         try:
             compression_value = max(1, int(compression or 1))
         except Exception:
@@ -1334,7 +1339,12 @@ class LiveTrader:
             now_timestamp = pd.Timestamp(context.now)
             if self.config.get('execution_price', 'close') == 'next_open':
                 now_timestamp = now_timestamp.normalize() - pd.Timedelta(days=1)
-            if is_intraday:
+                if has_daily_cutoff:
+                    cutoff = parse_daily_cutoff(timeframe)
+                    now_timestamp += pd.Timedelta(
+                        hours=cutoff.hour, minutes=cutoff.minute, seconds=cutoff.second,
+                    )
+            if is_intraday or has_daily_cutoff:
                 end_date = now_timestamp.strftime('%Y-%m-%d %H:%M:%S')
             else:
                 # 日线使用自然日边界；Futu Provider 会将该边界扩展到日末，
@@ -1445,6 +1455,7 @@ class LiveTrader:
             getattr(config, 'ANNUAL_FACTOR', 252),
         )
         is_intraday = timeframe in {'Minutes', 'Seconds'}
+        has_daily_cutoff = parse_daily_cutoff(timeframe) is not None
         try:
             compression_value = max(1, int(compression or 1))
         except Exception:
@@ -1458,7 +1469,12 @@ class LiveTrader:
         now_ts = pd.Timestamp(context.now)
         if self.config.get('execution_price', 'close') == 'next_open':
             now_ts = now_ts.normalize() - pd.Timedelta(days=1)
-        end_date = now_ts.strftime('%Y-%m-%d %H:%M:%S') if is_intraday else now_ts.strftime('%Y-%m-%d')
+            if has_daily_cutoff:
+                cutoff = parse_daily_cutoff(timeframe)
+                now_ts += pd.Timedelta(
+                    hours=cutoff.hour, minutes=cutoff.minute, seconds=cutoff.second,
+                )
+        end_date = now_ts.strftime('%Y-%m-%d %H:%M:%S') if is_intraday or has_daily_cutoff else now_ts.strftime('%Y-%m-%d')
         today_key = now_ts.strftime('%Y-%m-%d')
 
         def _align_to_index_tz(dt_input, index):
