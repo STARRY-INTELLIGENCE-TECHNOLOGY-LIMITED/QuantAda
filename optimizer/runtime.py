@@ -309,7 +309,57 @@ def _build_combination_argv(strategy_name, selection_name, original_strategy=Non
     return argv
 
 
+def _split_optimizer_end_dates(raw_value):
+    """解析 optimizer 的逗号结束日期，并统一为 YYYYMMDD。"""
+    text = str(raw_value or '').strip()
+    if not text:
+        return [None]
+    values = [item.strip() for item in text.split(',')]
+    if not values or any(not item for item in values):
+        raise ValueError("--end_date 不允许包含空的逗号项")
+
+    normalized = []
+    for value in values:
+        try:
+            timestamp = pd.Timestamp(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"--end_date 包含无效日期: {value}") from exc
+        if pd.isna(timestamp):
+            raise ValueError(f"--end_date 包含无效日期: {value}")
+        normalized.append(timestamp.strftime('%Y%m%d'))
+    return list(dict.fromkeys(normalized))
+
+
+def _replace_end_date_argument(argv, end_date):
+    """把保存的原始命令中的单项结束日期替换为当前窗口日期。"""
+    if end_date is None:
+        return argv
+    updated = list(argv)
+    for index, item in enumerate(list(updated)):
+        if item == '--end_date' and index + 1 < len(updated):
+            updated[index + 1] = str(end_date)
+            return updated
+        if str(item).startswith('--end_date='):
+            updated[index] = f'--end_date={end_date}'
+            return updated
+    updated.extend(('--end_date', str(end_date)))
+    return updated
+
+
 def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
+    raw_end_date = getattr(args, 'end_date', None)
+    raw_end_date_text = str(raw_end_date or '').strip()
+    try:
+        end_dates = _split_optimizer_end_dates(raw_end_date)
+    except (TypeError, ValueError, OverflowError) as exc:
+        print(f"\n[Optimizer] Invalid --end_date: {exc}")
+        return 1
+    # 只要用户使用逗号语法，就按窗口展开路径处理；重复日期归一化后可能只剩一个窗口。
+    multi_end_date = ',' in raw_end_date_text
+    if multi_end_date:
+        # 终端日志命名和启动前提权只需要一个锚点；每个训练子项随后写回自己的日期。
+        args.end_date = end_dates[0]
+
     terminal_log_path = get_optimizer_terminal_log_path()
     if not terminal_log_path:
         terminal_log_path = _build_optimizer_terminal_log_path_for_args(args, symbol_list)
@@ -322,42 +372,68 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
         )
         if process_elevation.request_optimizer_elevation_if_needed(args, resolve_worker_count):
             return 0
-        original_window = (getattr(args, "start_date", None), getattr(args, "end_date", None))
-        infer_omitted_backtest_window(args)
+        original_start_date = getattr(args, "start_date", None)
+        original_window = (original_start_date, raw_end_date)
+        if not multi_end_date:
+            infer_omitted_backtest_window(args)
+            end_dates = [getattr(args, "end_date", None)]
         combinations = expand_training_matrix(
             getattr(args, "strategy", None), getattr(args, "selection", None),
         )
-        result_file = build_optimizer_result_file_path() if len(combinations) > 0 else None
+        window_combinations = [
+            (strategy_name, selection_name, end_date)
+            for strategy_name, selection_name in combinations
+            for end_date in end_dates
+        ]
+        total_combinations = len(window_combinations)
+        result_file = build_optimizer_result_file_path() if total_combinations > 0 else None
         if result_file:
             append_optimizer_result(
                 result_file,
                 "QuantAda optimizer AI analysis results\n"
-                f"Original command combinations: {len(combinations)}",
+                f"Original command combinations: {total_combinations}",
             )
         statuses = []
-        for index, (strategy_name, selection_name) in enumerate(combinations, 1):
-            child_args = args if len(combinations) == 1 else copy.deepcopy(args)
+        for index, (strategy_name, selection_name, end_date) in enumerate(window_combinations, 1):
+            child_args = args if total_combinations == 1 else copy.deepcopy(args)
             if strategy_name is not None:
                 child_args.strategy = strategy_name
             child_args.selection = selection_name
-            if len(combinations) > 1:
+            child_args.end_date = end_date
+            if multi_end_date and not original_start_date and not getattr(child_args, 'connect', None):
+                infer_omitted_backtest_window(child_args)
+
+            if total_combinations > 1:
                 base_study_name = str(
                     getattr(args, "study_name", None)
                     or os.environ.get("QUANTADA_STUDY_NAME", "")
                 ).strip()
                 if base_study_name:
-                    child_args.study_name = f"{base_study_name}__combo_{index}"
+                    suffix_parts = []
+                    if len(combinations) > 1:
+                        suffix_parts.append(f"combo_{index}")
+                    if multi_end_date:
+                        suffix_parts.append(f"end_{end_date}")
+                    child_args.study_name = f"{base_study_name}__{'__'.join(suffix_parts)}"
                 print(
-                    f"\n\n===== Training combination {index}/{len(combinations)}: "
-                    f"strategy={strategy_name}; selection={selection_name or 'None'} ====="
+                    f"\n\n===== Training combination {index}/{total_combinations}: "
+                    f"strategy={strategy_name}; selection={selection_name or 'None'}; "
+                    f"end_date={end_date} ====="
                 )
             if result_file:
                 print(f"[Optimizer] AI analysis result file: {result_file}")
             combination_argv = (
-                _build_combination_argv(
+                _replace_end_date_argument(
+                    _build_combination_argv(
+                        strategy_name, selection_name, getattr(args, "strategy", None),
+                    ),
+                    end_date,
+                )
+                if multi_end_date
+                else _build_combination_argv(
                     strategy_name, selection_name, getattr(args, "strategy", None),
                 )
-                if len(combinations) > 1 else None
+                if total_combinations > 1 else None
             )
             try:
                 with ExitStack() as run_scope:
@@ -369,12 +445,16 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                         run_scope=run_scope,
                         result_file=result_file,
                         result_label=(
-                            f"Combination {index}/{len(combinations)} | "
-                            f"strategy={strategy_name} | selection={selection_name or 'None'}"
+                            f"Combination {index}/{total_combinations} | "
+                            f"strategy={strategy_name} | selection={selection_name or 'None'} | "
+                            f"end_date={end_date}"
                         ),
                         original_argv_override=combination_argv,
-                        suppress_dashboard=(len(combinations) > 1),
-                        requested_window=original_window,
+                        suppress_dashboard=(total_combinations > 1),
+                        requested_window=(
+                            (original_start_date, end_date)
+                            if multi_end_date else original_window
+                        ),
                     )
                 statuses.append(status)
             except KeyboardInterrupt:
@@ -383,7 +463,7 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                 print(f"\n[Optimizer] Combination {index} failed; continuing with the next combination.")
                 traceback.print_exc()
                 statuses.append(1)
-        if len(combinations) > 1 and result_file:
+        if total_combinations > 1 and result_file:
             print(f"[Optimizer] Opening combined AI analysis result file: {result_file}")
             if not open_optimizer_result_file(result_file):
                 print(f"[Optimizer] Could not open the result file automatically: {result_file}")

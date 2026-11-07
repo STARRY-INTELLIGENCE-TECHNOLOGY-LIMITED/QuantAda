@@ -315,7 +315,12 @@ def _run_main():
     parser.add_argument('--commission', type=float, default=0, help="手续费率，例如：万1.5为:0.00015 (默认：0)")
     parser.add_argument('--slippage', type=float, default=0.001, help="滑点，模拟真实市场的冲击成本 (默认: 0.001)")
     parser.add_argument('--start_date', type=str, default=None, help="回测起始日期 (例如: 20241111)")
-    parser.add_argument('--end_date', type=str, default=None, help="回测结束日期 (例如: 20250101)")
+    parser.add_argument(
+        '--end_date',
+        type=str,
+        default=None,
+        help="回测结束日期 (例如: 20250101)；优化模式支持逗号分隔的多窗口结束日期",
+    )
     parser.add_argument('--risk', type=str, default=None, help="风控模块名称 (位于 risk_controls目录 或 自定义包路径)")
     parser.add_argument('--risk_params', type=str, default='{}',
                         help="风控参数 (JSON字符串, 例如: \"{\'stop_loss\': 0.05}\")")
@@ -440,6 +445,13 @@ def _run_main():
     # 3. 解析参数
     args = parser.parse_args()
 
+    environment_overrides = config.apply_environment_overrides()
+    if environment_overrides:
+        print(
+            "[Config] Environment fallbacks applied: "
+            + ", ".join(sorted(environment_overrides))
+        )
+
     if args.force_schedule and not args.connect:
         parser.error("--force_schedule 仅对本次实盘启动生效，必须与 --connect 一起使用")
 
@@ -450,6 +462,12 @@ def _run_main():
 
     if args.train_resume and args.train_kill:
         parser.error("--train_resume and --train_kill cannot be used together")
+
+    has_multiple_end_dates = bool(args.end_date and ',' in str(args.end_date))
+    if args.start_date and ',' in str(args.start_date):
+        parser.error("--start_date 暂不支持逗号分隔；请为每个优化窗口使用同一训练周期自动推断")
+    if has_multiple_end_dates and (not args.opt_params or args.connect or args.fetch_only):
+        parser.error("逗号分隔的 --end_date 仅支持优化模式，不能与 --connect 或 --fetch_only 一起使用")
 
     if args.train_kill:
         from optimizer.training_tasks import (

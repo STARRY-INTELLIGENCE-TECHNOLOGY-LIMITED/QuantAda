@@ -41,7 +41,7 @@ DB_ENABLED = True
 DB_URL = "sqlite:///quantada_logs.db"
 ```
 
-Configuration is split by responsibility. `config.py` lists the `configs` submodules explicitly and flattens each with one `import *` line; the Futu Provider and adapter use the same-named keys owned by `configs/futu.py`. There is no directory auto-discovery, so users only need one configuration facade. `configs/manager.py` only combines broker connection environments and provides alarm-state helpers:
+Configuration is split by responsibility. `config.py` lists the `configs` submodules explicitly and flattens each with one `import *` line; the Futu Provider and adapter use the same-named keys owned by `configs/futu.py`. After standard `run.py` startup, same-named environment variables are type-converted as configuration fallbacks, while explicit `--config` values take precedence. Tests set `QUANTADA_TEST_MODE=1` to disable this mapping and prevent inherited brokers, credentials, and notifications. There is no directory auto-discovery, so users only need one configuration facade. `configs/manager.py` only combines broker connection environments and provides alarm-state helpers:
 
 | Configuration file | Main settings | Purpose |
 | --- | --- | --- |
@@ -130,6 +130,8 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 ```
 
 `--opt_params` supports both flat and strategy-keyed search spaces. Single- and multi-strategy runs automatically keep only parameters declared by the current strategy's class-level `params`, so unused parameters do not add search dimensions:
+
+In optimization mode, `--end_date` accepts comma-separated window ends, for example `--end_date 20240930,20250930,20261105`; each end date gets an independent train/test window and Study. Backtest, live, and `--fetch_only` accept only one end date.
 
 ```bash
 # Flat space: each strategy keeps its declared parameters

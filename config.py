@@ -1,3 +1,102 @@
+# --- 运行时环境配置映射 ---
+import ast
+import os
+import warnings
+
+
+def _coerce_environment_value(name, raw_value, default_value):
+    """按统一入口中现有默认值的类型转换环境变量。"""
+    raw_text = str(raw_value)
+    if isinstance(default_value, bool):
+        normalized = raw_text.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError("expected a boolean")
+
+    if isinstance(default_value, int) and not isinstance(default_value, bool):
+        return int(raw_text.strip(), 10)
+
+    if isinstance(default_value, float):
+        return float(raw_text.strip())
+
+    if isinstance(default_value, str):
+        return raw_text
+
+    if default_value is None:
+        normalized = raw_text.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+        if normalized in {"", "none", "null"}:
+            return None
+        try:
+            parsed = ast.literal_eval(raw_text)
+        except (SyntaxError, ValueError):
+            return raw_text
+        if not isinstance(parsed, str):
+            return parsed
+        return raw_text
+
+    parsed = ast.literal_eval(raw_text)
+    if isinstance(default_value, dict) and not isinstance(parsed, dict):
+        raise ValueError("expected a dictionary")
+    if isinstance(default_value, list) and not isinstance(parsed, list):
+        raise ValueError("expected a list")
+    if isinstance(default_value, tuple):
+        if not isinstance(parsed, (list, tuple)):
+            raise ValueError("expected a list or tuple")
+        return tuple(parsed)
+    if isinstance(default_value, set):
+        if not isinstance(parsed, (list, tuple, set)):
+            raise ValueError("expected a list, tuple or set")
+        return set(parsed)
+    return parsed
+
+
+def apply_environment_overrides():
+    """将同名环境变量映射到已平铺配置；测试模式下完全跳过。"""
+    if str(os.environ.get("QUANTADA_TEST_MODE", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return {}
+
+    module_globals = globals()
+    applied = {}
+    for name, default_value in list(module_globals.items()):
+        if (
+            not isinstance(name, str)
+            or not name.isupper()
+            or name not in os.environ
+        ):
+            continue
+        try:
+            value = _coerce_environment_value(name, os.environ[name], default_value)
+        except (SyntaxError, TypeError, ValueError, OverflowError) as exc:
+            warnings.warn(
+                f"环境变量 {name} 无法转换为配置默认类型，已保留默认值: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+        module_globals[name] = value
+        applied[name] = value
+    if set(applied) & {
+        "GM_BROKER_ENVIRONMENTS",
+        "IB_BROKER_ENVIRONMENTS",
+        "FUTU_BROKER_ENVIRONMENTS",
+    }:
+        from configs.manager import refresh_broker_environments
+
+        module_globals["BROKER_ENVIRONMENTS"] = refresh_broker_environments()
+    return applied
+
+
 # --- 交易及框架基础配置 ---
 # 通用数量步长；具体 Broker 可按市场覆盖（例如 Futu A 股买入强制至少 100 股）。
 # 美股通常为整数 1，币市可按交易对设置为 0.00000001 等正数。

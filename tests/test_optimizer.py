@@ -228,6 +228,85 @@ def test_run_optimizer_mode_executes_strategy_selection_matrix(monkeypatch, tmp_
     assert len(opened) == 1
 
 
+def test_split_optimizer_end_dates_normalizes_and_rejects_empty_items():
+    assert optimizer._split_optimizer_end_dates("20240930, 2025-09-30") == [
+        "20240930",
+        "20250930",
+    ]
+    assert optimizer._split_optimizer_end_dates("20240930, 2024-09-30") == [
+        "20240930",
+    ]
+    with pytest.raises(ValueError, match="空的逗号项"):
+        optimizer._split_optimizer_end_dates("20240930,")
+
+
+def test_run_optimizer_mode_reports_invalid_end_date_without_raising(monkeypatch, capsys):
+    args = _build_args(end_date="20240930,")
+
+    assert optimizer.run_optimizer_mode(args, {}, {}, []) == 1
+    assert "Invalid --end_date" in capsys.readouterr().out
+
+
+def test_run_optimizer_mode_expands_end_date_windows(monkeypatch, tmp_path):
+    calls = []
+    opened = []
+
+    def fake_impl(**kwargs):
+        calls.append(
+            {
+                "end_date": kwargs["args"].end_date,
+                "study_name": kwargs["args"].study_name,
+                "label": kwargs["result_label"],
+                "argv": kwargs["original_argv_override"],
+                "window": kwargs["requested_window"],
+                "suppress_dashboard": kwargs["suppress_dashboard"],
+            }
+        )
+        return 0
+
+    monkeypatch.setattr(optimizer, "_run_optimizer_mode_impl", fake_impl)
+    monkeypatch.setattr(optimizer, "open_optimizer_result_file", lambda path: opened.append(path))
+    monkeypatch.setattr(optimizer.config, "DATA_PATH", str(tmp_path / "data"))
+    monkeypatch.delenv(terminal_log.OPTIMIZER_TERMINAL_LOG_ENV, raising=False)
+    monkeypatch.setattr(
+        optimizer.sys,
+        "argv",
+        [
+            "run.py",
+            "strategy_a",
+            "--selection",
+            "selector_a",
+            "--end_date",
+            "20240930,20250930",
+            "--opt_params",
+            "{}",
+        ],
+    )
+
+    args = _build_args(
+        strategy="strategy_a",
+        selection="selector_a",
+        start_date=None,
+        end_date="20240930,20250930",
+        study_name="fair_window",
+    )
+
+    assert optimizer.run_optimizer_mode(args, {}, {}, []) == 0
+    assert [item["end_date"] for item in calls] == ["20240930", "20250930"]
+    assert [item["study_name"] for item in calls] == [
+        "fair_window__end_20240930",
+        "fair_window__end_20250930",
+    ]
+    assert [item["window"] for item in calls] == [
+        (None, "20240930"),
+        (None, "20250930"),
+    ]
+    assert all(item["suppress_dashboard"] is True for item in calls)
+    assert calls[0]["argv"][calls[0]["argv"].index("--end_date") + 1] == "20240930"
+    assert calls[1]["argv"][calls[1]["argv"].index("--end_date") + 1] == "20250930"
+    assert len(opened) == 1
+
+
 def test_run_optimizer_mode_elevates_once_before_training_matrix(monkeypatch, tmp_path):
     elevation_calls = []
     combination_calls = []

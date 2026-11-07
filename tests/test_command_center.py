@@ -807,10 +807,23 @@ def test_variable_values_fill_placeholders_from_command_set(
     )
     values = catalog.variable_values()
     assert values["TIINGO_TOKEN"] == "from-ps1"
-    assert values["GM_TOKEN"] == "tok"
-    assert values["GM_HOST"] == "8.8.8.8"
-    assert values["GM_PORT"] == "7002"
     import config as project_config
+
+    configured_gm = str(getattr(project_config, "GM_TOKEN", "") or "").strip()
+    if configured_gm and not configured_gm.startswith("your_token_here"):
+        assert values["GM_TOKEN"] == configured_gm.split("|", 1)[0]
+        configured_endpoint = configured_gm.split("|", 1)[1] if "|" in configured_gm else ""
+        if ":" in configured_endpoint:
+            configured_host, configured_port = configured_endpoint.rsplit(":", 1)
+            assert values["GM_HOST"] == configured_host
+            assert values["GM_PORT"] == configured_port
+        else:
+            assert values["GM_HOST"] == "8.8.8.8"
+            assert values["GM_PORT"] == "7002"
+    else:
+        assert values["GM_TOKEN"] == "tok"
+        assert values["GM_HOST"] == "8.8.8.8"
+        assert values["GM_PORT"] == "7002"
 
     configured = str(getattr(project_config, "FUTU_HOST", "") or "").strip()
     if configured:

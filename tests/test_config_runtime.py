@@ -1,5 +1,11 @@
 """运行时解析配置值的回归测试。"""
 
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 
 def test_config_facade_exports_public_subconfig_groups():
     import config
@@ -16,9 +22,9 @@ def test_config_facade_exports_public_subconfig_groups():
     assert config.IBKR_PORT == 7497
     assert config.GM_BROKER_ENVIRONMENTS["gm_broker"]["sim"]["schedule"] == "1d:14:45:00"
     assert config.IB_BROKER_ENVIRONMENTS["ib_broker"]["real"]["timezone"] == "America/New_York"
-    assert config.FUTU_HOST == '127.0.0.1'
-    assert config.FUTU_PORT == 11111
-    assert config.FUTU_RSA_KEY_PATH == ''
+    assert config.FUTU_HOST == os.getenv('FUTU_HOST', '127.0.0.1')
+    assert config.FUTU_PORT == int(os.getenv('FUTU_PORT', '11111'))
+    assert config.FUTU_RSA_KEY_PATH == os.getenv('FUTU_RSA_KEY_PATH', '')
     assert config.FUTU_TRADE_PASSWORD_ENV == ''
     assert config.FUTU_TRADE_PASSWORD_MD5_ENV == ''
     assert config.FUTU_TRADE_PASSWORD == ''
@@ -31,8 +37,94 @@ def test_config_facade_exports_public_subconfig_groups():
     assert not hasattr(config, 'THETADATA_API_KEY')
     assert config.FUTU_BROKER_ENVIRONMENTS['futu_broker']['sim']['trd_env'] == 'SIMULATE'
     assert config.BROKER_ENVIRONMENTS["ib_broker"]["real"]["timezone"] == "America/New_York"
-    assert config.has_alarm_webhook() is False
-    assert config.is_alarms_enabled() is False
+    assert config.has_alarm_webhook() == bool(
+        os.getenv('DINGTALK_WEBHOOK') or os.getenv('WECOM_WEBHOOK')
+    )
+    expected_alarms_enabled = (
+        bool(config.ALARMS_ENABLED)
+        if config.ALARMS_ENABLED is not None
+        else config.has_alarm_webhook()
+    )
+    assert config.is_alarms_enabled() == expected_alarms_enabled
+
+
+def test_config_import_maps_same_named_environment_values_to_flattened_keys():
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.update(
+        {
+            "FUTU_HOST": "192.0.2.10",
+            "FUTU_PORT": "22222",
+            "FUTU_RSA_KEY_PATH": "/tmp/futu-key",
+            "CACHE_DATA": "true",
+            "LOT_SIZE": "7",
+            "DATA_PATH": "/tmp/env-data",
+            "ALARMS_ENABLED": "false",
+            "FUTU_BROKER_ENVIRONMENTS": (
+                "{'futu_broker': {'sim': {'schedule': '1d:12:00:00'}}}"
+            ),
+        }
+    )
+    env.pop("QUANTADA_TEST_MODE", None)
+    code = (
+        "import config; config.apply_environment_overrides(); import json; "
+        "print(json.dumps({'host': config.FUTU_HOST, 'port': config.FUTU_PORT, "
+        "'rsa': config.FUTU_RSA_KEY_PATH, 'cache': config.CACHE_DATA, "
+        "'alarms': config.ALARMS_ENABLED, "
+        "'lot': config.LOT_SIZE, 'path': config.DATA_PATH, "
+        "'schedule': config.BROKER_ENVIRONMENTS['futu_broker']['sim']['schedule']}, "
+        "sort_keys=True))"
+    )
+    output = subprocess.check_output(
+        [sys.executable, "-c", code],
+        cwd=project_root,
+        env=env,
+        text=True,
+    )
+    values = json.loads(output.strip().splitlines()[-1])
+
+    assert values == {
+        "cache": True,
+        "alarms": False,
+        "host": "192.0.2.10",
+        "lot": 7,
+        "path": "/tmp/env-data",
+        "port": 22222,
+        "rsa": "/tmp/futu-key",
+        "schedule": "1d:12:00:00",
+    }
+
+
+def test_config_import_keeps_default_when_environment_type_is_invalid():
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["FUTU_PORT"] = "invalid-port"
+    env.pop("QUANTADA_TEST_MODE", None)
+    code = "import config; config.apply_environment_overrides(); print(config.FUTU_PORT)"
+    output = subprocess.check_output(
+        [sys.executable, "-c", code],
+        cwd=project_root,
+        env=env,
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+
+    assert output.strip().splitlines()[-1] == "11111"
+
+
+def test_config_test_mode_skips_environment_mapping():
+    project_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.update({"QUANTADA_TEST_MODE": "1", "FUTU_PORT": "22222"})
+    code = "import config; config.apply_environment_overrides(); print(config.FUTU_PORT)"
+    output = subprocess.check_output(
+        [sys.executable, "-c", code],
+        cwd=project_root,
+        env=env,
+        text=True,
+    )
+
+    assert output.strip() == "11111"
 
 
 def test_run_main_overrides_futu_public_keys_like_other_config(monkeypatch, capsys):

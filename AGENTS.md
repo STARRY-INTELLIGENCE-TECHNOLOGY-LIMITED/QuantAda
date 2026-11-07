@@ -39,6 +39,8 @@ If a proposed change conflicts with these rules, reject or redesign it.
 
 5. Execution Discipline
 - Keep behavior deterministic and auditable.
+- Standard `run.py` may map same-named environment variables to flattened configuration keys, but tests must set `QUANTADA_TEST_MODE=1`; test mode must not inherit live Broker endpoints, trading credentials, Webhooks, or external notification settings.
+- No agent may start live trading, submit orders, enable real Broker connections, or send external IM notifications during tests or diagnostics unless the user explicitly authorizes that exact action in the current task.
 - Follow existing execution semantics consistently (sellability guard, immediate downgrade retry, daily cleanup policy).
 - Live-only execution guards such as pending-order waits, rolling buys, cash settlement waits, broker sync, and realtime pending-order queries must not run in backtests. Backtests must assume planned orders execute synchronously and remain fast.
 - Any new execution-path logic must preserve this split at the call boundary: live may poll, reconcile, or wait only within a bounded current-run scope; backtests and optimizations must remain in-memory, synchronous, and non-blocking.

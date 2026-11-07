@@ -1,0 +1,50 @@
+"""测试环境安全隔离。"""
+
+import os
+
+
+# 测试进程不得继承真实 Broker、凭据、Webhook 或外部数据令牌。
+os.environ["QUANTADA_TEST_MODE"] = "1"
+for _name in (
+    "FUTU_HOST",
+    "FUTU_PORT",
+    "FUTU_RSA_KEY_PATH",
+    "FUTU_TRADE_ENV",
+    "FUTU_TRADE_PASSWORD",
+    "FUTU_TRADE_PASSWORD_MD5",
+    "FUTU_TRADE_PASSWORD_ENV",
+    "FUTU_TRADE_PASSWORD_MD5_ENV",
+    "FUTU_ACCOUNT_ID",
+    "FUTU_ACCOUNT_INDEX",
+    "FUTU_BROKER_ENVIRONMENTS",
+    "GM_HOST",
+    "GM_PORT",
+    "GM_STRATEGY_ID",
+    "GM_TOKEN_LOCAL",
+    "GM_TOKEN_SERVER",
+    "IBKR_HOST",
+    "IBKR_PORT",
+    "IBKR_ORDER_ACCOUNT",
+    "IB_BROKER_ENVIRONMENTS",
+    "GM_TOKEN",
+    "GM_BROKER_ENVIRONMENTS",
+    "ALARMS_ENABLED",
+    "DINGTALK_WEBHOOK",
+    "DINGTALK_SECRET",
+    "WECOM_WEBHOOK",
+    "GLOBAL_WECOM_WEBHOOK",
+    "THETADATA_TOKEN",
+    "THETADATA_API_KEY",
+    "EODHD_API_TOKEN",
+    "TIINGO_TOKEN",
+    "TUSHARE_TOKEN",
+    "SXSC_TUSHARE_TOKEN",
+    "SEC_USER_AGENT",
+    "OCC_ACTIONS_URL",
+    "OCC_ACTIONS_PATH",
+    "EARNINGS_ARCHIVE_PATH",
+    "QUANTADA_COMMAND_SET",
+    "QUANTADA_PRIVATE_CATALOG",
+):
+    os.environ.pop(_name, None)
+

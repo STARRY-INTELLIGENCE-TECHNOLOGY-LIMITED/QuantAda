@@ -43,7 +43,7 @@ DB_ENABLED = True
 DB_URL = "sqlite:///quantada_logs.db"
 ```
 
-配置按责任域拆分，`config.py` 固定列出各 `configs` 子模块并用一行 `import *` 平铺配置；Futu Provider/adapter 使用 `configs/futu.py` 维护的同名键。这里不做目录自动扫描，用户只需理解一个统一入口；`configs/manager.py` 只负责合并 Broker 连接环境并提供报警状态判断：
+配置按责任域拆分，`config.py` 固定列出各 `configs` 子模块并用一行 `import *` 平铺配置；Futu Provider/adapter 使用 `configs/futu.py` 维护的同名键。标准 `run.py` 启动后，同名环境变量会按默认值类型自动转换为配置 fallback，显式 `--config` 覆盖环境变量；测试设置 `QUANTADA_TEST_MODE=1` 后禁止该映射，避免继承真实 Broker、凭据和通知。这里不做目录自动扫描，用户只需理解一个统一入口；`configs/manager.py` 只负责合并 Broker 连接环境并提供报警状态判断：
 
 | 配置文件 | 主要配置项 | 用途 |
 | --- | --- | --- |
@@ -139,6 +139,8 @@ python run.py sample_macd_cross_strategy --symbols=SHSE.600519 --opt_params "{'f
 ```
 
 `--opt_params` 支持扁平空间和策略分组空间。单策略或多策略训练都会按当前策略类的 `params` 自动筛选实际搜索参数，未声明参数不会增加搜索维度：
+
+优化模式的 `--end_date` 支持逗号分隔的多个结束日期，例如 `--end_date 20240930,20250930,20261105`；每个日期会独立训练/测试并使用独立 Study。回测、实盘和 `--fetch_only` 只接受单个结束日期。
 
 ```bash
 # 扁平空间：每个策略自动取自己声明的参数

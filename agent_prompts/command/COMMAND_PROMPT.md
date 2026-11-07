@@ -26,6 +26,7 @@
    - `--selection` 支持使用 `+` 连接多个选股器，按顺序执行并取去重后的并集；回测、实盘和训练语义一致。
    - 多风控时，`--risk_params` 可以使用平铺 dict，也可以使用 `{risk_name: {...}}` 的 scoped dict。
    - `--data_source` 可以是单个 provider，也可以是逗号/空格分隔的 provider 链。
+   - 优化模式的 `--end_date` 可以是逗号分隔的多个结束日期；每个日期独立训练/测试并生成独立 Study。回测、实盘和 `--fetch_only` 只能使用单个结束日期。
    - `--connect` 必须是 `broker:env`。
 3. 当 `mode=live` 且提供 `--connect` 时:
    - 先按**具体 broker 适配器**判断语义，不要假设所有 broker 都一样。
@@ -39,7 +40,7 @@
    - `{'KEEP_OVERNIGHT_ORDERS': False}`: 交易日首轮前清理隔夜在途委托（默认推荐）
    - `{'KEEP_OVERNIGHT_ORDERS': True}`: 保留隔夜在途委托；24x7 币市应使用该值
    - 币市数量精度通过正小数配置，例如 `{'LOT_SIZE': 0.00000001, 'BROKER_LOT_LIMITS': 0.1, 'KEEP_OVERNIGHT_ORDERS': True}`；不得把数量参数改写为整数
-8. `--config` 接受 `config.py` 入口按责任域模块 `import *` 平铺的全部大写键；入口不自动扫描目录，新增责任域由维护者显式增加一行导入。用户不需要区分配置来源，也不应被额外的运行时白名单限制。旧名称/拼写错误会明确打印警告并被忽略，生成命令时必须使用当前键名。
+8. `--config` 接受 `config.py` 入口按责任域模块 `import *` 平铺的全部大写键；入口不自动扫描目录，新增责任域由维护者显式增加一行导入。标准 `run.py` 会把同名环境变量按当前默认值类型转换后作为配置 fallback，显式 `--config` 优先于环境变量；`QUANTADA_TEST_MODE=1` 时禁止该映射，测试不得继承真实 Broker、交易凭据、Webhook 或外部令牌。用户不需要区分配置来源，也不应被额外的运行时白名单限制。旧名称/拼写错误会明确打印警告并被忽略，生成命令时必须使用当前键名。
 9. 当 `mode=optimize` 时，框架会自动将终端滚动输出异步归档到 `.data/optimizer`；不要要求用户手动传任何内部日志路径参数。
 10. 当需要查看月度收益热力图时，使用 `--plot_scope monthly_heatmap`；也可和组合图逗号组合，例如 `--plot_scope portfolio_equity,portfolio_drawdown,monthly_heatmap`。
 11. 当 `mode=optimize` 需要续传时，默认直接重跑原命令；框架按训练配置自动匹配 Study，多 metric 保留各自真实名称，每个 Study 独占 Journal。训练结束的 dashboard 只读聚合这些 Study，不合并训练 Journal。缺少必要元数据的任务不进入续传列表；需要训练时使用新的 Study 名称或 Journal。`--n_trials` 表示累计总预算，已完成部分会扣除；省略日期时命中匹配任务会沿用原窗口，开始新窗口应指定 `--end_date`。重复启动同一 Journal 会提示正在运行并退出，不自动停止旧 worker。显式 `--study_name` / `--study_journal` 仅在需要指定匹配任务时添加。名称属于其它指标时拒绝复用，只允许用它定位同一快照中的匹配指标。
