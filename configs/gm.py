@@ -56,6 +56,10 @@ except Exception:
 # GM SDK Token，支持 ``token|host:port`` 格式；设置 GM_TOKEN 环境变量时优先读取。
 GM_TOKEN = os.environ.get('GM_TOKEN', '').strip() or 'your_token_here|host:port'
 
+# GM 历史行情复权口径：1=前复权（兼容旧默认），0=原始价格，2=后复权。
+# 账户成交对账和跨券商价格比较应使用 0；行情缓存按口径标记，切换后自动重取，无需独立 DATA_PATH。
+GM_PRICE_ADJUSTMENT = 1
+
 # GM Broker 的连接环境；连接命令保持 ``--connect=gm_broker:sim`` 兼容。
 GM_BROKER_ENVIRONMENTS = {
     'gm_broker': {

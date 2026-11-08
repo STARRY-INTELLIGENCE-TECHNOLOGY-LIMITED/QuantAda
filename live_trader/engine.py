@@ -22,7 +22,7 @@ from common.live_execution_budget import (
     live_run_budget_expired,
     sleep_with_live_run_budget,
 )
-from common.live_runtime import runtime_print
+from common.live_runtime import order_created_before, runtime_print
 from common.log import extract_order_execution_dt, format_dt, warning as log_warning
 from common.order_quantity import format_quantity, quantity_number
 from common.options.data_safety import sanitize_market_dataframe
@@ -138,7 +138,7 @@ class LiveTrader:
         # 每日隔日委托清理执行记录（按自然日）
         self._overnight_cleanup_done_on = None
         self._option_risk_watchdog = None
-        self._processed_settlement_event_ids = set()
+        self._processed_settlement_event_ids = {}
 
     def _load_adapter_classes(self, platform: str):
         """
@@ -810,7 +810,8 @@ class LiveTrader:
     def _cleanup_overnight_orders_before_refresh(self, context):
         """
         在拉取当轮数据前清理隔日遗留委托，缩短“算信号 -> 下单”间的流程噪声。
-        仅在每个自然日首次 run 执行一次，保持无状态且避免误杀日内新单。
+        同一进程每个自然日只执行一次；只撤销创建于当日 0 点（context.now 所在时区）之前的委托，
+        进程重启后再次执行也不会误撤当日在途单。创建时间未知的委托按隔夜单处理。
         """
         keep_overnight = bool(
             self.config.get('KEEP_OVERNIGHT_ORDERS', getattr(config, 'KEEP_OVERNIGHT_ORDERS', False))
@@ -827,6 +828,10 @@ class LiveTrader:
 
         if run_date is None:
             return
+        try:
+            day_start = pd.Timestamp(context.now).normalize()
+        except Exception:
+            day_start = None
         if self._overnight_cleanup_done_on == run_date:
             return
         if not hasattr(self.broker, 'cleanup_overnight_orders'):
@@ -835,13 +840,15 @@ class LiveTrader:
 
         max_attempts = 5
         pending_cleared = False
+        attempted = False
         last_pending_snapshot = []
 
         for attempt in range(1, max_attempts + 1):
             if live_run_budget_expired(self.broker):
                 break
+            attempted = True
             try:
-                summary = self.broker.cleanup_overnight_orders() or {}
+                summary = self.broker.cleanup_overnight_orders(before=day_start) or {}
             except Exception as e:
                 print(f"[Engine Warning] overnight order cleanup failed (attempt {attempt}/{max_attempts}): {e}")
                 summary = {'total': 0, 'canceled': 0, 'failed': 1, 'skipped': 0}
@@ -865,17 +872,28 @@ class LiveTrader:
                         print(f"[Engine Warning] sync_balance after overnight cleanup failed: {e}")
 
             # 短确认仍不通过则继续重试，但不中断本轮策略执行。
-            pending_cleared = self._confirm_pending_orders_cleared(max_checks=2, sleep_seconds=0.5)
+            pending_cleared = self._confirm_pending_orders_cleared(
+                max_checks=2, sleep_seconds=0.5, before=day_start
+            )
             if pending_cleared:
                 break
             if not live_run_budget_expired(self.broker):
                 try:
-                    last_pending_snapshot = self.broker.get_pending_orders() or []
+                    last_pending_snapshot = [
+                        po for po in (self.broker.get_pending_orders() or [])
+                        if not isinstance(po, dict)
+                        or order_created_before(po.get('created_at'), day_start) is not False
+                    ]
                 except Exception:
                     last_pending_snapshot = []
 
             if attempt < max_attempts:
                 print("[Engine] Overnight cleanup barrier not cleared, retrying...")
+
+        if not attempted:
+            # 预算在任何清理尝试前耗尽：不标记当日完成，下一轮继续清理。
+            print("[Engine Warning] Overnight cleanup not attempted (live run budget exhausted); retry next run.")
+            return
 
         if not pending_cleared:
             pending_count = len(last_pending_snapshot)
@@ -1010,10 +1028,18 @@ class LiveTrader:
                 clearer(source='settlement')
             except TypeError:
                 pass
+        def alarm(message, *, block=True):
+            runtime_print(message)
+            if hasattr(self, 'alarm_manager') and self.alarm_manager:
+                self.alarm_manager.push_text(message, level='ERROR')
+            if block:
+                block_entries(message)
+
         events = []
+        # 按插入顺序保存已处理事件 ID，裁剪时淘汰最早的记录。
         processed_events = getattr(self, '_processed_settlement_event_ids', None)
-        if not isinstance(processed_events, set):
-            processed_events = set()
+        if not isinstance(processed_events, dict):
+            processed_events = dict.fromkeys(processed_events or ())
             self._processed_settlement_event_ids = processed_events
         event_ids = []
         current_event_ids = set()
@@ -1042,53 +1068,44 @@ class LiveTrader:
             apply_adjustments = getattr(self.broker, 'apply_option_settlement_adjustments', None)
             if callable(apply_adjustments):
                 try:
-                    apply_adjustments(tuple(result.get('adjustments') or ()), events=events)
-                except TypeError:
-                    apply_adjustments(tuple(result.get('adjustments') or ()))
+                    try:
+                        apply_adjustments(tuple(result.get('adjustments') or ()), events=events)
+                    except TypeError:
+                        apply_adjustments(tuple(result.get('adjustments') or ()))
                 except Exception as exc:
-                    message = f'[Engine Error] broker settlement adjustments failed: {exc}'
-                    runtime_print(message)
-                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
-                        self.alarm_manager.push_text(message, level='ERROR')
-                    return False
+                    # 调整未生效: 不记录事件 ID，下轮重试；本轮只阻断期权开仓，风控退出继续执行。
+                    alarm(f'[Engine Error] broker settlement adjustments failed: {exc}')
+                    return True
+            # 调整已生效后立即记录，后续环节失败也不会在下一轮重复应用同一事件。
+            for event_id in event_ids:
+                processed_events[event_id] = None
             tracker = getattr(self.strategy, 'closed_trade_tracker', None)
             reconcile_tracker = getattr(tracker, 'reconcile_external_settlement', None)
             if callable(reconcile_tracker):
                 try:
                     reconcile_tracker(events)
                 except Exception as exc:
-                    message = f'[Engine Error] closed-trade settlement reconciliation failed: {exc}'
-                    runtime_print(message)
-                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
-                        self.alarm_manager.push_text(message, level='ERROR')
-                    return False
+                    # 仅影响成交统计，不阻断开仓。
+                    alarm(f'[Engine Error] closed-trade settlement reconciliation failed: {exc}', block=False)
             handler = getattr(self.strategy, 'reconcile_settlement', None)
             if callable(handler):
                 try:
                     handler(events)
                 except Exception as exc:
-                    message = f'[Engine Error] strategy settlement reconciliation failed: {exc}'
-                    runtime_print(message)
-                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
-                        self.alarm_manager.push_text(message, level='ERROR')
-                    return False
-        if result.get('sizing_reset') and events:
-            resetter = getattr(self.strategy, 'reset_position_sizing', None)
-            if callable(resetter):
-                try:
-                    resetter()
-                except Exception as exc:
-                    message = f'[Engine Error] strategy sizing reset failed: {exc}'
-                    runtime_print(message)
-                    if hasattr(self, 'alarm_manager') and self.alarm_manager:
-                        self.alarm_manager.push_text(message, level='ERROR')
-                    return False
-        processed_events.update(event_ids)
+                    alarm(f'[Engine Error] strategy settlement reconciliation failed: {exc}')
+            if result.get('sizing_reset'):
+                resetter = getattr(self.strategy, 'reset_position_sizing', None)
+                if callable(resetter):
+                    try:
+                        resetter()
+                    except Exception as exc:
+                        alarm(f'[Engine Error] strategy sizing reset failed: {exc}')
         if len(processed_events) > 5000:
-            self._processed_settlement_event_ids = set(list(processed_events)[-2500:])
+            for stale_id in list(processed_events)[:len(processed_events) - 2500]:
+                del processed_events[stale_id]
         return True
 
-    def _confirm_pending_orders_cleared(self, max_checks=6, sleep_seconds=0.5):
+    def _confirm_pending_orders_cleared(self, max_checks=6, sleep_seconds=0.5, before=None):
         if not hasattr(self.broker, 'get_pending_orders'):
             return True
 
@@ -1115,6 +1132,12 @@ class LiveTrader:
                 print(f"[Engine Warning] pending-order barrier check untrusted: {err}")
                 return False
 
+            if before is not None:
+                # 只确认隔夜单已清空；当日委托（创建时间可证明不早于 before）不计入屏障。
+                pending = [
+                    po for po in pending
+                    if not isinstance(po, dict) or order_created_before(po.get('created_at'), before) is not False
+                ]
             if len(pending) == 0:
                 return True
 
@@ -1648,6 +1671,8 @@ class LiveTrader:
         # 1. 初始化风控订单跟踪字典 (如果尚未存在)
         if not hasattr(self, '_pending_risk_orders'):
             self._pending_risk_orders = {}
+        # 本轮按需读取一次券商在途委托 ID；None 表示尚未读取或快照不可信。
+        broker_pending_ids = None
 
         for data_feed in self.broker.datas:
             if self.broker.is_live and live_run_budget_expired(self.broker):
@@ -1677,10 +1702,7 @@ class LiveTrader:
                     self.broker.unlock_for_risk(data_name)
 
                 # 同步清理 risk_control 内部可能存在的标记 (兼容旧有的 exit_triggered 逻辑)
-                if hasattr(self.risk_control, 'clear_exit_trigger'):
-                    self.risk_control.clear_exit_trigger(data_name)
-                elif hasattr(self.risk_control, 'exit_triggered') and isinstance(self.risk_control.exit_triggered, set):
-                    self.risk_control.exit_triggered.discard(data_name)
+                self._clear_risk_exit_trigger(data_name)
                 continue
 
             # --- B. 检查是否存在正在进行的风控订单 (异步处理核心) ---
@@ -1706,19 +1728,28 @@ class LiveTrader:
                     self.broker.log(
                         f"[Risk] Exit order for {data_name} failed (Rejected/Canceled). Resetting to retry.")
                     del self._pending_risk_orders[data_name]
-
-                elif pending_order.is_pending() or pending_order.is_accepted():
-                    # 关键点：订单正在交易所排队或处理中。
-                    # 此时绝对不能再次发送订单，也不能清除状态。
-                    self.broker.log(f"[Risk] Pending exit order for {data_name} is active. Waiting for execution...")
-                    # 仅对该标的 lock_for_risk；run() 仍会执行 strategy.next()，让其他标的继续调仓。
-                    triggered_action = True
-                    continue
+                    self._clear_risk_exit_trigger(data_name)
 
                 else:
-                    # 其他未知状态，保守起见视为 Pending，避免误清后重复发平仓单。
-                    triggered_action = True
-                    continue
+                    # 提交时拿到的代理可能是过期快照（例如 GM 回调会新建代理），不能只信它的状态。
+                    # 以券商在途委托为准：快照可信且该单已不在途时，丢弃跟踪并让风控重新检查。
+                    if broker_pending_ids is None and self.broker.is_live and not live_run_budget_expired(self.broker):
+                        broker_pending_ids = self._fetch_broker_pending_order_ids()
+                    order_id = str(getattr(pending_order, 'id', '') or '').strip()
+                    if broker_pending_ids is not None and order_id and order_id not in broker_pending_ids:
+                        self.broker.log(
+                            f"[Risk] Exit order {order_id} for {data_name} is no longer working at the broker "
+                            f"while position remains. Resetting to retry."
+                        )
+                        del self._pending_risk_orders[data_name]
+                        self._clear_risk_exit_trigger(data_name)
+                    else:
+                        # 订单仍在途、快照不可信或无法核对时保守等待，避免重复发平仓单。
+                        # 仅对该标的 lock_for_risk；run() 仍会执行 strategy.next()，让其他标的继续调仓。
+                        self.broker.log(
+                            f"[Risk] Pending exit order for {data_name} is active. Waiting for execution...")
+                        triggered_action = True
+                        continue
 
             # --- C. 准备数据代理 (保持原逻辑) ---
             feed_proxy = None
@@ -1851,9 +1882,33 @@ class LiveTrader:
                         elif hasattr(self.risk_control, 'exit_triggered') and isinstance(self.risk_control.exit_triggered, set):
                             self.risk_control.exit_triggered.add(data_name)
                     else:
+                        # 未提交（如 T+1 不可卖、被前置拦截）时释放风控闩锁，下一轮重新检查并重试退出。
+                        self._clear_risk_exit_trigger(data_name)
                         self.broker.log(f"[Risk] Error: Failed to submit sell order for {data_name}")
 
         return triggered_action
+
+    def _clear_risk_exit_trigger(self, data_name):
+        """释放风控模块内部的 exit_triggered 闩锁，让失败或未提交的退出在后续 bar 重试。"""
+        if hasattr(self.risk_control, 'clear_exit_trigger'):
+            self.risk_control.clear_exit_trigger(data_name)
+        elif hasattr(self.risk_control, 'exit_triggered') and isinstance(self.risk_control.exit_triggered, set):
+            self.risk_control.exit_triggered.discard(data_name)
+
+    def _fetch_broker_pending_order_ids(self):
+        """读取券商当前在途委托 ID；查询失败或 health flag 标记不可信时返回 None。"""
+        try:
+            orders = self.broker.get_pending_orders() or []
+        except Exception as e:
+            self.broker.log(f"[Risk] Pending-order query failed; keep waiting on tracked exits: {e}")
+            return None
+        if getattr(self.broker, '_last_pending_orders_fetch_failed', False):
+            return None
+        return {
+            str(po.get('id', '') or '').strip()
+            for po in orders
+            if isinstance(po, dict)
+        }
 
     def _recover_data_feeds(self, context) -> bool:
         """

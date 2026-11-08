@@ -106,3 +106,30 @@ def test_trend_protection_returns_none_when_history_not_enough():
     action = risk.check(data)
 
     assert action is None, "历史不足时应直接返回 None，避免误平仓。"
+
+
+def test_trend_score_sells_on_steady_downtrend_and_holds_on_uptrend():
+    """trend_score 模式回归: 平稳下跌应 SELL，平稳上涨不应触发。"""
+    broker = _DummyBroker(datas=[])
+    risk = SampleTrendProtection(
+        broker=broker,
+        params={"method": "trend_score", "period": 10, "threshold": 0.0},
+    )
+
+    down = _FrameworkLikeData("SHSE.600000", [20.0 - 0.2 * i for i in range(20)])
+    up = _FrameworkLikeData("SHSE.600000", [10.0 + 0.2 * i for i in range(20)])
+
+    assert risk.check(down) == "SELL"
+    assert risk.check(up) is None
+
+
+def test_trend_score_threshold_filters_weak_uptrend():
+    """trend_score 模式回归: 弱上涨得分低于阈值时也应 SELL。"""
+    broker = _DummyBroker(datas=[])
+    risk = SampleTrendProtection(
+        broker=broker,
+        params={"method": "trend_score", "period": 10, "threshold": 10.0},
+    )
+    weak_up = _FrameworkLikeData("SHSE.600000", [10.0 + 0.001 * i for i in range(20)])
+
+    assert risk.check(weak_up) == "SELL"

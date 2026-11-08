@@ -133,6 +133,49 @@ def test_get_cached_indicator_series_reuses_optimizer_cache_only_offline():
     assert calls["count"] == 1
 
 
+def test_get_cached_indicator_series_ignores_entry_after_dataframe_id_reuse(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    old_frame = pd.DataFrame({"close": [1.0, 2.0, 3.0]}, index=idx)
+    new_frame = pd.DataFrame({"close": [7.0, 8.0, 9.0]}, index=idx)
+    cache = {}
+    strategy = _DummyStrategy(_DummyBroker(is_live=False, indicator_cache_obj=cache))
+    # 模拟原 DataFrame 回收后 id 被新对象复用：两张表得到相同 id，缓存键完全一致。
+    monkeypatch.setattr(indicator_cache, "id", lambda obj: 42, raising=False)
+
+    stale = indicator_cache.get_cached_indicator_series(
+        strategy, _DummyData("AAA", old_frame, idx[-1].to_pydatetime()), "score", (5,),
+        lambda: pd.Series([1.0, 1.0, 1.0], index=idx),
+    )
+    del old_frame
+    fresh = indicator_cache.get_cached_indicator_series(
+        strategy, _DummyData("AAA", new_frame, idx[-1].to_pydatetime()), "score", (5,),
+        lambda: pd.Series([2.0, 2.0, 2.0], index=idx),
+    )
+
+    assert stale.tolist() == [1.0, 1.0, 1.0]
+    assert fresh.tolist() == [2.0, 2.0, 2.0]
+    assert len(cache) == 1
+
+
+def test_get_cached_indicator_series_does_not_retain_dataframe():
+    import gc
+    import weakref
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    dataframe = pd.DataFrame({"close": [1.0, 2.0, 3.0]}, index=idx)
+    probe = weakref.ref(dataframe)
+    cache = {}
+    strategy = _DummyStrategy(_DummyBroker(is_live=False, indicator_cache_obj=cache))
+    indicator_cache.get_cached_indicator_series(
+        strategy, _DummyData("AAA", dataframe, idx[-1].to_pydatetime()), "score", (5,),
+        lambda: pd.Series([1.0, 2.0, 3.0], index=idx),
+    )
+    del dataframe
+    gc.collect()
+
+    assert probe() is None
+
+
 def test_get_cached_indicator_series_recomputes_in_live_mode():
     idx = pd.date_range("2024-01-01", periods=3, freq="D")
     dataframe = pd.DataFrame({"close": [1.0, 2.0, 3.0]}, index=idx)
@@ -161,3 +204,37 @@ def test_bounded_indicator_cache_evicts_oldest_entry():
     assert "a" in cache
     assert "b" not in cache
     assert "c" in cache
+
+
+def test_fast_dict_cache_does_not_leak_values_between_trials():
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    shared_cache = {}
+    data = _DummyData("AAA", pd.DataFrame(index=idx), idx[1].to_pydatetime())
+
+    first = _DummyStrategy(_DummyBroker(is_live=False, indicator_cache_obj=shared_cache))
+    indicator_cache.register_indicator(first, "AAA", "roc", pd.Series([1.0, 2.0, 3.0], index=idx))
+    second = _DummyStrategy(_DummyBroker(is_live=False, indicator_cache_obj=shared_cache))
+    indicator_cache.register_indicator(second, "AAA", "roc", pd.Series([10.0, 20.0, 30.0], index=idx))
+
+    assert indicator_cache.get_indicator(first, data, "roc", None) == 2.0
+    assert indicator_cache.get_indicator(second, data, "roc", None) == 20.0
+
+
+def test_fast_dict_cache_reuses_identical_content_and_rejects_key_collision():
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    shared_cache = {}
+    data = _DummyData("AAA", pd.DataFrame(index=idx), idx[1].to_pydatetime())
+    strategy = _DummyStrategy(_DummyBroker(is_live=False, indicator_cache_obj=shared_cache))
+
+    indicator_cache.register_indicator(strategy, "AAA", "roc", pd.Series([1.0, 2.0, 3.0], index=idx))
+    first_dict = strategy._fast_dict_registry["AAA"]["roc"]
+    indicator_cache.register_indicator(strategy, "AAA", "roc", pd.Series([1.0, 2.0, 3.0], index=idx))
+    assert strategy._fast_dict_registry["AAA"]["roc"] is first_dict
+
+    # 模拟键碰撞：缓存条目保存的序列与当前内容不同，必须重建而不是复用。
+    (key,) = [key for key in shared_cache if key[0] == "fast_dict"]
+    stale = pd.Series([7.0, 8.0, 9.0], index=idx)
+    shared_cache[key] = (stale, dict(zip([dt.to_pydatetime() for dt in idx], stale.values)))
+    indicator_cache.register_indicator(strategy, "AAA", "roc", pd.Series([1.0, 2.0, 3.0], index=idx))
+
+    assert indicator_cache.get_indicator(strategy, data, "roc", None) == 2.0

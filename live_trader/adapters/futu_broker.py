@@ -1024,13 +1024,14 @@ class FutuBrokerAdapter(BaseLiveBroker):
     def _fetch_settled_cash(self) -> float:
         """读取现金担保专用的已结算现金；缺失时失败关闭。"""
         rows = self._query_account_info()
-        value = self._first_numeric(rows, self._settled_cash_field_names(), positive=True)
+        value = self._first_numeric(rows, self._settled_cash_field_names())
         if value is None:
             error = RuntimeError('Futu account snapshot has no settled cash field for CSP')
             self._last_account_snapshot_fetch_failed = True
             self._last_account_snapshot_fetch_error = error
             raise error
-        return float(value)
+        # 负现金（融资欠款）不提供任何可用担保资金。
+        return max(0.0, float(value))
 
     def _get_fx_rate(self, source_currency, target_currency):
         """读取报价币种到账户币种的实时汇率；不可用时返回 None。"""
@@ -1777,33 +1778,31 @@ class FutuBrokerAdapter(BaseLiveBroker):
             return False
 
     @staticmethod
-    def _first_numeric(rows, names, positive=False):
+    def _first_numeric(rows, names):
         # 富途账户表常同时返回 ``N/A`` 和有效字段，不能因第一个字段为空
         # 就跳过同一行后面的现金字段。
+        # 优先字段只要是数值就必须采用：例如资金全部冻结时 available_funds=0，
+        # 不能跳过它再回退到更大的 cash，否则会高估可用资金。
         if isinstance(names, str):
             names = (names,)
-        zero_value = None
         for name in names:
             for row in rows:
                 value = _decimal(_field(row, name), None)
                 if value is not None:
-                    if positive and value <= 0:
-                        if zero_value is None:
-                            zero_value = value
-                        continue
                     return value
-        return zero_value
+        return None
 
     def _fetch_real_cash(self) -> float:
         """读取富途账户当前可用购买力，不维护本地资金缓存。"""
         rows = self._query_account_info()
-        value = self._first_numeric(rows, self._cash_field_names(), positive=True)
+        value = self._first_numeric(rows, self._cash_field_names())
         if value is None:
             error = RuntimeError('Futu account snapshot has no usable cash field')
             self._last_account_snapshot_fetch_failed = True
             self._last_account_snapshot_fetch_error = error
             raise error
-        return float(value)
+        # 负值表示无可用资金，按 0 处理而不是回退到其它字段。
+        return max(0.0, float(value))
 
     def getcash(self):
         """提供 Backtrader 风格的现金别名。"""
@@ -1815,7 +1814,8 @@ class FutuBrokerAdapter(BaseLiveBroker):
         total_assets = self._first_numeric(rows, ('total_assets', 'net_assets', 'nav'))
         if total_assets is not None:
             return float(total_assets)
-        cash = self._first_numeric(rows, self._cash_field_names(), positive=True)
+        # NAV 兜底保留负现金（融资欠款），不能截断为 0 而高估净资产。
+        cash = self._first_numeric(rows, self._cash_field_names())
         market_value = self._first_numeric(rows, ('market_val', 'market_value', 'securities_assets'))
         if cash is None or market_value is None:
             error = RuntimeError('Futu account snapshot has no total_assets or cash/market value')
@@ -2538,6 +2538,19 @@ class FutuBrokerAdapter(BaseLiveBroker):
                     raise RuntimeError(
                         f'Futu pending order has no verifiable remaining quantity: id={order_id!r}'
                     )
+                # 委托创建时间供隔夜清理区分当日单；Futu 返回市场本地时间，按代码市场补时区，无法确定时不输出该字段。
+                try:
+                    created_at = pd.to_datetime(_field(row, ('create_time', 'created_at'), None), errors='coerce')
+                except (TypeError, ValueError, OverflowError):
+                    created_at = None
+                if created_at is None or pd.isna(created_at):
+                    created_at = None
+                elif created_at.tzinfo is None:
+                    market_tz = _FUTU_MARKET_TIMEZONES.get(_normalise_symbol(symbol).split('.', 1)[0])
+                    created_at = (
+                        created_at.tz_localize(ZoneInfo(market_tz), ambiguous=True, nonexistent='shift_forward')
+                        if market_tz else None
+                    )
                 combo_map = getattr(self, '_combo_order_legs', None)
                 combo_legs = combo_map.get(order_id, ()) if isinstance(combo_map, dict) else ()
                 raw_combo_legs = _field(row, ('combo_legs', 'comboLegs', 'legs'), None)
@@ -2590,19 +2603,25 @@ class FutuBrokerAdapter(BaseLiveBroker):
                             raise RuntimeError(
                                 f'Futu combo pending leg has unknown direction: id={order_id!r}'
                             )
-                        result.append({
+                        leg_item = {
                             'id': order_id,
                             'symbol': self._framework_symbol(leg_symbol),
                             'direction': leg_direction,
                             'size': quantity_number(remaining),
-                        })
+                        }
+                        if created_at is not None:
+                            leg_item['created_at'] = created_at
+                        result.append(leg_item)
                     continue
-                result.append({
+                pending_item = {
                     'id': order_id,
                     'symbol': self._framework_symbol(symbol),
                     'direction': side,
                     'size': quantity_number(remaining),
-                })
+                }
+                if created_at is not None:
+                    pending_item['created_at'] = created_at
+                result.append(pending_item)
             self._last_pending_orders_fetch_failed = False
             self._last_pending_orders_fetch_error = None
             return result

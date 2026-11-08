@@ -7,6 +7,9 @@ import config
 from common.data_paths import ensure_data_dir, resolve_data_path
 from .base_provider import BaseDataProvider
 
+# 缓存行的价格口径身份（来源 + 复权口径）；读取时剥离到 attrs['price_basis']，不进入策略行情。
+PRICE_BASIS_COLUMN = "_price_basis"
+
 
 class CsvDataProvider(BaseDataProvider):
     """
@@ -59,12 +62,21 @@ class CsvDataProvider(BaseDataProvider):
         try:
             df = pd.read_csv(csv_filepath, index_col="datetime", parse_dates=True)
 
+            # 口径必须在按窗口切片前按整个文件判定，否则混合口径文件在只含单一口径的窗口里会被误判有效。
+            price_basis = None
+            if PRICE_BASIS_COLUMN in df.columns:
+                values = df[PRICE_BASIS_COLUMN].dropna().astype(str).unique()
+                price_basis = values[0] if len(values) == 1 and df[PRICE_BASIS_COLUMN].notna().all() else None
+                df = df.drop(columns=[PRICE_BASIS_COLUMN])
+
             # 根据日期筛选
             if start_date:
                 df = df[df.index >= pd.to_datetime(start_date)]
             if end_date:
                 df = df[df.index <= pd.to_datetime(end_date)]
 
+            # 缺少标记的旧缓存或混合口径记为 None，由 DataManager 视为未知口径而重取。
+            df.attrs["price_basis"] = price_basis
             return df
         except Exception as e:
             print(f"Error reading CSV file {csv_filepath}: {e}")

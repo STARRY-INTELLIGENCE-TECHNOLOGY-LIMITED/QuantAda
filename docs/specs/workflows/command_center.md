@@ -7,7 +7,7 @@
 ## 入口与边界
 
 1. 根目录入口为 `run.py --ui`，启动本地 Web 页面并自动打开默认浏览器；直接运行 `python run.py` 时先显示完整 CLI 帮助再启动 Web 工作台。
-2. 具体实现放在根目录 `command_center/` 聚焦包中，不放入 `common/`；默认只监听本机地址，只有用户显式使用 `--ui_ip`/`--host` 配置监听地址时才暴露到其它接口。该工具按内部使用设计，页面可显示当前会话变量，外部暴露由操作者自行负责。
+2. 具体实现放在根目录 `command_center/` 聚焦包中，不放入 `common/`；默认只监听本机地址，只有用户显式使用 `--ui_ip`/`--host` 配置监听地址时才暴露到其它接口。该工具按内部使用设计，页面可显示当前会话变量，外部暴露由操作者自行负责。工作台无认证且可启动子进程，默认必须拒绝：Host 不是 `localhost` 或本机/私网/链路本地 IP 字面量的请求（防 DNS 重绑定与公网访问）、Origin 与 Host 不一致或 `Sec-Fetch-Site: cross-site` 的跨站请求、非 `application/json` 的 POST，以及请求 `variables` 中的 `PYTHON_EXECUTABLE` 和 `PYTHON*`/`LD_*`/`DYLD_*` 加载器变量。只有显式使用 `--dangerously-ui-executable` 启动时才关闭上述校验，保留旧行为以便公网调试，启动时必须打印危险提示。
 3. 页面资源独立存放于 `command_center/static/index.html`，Python 仅负责静态资源读取和 API 服务。页面右上角提供中文/English 切换；语言选择仅保存在浏览器本地，不进入命令方案或运行参数。
 4. 工具执行时使用当前 Python 解释器、QuantAda 根目录和 `subprocess.Popen(..., shell=False)`。
 5. 工具不得创建交易意图队列、保存订单状态或重放历史交易意图。

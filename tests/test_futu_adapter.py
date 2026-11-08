@@ -600,6 +600,19 @@ def test_futu_cash_falls_back_when_preferred_account_fields_are_na():
     assert broker.get_cash() == 999277.145
 
 
+@pytest.mark.parametrize("available_funds", [0.0, -250.0])
+def test_futu_cash_honors_zero_or_negative_available_funds(available_funds):
+    """资金全部冻结时 available_funds 为 0/负数，不能跳过它回退到更大的 cash。"""
+    class FrozenFunds(FakeTradeContext):
+        def accinfo_query(self, **kwargs):
+            return 0, pd.DataFrame(
+                [{'available_funds': available_funds, 'cash': 50000.0, 'total_assets': 50000.0}]
+            )
+
+    broker, _ = _broker(FrozenFunds())
+    assert broker.get_cash() == 0.0
+
+
 def test_futu_cash_prefers_account_currency_specific_buying_power():
     class CurrencyCash(FakeTradeContext):
         def accinfo_query(self, **kwargs):

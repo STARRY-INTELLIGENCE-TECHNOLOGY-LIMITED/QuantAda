@@ -284,3 +284,77 @@ def test_stock_feed_preparation_reuse_keeps_the_same_clock_and_rows():
         first._prepared_datas["US.SPY"]
     )
 
+
+
+def test_option_valuation_mark_carries_last_price_and_expires_at_intrinsic():
+    clock = pd.bdate_range("2024-01-02", "2024-01-12")
+    hole = pd.Timestamp("2024-01-04")
+    expiry = pd.Timestamp("2024-01-10")
+    option_index = pd.DatetimeIndex([day for day in clock if day != hole and day <= expiry])
+    stock = _ohlcv(clock, close=390.0)
+    engine = _run(
+        {
+            "US.SPY": stock,
+            "US.SPY240110P00400000": _option_frame(option_index, close=2.0),
+        },
+        start="20240102",
+        end="20240112",
+    )
+    option = next(
+        data for data in engine.cerebro.datas
+        if getattr(data, "_name", "") == "US.SPY240110P00400000"
+    )
+    frame = option.p.dataname
+    # 报价列仍补 0 供策略识别无报价；估值标记沿用上一有效价，到期后为 400-390 的内在价值。
+    assert float(frame.loc[hole, "close"]) == 0.0
+    assert float(frame.loc[hole, "_quantada_mark"]) == 2.0
+    assert float(frame.loc[pd.Timestamp("2024-01-12"), "close"]) == 0.0
+    assert float(frame.loc[pd.Timestamp("2024-01-12"), "_quantada_mark"]) == 10.0
+    closes = list(option.close.array)
+    assert closes[clock.get_loc(hole)] == 2.0
+    assert closes[-1] == 10.0
+
+
+def test_order_target_refuses_option_orders_on_days_without_a_raw_quote():
+    """估值标记让 close 线在无报价日沿用旧价，order_target_* 不得据此下单。"""
+    clock = pd.bdate_range("2024-01-02", "2024-01-12")
+    hole = pd.Timestamp("2024-01-04")
+    option_index = pd.DatetimeIndex([day for day in clock if day != hole])
+    seen = {}
+
+    class _TargetStrategy(BaseStrategy):
+        def init(self):
+            pass
+
+        def next(self):
+            option = next(d for d in self.broker.datas if d._name.startswith("US.SPY2402"))
+            day = pd.Timestamp(option.datetime.datetime(0)).normalize()
+            if day in (hole, pd.Timestamp("2024-01-05")):
+                seen[day] = (
+                    option.close[0],
+                    self.broker.order_target_value(data=option, target=1000.0),
+                    self.broker._last_order_target_skip_reason,
+                    self.broker.order_target_percent(data=option, target=0.01),
+                )
+
+    engine = Backtester(
+        datas={
+            "US.SPY": _ohlcv(clock, close=390.0),
+            "US.SPY240216P00400000": _option_frame(option_index, close=2.0),
+        },
+        strategy_class=_TargetStrategy,
+        start_date="20240102",
+        end_date="20240112",
+        cash=100000.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+    )
+    engine.run()
+
+    mark, value_order, reason, percent_order = seen[hole]
+    assert mark == 2.0  # close 线是旧估值标记，不是可成交报价
+    assert value_order is None and reason == "invalid_price" and percent_order is None
+    # 有当日报价时不受影响。
+    assert seen[pd.Timestamp("2024-01-05")][1] is not None

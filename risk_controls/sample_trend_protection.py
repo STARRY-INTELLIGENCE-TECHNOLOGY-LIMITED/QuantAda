@@ -72,3 +72,28 @@ class SampleTrendProtection(BaseRiskControl):
                 return 'SELL'
 
         return None
+
+    def _check_trend_score(self, close):
+        """趋势得分逻辑: 对最近 period 根收盘价取对数做线性回归，得分 = 年化收益 * R^2，低于 threshold 则 SELL。"""
+        window = np.asarray(close[-int(self.p.period):], dtype=float)
+        # 非正价格或缺失值无法取对数，保守不操作，避免误平仓。
+        if window.size < 2 or not np.all(np.isfinite(window)) or np.any(window <= 0):
+            return None
+
+        y = np.log(window)
+        x = np.arange(window.size, dtype=float)
+        slope, intercept = np.polyfit(x, y, 1)
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        # 价格完全不变时 R^2 无定义，趋势得分视为 0。
+        if ss_tot <= 0:
+            score = 0.0
+        else:
+            residual = y - (slope * x + intercept)
+            r_squared = 1.0 - float(np.sum(residual ** 2)) / ss_tot
+            # 按 250 个交易日年化日频对数斜率。
+            annualized_return = float(np.exp(slope * 250) - 1.0)
+            score = annualized_return * r_squared
+
+        if score < float(self.p.threshold):
+            return 'SELL'
+        return None

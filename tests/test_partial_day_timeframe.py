@@ -82,14 +82,15 @@ def test_data_manager_fetches_minutes_then_caches_partial_day_bars(tmp_path, mon
     assert calls[0][2] == "2024-01-03 14:45:00"
     assert list((tmp_path / "market_cache").glob("*Day_14_45_00*"))
 
-    class FailingMinuteDataProvider(MinuteDataProvider):
-        def get_data(self, *args, **kwargs):
-            raise AssertionError("完整的 partial-day 缓存不应再次访问 Provider")
+    def failing_get_data(self, *args, **kwargs):
+        raise AssertionError("完整的 partial-day 缓存不应再次访问 Provider")
 
+    # 保持同一来源名与价格口径，缓存才能命中；只把取数替换为失败。
+    monkeypatch.setattr(MinuteDataProvider, "get_data", failing_get_data)
     monkeypatch.setattr(
         DataManager,
         "auto_discover_and_sort_providers",
-        lambda self: [FailingMinuteDataProvider()],
+        lambda self: [MinuteDataProvider()],
     )
     cached_manager = DataManager()
     cached = cached_manager.get_data(

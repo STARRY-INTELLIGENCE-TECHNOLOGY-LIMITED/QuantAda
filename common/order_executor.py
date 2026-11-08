@@ -32,6 +32,12 @@ class OrderExecutor:
         'below_min_lot_delta',
         'insufficient_cash_for_min_lot',
         'target_already_met',
+        'risk_control_lock',
+    }
+    # 实盘仅把“无需下单”的数量边界视为良性跳过；资金不足、风控锁等仍需告警。
+    _BENIGN_LIVE_SKIP_REASONS = {
+        'below_min_lot_delta',
+        'target_already_met',
     }
 
     def __init__(self, broker, debug=False):
@@ -110,7 +116,7 @@ class OrderExecutor:
                         target_value=0.0,
                     )
             else:
-                if not self._is_benign_backtest_skip():
+                if not self._is_benign_skip():
                     sell_submit_failed = True
                 self._warn_order_not_submitted('SELL', data, 0.0, phase='clear')
 
@@ -152,7 +158,7 @@ class OrderExecutor:
                         target_value=target,
                     )
             else:
-                if not self._is_benign_backtest_skip():
+                if not self._is_benign_skip():
                     sell_submit_failed = True
                 self._warn_order_not_submitted('SELL', data, target, phase='reduce')
 
@@ -231,16 +237,16 @@ class OrderExecutor:
             print(msg)
         runtime_notifications.push_text(msg, level=level)
 
-    def _is_benign_backtest_skip(self):
-        if getattr(self.broker, 'is_live', True) is True:
-            return False
+    def _is_benign_skip(self):
         reason = getattr(self.broker, '_last_order_target_skip_reason', None)
+        if getattr(self.broker, 'is_live', True) is True:
+            return reason in self._BENIGN_LIVE_SKIP_REASONS
         return reason in self._BENIGN_BACKTEST_SKIP_REASONS
 
     def _warn_order_not_submitted(self, side, data, target, phase):
-        if self._is_benign_backtest_skip():
+        if self._is_benign_skip():
             self._log(
-                f"{side} order skipped as backtest no-op: "
+                f"{side} order skipped as no-op: "
                 f"phase={phase}, symbol={getattr(data, '_name', str(data))}, "
                 f"reason={getattr(self.broker, '_last_order_target_skip_reason', None)}"
             )
@@ -530,6 +536,7 @@ class OrderExecutor:
                 'below_min_lot_delta',
                 'insufficient_cash_for_min_lot',
                 'broker_lot_limit_exceeded',
+                'submit_outcome_unknown',
             }:
                 # 当前资金/数量边界下，该标的无法产生可执行子单。只记录本轮的
                 # 短期事实，避免轮询再次创建必然失败的委托；其他标的仍可独立重试。

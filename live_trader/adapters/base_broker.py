@@ -11,7 +11,7 @@ from common.live_execution_budget import (
     get_live_run_deadline,
     live_run_budget_expired,
 )
-from common.live_runtime import runtime_print
+from common.live_runtime import order_created_before, runtime_print
 from common.order_quantity import (
     align_quantity_down,
     decimal_quantity,
@@ -354,12 +354,15 @@ class BaseLiveBroker(ABC):
         """
         return False
 
-    def cleanup_overnight_orders(self) -> dict:
+    def cleanup_overnight_orders(self, before=None) -> dict:
         """
-        清理当前在途委托（用于交易日首次运行前的无状态自愈）。
+        清理隔夜遗留委托（用于交易日运行前的无状态自愈）。
         约定:
         - 依赖 get_pending_orders 返回的 'id' 字段
         - 无 'id' 时跳过，不抛异常
+        - before 为当前交易日起点时，只撤 'created_at' 早于 before 的委托；当日委托保留，避免进程重启误撤当日在途单
+        - 'created_at' 缺失或无法比较时视为隔夜单并撤销（宁可撤掉需重新决策的当日单，也不保留陈旧意图）
+        - before 为 None 时撤销全部在途委托
         """
         summary = {'total': 0, 'canceled': 0, 'failed': 0, 'skipped': 0}
         if live_run_budget_expired(self):
@@ -388,6 +391,15 @@ class BaseLiveBroker(ABC):
                 seen_order_ids.add(order_id)
             unique_pending_orders.append(pending)
         pending_orders = unique_pending_orders
+        if before is not None:
+            overnight_orders = [
+                po for po in pending_orders
+                if not isinstance(po, dict) or order_created_before(po.get('created_at'), before) is not False
+            ]
+            kept = len(pending_orders) - len(overnight_orders)
+            if kept:
+                self._runtime_log(f"[Broker] cleanup_overnight_orders kept {kept} order(s) created on the current trading day.")
+            pending_orders = overnight_orders
         summary['total'] = len(pending_orders)
         if not pending_orders:
             return summary
@@ -987,6 +999,8 @@ class BaseLiveBroker(ABC):
                         'invalid_buy_price',
                         'broker_lot_limit_exceeded',
                         'unsupported_contract',
+                        # 提交结果未知（如超时）时委托可能已在券商侧生效，降级重试会重复下单。
+                        'submit_outcome_unknown',
                     }:
                         return None
                     max_retries = self._BUY_LOT_STEP_RETRIES + self._BUY_GEOMETRIC_RETRIES
@@ -1142,7 +1156,16 @@ class BaseLiveBroker(ABC):
         if shares >= sellable_pos > 0:
             shares = sellable_pos
         else:
+            raw_shares = shares
             shares = self._align_shares_down(shares, lot_size)
+            if raw_shares > 0 >= shares:
+                # 减仓差额不足一手属于良性跳过，不是提交失败；执行器据此不触发卖出失败告警。
+                self._last_order_target_skip_reason = 'below_min_lot_delta'
+                self._runtime_log(
+                    f"[Broker] SELL {data._name} skipped: reduce quantity {format_quantity(raw_shares)} "
+                    f"is below one lot ({lot_size})."
+                )
+                return None
 
         if shares > 0:
             chunk_limit = self._live_order_chunk_limit(data, lot_size, 'SELL')
@@ -1205,6 +1228,9 @@ class BaseLiveBroker(ABC):
                             )
                             self.on_order_status(proxy)
                             proxy = None
+                        elif getattr(self, '_last_order_target_skip_reason', None) == 'submit_outcome_unknown':
+                            # 提交结果未知时原委托可能已生效，本轮不得对同一标的降级重试。
+                            break
 
                         if retries >= retry_limit:
                             break

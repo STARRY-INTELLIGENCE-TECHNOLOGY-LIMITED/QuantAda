@@ -7,6 +7,7 @@ BaseStrategy 负责公开的策略 API。本模块负责规范化指标序列、
 from collections import OrderedDict
 from bisect import bisect_right
 import math
+import weakref
 
 import pandas as pd
 
@@ -92,20 +93,25 @@ def register_indicator(strategy, data_name, indicator_name, series):
     cache = getattr(strategy.broker, 'indicator_cache', None)
     if isinstance(cache, dict):
         try:
+            # sanitize 每次都会复制序列，id() 在 GC 后可能被新试验复用；改用内容指纹作键，
+            # 命中后再逐值核对缓存中保留的序列，避免把上一个试验的指标值串给当前试验。
             fast_key = (
                 'fast_dict',
                 data_name,
                 indicator_name,
-                id(series),
+                int(pd.util.hash_pandas_object(series, index=True).sum()),
                 len(series),
                 series.index[0] if len(series.index) else None,
                 series.index[-1] if len(series.index) else None,
             )
-            fast_dict = cache.get(fast_key)
+            entry = cache.get(fast_key)
+            fast_dict = None
+            if isinstance(entry, tuple) and len(entry) == 2 and entry[0].equals(series):
+                fast_dict = entry[1]
             if fast_dict is None:
                 idx = [dt.to_pydatetime() for dt in series.index]
                 fast_dict = dict(zip(idx, series.values))
-                cache[fast_key] = fast_dict
+                cache[fast_key] = (series, fast_dict)
             strategy._fast_dict_registry[data_name][indicator_name] = fast_dict
             strategy._fast_dict_keys_registry[data_name][indicator_name] = tuple(sorted(fast_dict))
             return
@@ -137,11 +143,15 @@ def get_cached_indicator_series(strategy, data, indicator_name, params_key, comp
         indicator_name,
     ) + tuple(params_key)
 
-    series = cache.get(cache_key)
+    # id() 可能在原 DataFrame 回收后被复用；缓存项附带弱引用，仅当弱引用仍指向当前对象时才算命中，且不强持有整表。
+    entry = cache.get(cache_key)
+    series = None
+    if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[0], weakref.ref) and entry[0]() is dataframe:
+        series = entry[1]
     if series is None:
         series = compute_func()
         series = sanitize_indicator_series(series)
-        cache[cache_key] = series
+        cache[cache_key] = (weakref.ref(dataframe), series)
     else:
         # 命中缓存时保留对象身份；仅在发现非有限值时替换，避免优化器
         # 每次查询都复制整条序列。
@@ -149,10 +159,10 @@ def get_cached_indicator_series(strategy, data, indicator_name, params_key, comp
             numeric = pd.to_numeric(series, errors='coerce')
             if not numeric.map(math.isfinite).all():
                 series = sanitize_indicator_series(series)
-                cache[cache_key] = series
+                cache[cache_key] = (entry[0], series)
         except Exception:
             series = sanitize_indicator_series(series)
-            cache[cache_key] = series
+            cache[cache_key] = (entry[0], series)
     return series
 
 

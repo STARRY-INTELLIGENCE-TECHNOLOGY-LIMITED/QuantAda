@@ -421,11 +421,13 @@ def _run_main():
                         help="命令工作台监听端口；与 --ui 一起使用，默认 8765")
     parser.add_argument('--ui', action='store_true',
                         help="启动本地命令工作台")
+    parser.add_argument('--dangerously-ui-executable', action='store_true',
+                        help="危险调试：工作台关闭 Host/Origin 校验并允许请求指定解释器，可被公网执行任意命令")
 
     # 无参数或显式 --ui 时进入本地 Web 工作台；无参数先展示完整 CLI 帮助。
     raw_cli_args = sys.argv[1:]
     ui_requested = any(
-        item == "--ui"
+        item in {"--ui", "--dangerously-ui-executable"}
         or item.startswith("--ui_ip=")
         or item.startswith("--ui_port=")
         for item in raw_cli_args

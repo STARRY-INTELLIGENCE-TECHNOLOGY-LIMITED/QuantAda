@@ -236,7 +236,7 @@ def test_order_executor_warns_after_5m_but_keeps_waiting_until_sell_settles(monk
 
 @pytest.mark.parametrize(
     "skip_reason",
-    ["below_min_lot_delta", "insufficient_cash_for_min_lot", "broker_lot_limit_exceeded"],
+    ["below_min_lot_delta", "insufficient_cash_for_min_lot", "broker_lot_limit_exceeded", "submit_outcome_unknown"],
 )
 def test_order_executor_does_not_repeat_deterministic_rolling_buy_noop(monkeypatch, skip_reason):
     """确定性 BUY no-op 本轮只尝试一次，不能按轮询频率刷屏。"""
@@ -1791,3 +1791,89 @@ def test_order_executor_does_not_treat_futu_market_prefix_as_same_symbol():
     executor = OrderExecutor(Broker())
     assert executor._has_remote_pending_buy(SimpleNamespace(_name="HK.00700")) is True
     assert executor._has_remote_pending_buy(SimpleNamespace(_name="HK.09988")) is False
+
+
+def test_order_executor_treats_live_below_lot_reduce_as_benign_skip(monkeypatch):
+    """实盘减仓差额不足一手属于良性跳过：不告警 ERROR，也不进入卖出失败分支。"""
+    import common.order_executor as executor_module
+
+    pushed = []
+    monkeypatch.setattr(
+        executor_module.runtime_notifications,
+        "push_text",
+        lambda content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+
+    class DummyLiveBroker:
+        is_live = True
+        _last_order_target_skip_reason = None
+
+        def __init__(self):
+            self.calls = []
+
+        def get_position(self, data):
+            return SimpleNamespace(size=1000, price=10.0)
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            if data._name == "SHSE.600000":
+                self._last_order_target_skip_reason = "below_min_lot_delta"
+                return None
+            self._last_order_target_skip_reason = None
+            return object()
+
+    broker = DummyLiveBroker()
+    executor = executor_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [],
+        "reduce": [(SimpleNamespace(_name="SHSE.600000"), 9950.0)],
+        "increase": [(SimpleNamespace(_name="SHSE.600001"), 5000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("SHSE.600000", 9950.0), ("SHSE.600001", 5000.0)]
+    assert pushed == []
+
+
+def test_order_executor_live_sell_outcome_unknown_alarms_and_other_symbols_continue(monkeypatch):
+    """单个标的提交结果未知时必须告警，但不得中断其它标的的计划。"""
+    import common.order_executor as executor_module
+
+    pushed = []
+    monkeypatch.setattr(
+        executor_module.runtime_notifications,
+        "push_text",
+        lambda content, level="INFO": pushed.append({"content": content, "level": level}),
+    )
+
+    class DummyLiveBroker:
+        is_live = True
+        _last_order_target_skip_reason = None
+
+        def __init__(self):
+            self.calls = []
+
+        def order_target_value(self, data, target):
+            self.calls.append((data._name, float(target)))
+            if data._name == "SPY.ARCA":
+                self._last_order_target_skip_reason = "submit_outcome_unknown"
+                return None
+            self._last_order_target_skip_reason = None
+            return object()
+
+    broker = DummyLiveBroker()
+    executor = executor_module.OrderExecutor(broker)
+    plan = {
+        "sell_clear": [SimpleNamespace(_name="SPY.ARCA")],
+        "reduce": [],
+        "increase": [(SimpleNamespace(_name="EWJ.ARCA"), 1000.0)],
+    }
+
+    executor.execute_plan(plan)
+
+    assert broker.calls == [("SPY.ARCA", 0.0), ("EWJ.ARCA", 1000.0)]
+    assert any(
+        item["level"] == "ERROR" and "SELL order not submitted" in item["content"]
+        for item in pushed
+    )

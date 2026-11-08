@@ -17,8 +17,12 @@ from backtest.plotting import (
 from backtest.reporting import format_backtest_results_report
 from backtest.trade_attribution import format_trade_micro_attribution_report
 from common import log, runtime_command, runtime_notifications
+from common.data_view import visible_row
 from common.order_quantity import align_quantity_down, normalize_quantity_step
 from common.timeframe import parse_daily_cutoff
+
+# 期权估值标记列：报价列缺 K 仍补 0 供策略识别无报价，Broker 估值读此列，避免把空报价日记成 0 元。
+OPTION_MARK_COLUMN = "_quantada_mark"
 
 
 def _extract_contract_multiplier(data) -> float:
@@ -273,6 +277,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
         self.dataclose = self.datas[0].close
         self.strategy = strategy_class(broker=self, params=params)
         self.risk_controls = []
+        # 记录本根 K 已由风控提交平仓的标的，避免轮动计划重复卖出造成反向仓位。
+        self._risk_control_order_symbols = set()
         self.trade_tracker = ClosedTradeTracker(self)
         self.closed_trades = self.trade_tracker.closed_trades
         if risk_control_classes:
@@ -328,12 +334,20 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
     def get_option_uncommitted_cash(self):
         """按已确认期权现金义务计算可用于新增仓位的现金。"""
+        from common.options.analytics import parse_option_symbol
         from common.options.cash import uncommitted_cash
 
         short_puts = []
+        long_puts = {}
         for data in self.datas:
             position = self.getposition(data)
-            if position.size >= 0:
+            if position.size > 0:
+                parsed = parse_option_symbol(getattr(data, '_name', ''))
+                if parsed.get('option_type') == 'PUT' and parsed.get('strike'):
+                    key = (parsed.get('underlying'), parsed.get('expiry'))
+                    long_puts.setdefault(key, []).append([float(parsed['strike']), float(position.size)])
+                continue
+            if position.size == 0:
                 continue
             dataframe = getattr(getattr(data, 'p', None), 'dataname', None)
             row = None
@@ -381,11 +395,32 @@ class BacktraderStrategyWrapper(bt.Strategy):
             # 只有 Short Put 产生现金担保义务；Covered Call 的担保事实
             # 是标的股数，不应被误扣成 Strike×Multiplier 现金。
             if option_type in {'PUT', 'P'}:
+                parsed = parse_option_symbol(getattr(data, '_name', ''))
                 short_puts.append({
                     'strike': strike,
                     'contracts': abs(position.size),
                     'contract_multiplier': self.get_contract_multiplier(data),
+                    '_spread_key': (parsed.get('underlying'), parsed.get('expiry')) if parsed else None,
                 })
+        # 已成交价差：同标的同到期的多头 Put 保护腿把对应空头 Put 的义务降为执行价宽度（定义风险）。
+        # 高执行价空头优先配高执行价保护腿；未配对部分仍按 CSP 全额指派计算。
+        for item in sorted(short_puts, key=lambda value: -float(value['strike'])):
+            hedges = long_puts.get(item.pop('_spread_key', None))
+            if not hedges:
+                continue
+            short_strike = float(item['strike'])
+            multiplier = float(item['contract_multiplier'])
+            remaining = float(item['contracts'])
+            reserved = 0.0
+            for hedge in sorted(hedges, key=lambda value: -value[0]):
+                paired = min(remaining, hedge[1])
+                if paired <= 0:
+                    continue
+                reserved += max(short_strike - hedge[0], 0.0) * paired * multiplier
+                hedge[1] -= paired
+                remaining -= paired
+            if remaining < float(item['contracts']):
+                item['reserved_cash'] = reserved + short_strike * remaining * multiplier
         pending_short_puts = []
         for reservation in self._option_cash_reservations.values():
             remaining = float(reservation.get('remaining', 0.0))
@@ -406,7 +441,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         ))
 
     def submit_option_order(self, data, volume, order_effect, price=None, **kwargs):
-        """回测显式期权效果入口；到期交割由声明 option_settlement 的策略启用。"""
+        """回测显式期权效果入口；到期默认现金结算，声明 option_settlement="physical" 的策略改为物理交割。"""
         from common.options.contracts import (
             InvalidOptionOrderEffect,
             normalize_option_order_effect,
@@ -846,6 +881,8 @@ class BacktraderStrategyWrapper(bt.Strategy):
         self.expected_freed_cash = 0.0
         # 每过一个K线，重置虚拟消费账本
         self.virtual_spent_cash = 0.0
+        # 风控平仓只对当前 K 生效，下一根 K 重新由实时持仓决定。
+        self._risk_control_order_symbols = set()
 
         # 仅在回测中，缓存当前 Bar 的账户总价值
         # 避免在调仓循环中重复对所有持仓资产进行市值核算的 O(N) 操作
@@ -924,9 +961,41 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
         self.strategy.notify_trade(TradeProxy(trade))
 
+    def _net_sell_proceeds(self, data, gross_value):
+        """卖出回笼现金的保守估计：扣除卖出侧滑点与佣金。
+
+        买单定量已按 (1+滑点)(1+佣金) 预留成本，回笼现金若按毛额计入，满仓换仓的买单总成本会略高于
+        实际到账现金，被 Backtrader 以 Margin 拒绝并推迟到下一根 K 线。
+        """
+        commission_ratio = self.broker.getcommissioninfo(data).p.commission
+        return gross_value * (1 - self.slippage) * (1 - commission_ratio)
+
+    def _option_quote_missing(self, data):
+        """期权数据流当日没有可执行原始报价时返回 True。
+
+        数据流 close 线读的是估值标记（无报价日沿用旧价），不能作为下单价；
+        此时按原行为拒单，与此前无报价日 close=0 被拒一致。
+        """
+        frame = getattr(getattr(data, "p", None), "dataname", None)
+        if not isinstance(frame, pd.DataFrame) or OPTION_MARK_COLUMN not in frame.columns:
+            return False
+        return visible_row(
+            data, data.datetime.datetime(0), require_current_quote=True, cache_owner=self,
+        ) is None
+
     def order_target_percent(self, data=None, target=0.0, **kwargs):
         data = data or self.datas[0]
         lot_size = normalize_quantity_step(kwargs.get('lot_size', config.LOT_SIZE))
+        self._last_order_target_skip_reason = None
+
+        # 风控已经在本根 K 提交平仓时，轮动计划不得再次提交同一标的的卖单。
+        # 否则 next_open 会在下一根 K 重复执行两笔卖单，可能把多仓打成空头。
+        if (
+            data._name in getattr(self, '_risk_control_order_symbols', set())
+            and target <= 0
+        ):
+            self._last_order_target_skip_reason = 'risk_control_lock'
+            return None
 
         # 防守逻辑：如果该标的正在被风控接管，且策略试图买入，则拦截
         if hasattr(self.strategy, 'risk_handled_symbols'):
@@ -940,6 +1009,9 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
         if price <= 0:
             return None  # 价格异常，不操作
+        if self._option_quote_missing(data):
+            self._last_order_target_skip_reason = 'invalid_price'
+            return None
 
         # 2. 获取账户总价值 (现金 + 持仓市值)
         # self.broker.getvalue() 返回的是当前回测时刻的总资产
@@ -993,7 +1065,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             # 如果目标是 0，通常意味着清仓
             if target == 0.0:
                 if pos_size > 0:
-                    self.expected_freed_cash += pos_size * unit_value
+                    self.expected_freed_cash += self._net_sell_proceeds(data, pos_size * unit_value)
                 # 如果是清仓，直接使用 close()，它会处理所有持仓
                 # 注意：self.close() 内部逻辑可能不保证 100 整手，但在清仓时通常需要卖出所有零股
                 # 如果需要严格整手卖出，可以使用下面的逻辑，但会残留零股
@@ -1007,7 +1079,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
             if shares_to_sell > 0:
                 estimated_value = shares_to_sell * unit_value
-                self.expected_freed_cash += estimated_value
+                self.expected_freed_cash += self._net_sell_proceeds(data, estimated_value)
                 return self.sell(data=data, size=shares_to_sell)
 
         return None
@@ -1023,6 +1095,14 @@ class BacktraderStrategyWrapper(bt.Strategy):
         lot_size = normalize_quantity_step(kwargs.get('lot_size', config.LOT_SIZE))
         self._last_order_target_skip_reason = None
 
+        # 风控平仓和轮动清仓不能在同一根 K 重复提交。
+        if (
+            data._name in getattr(self, '_risk_control_order_symbols', set())
+            and target <= 0
+        ):
+            self._last_order_target_skip_reason = 'risk_control_lock'
+            return None
+
         # 0. 风控拦截：如果该标的正在被风控接管，且策略试图买入/持有，则拦截
         if hasattr(self.strategy, 'risk_handled_symbols'):
             # 如果目标金额 > 0，视为买入或维持持仓意图，予以拦截
@@ -1035,7 +1115,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
         pos_size = self.getposition(data).size
         price = data.close[0]
 
-        if price <= 0:
+        if price <= 0 or self._option_quote_missing(data):
             self._last_order_target_skip_reason = 'invalid_price'
             return None
 
@@ -1101,7 +1181,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
             # 如果目标价值是 0 或极小，视为清仓
             if target <= 1.0:  # 容忍浮点误差，小于1块钱视同清仓
                 if pos_size > 0:
-                    self.expected_freed_cash += pos_size * unit_value
+                    self.expected_freed_cash += self._net_sell_proceeds(data, pos_size * unit_value)
                 return self.close(data=data)
 
             # [关键] 向下取整到 lot_size
@@ -1112,7 +1192,7 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
             if shares_to_sell > 0:
                 estimated_freed_value = shares_to_sell * unit_value
-                self.expected_freed_cash += estimated_freed_value
+                self.expected_freed_cash += self._net_sell_proceeds(data, estimated_freed_value)
                 return self.sell(data=data, size=shares_to_sell)
 
             self._last_order_target_skip_reason = 'below_min_lot_delta'
@@ -1155,6 +1235,9 @@ class BacktraderStrategyWrapper(bt.Strategy):
 
                 if hasattr(self.strategy, 'order'):
                     self.strategy.order = order
+
+                if order is not None:
+                    self._risk_control_order_symbols.add(data._name)
 
                 triggered_symbols.append(data._name)
 
@@ -1209,11 +1292,11 @@ class SignalLoggingBroker(bt.brokers.BackBroker):
     """
 
     def next(self):
-        """撮合后、策略前执行显式启用的离线到期交割。"""
+        """撮合后、策略前执行期权到期结算：显式声明物理交割，否则有期权行情时按现金结算。"""
         super().next()
-        if getattr(self, "physical_option_settlement", False):
-            from backtest.option_settlement import settle_physical_options
-            settle_physical_options(self)
+        if getattr(self, "option_expiry_settlement", None):
+            from backtest.option_settlement import settle_expired_options
+            settle_expired_options(self)
 
     def _try_exec_market(self, order, popen, phigh, plow):
         """次日开盘按实际可用现金当场缩减超额买单，避免整笔保证金拒单。"""
@@ -1247,10 +1330,20 @@ class SignalLoggingBroker(bt.brokers.BackBroker):
             self._execute(order, ago=0, price=execution_price, dtcoc=dtcoc)
             return
 
+        if self.p.coc and order.info.get("coc", True):
+            # COC 以信号日收盘价成交；原生实现会再用下一根 K 线的高低价截断滑点价，
+            # 跳空时卖单被抬到次日最低价、买单被压到次日最高价，等于引入未来信息。
+            pclose = order.created.pclose
+            if order.isbuy():
+                execution_price = self._slip_up(float('inf'), pclose, doslip=self.p.slip_open)
+            else:
+                execution_price = self._slip_down(0.0, pclose, doslip=self.p.slip_open)
+            self._execute(order, ago=0, price=execution_price, dtcoc=order.created.dt)
+            return
+
         if (
             getattr(self, "execution_price", "close") != "next_open"
             or not order.isbuy()
-            or self.p.coc and order.info.get("coc", True)
         ):
             return super()._try_exec_market(order, popen, phigh, plow)
         if not self.p.coo and order.data.datetime[0] <= order.created.dt:
@@ -1430,8 +1523,12 @@ class Backtester:
             print(msg)
 
     def _init_data_feeds(self):
-        """注册行情。短命期权对齐正股时钟；缺 K 与到期后补 0，避免把旧价当成当日报价。"""
-        from common.options.analytics import parse_option_symbol
+        """注册行情。短命期权对齐正股时钟；缺 K 与到期后补 0，避免把旧价当成当日报价。
+
+        Broker 估值另用 OPTION_MARK_COLUMN：存续期内沿用上一有效价，到期后按到期日正股收盘的内在价值。
+        到期持仓由 Broker 按同一内在价值结算平仓（默认现金结算），该标记仅在缺标的价格而无法结算时继续承担估值。
+        """
+        from common.options.analytics import parse_option_symbol, underlying_key
 
         start = pd.to_datetime(self.start_date) if self.start_date else None
         end = pd.to_datetime(self.end_date) if self.end_date else None
@@ -1494,6 +1591,8 @@ class Backtester:
                 clock_days = clock_days.tz_localize(None)
             clock_days = clock_days.normalize()
         alive_masks = {}
+        underlying_frames = {underlying_key(symbol): frame for symbol, frame in underlyings.items()}
+        expiry_spots = {}
         prepared = {}
         for symbol in self.datas:
             if symbol in underlyings:
@@ -1524,6 +1623,41 @@ class Backtester:
                     else:
                         alive_mask = None
                     if not already_aligned:
+                        # 估值标记：成交价优先，缺成交用有效买卖中价，再向前沿用；首个有效价之前保持 0。
+                        mark = None
+                        if "close" in aligned.columns:
+                            mark = pd.to_numeric(aligned["close"], errors="coerce")
+                            mark = mark.where(mark > 0)
+                            for bid_column, ask_column in (("bid", "ask"), ("bid_price", "ask_price")):
+                                if bid_column in aligned.columns and ask_column in aligned.columns:
+                                    bid = pd.to_numeric(aligned[bid_column], errors="coerce")
+                                    ask = pd.to_numeric(aligned[ask_column], errors="coerce")
+                                    mark = mark.fillna(((bid + ask) / 2.0).where((bid > 0) & (ask >= bid)))
+                            mark = mark.ffill()
+                            if alive_mask is not None:
+                                parsed = parsed_symbols.get(symbol, {})
+                                spot_key = (underlying_key(parsed.get("underlying")), expiry_day.value)
+                                if spot_key not in expiry_spots:
+                                    spot = None
+                                    stock = underlying_frames.get(spot_key[0])
+                                    if stock is not None and "close" in stock.columns:
+                                        closes = pd.to_numeric(
+                                            stock["close"].loc[stock.index < expiry_day + pd.Timedelta(days=1)],
+                                            errors="coerce",
+                                        ).dropna()
+                                        closes = closes[closes > 0]
+                                        spot = float(closes.iloc[-1]) if not closes.empty else None
+                                    expiry_spots[spot_key] = spot
+                                spot = expiry_spots[spot_key]
+                                strike = parsed.get("strike")
+                                if spot is not None and strike:
+                                    # 未实物交割的到期合约按到期日内在价值估值，空头指派亏损不会被记成 0 元。
+                                    if parsed.get("option_type") == "CALL":
+                                        intrinsic = max(spot - float(strike), 0.0)
+                                    else:
+                                        intrinsic = max(float(strike) - spot, 0.0)
+                                    mark = mark.where(alive_mask, intrinsic)
+                            mark = mark.fillna(0.0)
                         for column in ("open", "high", "low", "close", "bid", "ask", "bid_price", "ask_price", "last"):
                             if column not in aligned.columns:
                                 continue
@@ -1534,18 +1668,24 @@ class Backtester:
                             aligned[column] = series
                         if "volume" in aligned.columns:
                             aligned["volume"] = pd.to_numeric(aligned["volume"], errors="coerce").fillna(0.0)
+                        if mark is not None:
+                            aligned[OPTION_MARK_COLUMN] = mark
                         aligned.attrs["_quantada_aligned_clock"] = clock_signature
                     frame = aligned
                 prepared[symbol] = frame
         self._prepared_datas = prepared
         for symbol, df in prepared.items():
+            feed_kwargs = {}
+            if OPTION_MARK_COLUMN in getattr(df, "columns", ()):
+                feed_kwargs["close"] = OPTION_MARK_COLUMN
             feed = FastPandasData(
                 dataname=df,
                 fromdate=start,
                 todate=end,
                 name=symbol,
                 timeframe=self.timeframe,
-                compression=self.compression
+                compression=self.compression,
+                **feed_kwargs,
             )
             apply_data_feed_plot_scope(feed, self.plot_scope)
             self.cerebro.adddata(feed)
@@ -1577,7 +1717,7 @@ class Backtester:
                     "Physical option settlement requires full daily bars with compression=1; "
                     "Day cutoff bars are not official closing prices"
                 )
-            self.cerebro.broker.physical_option_settlement = True
+            self.cerebro.broker.option_expiry_settlement = "physical"
             self.cerebro.broker.option_settlement_events = []
         self.cerebro.broker.execution_price = self.execution_price
         self.cerebro.broker.setcash(self.cash)
@@ -1600,6 +1740,10 @@ class Backtester:
                 raise ValueError(
                     f"Option DataFeed {getattr(data, '_name', '')!r} requires a positive contract multiplier"
                 )
+            if parsed_option.get('option_type') and not getattr(self.cerebro.broker, 'option_expiry_settlement', None):
+                # 未声明物理交割时，到期持仓按内在价值现金平仓，使到期盈亏进入已平仓交易统计；纯股票回测不启用。
+                self.cerebro.broker.option_expiry_settlement = "cash"
+                self.cerebro.broker.option_settlement_events = []
             if multiplier == 1.0:
                 continue
             self.cerebro.broker.addcommissioninfo(
@@ -1629,8 +1773,21 @@ class Backtester:
 
     def _init_analyzers(self):
         # 1. 基础指标 (优化器也需要)
+        # 年化因子必须与收益采样周期一致：日内 K 线先聚合为日收益，日/周/月按每根 K 覆盖的周期数折算。
+        compression = max(int(self.compression or 1), 1)
+        if self.timeframe < bt.TimeFrame.Days:
+            sharpe_timeframe, sharpe_factor = bt.TimeFrame.Days, float(config.ANNUAL_FACTOR)
+        else:
+            sharpe_timeframe = self.timeframe
+            periods_per_year = {
+                bt.TimeFrame.Days: float(config.ANNUAL_FACTOR),
+                bt.TimeFrame.Weeks: 52.0,
+                bt.TimeFrame.Months: 12.0,
+                bt.TimeFrame.Years: 1.0,
+            }.get(self.timeframe, float(config.ANNUAL_FACTOR))
+            sharpe_factor = periods_per_year / compression
         self.cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', riskfreerate=0.0,
-                                 timeframe=self.timeframe, compression=self.compression, factor=config.ANNUAL_FACTOR, annualize=True)
+                                 timeframe=sharpe_timeframe, compression=1, factor=sharpe_factor, annualize=True)
         self.cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
         self.cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         self.cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='tradeanalyzer')
@@ -1667,8 +1824,9 @@ class Backtester:
         # 获取获利交易数
         win_trades = trade_analysis.get('won', {}).get('total', 0)
 
-        # 计算胜率 (0.0 ~ 1.0)
-        win_rate = (win_trades / total_trades) if total_trades > 0 else 0.0
+        # 计算胜率 (0.0 ~ 1.0)；未平仓交易没有盈亏结果，不能计入分母。
+        closed_trades = trade_analysis.get('total', {}).get('closed', 0)
+        win_rate = (win_trades / closed_trades) if closed_trades > 0 else 0.0
 
         self.recorder.finish_execution(
             final_value=final_val, total_return=total_ret,
@@ -1847,7 +2005,9 @@ class Backtester:
             total_loss_pnl = 0.0
             avg_loss_pnl = 0.0
 
-        win_rate = (win_trades / total_trades) * 100 if total_trades > 0 else 0.0
+        # 胜率只统计已平仓交易，未平仓交易不应拉低胜率。
+        closed_trades = trade_analysis.get('total', {}).get('closed', 0)
+        win_rate = (win_trades / closed_trades) * 100 if closed_trades > 0 else 0.0
         profit_factor = total_win_pnl / abs(total_loss_pnl) if total_loss_pnl != 0 else float('inf')
         pnl_ratio = avg_win_pnl / abs(avg_loss_pnl) if avg_loss_pnl != 0 else float('inf')
 

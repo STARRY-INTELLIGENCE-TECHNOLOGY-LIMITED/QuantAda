@@ -27,10 +27,11 @@
 - `is_live_mode(context)`
 3. `_submit_order()` 返回的代理若已是 Rejected/Canceled/Expired 等不会继续成交的终态，基础层会按未接受处理；BUY Rejected 会立即走统一降级重试。适配器必须准确映射这些状态，不能把同步废单伪装成 accepted/pending。
 4. `_submit_order()` 返回 accepted/pending/completed 代理时必须提供非空 `id`；缺失 `id` 的代理会被基础层按未提交处理，避免留下不可跟踪的在途单或虚拟占资。
+   - `_submit_order()` 不得把 SDK/网络异常抛给基础层或执行器：记录日志并返回 `None`，单个标的失败不能中断同一调仓计划中其它标的。若失败时委托可能已抵达券商（如发单超时），必须设置 `_last_order_target_skip_reason='submit_outcome_unknown'` 并推送 ERROR；基础层本轮不再对同一标的做 BUY/SELL 降级重试，执行器不再滚动重试该标的，下一轮以券商在途单/持仓为准，不保存该意图。
 5. 建议按市场覆盖 `get_sellable_position(data)`。
 6. 数量字段 `volume`、持仓 `.size`、pending `size`、`executed.size` 允许整数或小数。`LOT_SIZE` 和 `BROKER_LOT_LIMITS` 均为十进制正数语义；adapter 不得无条件转为 `int`，只可在目标券商/合约明确要求整数时做最终转换。
 7. 基础层拆单是第一道边界；适配器的最终 `_submit_order()` 入口也必须按本轮有效配置再次拒绝超出 `BROKER_LOT_LIMITS` 的请求，不能让超限数量抵达券商 API。有效配置应优先读取实盘运行的配置快照，避免长进程重连时模块级默认值覆盖命令行覆盖值。
-8. GM 适配器只服务中国市场，实盘调仓的 BUY/SELL 均使用 `OrderType_Market`。BUY 的 `price` 应至少覆盖实时最优卖价，SELL 使用实时行情作为保护价；该字段是市价保护价，不会把订单变回限价单。资金预检查、虚拟占资和拒单退款均按本次保护价估算。回测仍使用同步市价语义。
+8. GM 适配器只服务中国市场，实盘调仓的 BUY/SELL 均使用 `OrderType_Market`。BUY 的 `price` 应至少覆盖实时最优卖价，SELL 使用实时行情作为保护价；该字段是市价保护价，不会把订单变回限价单。资金预检查、虚拟占资和拒单退款均按本次保护价估算。GM `available` 已扣除挂单冻结资金，`get_cash()` 与发单资金预检查只扣除虚拟占资中尚未被柜台 `order_frozen` 覆盖的部分（缺少该字段时完整扣减），避免双重扣减。回测仍使用同步市价语义。
 9. IBKR `CRYPTO`（PAXOS）合约的历史数据使用 `AGGTRADES`；市价委托必须使用合约要求的现金数量精度（USD 分）并设置明确的有效期（当前为 `IOC`），不得同时发送非零 `totalQuantity`。订单代理应通过 `submitted_size` 保留基础层所需的币数量，不能因柜台现金数量委托的 wire 数量为零而误判未受理。
 10. Broker 专属的 SDK 导入在模块导入阶段必须保持可选。若选择的 Broker 未安装对应 SDK，适配器必须抛出异常或安全失败，并给出可执行提示：取消 `requirements.txt` 中对应行的注释，然后运行 `python -m pip install -r requirements.txt`。
 
@@ -41,12 +42,13 @@
 - `direction`
 - `size`（可为正整数或正小数，必须保留券商返回精度）
 2. `id` 必须可用于后续撤单。
+   - 可选 `created_at`：券商提供的委托创建时间（建议带时区的 `pd.Timestamp`），供隔夜清理区分当日单；无法可靠获得时不输出该字段（视为隔夜单）。GM 读取 `created_at`（无时区按 `Asia/Shanghai`），Futu 读取 `create_time`（按代码市场时区）；IB 的 `trade.log` 时间是本地接收时间而非创建时间，不输出。
 3. `cancel_pending_order(order_id)` 失败时返回 `False`，不要把撤单失败变成致命异常。
 4. 若原生 `orderId` 不稳定或缺失，必须提供可区分、可回查的兜底标识。
 5. 若实时在途查询失败、断连或快照不完整，adapter 可安全返回 `[]`，但必须设置 `_last_pending_orders_fetch_failed=True` 与 `_last_pending_orders_fetch_error`；成功查询必须清零，避免 engine/executor 将“查不到”误判为“无在途”。
 6. 上述失败标记仅用于 live runtime 判断快照可信度；它不是订单意图、不是重试队列，也不得被用于回测路径。回测 broker 应保持同步成交语义，不依赖 live pending-order 状态。
 7. 实盘引擎每轮策略执行前、策略资金/仓位盘点时，以及基础层 `order_target_percent()` / `order_target_value()` 发单边界都会检查该快照；异常或失败标记为真时必须失败关闭并跳过当轮调仓，不得将其解释为空在途。可信在途数量必须计入目标仓位差额，允许继续执行可确认的剩余计划。回测路径不得查询该快照。
-8. 若券商原始在途记录缺失/空 `id`、缺失 `symbol`、方向未知、剩余数量为负或非数值，或剩余数量为零但缺少可验证证据，adapter 必须将整份 pending 快照标记为不可信；不得静默跳过坏记录或把未知方向默认解释为 SELL。已知非终态但短暂报告 `remaining=0` 时，只有同时提供正的 `totalQuantity` 与 `filled` 才可判断：`filled >= totalQuantity` 安全排除，`filled < totalQuantity` 按 `totalQuantity-filled` 保守计入在途；缺少该证据仍必须失败关闭。
+8. GM 在途记录 `volume>0` 且已成交量等于委托量（剩余恰为零）视为终态回报滞后，直接跳过；已成交量大于委托量（剩余为负）是非法记录，必须使整份快照不可信。若券商原始在途记录缺失/空 `id`、缺失 `symbol`、方向未知、剩余数量为负或非数值，或剩余数量为零但缺少可验证证据，adapter 必须将整份 pending 快照标记为不可信；不得静默跳过坏记录或把未知方向默认解释为 SELL。已知非终态但短暂报告 `remaining=0` 时，只有同时提供正的 `totalQuantity` 与 `filled` 才可判断：`filled >= totalQuantity` 安全排除，`filled < totalQuantity` 按 `totalQuantity-filled` 保守计入在途；缺少该证据仍必须失败关闭。
 
 ## 4. 无状态约束
 1. 不维护长期本地 fake cash / fake position 作为事实来源。
@@ -56,7 +58,7 @@
 5. 多账户 adapter 必须让现金、持仓、pending 与下单使用同一明确账户范围。GM adapter 当前只支持券商会话绑定的单一账户，使用 SDK 默认单账户语义，不增加账户选择配置；IB 等多账户 adapter 仍须按其连接配置明确筛选目标账户。已明确筛选目标账户后，其他账户有仓而目标账户为空是合法的零仓，不得误报为快照故障。
 6. 卖单完成后的现金快照等待由 `common.order_executor` 统一处理；adapter 不应自行实现固定 sleep、轮询补买或卖后现金等待状态机。
 7. 为支持通用卖后现金等待，adapter 只需保证:
-- `get_rebalance_cash()` 或 `get_cash()` 返回当前真实可用于调仓的现金口径；如期权担保/保证金会改变持仓市值盘点，可提供 `get_rebalance_position_value(data, signed_size, price, market_value)`，由 Broker 自己解释其风险口径。
+- `get_rebalance_cash()` 或 `get_cash()` 返回当前真实可用于调仓的现金口径；现金/在途占资快照不可信时 `get_rebalance_cash()` 必须抛错（由策略层 live 守卫中止本轮调仓），不能返回 0 让计划误判为需要减仓；下单口径 `get_cash()` 可按 0 失败关闭以阻止买入。富途账户字段按优先级取第一个数值字段，`available_funds=0`/负数等有效数值必须采用（负数按 0），只有缺失或非数值才回退下一字段。如期权担保/保证金会改变持仓市值盘点，可提供 `get_rebalance_position_value(data, signed_size, price, market_value)`，由 Broker 自己解释其风险口径。
 - `get_current_price(data)` 能返回当前估算价格
 - 卖单返回的 OrderProxy 可被执行器推断单笔委托数量，优先暴露 `submitted_size` / `requested_size`，或让原始对象保留在 `platform_order.volume` / `raw_order.volume` / `trade.order.totalQuantity`
 - `submitted_size` / `requested_size` 只能表示该代理对应的单笔委托数量；基础层拆单批次总量使用 `batch_submitted_size`
@@ -94,7 +96,7 @@
 2. 不要假设所有 broker 对 `start_date`、schedule、回放模式的解释一致。
 3. 若某 adapter 支持 live + replay/backtest 复合模式，应在该 adapter 文档或实现中明确说明。
 4. 若 adapter 使用实盘 schedule 回调，应在运行 context 上设置 `schedule_rule` 或 `use_schedule`，避免基础 broker 将正常的 30m/1h 调度间隔误判为日内长中断。
-5. schedule 兼容 `Nd|Nw|Nm|Nh[:HH:MM[:SS]]`；`N` 为正整数，`Nw` 以本机时间周一为周锚点，省略时刻时默认 `00:00:00`。配置 `Ns` 必须明确报错并引导使用长连接事件回调与 `timeframe='Seconds'`，不得静默降级为不运行策略。分钟级 SDK 轮询和单次调用超时应随实际周期缩短，避免跨入下一周期。
+5. schedule 兼容 `Nd|Nw|Nm|Nh[:HH:MM[:SS]]`；`N` 为正整数，`Nw` 以本机时间周一为周锚点，省略时刻时默认 `00:00:00`。`1d/1w/Nd/Nw` 按本地日历日/周计数后再组合墙钟时刻并本地化，夏令时切换当日及前后都保持配置的本地时刻；春季跳过的时刻顺延到第一个有效时刻，秋季重复的时刻取第一次出现。配置 `Ns` 必须明确报错并引导使用长连接事件回调与 `timeframe='Seconds'`，不得静默降级为不运行策略。分钟级 SDK 轮询和单次调用超时应随实际周期缩短，避免跨入下一周期。
 6. 若 schedule 回调与订单状态回调共享单线程 SDK 事件循环（包括 GM schedule、IB `ib.sleep()` 主循环），不能在回调线程同步执行包含 SELL 等待、现金同步和最终 BUY 的完整实盘运行；必须将 slot 调度到单个短生命周期工作线程，并让 SDK 回调线程立即返回。重叠 slot 只记录并跳过；worker 失败时必须释放该 slot 的去重键，允许后续同槽位重试；回测/优化不得创建该工作线程。
 7. 对 24x7 市场使用 `KEEP_OVERNIGHT_ORDERS=True` 时，跨自然日及正常长周期 bar 间隔必须同时保留柜台订单及本地 `_active_buys`、`_pending_sells`、虚拟占资跟踪；仍以实时柜台快照和终态回调为事实来源。
 8. `common.live_schedule.LiveScheduleRunner` 是通用的 schedule 运行器：无原生 schedule 回调的 Broker 可调用 `run_forever()` 保活并轮询；共享 SDK 事件循环的 Broker 应在事件回调中调用 `poll_once()`。它集中处理 slot/prewarm 去重、重叠运行保护和短生命周期工作线程，Broker 只提供连接与 `LiveTrader.run()` 上下文。

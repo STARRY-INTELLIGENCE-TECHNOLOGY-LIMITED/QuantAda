@@ -125,6 +125,10 @@ class ClosedTradeTracker:
             state = self._active_trade_states.get(symbol)
             if state:
                 state["last_exit_price"] = price
+                # 到期结算按内在价值平仓，指派/行权盈亏已计入本笔期权交易；保留事件便于归因。
+                settlement_event = self._order_info_text(order, "option_settlement_event")
+                if settlement_event:
+                    state["settlement_event"] = settlement_event
         elif effect == "BUY_TO_OPEN" or (not effect and order.isbuy() and size > 0):
             self._track_buy(
                 symbol,
@@ -200,6 +204,8 @@ class ClosedTradeTracker:
             "premium_credit": premium_credit,
             "contract_multiplier": contract_multiplier,
         }
+        if state and state.get("settlement_event"):
+            leg_record["settlement_event"] = state["settlement_event"]
         spread_id = state.get("spread_id") if state else None
         if spread_id:
             bucket = self._spread_closed.setdefault(spread_id, {})

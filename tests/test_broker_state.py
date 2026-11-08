@@ -1595,3 +1595,53 @@ def test_risk_lock_allows_covering_short_but_blocks_new_exposure():
     assert added is None
     assert broker.risk_lock_blocks_option_open(data._name, "SELL_TO_OPEN") is True
     assert broker.risk_lock_blocks_option_open(data._name, "BUY_TO_CLOSE") is False
+
+
+def test_smart_sell_reduce_below_one_lot_sets_benign_skip_reason():
+    """减仓差额不足一手时应标记良性跳过原因，而不是被执行器当作卖单提交失败。"""
+    broker = MockBroker(initial_cash=100000.0)
+    broker.mock_position = 1000
+
+    ret = broker.order_target_value(_make_data(), target=9950.0)
+
+    assert ret is None
+    assert broker.submitted_orders == []
+    assert broker._last_order_target_skip_reason == "below_min_lot_delta"
+
+
+class _OutcomeUnknownBroker(MockBroker):
+    """首次提交模拟券商超时（结果未知），之后正常受理。"""
+
+    def __init__(self, initial_cash):
+        super().__init__(initial_cash)
+        self.submit_attempts = []
+
+    def _submit_order(self, data, volume, side, price):
+        self.submit_attempts.append((data._name, side, volume))
+        if len(self.submit_attempts) == 1:
+            self._last_order_target_skip_reason = "submit_outcome_unknown"
+            return None
+        return super()._submit_order(data, volume, side, price)
+
+
+def test_buy_submit_outcome_unknown_does_not_downgrade_retry():
+    """提交结果未知时原买单可能已生效，本轮不得对同一标的降级重试。"""
+    broker = _OutcomeUnknownBroker(initial_cash=100000.0)
+
+    ret = broker.order_target_value(_make_data(), target=10000.0)
+
+    assert ret is None
+    assert broker.submit_attempts == [("SHSE.600000", "BUY", 1000)]
+    assert broker.submitted_orders == []
+
+
+def test_sell_submit_outcome_unknown_does_not_downgrade_retry():
+    """提交结果未知时原卖单可能已生效，本轮不得对同一标的降级重试。"""
+    broker = _OutcomeUnknownBroker(initial_cash=100000.0)
+    broker.mock_position = 1000
+
+    ret = broker.order_target_value(_make_data(), target=0.0)
+
+    assert ret is None
+    assert broker.submit_attempts == [("SHSE.600000", "SELL", 1000)]
+    assert broker.submitted_orders == []

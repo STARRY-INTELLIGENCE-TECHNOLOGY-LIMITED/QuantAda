@@ -34,6 +34,17 @@ class GmDataProvider(BaseDataProvider):
 
     PRIORITY = 40
 
+    @staticmethod
+    def price_adjustment():
+        """读取并校验 GM 历史行情复权口径；DataManager 也用它区分缓存价格口径。"""
+        try:
+            adjustment = int(getattr(config, 'GM_PRICE_ADJUSTMENT', 1))
+        except (TypeError, ValueError, OverflowError):
+            adjustment = 1
+        if adjustment not in {0, 1, 2}:
+            raise ValueError('GM_PRICE_ADJUSTMENT must be 0, 1 or 2')
+        return adjustment
+
     def __init__(self, token=None):
         # 如果未传入，尝试从 config 读取默认值
         if token is None and hasattr(config, 'GM_TOKEN'):
@@ -83,6 +94,7 @@ class GmDataProvider(BaseDataProvider):
         
         try:
             freq = self._map_frequency(timeframe, compression)
+            price_adjustment = self.price_adjustment()
 
             # 1. 获取历史数据
             if end_date is None:
@@ -114,7 +126,7 @@ class GmDataProvider(BaseDataProvider):
                                 symbol=symbol, frequency=freq,
                                 start_time=cursor.strftime('%Y-%m-%d %H:%M:%S'),
                                 end_time=chunk_end.strftime('%Y-%m-%d %H:%M:%S'),
-                                fields='open,high,low,close,volume,eob', adjust=1,
+                                fields='open,high,low,close,volume,eob', adjust=price_adjustment,
                                 adjust_end_time=request_end.strftime('%Y-%m-%d %H:%M:%S'), df=True,
                             )
                             if chunk is None:
@@ -135,7 +147,7 @@ class GmDataProvider(BaseDataProvider):
                 df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             else:
                 df = history(symbol=symbol, frequency=freq, start_time=start_date, end_time=end_date,
-                             fields='open,high,low,close,volume,eob', adjust=1, df=True)
+                             fields='open,high,low,close,volume,eob', adjust=price_adjustment, df=True)
 
             # 2. 清洗历史数据
             if not df.empty:
@@ -177,6 +189,7 @@ class GmDataProvider(BaseDataProvider):
             df = df[['open', 'high', 'low', 'close', 'volume', 'openinterest']]
             df.sort_index(inplace=True)
             df = df[~df.index.duplicated(keep='last')]
+            df.attrs['gm_price_adjustment'] = price_adjustment
 
             return df
 

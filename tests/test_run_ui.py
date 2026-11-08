@@ -41,6 +41,17 @@ def test_run_ui_ip_alone_enters_ui_and_forwards_explicit_bind_address(monkeypatc
     assert called["argv"] == ["--ui_ip", "0.0.0.0", "--no-browser"]
 
 
+def test_run_dangerous_ui_flag_enters_ui_and_reaches_web_parser(monkeypatch):
+    import run
+
+    called: dict[str, object] = {}
+    monkeypatch.setattr(run.sys, "argv", ["run.py", "--dangerously-ui-executable", "--no-browser"])
+    monkeypatch.setattr(web, "serve", lambda *a, **kw: called.update(kw) or (_ for _ in ()).throw(OSError("stop")))
+
+    assert run._run_main() == 1
+    assert called["dangerously_ui_executable"] is True
+
+
 def test_run_ui_ip_equals_form_enters_ui(monkeypatch):
     import run
 

@@ -190,26 +190,54 @@ class SchedulePlanner:
         return max(0.0, amount * multiplier)
 
     @staticmethod
-    def schedule_anchor_for_day(now: datetime.datetime, parsed_schedule: dict):
-        now_ts = pd.Timestamp(now)
-        day_anchor = now_ts.normalize()
-        kind = parsed_schedule.get('kind')
-        if kind == 'weekly' and parsed_schedule.get('freq_unit') == 'w':
-            day_anchor -= pd.Timedelta(days=int(now_ts.weekday()))
-        elif kind == 'calendar_interval' and parsed_schedule.get('freq_unit') == 'w':
-            day_anchor = pd.Timestamp('1970-01-05')
-            if now_ts.tzinfo is not None:
-                day_anchor = day_anchor.tz_localize(now_ts.tz)
-        elif kind == 'calendar_interval' and parsed_schedule.get('freq_unit') == 'd':
-            epoch = pd.Timestamp('1970-01-01')
-            if now_ts.tzinfo is not None:
-                epoch = epoch.tz_localize(now_ts.tz)
-            day_anchor = epoch
-        return day_anchor + pd.Timedelta(
+    def _local_day(ts):
+        """返回时间点所在的本地日历日（无时区、零点）。"""
+        ts = pd.Timestamp(ts)
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        return ts.normalize()
+
+    @staticmethod
+    def _wall_slot(reference, day, parsed_schedule):
+        """在 reference 时区内把本地日历日和目标墙钟时刻组合为槽位。
+
+        先按无时区墙钟相加，再本地化，避免 DST 当日或跨 DST 时用绝对秒数漂移 1 小时。
+        春季跳过的时刻顺延到第一个有效时刻；秋季重复的时刻取第一次出现。
+        """
+        slot = pd.Timestamp(day).normalize() + pd.Timedelta(
             hours=int(parsed_schedule['target_h']),
             minutes=int(parsed_schedule['target_m']),
             seconds=int(parsed_schedule['target_s']),
         )
+        reference = pd.Timestamp(reference)
+        if reference.tzinfo is not None:
+            slot = slot.tz_localize(reference.tz, ambiguous=True, nonexistent='shift_forward')
+        return slot
+
+    @classmethod
+    def _calendar_slot_day(cls, now_ts, parsed_schedule):
+        """返回 Nd/Nw 中不晚于 now 的最近槽位本地日和以天计的周期。"""
+        weekly = parsed_schedule.get('freq_unit') == 'w'
+        period = int(parsed_schedule.get('freq_n') or 1) * (7 if weekly else 1)
+        epoch = pd.Timestamp('1970-01-05' if weekly else '1970-01-01')
+        day = cls._local_day(now_ts)
+        day -= pd.Timedelta(days=(day - epoch).days % period)
+        if cls._wall_slot(now_ts, day, parsed_schedule) > now_ts:
+            day -= pd.Timedelta(days=period)
+        return day, period
+
+    @classmethod
+    def schedule_anchor_for_day(cls, now: datetime.datetime, parsed_schedule: dict):
+        now_ts = pd.Timestamp(now)
+        day_anchor = cls._local_day(now_ts)
+        kind = parsed_schedule.get('kind')
+        if kind == 'weekly' and parsed_schedule.get('freq_unit') == 'w':
+            day_anchor -= pd.Timedelta(days=int(day_anchor.weekday()))
+        elif kind == 'calendar_interval' and parsed_schedule.get('freq_unit') == 'w':
+            day_anchor = pd.Timestamp('1970-01-05')
+        elif kind == 'calendar_interval' and parsed_schedule.get('freq_unit') == 'd':
+            day_anchor = pd.Timestamp('1970-01-01')
+        return cls._wall_slot(now_ts, day_anchor, parsed_schedule)
 
     @staticmethod
     def format_schedule_slot_key(slot_dt) -> str:
@@ -228,12 +256,11 @@ class SchedulePlanner:
         if kind == 'weekly':
             return anchor_dt if now_ts >= anchor_dt else None
         if kind == 'calendar_interval':
-            interval_seconds = float(parsed_schedule.get('interval_seconds') or 0.0)
-            if interval_seconds <= 0 or now_ts < anchor_dt:
+            if now_ts < anchor_dt:
                 return None
-            elapsed_seconds = max(0.0, (now_ts - anchor_dt).total_seconds())
-            slot_index = int(elapsed_seconds // interval_seconds)
-            return anchor_dt + pd.Timedelta(seconds=slot_index * interval_seconds)
+            # 按本地日历日计数，再组合墙钟时刻，DST 前后都保持同一本地时刻。
+            slot_day, _ = cls._calendar_slot_day(now_ts, parsed_schedule)
+            return cls._wall_slot(now_ts, slot_day, parsed_schedule)
         if now_ts < anchor_dt:
             return None
 
@@ -248,32 +275,25 @@ class SchedulePlanner:
     def resolve_next_schedule_slot(cls, now: datetime.datetime, parsed_schedule: dict):
         now_ts = pd.Timestamp(now)
         anchor_dt = cls.schedule_anchor_for_day(now_ts, parsed_schedule)
+        next_day = cls._local_day(anchor_dt) + pd.Timedelta(days=1)
 
         kind = parsed_schedule.get('kind')
-        if kind == 'once':
+        if kind in {'once', 'daily'}:
             if now_ts <= anchor_dt:
                 return anchor_dt
-            return anchor_dt + pd.Timedelta(days=1)
-        if kind == 'daily':
-            if now_ts <= anchor_dt:
-                return anchor_dt
-            return anchor_dt + pd.Timedelta(days=1)
+            return cls._wall_slot(now_ts, next_day, parsed_schedule)
         if kind == 'weekly':
             if now_ts <= anchor_dt:
                 return anchor_dt
-            return anchor_dt + pd.Timedelta(days=7)
+            return cls._wall_slot(now_ts, next_day + pd.Timedelta(days=6), parsed_schedule)
         if kind == 'calendar_interval':
-            interval_seconds = float(parsed_schedule.get('interval_seconds') or 0.0)
-            if interval_seconds <= 0:
-                return None
             if now_ts <= anchor_dt:
                 return anchor_dt
-            elapsed_seconds = max(0.0, (now_ts - anchor_dt).total_seconds())
-            slot_index = int(elapsed_seconds // interval_seconds)
-            current_slot_dt = anchor_dt + pd.Timedelta(seconds=slot_index * interval_seconds)
+            slot_day, period = cls._calendar_slot_day(now_ts, parsed_schedule)
+            current_slot_dt = cls._wall_slot(now_ts, slot_day, parsed_schedule)
             if now_ts <= current_slot_dt:
                 return current_slot_dt
-            return current_slot_dt + pd.Timedelta(seconds=interval_seconds)
+            return cls._wall_slot(now_ts, slot_day + pd.Timedelta(days=period), parsed_schedule)
 
         interval_seconds = float(parsed_schedule.get('interval_seconds') or 0.0)
         if interval_seconds <= 0:
@@ -291,29 +311,30 @@ class SchedulePlanner:
             next_slot_dt = current_slot_dt + pd.Timedelta(seconds=interval_seconds)
 
         if next_slot_dt.date() != now_ts.date():
-            return anchor_dt + pd.Timedelta(days=1)
+            return cls._wall_slot(now_ts, next_day, parsed_schedule)
         return next_slot_dt
 
     @classmethod
     def advance_schedule_slot(cls, slot_dt, parsed_schedule: dict):
         slot_ts = pd.Timestamp(slot_dt)
+        slot_day = cls._local_day(slot_ts)
         kind = parsed_schedule.get('kind')
         if kind == 'once':
             return None
         if kind == 'daily':
-            return cls.schedule_anchor_for_day(slot_ts + pd.Timedelta(days=1), parsed_schedule)
+            return cls._wall_slot(slot_ts, slot_day + pd.Timedelta(days=1), parsed_schedule)
         if kind == 'weekly':
-            return slot_ts + pd.Timedelta(days=7)
+            return cls._wall_slot(slot_ts, slot_day + pd.Timedelta(days=7), parsed_schedule)
         if kind == 'calendar_interval':
-            interval_seconds = float(parsed_schedule.get('interval_seconds') or 0.0)
-            return slot_ts + pd.Timedelta(seconds=interval_seconds) if interval_seconds > 0 else None
+            _, period = cls._calendar_slot_day(slot_ts, parsed_schedule)
+            return cls._wall_slot(slot_ts, slot_day + pd.Timedelta(days=period), parsed_schedule)
 
         interval_seconds = float(parsed_schedule.get('interval_seconds') or 0.0)
         if interval_seconds <= 0:
             return None
         next_slot_dt = slot_ts + pd.Timedelta(seconds=interval_seconds)
         if next_slot_dt.date() != slot_ts.date():
-            return cls.schedule_anchor_for_day(slot_ts + pd.Timedelta(days=1), parsed_schedule)
+            return cls._wall_slot(slot_ts, slot_day + pd.Timedelta(days=1), parsed_schedule)
         return next_slot_dt
 
     @classmethod

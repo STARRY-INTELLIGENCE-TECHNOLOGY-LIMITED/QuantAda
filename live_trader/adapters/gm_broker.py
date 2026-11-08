@@ -516,12 +516,26 @@ class GmBrokerAdapter(BaseLiveBroker):
                     raise RuntimeError("GM pending order is missing cl_ord_id")
                 if not symbol:
                     raise RuntimeError(f"GM pending order is missing symbol: id={order_id!r}")
+                if remaining == 0 and volume > 0:
+                    # 终态回报滞后时 GM 仍可能把已全部成交的委托列为未完成；已成交量证明无剩余，
+                    # 与 Futu/IB 一致直接跳过，不能让单笔滞后记录把整份在途快照标记为不可信。
+                    # 已成交量大于委托量（剩余为负）是非法记录，必须落到下面的校验使快照不可信。
+                    continue
                 if not remaining.is_finite() or remaining <= 0:
                     raise RuntimeError(
                         f"GM pending order has non-positive remaining size: "
                         f"id={order_id!r}, volume={volume!r}, filled_volume={filled_volume!r}"
                     )
-                res.append({
+                # 委托创建时间供隔夜清理区分当日单；无法解析时不输出该字段，按未知（隔夜）处理。
+                try:
+                    created_at = pd.to_datetime(self._object_field(o, 'created_at'), errors='coerce')
+                except (TypeError, ValueError, OverflowError):
+                    created_at = None
+                if created_at is None or pd.isna(created_at):
+                    created_at = None
+                elif created_at.tzinfo is None:
+                    created_at = created_at.tz_localize('Asia/Shanghai')
+                pending_item = {
                     'id': order_id,
                     'symbol': symbol,
                     'direction': direction,
@@ -530,7 +544,10 @@ class GmBrokerAdapter(BaseLiveBroker):
                     # GM 官方撤单接口要求订单自身的 account_id；这是 SDK
                     # 返回的订单元数据，不是可配置的账户路由。
                     'account_id': self._object_field(o, 'account_id', ''),
-                })
+                }
+                if created_at is not None:
+                    pending_item['created_at'] = created_at
+                res.append(pending_item)
             self._last_pending_orders_fetch_failed = False
             self._last_pending_orders_fetch_error = None
         except Exception as e:
@@ -708,6 +725,33 @@ class GmBrokerAdapter(BaseLiveBroker):
         if available is None:
             raise RuntimeError("GM account cash snapshot has no available field")
         return available
+
+    def _spendable_cash(self):
+        """GM available 已扣除挂单冻结资金；本地虚拟占资只扣除柜台尚未冻结的部分，避免双重扣减。
+
+        回调或柜台冻结滞后时，max(0, 虚拟占资 - order_frozen) 仍保留未冻结部分的保守扣减。
+        快照缺少 order_frozen 时无法区分，回退为完整扣减虚拟占资。
+        """
+        available = float(self._fetch_real_cash())
+        virtual_spent = float(getattr(self, '_virtual_spent_cash', 0.0) or 0.0)
+        if virtual_spent > 0:
+            cash = self._fetch_cash_snapshot()
+            raw_frozen = cash.get('order_frozen') if isinstance(cash, dict) else getattr(cash, 'order_frozen', None)
+            try:
+                order_frozen = float(raw_frozen)
+            except (TypeError, ValueError):
+                order_frozen = None
+            if order_frozen is not None and math.isfinite(order_frozen) and order_frozen > 0:
+                virtual_spent = max(0.0, virtual_spent - order_frozen)
+        return max(0.0, available - virtual_spent)
+
+    def get_cash(self):
+        """覆盖基类: 使用 _spendable_cash，避免 available 与本地虚拟占资双重扣减挂单资金。"""
+        with self._ledger_lock:
+            cash = self._spendable_cash()
+        if self._cash_override is not None:
+            return min(cash, self._cash_override)
+        return cash
 
     def is_account_snapshot_trusted(self) -> bool:
         """校验 live GM session 是否暴露当前账户数据。
@@ -908,7 +952,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             # 本地虚拟占资。普通单仍沿用实时现金 + 虚拟账本的保守口径。
             batch_cash_budget = getattr(self, '_buy_batch_cash_budget', None)
             if batch_cash_budget is None:
-                available_cash = self._fetch_real_cash() - getattr(self, '_virtual_spent_cash', 0.0)
+                available_cash = self._spendable_cash()
             else:
                 available_cash = float(batch_cash_budget)
             if available_cash < 0:

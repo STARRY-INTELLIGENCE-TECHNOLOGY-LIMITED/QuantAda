@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import pytest
 
+import config
 from data_providers.base_provider import BaseDataProvider
 from data_providers.manager import DataManager, resolve_platform_default_source
 
@@ -553,17 +554,17 @@ def test_cache_data_removes_nonfinite_rows_from_existing_cache(tmp_path, monkeyp
     manager.data_path = str(tmp_path)
     path = _market_cache_csv(tmp_path, 'US_AAPL.csv')
     path.write_text(
-        'datetime,open,high,low,close,volume\n'
-        '2024-01-01,1,2,0.5,inf,10\n'
-        '2024-01-02,2,3,1,2.5,20\n',
+        'datetime,open,high,low,close,volume,_price_basis\n'
+        '2024-01-01,1,2,0.5,inf,10,theta\n'
+        '2024-01-02,2,3,1,2.5,20,theta\n',
         encoding='utf-8',
     )
     incoming = pd.DataFrame(
-        {'open': [3], 'high': [4], 'low': [2], 'close': [3.5], 'volume': [30]},
-        index=pd.to_datetime(['2024-01-03']),
+        {'open': [2, 3], 'high': [3, 4], 'low': [1, 2], 'close': [2.5, 3.5], 'volume': [20, 30]},
+        index=pd.to_datetime(['2024-01-02', '2024-01-03']),
     )
 
-    manager._cache_data(incoming, 'US.AAPL')
+    manager._cache_data(incoming, 'US.AAPL', price_basis='theta')
 
     cached = pd.read_csv(path)
     assert cached['datetime'].tolist() == ['2024-01-02', '2024-01-03']
@@ -720,7 +721,7 @@ def test_option_cache_through_expiry_covers_long_request_window(tmp_path, monkey
             "volume": [10, 11],
         },
         index=pd.to_datetime(["2024-01-02", "2024-01-19"]),
-    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    ).assign(_price_basis="theta").rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
     calls = []
 
     class ThetaDataProvider(BaseDataProvider):
@@ -771,7 +772,7 @@ def test_option_cache_covering_contract_life_is_complete(tmp_path, monkeypatch):
             "volume": [10] * len(index),
         },
         index=index,
-    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    ).assign(_price_basis="theta").rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
     calls = []
 
     class ThetaDataProvider(BaseDataProvider):
@@ -812,7 +813,7 @@ def test_option_cache_before_expiry_uses_requested_end_boundary(tmp_path, monkey
             "close": [1.1, 1.2], "volume": [10, 11],
         },
         index=pd.to_datetime(["2024-02-01", "2024-03-01"]),
-    ).rename_axis("datetime").to_csv(
+    ).assign(_price_basis="theta").rename_axis("datetime").to_csv(
         _market_cache_csv(tmp_path, "US_AAPL241127P00150000.csv")
     )
     calls = []
@@ -1086,6 +1087,34 @@ def test_gm_historical_end_skips_realtime_stitch(monkeypatch):
     assert calls['current'] == 0
 
 
+def test_gm_provider_passes_configured_raw_price_adjustment(monkeypatch):
+    import data_providers.gm_provider as gm_module
+
+    calls = []
+    history = pd.DataFrame(
+        {
+            'open': [1.0], 'high': [1.1], 'low': [0.9],
+            'close': [1.0], 'volume': [100.0],
+            'eob': pd.to_datetime(['2024-01-02']),
+        }
+    )
+    monkeypatch.setattr(gm_module, 'history', lambda **kwargs: calls.append(kwargs) or history.copy())
+    monkeypatch.setattr(config, 'GM_PRICE_ADJUSTMENT', 0, raising=False)
+    provider = gm_module.GmDataProvider(token='historical-token')
+
+    result = provider.get_data(
+        'SHSE.510300',
+        start_date='20240101',
+        end_date='20240131',
+        timeframe='Days',
+        compression=1,
+    )
+
+    assert result is not None
+    assert calls[0]['adjust'] == 0
+    assert result.attrs['gm_price_adjustment'] == 0
+
+
 def test_data_manager_close_does_not_call_dynamic_provider_attribute():
     class DynamicProvider:
         def __init__(self):
@@ -1334,7 +1363,7 @@ def test_daily_cache_treats_weekend_end_as_complete(tmp_path, monkeypatch):
             "volume": [10, 20],
         },
         index=pd.to_datetime(["2024-01-02", "2024-01-05"]),
-    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_SPY.csv"))
+    ).assign(_price_basis="futu").rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_SPY.csv"))
     calls = []
 
     class FutuDataProvider(BaseDataProvider):
@@ -1466,7 +1495,7 @@ def test_checked_empty_theta_option_cache_stays_complete(tmp_path, monkeypatch):
             "_theta_enrichment_checked": [1],
         },
         index=pd.to_datetime(["2024-01-19"]),
-    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    ).assign(_price_basis="theta").rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
     calls = []
 
     class ThetaDataProvider(BaseDataProvider):
@@ -1500,7 +1529,7 @@ def test_next_execution_reuses_filled_cache_and_keeps_complete_sibling(tmp_path,
             "open_interest": [20.0, 21.0],
         },
         index=index,
-    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
+    ).assign(_price_basis="theta").rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00150000.csv"))
     pd.DataFrame(
         {
             "open": [1.0, 1.2], "high": [1.3, 1.4], "low": [0.9, 1.1],
@@ -1509,7 +1538,7 @@ def test_next_execution_reuses_filled_cache_and_keeps_complete_sibling(tmp_path,
             "_theta_enrichment_incomplete": [1, 1],
         },
         index=index,
-    ).rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00160000.csv"))
+    ).assign(_price_basis="theta").rename_axis("datetime").to_csv(_market_cache_csv(tmp_path, "US_AAPL240119P00160000.csv"))
     calls = []
 
     class ThetaDataProvider(BaseDataProvider):

@@ -282,8 +282,10 @@ class TiingoDataProvider(BaseDataProvider):
         if not self.client:
             return None
 
-        if timeframe != 'Days':
-            print(f"[Tiingo] Warning: Tiingo best supports Daily data. Intraday might vary.")
+        if timeframe != 'Days' or str(compression) != '1':
+            # 只请求 daily 频率；其它周期返回 None 让责任链回退，避免把日线缓存成分钟/周线。
+            print(f"[Tiingo] Only Days/1 is supported; skipping {timeframe}/{compression}.")
+            return None
 
         tiingo_symbol = self._map_symbol(symbol)
         print(f"[Tiingo] Fetching {tiingo_symbol}...")

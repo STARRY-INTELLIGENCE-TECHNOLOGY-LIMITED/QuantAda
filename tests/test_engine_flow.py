@@ -3232,7 +3232,7 @@ def test_live_run_skips_overnight_cleanup_when_keep_overnight_orders_true(monkey
             super().__init__(context, cash_override, commission_override, slippage_override)
             self.cleanup_calls = 0
 
-        def cleanup_overnight_orders(self):
+        def cleanup_overnight_orders(self, before=None):
             self.cleanup_calls += 1
             return {"total": 1, "canceled": 1, "failed": 0, "skipped": 0}
 
@@ -3288,7 +3288,7 @@ def test_live_run_continues_and_alarms_when_cleanup_raises(monkeypatch):
             super().__init__(context, cash_override, commission_override, slippage_override)
             self.cleanup_calls = 0
 
-        def cleanup_overnight_orders(self):
+        def cleanup_overnight_orders(self, before=None):
             self.cleanup_calls += 1
             raise RuntimeError("cleanup failed")
 

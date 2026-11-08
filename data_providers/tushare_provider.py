@@ -29,9 +29,10 @@ class TushareDataProvider(BaseDataProvider):
         if not self.pro:
             return None
 
-        if timeframe != 'Days' or compression != 1:
-            print(f"Warning: TushareProvider (TushareDataProvider) current implementation only supports daily data. "
-                  f"Ignoring timeframe/compression. Use 'pro.stk_mins' for intraday.")
+        if str(timeframe or '').strip().lower() not in {'days', 'day', 'd'} or str(compression) != '1':
+            # 只实现日线；返回 None 让责任链回退，避免把日线当作分钟/周线写入缓存。
+            print(f"TushareDataProvider only supports Days/1; skipping {timeframe}/{compression}.")
+            return None
 
         try:
             # 转换symbol格式, e.g., 'SHSE.600519' -> '600519.SH'

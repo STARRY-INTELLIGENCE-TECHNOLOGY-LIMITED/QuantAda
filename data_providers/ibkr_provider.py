@@ -1,4 +1,5 @@
 import math
+import re
 import threading
 from datetime import datetime
 
@@ -295,7 +296,14 @@ class IbkrDataProvider(BaseDataProvider):
         # 3. 处理时间参数
         # ADJUSTED_LAST 不支持指定 endDateTime，必须为空
         req_end_date = ''
-        calc_end_date = end_date
+        intraday = timeframe in {'Minutes', 'Seconds'}
+        end_bound = None
+        if end_date:
+            end_bound = pd.to_datetime(end_date)
+            if intraday and not re.search(r'[T\s]\d', str(end_date).strip()):
+                # 纯日期终点表示整天，与 GM/Futu 一致；否则 00:00:00 会丢掉整个结束日。
+                end_bound = end_bound.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        calc_end_date = end_bound
 
         if what_to_show == 'ADJUSTED_LAST':
             # 强制请求截至当前的数据
@@ -306,12 +314,13 @@ class IbkrDataProvider(BaseDataProvider):
             calc_end_date = datetime.now()
         else:
             # 其他类型正常处理
-            if end_date:
-                end_dt = pd.to_datetime(end_date)
-                if timeframe in {'Minutes', 'Seconds'}:
-                    req_end_date = end_dt.strftime('%Y%m%d %H:%M:%S')
+            if end_bound is not None and not (
+                intraday and end_bound.tzinfo is None and end_bound >= pd.Timestamp.now()
+            ):
+                if intraday:
+                    req_end_date = end_bound.strftime('%Y%m%d %H:%M:%S')
                 else:
-                    req_end_date = end_dt.strftime('%Y%m%d 23:59:59')
+                    req_end_date = end_bound.strftime('%Y%m%d 23:59:59')
             else:
                 req_end_date = ''
                 calc_end_date = datetime.now()
@@ -411,12 +420,25 @@ class IbkrDataProvider(BaseDataProvider):
             # 处理 datetime 索引
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
+            if intraday:
+                # IB 日内 K 线以开始时刻标记；统一改为结束时刻，与 GM eob/Futu 一致，
+                # 避免 Day:HH:MM 截止聚合把 cutoff 之后才结束的 K 线带入（前视）。
+                unit = 'minutes' if timeframe == 'Minutes' else 'seconds'
+                df.index = df.index + pd.Timedelta(**{unit: int(compression or 1)})
+
+            def align(value):
+                value = pd.Timestamp(value)
+                if df.index.tz is not None and value.tzinfo is None:
+                    return value.tz_localize(df.index.tz)
+                if df.index.tz is None and value.tzinfo is not None:
+                    return value.tz_convert(None)
+                return value
 
             # 裁剪日期 (因为 durationStr 可能会取多一点数据)
             if start_date:
-                df = df[df.index >= pd.to_datetime(start_date)]
-            if end_date:
-                df = df[df.index <= pd.to_datetime(end_date)]
+                df = df[df.index >= align(pd.to_datetime(start_date))]
+            if end_bound is not None:
+                df = df[df.index <= align(end_bound)]
 
             # 确保列存在
             cols = ['open', 'high', 'low', 'close', 'volume']

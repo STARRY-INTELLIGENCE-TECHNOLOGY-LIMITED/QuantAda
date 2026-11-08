@@ -37,9 +37,10 @@ class SxscTushareDataProvider(BaseDataProvider):
         if not self.token:
             return None
 
-        if timeframe != 'Days' or compression != 1:
-            print(f"Warning: SxscTushareDataProvider current implementation only supports daily data. "
-                  f"Ignoring timeframe/compression. Intraday API 'daily_mins' not implemented.")
+        if str(timeframe or '').strip().lower() not in {'days', 'day', 'd'} or str(compression) != '1':
+            # 只实现日线；返回 None 让责任链回退，避免把日线当作分钟/周线写入缓存。
+            print(f"SxscTushareDataProvider only supports Days/1; skipping {timeframe}/{compression}.")
+            return None
 
         try:
             # 1. 转换symbol格式, e.g., 'SHSE.600519' -> '600519.SH'

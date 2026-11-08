@@ -45,7 +45,7 @@ def load_daily_cutoff(manager, symbol, start_date, end_date, specified_sources, 
             cache_end -= pd.Timedelta(days=1)
         aggregated = manager._load_complete_cache(
             symbol, cache_start, cache_end, timeframe, 1, refresh,
-            cache_root=cache_root,
+            cache_root=cache_root, price_basis=manager._source_price_basis(specified_sources),
         )
         if aggregated is not None and not aggregated.empty:
             origin = "cache"
@@ -90,6 +90,7 @@ def load_daily_cutoff(manager, symbol, start_date, end_date, specified_sources, 
             return None
         aggregated = aggregate_daily_cutoff(minute_frame, cutoff)
         origin = minute_frame.attrs.get("data_origin", "fetch")
+        price_basis = minute_frame.attrs.get("price_basis")
     if aggregated is None or aggregated.empty:
         return None
     local_index = aggregated.index.tz_localize(None) if aggregated.index.tz is not None else aggregated.index
@@ -103,5 +104,5 @@ def load_daily_cutoff(manager, symbol, start_date, end_date, specified_sources, 
         "data_origin": origin, "timeframe": timeframe, "partial_day_cutoff": f"{cutoff:%H:%M:%S}",
     })
     if single_source and generated and getattr(config, "CACHE_DATA", False) and not getattr(manager, "_live_mode", False):
-        manager._cache_data(aggregated, symbol, timeframe, 1, cache_root=cache_root)
+        manager._cache_data(aggregated, symbol, timeframe, 1, cache_root=cache_root, price_basis=price_basis)
     return aggregated

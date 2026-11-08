@@ -1484,8 +1484,9 @@ class IBBrokerAdapter(BaseLiveBroker):
         - get_cash: 可立即下单资金（AvailableFunds 语义）
         - TotalCashValue: 账户现金口径（不引入额外杠杆）
         计划层使用两者更保守者，避免“计划金额远大于可成交金额”。
+        可用资金快照失败时直接抛错，由策略层 live 失败关闭守卫中止本轮调仓，不能按 0 现金触发减仓。
         """
-        spendable_cash = self.get_cash()
+        spendable_cash = self._spendable_cash_snapshot()
         total_cash_value = self._fetch_smart_value(['TotalCashValue'])
         try:
             spendable_cash = float(spendable_cash)
@@ -1503,6 +1504,17 @@ class IBBrokerAdapter(BaseLiveBroker):
     def get_cash(self):
         """
         覆盖 BaseLiveBroker 的 get_cash，确保策略层调用的是真实的可用购买力。
+        下单路径在快照失败时按 0 现金失败关闭（只会阻止买入）；调仓计划口径见 get_rebalance_cash。
+        """
+        try:
+            return self._spendable_cash_snapshot()
+        except Exception as e:
+            self._runtime_log(f"[IBBroker] 可用资金快照不可信，下单口径按 0 处理: {e}")
+            return 0.0
+
+    def _spendable_cash_snapshot(self):
+        """
+        计算真实可用购买力；快照不可信时抛错。
         由于盈透的 TotalCashValue 在挂单阶段不会扣减，
         此处必须手动减去在途买单(Pending BUY)的预期消耗，防止产生无限杠杆幻觉。
         """
@@ -1576,8 +1588,7 @@ class IBBrokerAdapter(BaseLiveBroker):
                         covered_local_order_ids.add(poid)
 
         except Exception as e:
-            self._runtime_log(f"[IBBroker] 计算买单虚拟冻结资金时发生异常: {e}")
-            return 0.0
+            raise RuntimeError(f"IB pending BUY reserved-cash snapshot is untrusted: {e}") from e
 
         # 3. 与本地占资做去重合并:
         # - active_buys_total：基于 _active_buys 逐单估算的本地占资
@@ -2932,7 +2943,22 @@ class IBBrokerAdapter(BaseLiveBroker):
             # 透传 IB 订单 account 字段；留空时由 IB 默认使用主账户路由。
             order.account = configured_account
 
-        trade = self._call_ib_sync('placeOrder', contract, order)
+        try:
+            trade = self._call_ib_sync('placeOrder', contract, order)
+        except TimeoutError as exc:
+            # 超时时委托可能已送达 IB；不能当作未提交而在本轮降级重试同一标的，
+            # 只标记结果未知并返回 None，让其它标的继续执行，下一轮以券商在途单/持仓为准。
+            self._last_order_target_skip_reason = 'submit_outcome_unknown'
+            msg = (
+                f"[IB Error] {side} {data._name} placeOrder timed out; the order may be live at IB. "
+                f"Same-symbol retries are skipped this run and broker reality is reconciled next run: {exc}"
+            )
+            self._runtime_log(msg)
+            AlarmManager().push_text(msg, level='ERROR')
+            return None
+        except Exception as exc:
+            self._runtime_log(f"[IB Error] {side} {data._name} placeOrder failed: {exc}")
+            return None
         proxy = IBOrderProxy(trade, data=data)
         if contract_type == 'CRYPTO':
             # wire order 有意将 totalQuantity 设为 0，但 base layer 仍需要 requested asset quantity。

@@ -455,7 +455,7 @@ def test_web_resume_uses_saved_arguments_and_existing_execution_tracking(tmp_pat
     service = CommandCenterService(tmp_path)
     task = service.training_tasks()[0]
     assert "recorded" not in task
-    payload = {"train_resume": task["task_id"], "strategy": "ignored", "params": {"size": 99}, "variables": {"PYTHON_EXECUTABLE": sys.executable}}
+    payload = {"train_resume": task["task_id"], "strategy": "ignored", "params": {"size": 99}}
     generated = service.generate(payload)
     assert generated["argv"][3] == "examples.Strategy"
     assert generated["params"] == {"size": 1}

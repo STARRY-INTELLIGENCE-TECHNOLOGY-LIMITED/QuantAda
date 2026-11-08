@@ -1379,7 +1379,7 @@ def test_ib_get_rebalance_cash_uses_conservative_cash_floor():
     broker = IBBrokerAdapter(context=context)
 
     # spendable 口径 = 9000, TotalCashValue 口径 = 7000 => 调仓应取 7000
-    broker.get_cash = lambda: 9000.0
+    broker._spendable_cash_snapshot = lambda: 9000.0
     broker._fetch_smart_value = lambda tags=None: 7000.0 if tags == ["TotalCashValue"] else 9000.0
 
     assert broker.get_rebalance_cash() == pytest.approx(7000.0), (
@@ -1811,7 +1811,7 @@ def test_ib_crypto_seconds_history_uses_bounded_24x7_request(monkeypatch):
         "util",
         SimpleNamespace(
             df=lambda bars: pd.DataFrame({
-                "date": [pd.Timestamp("2026-02-27 09:30:10")],
+                "date": [pd.Timestamp("2026-02-27 09:30:05")],  # IB 以 K 线开始时刻标记，Provider 改为结束时刻
                 "open": [1.0],
                 "high": [1.0],
                 "low": [1.0],
@@ -1864,7 +1864,7 @@ def test_ib_stock_seconds_history_uses_single_trades_request(monkeypatch):
         "util",
         SimpleNamespace(
             df=lambda bars: pd.DataFrame({
-                "date": [pd.Timestamp("2026-02-27 09:30:10")],
+                "date": [pd.Timestamp("2026-02-27 09:30:09")],  # IB 以 K 线开始时刻标记，Provider 改为结束时刻
                 "open": [1.0],
                 "high": [1.0],
                 "low": [1.0],
@@ -4337,3 +4337,67 @@ def test_ib_launch_restarts_on_system_exit_from_event_loop(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "IBKR SDK/event loop requested process exit" in captured.out
     assert pushed, "SystemExit 自愈重启应推送异常，便于定位 SDK 层直接退出。"
+
+
+@pytest.mark.parametrize(
+    "error, expected_reason",
+    [
+        (TimeoutError("placeOrder timed out after 3.00s"), "submit_outcome_unknown"),
+        (RuntimeError("IB event loop is closed; cannot run placeOrder"), None),
+    ],
+)
+def test_ib_submit_order_failure_returns_none_instead_of_raising(monkeypatch, error, expected_reason):
+    """placeOrder 超时/异常不能中断整份调仓计划；超时需标记结果未知以阻止同标的重试。"""
+    import live_trader.adapters.ib_broker as ib_module
+
+    alarms = []
+
+    class DummyAlarm:
+        def push_text(self, content, level="INFO"):
+            alarms.append((level, content))
+
+    monkeypatch.setattr(ib_module, "AlarmManager", lambda: DummyAlarm())
+    monkeypatch.setattr(
+        ib_module,
+        "MarketOrder",
+        lambda action, qty: SimpleNamespace(action=action, totalQuantity=qty, account="", tif=""),
+    )
+    monkeypatch.setattr(ib_module.config, "IBKR_ORDER_ACCOUNT", "U1234567", raising=False)
+    context = types.SimpleNamespace(ib_instance=DummyIBForSubmit())
+    broker = IBBrokerAdapter(context=context)
+    monkeypatch.setattr(
+        broker,
+        "parse_contract",
+        lambda symbol: SimpleNamespace(symbol="AAPL", secType="STK"),
+    )
+
+    def _raise(method_name, *args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(broker, "_call_ib_sync", _raise)
+    broker._last_order_target_skip_reason = None
+
+    proxy = broker._submit_order(SimpleNamespace(_name="AAPL.SMART"), 10, "BUY", 100.0)
+
+    assert proxy is None
+    assert broker._last_order_target_skip_reason == expected_reason
+    if expected_reason:
+        assert alarms and alarms[0][0] == "ERROR"
+
+
+def test_ib_rebalance_cash_fails_closed_when_spendable_snapshot_untrusted():
+    """在途买单占资不可信时，下单口径按 0 现金阻止买入，调仓口径必须抛错交给策略层中止。"""
+    broker = IBBrokerAdapter(
+        context=types.SimpleNamespace(ib_instance=DummyIBForCash(cash_usd=10000.0))
+    )
+
+    def _untrusted_pending():
+        broker._last_pending_orders_fetch_failed = True
+        broker._last_pending_orders_fetch_error = "open-order timeout"
+        return []
+
+    broker.get_pending_orders = _untrusted_pending
+
+    assert broker.get_cash() == 0.0
+    with pytest.raises(RuntimeError, match="untrusted"):
+        broker.get_rebalance_cash()

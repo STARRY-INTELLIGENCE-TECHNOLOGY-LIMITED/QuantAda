@@ -43,9 +43,28 @@ class BaseRiskControl(ABC):
     def notify_order(self, order):
         """
         订单状态通知。
-        风控模块可以在此跟踪订单状态。
+        默认行为: 子类若维护 exit_triggered 集合，平仓方向的订单被拒/撤后释放该标的闩锁，让后续 bar 重新检查并重试退出。
+        子类覆盖本方法时应调用 super().notify_order(order) 保留该行为。
         """
-        pass
+        triggered = getattr(self, 'exit_triggered', None)
+        if not isinstance(triggered, set) or not triggered:
+            return
+        name = getattr(getattr(order, 'data', None), '_name', None)
+        if name not in triggered:
+            return
+        failed = False
+        for probe in ('is_rejected', 'is_canceled'):
+            method = getattr(order, probe, None)
+            if callable(method) and method():
+                failed = True
+                break
+        if not failed:
+            return
+        getter = getattr(self.broker, 'getposition', None) or getattr(self.broker, 'get_position', None)
+        size = getattr(getter(order.data), 'size', 0) if callable(getter) else 0
+        # 只有平仓方向的失败单才释放闩锁，避免同标的其他失败单打断仍在途的退出单。
+        if (size > 0 and order.is_sell()) or (size < 0 and order.is_buy()):
+            triggered.discard(name)
 
     def notify_trade(self, trade):
         """

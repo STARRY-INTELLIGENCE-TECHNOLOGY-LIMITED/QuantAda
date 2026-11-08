@@ -3,6 +3,7 @@ import pytest
 
 import config
 from backtest.backtester import Backtester
+from risk_controls.base_risk_control import BaseRiskControl
 from strategies.base_strategy import BaseStrategy
 
 
@@ -101,6 +102,26 @@ class _NextOpenGapRebalanceProbeStrategy(BaseStrategy):
             self.__class__.completed.append((order.data._name, order.executed.size))
 
 
+class _CloseGapProbeStrategy(BaseStrategy):
+    fills = []
+
+    def init(self):
+        self.phase = 0
+
+    def next(self):
+        data = self.broker.datas[0]
+        if self.phase == 0:
+            self.broker.order_target_value(data, 1000.0)
+            self.phase = 1
+        elif self.phase == 1 and self.broker.getposition(data).size > 0:
+            self.broker.order_target_value(data, 0.0)
+            self.phase = 2
+
+    def notify_order(self, order):
+        if order.is_completed():
+            self.__class__.fills.append((order.is_buy(), order.executed.price))
+
+
 class _FractionalBuyThenSellProbeStrategy(BaseStrategy):
     completed_sizes = []
 
@@ -186,7 +207,6 @@ class _TinySellDoesNotFreeCashProbeStrategy(BaseStrategy):
             order = self.broker.order_target_value(data=self.broker.datas[0], target=100.0)
             assert order is not None
             self.step += 1
-            return
 
         if self.step == 1:
             # 当前 1 股，目标 99.5 美元，只需卖 0.005 股；LOT_SIZE=1 时不应提交卖单，也不应释放现金。
@@ -195,6 +215,43 @@ class _TinySellDoesNotFreeCashProbeStrategy(BaseStrategy):
             buy_order = self.broker.order_target_value(data=self.broker.datas[1], target=1.0)
             self.__class__.buy_order_submitted = buy_order is not None
             self.step += 1
+
+
+class _OneShotSellRisk(BaseRiskControl):
+    """测试用风控：首次看到多仓时提交一次平仓。"""
+
+    def __init__(self, broker, params=None):
+        super().__init__(broker, params)
+        self.triggered = False
+
+    def check(self, data):
+        if self.triggered or self.broker.getposition(data).size <= 0:
+            return None
+        self.triggered = True
+        return 'SELL'
+
+
+class _RiskThenRebalanceProbeStrategy(BaseStrategy):
+    """风控平仓后同 K 继续运行轮动，验证不会重复提交卖单。"""
+
+    def init(self):
+        self.phase = 0
+
+    def next(self):
+        data = self.broker.datas[0]
+        if self.phase == 0:
+            order = self.broker.order_target_value(data=data, target=100.0)
+            assert order is not None
+            self.phase = 1
+        elif self.phase == 1 and self.broker.getposition(data).size > 0:
+            self.execute_rebalance(
+                target_symbols=[],
+                top_k=1,
+                rebalance_threshold=0.0,
+                rebalance_when='next',
+            )
+            self.phase = 2
+            return
 
 
 class _SellThenTopKRebalanceProbeStrategy(BaseStrategy):
@@ -703,3 +760,116 @@ def test_us_sell_then_topk_rebalance_buys_integer_shares_without_margin(monkeypa
 
     assert 'Margin' not in _SellThenTopKRebalanceProbeStrategy.statuses
     assert final_sizes == {'AAA': 0, 'BBB': 5, 'CCC': 5}
+
+
+def test_risk_exit_does_not_duplicate_next_open_rebalance_sell(monkeypatch):
+    """风控平仓后轮动计划不能在 next_open 重复卖出同一多仓。"""
+    monkeypatch.setattr(config, 'LOT_SIZE', 1)
+
+    bt = Backtester(
+        datas={'AAA': _make_constant_price_df(100.0, bars=5)},
+        strategy_class=_RiskThenRebalanceProbeStrategy,
+        risk_control_classes=[_OneShotSellRisk],
+        cash=1000.0,
+        commission=0.0,
+        slippage=0.0,
+        enable_plot=False,
+        verbose=False,
+        execution_price='next_open',
+    )
+    bt.run()
+
+    wrapper = bt.results[0]
+    assert wrapper.getposition(wrapper.datas[0]).size == 0
+
+
+def test_close_mode_fills_at_signal_close_even_when_next_bar_gaps_away(monkeypatch):
+    """close 模式按信号日收盘价成交，不被下一根 K 线的高低价截断。"""
+    monkeypatch.setattr(config, 'LOT_SIZE', 1)
+    _CloseGapProbeStrategy.fills = []
+    index = pd.date_range('2024-01-01', periods=4, freq='D')
+    # 第 2 天收盘 100 触发卖出；第 3 天整根 K 线跳空到 110 以上，旧逻辑会把卖价抬到 110。
+    frame = pd.DataFrame(
+        {
+            'open': [100.0, 100.0, 112.0, 112.0],
+            'high': [100.0, 100.0, 115.0, 115.0],
+            'low': [100.0, 100.0, 110.0, 110.0],
+            'close': [100.0, 100.0, 113.0, 113.0],
+            'volume': [1000.0] * 4,
+        },
+        index=index,
+    )
+
+    engine = Backtester(
+        datas={'AAA': frame},
+        strategy_class=_CloseGapProbeStrategy,
+        cash=1000.0,
+        commission=0.0,
+        slippage=0.001,
+        execution_price='close',
+        enable_plot=False,
+        verbose=False,
+    )
+    engine.run()
+
+    sells = [price for is_buy, price in _CloseGapProbeStrategy.fills if not is_buy]
+    assert sells, _CloseGapProbeStrategy.fills
+    assert sells[0] == pytest.approx(100.0 * (1 - 0.001))
+
+
+class _RotateAllInStrategy(BaseStrategy):
+    """第 1 根 K 线满仓 A，第 2 根 K 线整仓换到 B，记录每个订单的状态与成交 K 线。"""
+
+    def init(self):
+        self.bar = 0
+        self.events = []
+
+    def next(self):
+        self.bar += 1
+        a, b = self.broker.datas[0], self.broker.datas[1]
+        if self.bar == 1:
+            self.broker.order_target_percent(data=a, target=1.0)
+        elif self.bar == 3:
+            self.broker.order_target_percent(data=a, target=0.0)
+            self.broker.order_target_percent(data=b, target=1.0)
+
+    def notify_order(self, order):
+        self.events.append((self.bar, order.data._name, order.getstatusname()))
+
+
+@pytest.mark.parametrize('use_value_api', [False, True])
+@pytest.mark.parametrize('commission,slippage', [(0.0003, 0.0), (0.0003, 0.001), (0.0, 0.001)])
+def test_full_rotation_buy_is_not_rejected_by_sell_side_costs(commission, slippage, use_value_api):
+    """卖出回笼现金要扣卖出侧佣金与滑点，满仓换仓的买单不得被 Margin 拒绝并推迟一根 K 线。"""
+
+    class Strategy(_RotateAllInStrategy):
+        def next(self):
+            if use_value_api and self.bar + 1 == 3:
+                self.bar += 1
+                a, b = self.broker.datas[0], self.broker.datas[1]
+                self.broker.order_target_value(data=a, target=0.0)
+                self.broker.order_target_value(data=b, target=self.broker.getvalue())
+                return
+            super().next()
+
+    engine = Backtester(
+        datas={
+            'A': _make_constant_price_df(37.0, bars=6),
+            'B': _make_constant_price_df(53.0, bars=6),
+        },
+        strategy_class=Strategy,
+        start_date='20240101',
+        end_date='20240106',
+        cash=300000.0,
+        commission=commission,
+        slippage=slippage,
+        enable_plot=False,
+        verbose=False,
+    )
+    engine.run()
+
+    events = engine.results[0].strategy.events
+    assert not [e for e in events if e[2] in {'Margin', 'Rejected'}], events
+    # B 的买单与 A 的卖单在同一轮完成，不推迟到后续 K 线。
+    completed_b = [e for e in events if e[1] == 'B' and e[2] == 'Completed']
+    assert completed_b and completed_b[0][0] == next(e for e in events if e[1] == 'A' and e[2] == 'Completed' and e[0] > 1)[0]

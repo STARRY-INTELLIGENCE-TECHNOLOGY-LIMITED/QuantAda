@@ -974,6 +974,8 @@ class OptimizationJob:
     HK_EXCHANGE_PREFIXES = {"SEHK", "HK"}
     US_EXCHANGE_PREFIXES = {"NASDAQ", "NYSE", "AMEX", "ARCA", "BATS", "ISLAND", "SMART", "PINK", "US"}
     DEFAULT_WARMUP_DAYS = 400
+    # 有盈利且无亏损交易时的盈亏因子有限上限；评分函数只做阈值或对数截断，10 已覆盖全部奖励区间。
+    NO_LOSS_PROFIT_FACTOR = 10.0
     OPTIMIZER_INDICATOR_CACHE_MAX_ENTRIES = 512
     TPE_DEFAULT_N_EI_CANDIDATES = 24
     TPE_PAYLOAD_COPY_MIN_N_EI_CANDIDATES = 8
@@ -2009,7 +2011,8 @@ class OptimizationJob:
             print(f"  Warm-up:    {self.warmup_days} calendar days")
             print(f"  => Fetching data from {req_start} to {req_end}")
 
-        elif getattr(self.args, 'train_ratio', None) is None and req_start:
+        elif req_start:
+            # 比例切分同样以用户窗口为逻辑起点，预热数据只补在窗口之前。
             req_start = self._warmup_start_date(req_start)
             print(f"[Auto-Fetch] Full Window Detected:")
             print(f"  Warm-up:    {self.warmup_days} calendar days")
@@ -2257,6 +2260,17 @@ class OptimizationJob:
             print(f"Split Mode: Ratio ({ratio * 100}% Train)")
 
             all_dates = sorted(list(set().union(*[self.prepare_data_index(df).index for df in self.raw_datas.values()])))
+            # 比例只作用于用户逻辑窗口 [start_date, end_date]；之前的预热 K 线仍由 slice_datas 补给指标，
+            # 但不计入训练期。缺省 start_date 时与 CLI 一致按 end_date 前 3 年推断。
+            logical_start = self.args.start_date or self._infer_recent_3y_window()[0]
+            window_start = pd.to_datetime(str(logical_start))
+            window_end = pd.to_datetime(str(self.args.end_date)) if self.args.end_date else None
+            if window_end is not None and window_end.normalize() == window_end:
+                window_end = window_end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+            all_dates = [
+                dt for dt in all_dates
+                if dt >= window_start and (window_end is None or dt <= window_end)
+            ]
             if not all_dates:
                 raise ValueError("Data has no valid dates.")
             if len(all_dates) < 2:
@@ -2812,12 +2826,17 @@ class OptimizationJob:
                 # 交易统计分析
                 ta = strat.analyzers.getbyname('tradeanalyzer').get_analysis()
                 total_trades = ta.get('total', {}).get('total', 0)
-                win_rate = ta.get('won', {}).get('total', 0) / max(total_trades, 1)
+                # 胜率只按已平仓交易计算，未平仓交易没有盈亏结果。
+                closed_trades = ta.get('total', {}).get('closed', 0)
+                win_rate = ta.get('won', {}).get('total', 0) / max(closed_trades, 1)
 
-                # 盈亏因子计算
+                # 盈亏因子计算：无亏损交易时比值无穷大，用有限上限代替，避免把盈利金额当作比值。
                 won_total = ta.get('won', {}).get('pnl', {}).get('total', 0)
                 lost_total = abs(ta.get('lost', {}).get('pnl', {}).get('total', 0))
-                profit_factor = won_total / lost_total if lost_total > 0 else won_total
+                if lost_total > 0:
+                    profit_factor = won_total / lost_total
+                else:
+                    profit_factor = self.NO_LOSS_PROFIT_FACTOR if won_total > 0 else 0.0
 
                 # 最大回撤
                 mdd = strat.analyzers.getbyname('drawdown').get_analysis().get('max', {}).get('drawdown', 100.0)

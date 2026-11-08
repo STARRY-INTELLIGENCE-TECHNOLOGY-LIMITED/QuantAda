@@ -6,13 +6,14 @@ import re
 import threading
 from collections import OrderedDict
 
+import numpy as np
 import pandas as pd
 
 import config
 from common.data_paths import resolve_data_path, share_data_file
 from .base_provider import BaseDataProvider
 from .compositions import build_provider_composition
-from .csv_provider import CsvDataProvider
+from .csv_provider import PRICE_BASIS_COLUMN, CsvDataProvider
 from .thetadata_provider import ENRICHMENT_INCOMPLETE_COLUMN, enrichment_retry_needed
 from common.options.analytics import parse_option_symbol
 from common.options.events import normalize_dividend_calendar, normalize_earnings_calendar
@@ -178,6 +179,34 @@ class DataManager:
                 except Exception:
                     return default
         return default
+
+    def _provider_price_basis(self, provider):
+        """返回缓存价格口径身份：Provider 名加可声明的复权口径，无法确定时返回 None。"""
+        name = type(provider).__name__.replace('DataProvider', '').lower()
+        try:
+            adjustment = self._explicit_provider_value(provider, "UNDERLYING_PRICE_ADJUSTMENT", None)
+            method = self._explicit_provider_method(provider, "price_adjustment")
+            if method is not None:
+                adjustment = method()
+        except Exception as exc:
+            print(f"[DataManager] price basis unavailable for {name}: {exc}")
+            return None
+        return name if adjustment is None else f"{name}:{adjustment}"
+
+    def _source_price_basis(self, specified_sources):
+        """显式数据源只有一个行情 Provider 时返回其价格口径，否则返回 None。"""
+        providers = []
+        for name in self._split_source_names(specified_sources or ''):
+            try:
+                provider = self._provider_for_source(name)
+            except Exception:
+                provider = None
+            if provider is not None and not any(
+                bool(self._explicit_provider_value(provider, flag, False))
+                for flag in ("VALUATION_ONLY", "AUXILIARY_ONLY", "EVENT_ONLY")
+            ):
+                providers.append(provider)
+        return self._provider_price_basis(providers[0]) if len(providers) == 1 else None
 
     def _provider_supports_historical_option_quotes(self, provider):
         """判断组合 Provider 是否能为历史期权补充真实 NBBO。"""
@@ -489,6 +518,8 @@ class DataManager:
         origin = "fetch"
         final_df = None
         valuation_providers = []
+        # 默认责任链不含 OCC 等辅助源，期权元数据只在显式选择时补充。
+        providers_to_use = []
         cache_root = self._cache_root_for_source(specified_sources)
 
         # 路径一: 用户指定了数据源
@@ -529,6 +560,9 @@ class DataManager:
                 for provider in price_providers
             )
             expected_price_adjustment = None
+            price_basis = (
+                self._provider_price_basis(price_providers[0]) if len(price_providers) == 1 else None
+            )
             if len(price_providers) == 1 and not parse_option_symbol(symbol):
                 expected_price_adjustment = self._explicit_provider_value(
                     price_providers[0], "UNDERLYING_PRICE_ADJUSTMENT", None
@@ -551,6 +585,7 @@ class DataManager:
                     require_option_quotes=require_option_quotes,
                     expected_price_adjustment=expected_price_adjustment,
                     cache_root=cache_root,
+                    price_basis=price_basis,
                 )
                 if final_df is not None and not final_df.empty:
                     origin = "cache"
@@ -562,10 +597,12 @@ class DataManager:
                     timeframe, compression, refresh=refresh, cache_root=cache_root,
                 )
                 origin = "fetch"
+                price_basis = final_df.attrs.get("price_basis") if final_df is not None else None
 
         # 路径二: 执行默认的责任链逻辑
         else:
             final_df = self._get_data_smart(symbol, start_date, end_date, timeframe, compression, refresh)
+            price_basis = final_df.attrs.get("price_basis") if final_df is not None else None
 
         # 【最终切片】确保返回的数据在请求的日期范围内
         if final_df is not None and not final_df.empty:
@@ -599,6 +636,7 @@ class DataManager:
                 ):
                     self._cache_data(
                         final_df, symbol, timeframe, compression, cache_root=cache_root,
+                        price_basis=price_basis,
                     )
 
             if parse_option_symbol(symbol).get("option_type"):
@@ -656,6 +694,7 @@ class DataManager:
             # 切片后再标记，避免布尔索引丢掉来源。进度行用它区分缓存和实拉。
             if not final_df.empty:
                 final_df.attrs["data_origin"] = origin
+                final_df.attrs["price_basis"] = price_basis
             return final_df
 
         print(f"Error: All data providers failed for symbol {symbol}.")
@@ -1160,6 +1199,7 @@ class DataManager:
         provider = self._option_history_prefetch_provider(specified_sources)
         if provider is None:
             return 0
+        price_basis = self._source_price_basis(specified_sources)
         missing = []
         for symbol in option_symbols:
             cached = self._load_complete_cache(
@@ -1171,6 +1211,7 @@ class DataManager:
                 False,
                 require_option_quotes=self._provider_supports_historical_option_quotes(provider),
                 cache_root=cache_root,
+                price_basis=price_basis,
             )
             if cached is None:
                 missing.append(symbol)
@@ -1182,6 +1223,7 @@ class DataManager:
             nonlocal saved
             self._cache_data(
                 frame, symbol, timeframe, compression, cache_root=cache_root,
+                price_basis=price_basis,
             )
             saved += 1
 
@@ -1200,8 +1242,12 @@ class DataManager:
     def _load_complete_cache(
         self, symbol, start_date, end_date, timeframe, compression, refresh,
         require_option_quotes=False, expected_price_adjustment=None, cache_root=None,
+        price_basis=None,
     ):
-        """读取覆盖请求窗口的缓存；缺口或刷新请求均返回 None。"""
+        """读取覆盖请求窗口的缓存；缺口、刷新请求或价格口径不一致均返回 None。
+
+        ``price_basis`` 是请求来源的价格口径身份；缺少标记的旧缓存视为未知口径，不得命中。
+        """
         if not getattr(config, 'CACHE_DATA', False) or refresh:
             return None
 
@@ -1316,6 +1362,8 @@ class DataManager:
             return None
         if candidate is None or candidate.empty:
             return None
+        if price_basis is None or candidate.attrs.get("price_basis") != price_basis:
+            return None
         candidate = sanitize_market_dataframe(candidate)
         if candidate is None or candidate.empty:
             print(f"Cached data for {symbol} contains no finite OHLCV rows.")
@@ -1375,16 +1423,17 @@ class DataManager:
                         compression=compression,
                     )
 
-                    if (
-                        not isinstance(provider, CsvDataProvider)
-                        and not (
+                    if not isinstance(provider, CsvDataProvider):
+                        price_basis = self._provider_price_basis(provider)
+                        df.attrs["price_basis"] = price_basis
+                        if not (
                             bool(self._explicit_provider_value(provider, 'HYBRID_ONLY', False))
                             and bool(getattr(self, '_live_mode', False))
-                        )
-                    ):
-                        self._cache_data(
-                            df, symbol, timeframe, compression, cache_root=cache_root,
-                        )
+                        ):
+                            self._cache_data(
+                                df, symbol, timeframe, compression, cache_root=cache_root,
+                                price_basis=price_basis,
+                            )
 
                     return df
             except Exception as e:
@@ -1393,8 +1442,12 @@ class DataManager:
         return None
 
     def _cache_data(self, df: pd.DataFrame, symbol: str, timeframe: str = 'Days', compression: int = 1,
-                    cache_root=None):
-        """将数据按时间索引与既有缓存合并后写入，避免分段下载覆盖历史。"""
+                    cache_root=None, price_basis=None):
+        """按价格口径写入缓存；口径相同且与旧段重叠一致时才合并，否则用本次数据替换。
+
+        口径不同、旧缓存无口径标记、两段不相交，或重叠行收盘价不一致（前复权基准已变化）
+        时直接替换，避免拼接不同复权基准或留下无法识别的中间缺口。
+        """
         if not getattr(config, 'CACHE_DATA', False):
             return
         root = resolve_data_path(cache_root or self.data_path)
@@ -1405,6 +1458,7 @@ class DataManager:
             incoming = sanitize_market_dataframe(df)
             if incoming is None or incoming.empty:
                 return
+            incoming = incoming.drop(columns=[PRICE_BASIS_COLUMN], errors='ignore')
             incoming.index = pd.to_datetime(incoming.index, errors='coerce', utc=True).tz_localize(None)
             incoming = incoming[~incoming.index.isna()]
             incoming = self._normalize_daily_sessions(
@@ -1416,6 +1470,11 @@ class DataManager:
                 try:
                     existing = pd.read_csv(csv_filepath, index_col='datetime', parse_dates=True)
                     existing.index = pd.to_datetime(existing.index, errors='coerce', utc=True).tz_localize(None)
+                    existing_basis = None
+                    if PRICE_BASIS_COLUMN in existing.columns:
+                        values = existing[PRICE_BASIS_COLUMN].dropna().astype(str).unique()
+                        existing_basis = values[0] if len(values) == 1 else None
+                        existing = existing.drop(columns=[PRICE_BASIS_COLUMN])
                     existing = sanitize_market_dataframe(existing)
                     if existing is not None and not existing.empty:
                         existing = self._normalize_daily_sessions(
@@ -1423,9 +1482,27 @@ class DataManager:
                             timeframe=timeframe,
                             compression=compression,
                         )
+                    compatible = (
+                        existing is not None
+                        and not existing.empty
+                        and price_basis is not None
+                        and existing_basis == price_basis
+                    )
+                    if compatible:
+                        overlap = existing.index.intersection(incoming.index)
+                        # 旧缓存最后一行可能是盘中未完成 K 线，不参与复权基准比较。
+                        stable = overlap[overlap != existing.index.max()]
+                        compatible = len(overlap) > 0 and bool(
+                            np.isclose(
+                                pd.to_numeric(existing.loc[stable, 'close'], errors='coerce'),
+                                pd.to_numeric(incoming.loc[stable, 'close'], errors='coerce'),
+                                rtol=1e-6,
+                                atol=1e-9,
+                            ).all()
+                        )
                     merged = (
                         pd.concat([existing, incoming], axis=0, sort=False)
-                        if existing is not None and not existing.empty
+                        if compatible
                         else incoming
                     )
                 except Exception as cache_error:
@@ -1445,6 +1522,8 @@ class DataManager:
                 compression=compression,
             )
             merged.index.name = 'datetime'
+            if price_basis is not None:
+                merged[PRICE_BASIS_COLUMN] = price_basis
             if ENRICHMENT_INCOMPLETE_COLUMN in merged.columns:
                 incoming_incomplete = False
                 if ENRICHMENT_INCOMPLETE_COLUMN in incoming.columns:

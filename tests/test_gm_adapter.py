@@ -1019,11 +1019,18 @@ def test_gm_pending_order_fetch_success_clears_failure_flag(monkeypatch):
             filled_volume=0,
         ),
         SimpleNamespace(
-            cl_ord_id="GM_ZERO_REMAINING",
+            cl_ord_id="GM_ZERO_VOLUME",
             symbol="SHSE.600000",
             side=mock_gm_api.OrderSide_Buy,
-            volume=1000,
-            filled_volume=1000,
+            volume=0,
+            filled_volume=0,
+        ),
+        SimpleNamespace(
+            cl_ord_id="GM_OVER_FILLED",
+            symbol="SHSE.600000",
+            side=mock_gm_api.OrderSide_Buy,
+            volume=100,
+            filled_volume=200,
         ),
         SimpleNamespace(
             cl_ord_id="GM_BAD_SIZE",
@@ -1046,6 +1053,37 @@ def test_gm_pending_order_malformed_record_marks_snapshot_untrusted(monkeypatch,
     assert broker.get_pending_orders() == []
     assert broker._last_pending_orders_fetch_failed is True
     assert broker._last_pending_orders_fetch_error is not None
+
+
+def test_gm_pending_order_fully_filled_stale_record_is_skipped(monkeypatch):
+    """已全部成交但终态回报滞后的委托应被跳过，不能让整份在途快照失效。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+    monkeypatch.setattr(gm_module, "context", None)
+    filled = SimpleNamespace(
+        cl_ord_id="GM_FILLED_STALE",
+        symbol="SHSE.600000",
+        side=mock_gm_api.OrderSide_Buy,
+        volume=1000,
+        filled_volume=1000,
+    )
+    live = SimpleNamespace(
+        cl_ord_id="GM_LIVE",
+        symbol="SHSE.600001",
+        side=mock_gm_api.OrderSide_Sell,
+        volume=1000,
+        filled_volume=400,
+    )
+    monkeypatch.setattr(mock_gm_api, "get_unfinished_orders", lambda: [filled, live], raising=False)
+    broker = GmBrokerAdapter(context=MagicMock())
+    broker.is_live = True
+
+    got = broker.get_pending_orders()
+
+    assert [item['id'] for item in got] == ["GM_LIVE"]
+    assert got[0]['size'] == 600
+    assert broker._last_pending_orders_fetch_failed is False
 
 
 def test_gm_pending_order_partial_snapshot_is_never_returned_after_bad_record(monkeypatch):

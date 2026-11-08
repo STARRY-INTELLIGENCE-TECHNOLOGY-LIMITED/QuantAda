@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import argparse
 import os
@@ -81,7 +82,17 @@ class RunRecord:
 class CommandCenterService:
     """组合命令目录、方案存储和后台执行器，供 HTTP handler 调用。"""
 
-    def __init__(self, project_root: Path | str | None = None, source_root: Path | str | None = None) -> None:
+    # 请求可注入的子进程加载器变量；危险调试模式之外一律拒绝，避免借环境变量替换解释器或注入代码。
+    _LOADER_VARIABLE_PREFIXES = ("PYTHON", "LD_", "DYLD_")
+
+    def __init__(
+        self,
+        project_root: Path | str | None = None,
+        source_root: Path | str | None = None,
+        *,
+        allow_request_executable: bool = False,
+    ) -> None:
+        self.allow_request_executable = bool(allow_request_executable)
         self.project_root = Path(project_root or Path(__file__).resolve().parent.parent).resolve()
         configured_source_root = source_root or os.environ.get("QUANTADA_SOURCE_ROOT")
         self.source_root = Path(configured_source_root).expanduser().resolve() if configured_source_root else None
@@ -95,6 +106,27 @@ class CommandCenterService:
         self.runs: dict[str, RunRecord] = {}
         self._active_run_id: str | None = None
         self._lock = threading.RLock()
+
+    def _request_variables(self, payload: Mapping[str, Any]) -> dict[str, str]:
+        """合并请求变量；默认拒绝 PYTHON_EXECUTABLE 及 PYTHON*/LD_*/DYLD_* 加载器变量。"""
+
+        variables = dict(self.variables)
+        incoming = payload.get("variables")
+        if not isinstance(incoming, Mapping):
+            return variables
+        incoming = {str(key): str(value) for key, value in incoming.items()}
+        if not self.allow_request_executable:
+            blocked = sorted(
+                name for name in incoming
+                if name.upper().startswith(self._LOADER_VARIABLE_PREFIXES)
+            )
+            if blocked:
+                raise ValueError(
+                    f"请求不得设置解释器或加载器变量: {', '.join(blocked)}；"
+                    "调试时可用 --dangerously-ui-executable 启动工作台"
+                )
+        variables.update(incoming)
+        return variables
 
     def _resolve_source_root(self, value: Any = None) -> Path | None:
         """解析可选外部策略仓库根目录。"""
@@ -772,9 +804,7 @@ class CommandCenterService:
                 raise ValueError("Task not found. Refresh the list and select again.")
             if not task["resumable"]:
                 raise ValueError(task["reason"])
-            variables = dict(self.variables)
-            if isinstance(payload.get("variables"), Mapping):
-                variables.update(payload["variables"])
+            variables = self._request_variables(payload)
             generated = build_resume_command(
                 task, variables, self.project_root, self._resolve_source_root(payload.get("source_root")),
             )
@@ -817,10 +847,7 @@ class CommandCenterService:
             raise ValueError("策略逗号组合仅支持优化/训练模式")
         if preset.mode != "optimize" and "," in str(preset.selection or ""):
             raise ValueError("选股器逗号组合仅支持优化/训练模式；回测和实盘请使用 '+'")
-        variables = dict(self.variables)
-        incoming = payload.get("variables")
-        if isinstance(incoming, Mapping):
-            variables.update({str(key): str(value) for key, value in incoming.items()})
+        variables = self._request_variables(payload)
         private_credentials = (
             {}
             if bool(payload.get("clear_private_credentials"))
@@ -1022,6 +1049,20 @@ class CommandCenterService:
             return self.executor.stop()
 
 
+def _is_trusted_request_host(host: str | None) -> bool:
+    """仅信任 localhost 与本机/私网 IP 字面量；域名可被 DNS 重绑定，公网 IP 需危险调试模式。"""
+
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private or address.is_link_local
+
+
 class _RequestHandler(BaseHTTPRequestHandler):
     """将 HTTP 请求转发到 CommandCenterService。"""
 
@@ -1071,11 +1112,48 @@ class _RequestHandler(BaseHTTPRequestHandler):
         value = json.loads(self.rfile.read(length).decode("utf-8"))
         return dict(value) if isinstance(value, Mapping) else {}
 
+    def _reject_untrusted_request(self) -> bool:
+        """拒绝跨站、DNS 重绑定和公网地址请求；返回 True 表示已发送 403。
+
+        工作台无认证且可启动子进程，必须保证请求来自同源页面或本机/内网直连。
+        --dangerously-ui-executable 启动时保留旧行为，便于公网调试。
+        """
+
+        if getattr(self.server, "dangerously_ui_executable", False):
+            return False
+        reason = None
+        host_header = str(self.headers.get("Host") or "").strip()
+        try:
+            host = urlparse(f"//{host_header}").hostname
+        except ValueError:
+            host = None
+        origin = self.headers.get("Origin")
+        if not _is_trusted_request_host(host):
+            reason = "Host 不受信任；公网访问需使用 --dangerously-ui-executable 启动"
+        elif origin is not None and urlparse(origin).netloc.lower() != host_header.lower():
+            reason = "拒绝跨站请求"
+        elif str(self.headers.get("Sec-Fetch-Site") or "").lower() == "cross-site":
+            reason = "拒绝跨站请求"
+        elif self.command == "POST" and (
+            str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            != "application/json"
+        ):
+            # 非 JSON 的 POST 可绕过浏览器 CORS 预检，必须拒绝。
+            reason = "POST 请求必须使用 application/json"
+        if reason is None:
+            return False
+        self._send({"error": reason}, HTTPStatus.FORBIDDEN)
+        return True
+
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if self._reject_untrusted_request():
+            return
         self.send_response(HTTPStatus.NO_CONTENT)
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        if self._reject_untrusted_request():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
@@ -1114,6 +1192,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def do_POST(self) -> None:  # noqa: N802
+        if self._reject_untrusted_request():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         try:
@@ -1147,6 +1227,8 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self._send({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def do_DELETE(self) -> None:  # noqa: N802
+        if self._reject_untrusted_request():
+            return
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         if path.startswith("/api/profiles/"):
@@ -1161,8 +1243,15 @@ class CommandCenterHTTPServer(ThreadingHTTPServer):
 
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], service: CommandCenterService) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        service: CommandCenterService,
+        *,
+        dangerously_ui_executable: bool = False,
+    ) -> None:
         self.service = service
+        self.dangerously_ui_executable = bool(dangerously_ui_executable)
         super().__init__(address, _RequestHandler)
 
 
@@ -1173,19 +1262,34 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
+    dangerously_ui_executable: bool = False,
 ) -> CommandCenterHTTPServer:
     """启动服务并可选地打开默认浏览器；返回 server 供调用方阻塞或关闭。"""
 
-    service = CommandCenterService(project_root, source_root=source_root)
-    server = CommandCenterHTTPServer((host, int(port)), service)
+    service = CommandCenterService(
+        project_root,
+        source_root=source_root,
+        allow_request_executable=dangerously_ui_executable,
+    )
+    server = CommandCenterHTTPServer(
+        (host, int(port)), service, dangerously_ui_executable=dangerously_ui_executable,
+    )
     address = server.server_address
     browser_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else address[0]
     url = f"http://{browser_host}:{address[1]}/"
     if open_browser:
         threading.Timer(0.2, lambda: webbrowser.open(url)).start()
     print(f"QuantAda 命令工作台已启动: {url}")
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        print("[CommandCenter Warning] 工作台已监听非本机地址；该内部工具不提供认证，请仅在受信任网络使用。")
+    if dangerously_ui_executable:
+        print(
+            "[CommandCenter DANGER] 已启用 --dangerously-ui-executable：不校验 Host/Origin，"
+            "允许请求指定解释器与加载器变量；任何能访问该端口的人都可在本机执行命令，仅限调试使用。"
+        )
+    elif host not in {"127.0.0.1", "localhost", "::1"}:
+        print(
+            "[CommandCenter Warning] 工作台已监听非本机地址；该内部工具不提供认证，仅接受本机/内网 IP 直连，"
+            "并拒绝跨站与公网地址请求，请仅在受信任网络使用。"
+        )
     return server
 
 
@@ -1203,6 +1307,12 @@ def main(project_root: Path | str | None = None, argv: list[str] | None = None) 
         default=None,
         help="外部策略/选股器源码仓库根目录",
     )
+    parser.add_argument(
+        "--dangerously-ui-executable",
+        dest="dangerously_ui_executable",
+        action="store_true",
+        help="危险调试：关闭 Host/Origin 校验并允许请求指定 PYTHON_EXECUTABLE，可被公网执行任意命令",
+    )
     args = parser.parse_args(argv)
     try:
         server = serve(
@@ -1211,6 +1321,7 @@ def main(project_root: Path | str | None = None, argv: list[str] | None = None) 
             host=args.host,
             port=args.port,
             open_browser=not args.no_browser,
+            dangerously_ui_executable=args.dangerously_ui_executable,
         )
     except OSError as exc:
         print(f"无法启动 QuantAda Web 工作台：{exc}")

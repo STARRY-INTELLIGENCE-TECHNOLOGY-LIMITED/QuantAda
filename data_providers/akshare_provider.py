@@ -10,12 +10,11 @@ class AkshareDataProvider(BaseDataProvider):
 
     def _map_akshare_period(self, timeframe: str, compression: int) -> str:
         """将Backtrader的时间框架映射到Akshare的period参数"""
-        if timeframe == 'Days':
-            return 'daily'
-        if timeframe == 'Weeks':
-            return 'weekly'
-        if timeframe == 'Months':
-            return 'monthly'
+        native = {'Days': 'daily', 'Weeks': 'weekly', 'Months': 'monthly'}
+        if timeframe in native:
+            if str(compression) != '1':
+                raise ValueError(f"Akshare {timeframe} requires compression=1, got {compression}")
+            return native[timeframe]
         if timeframe == 'Minutes':
             # Akshare 支持 '1', '5', '15', '30', '60'
             supported_compressions = [1, 5, 15, 30, 60]
@@ -24,8 +23,8 @@ class AkshareDataProvider(BaseDataProvider):
             else:
                 raise ValueError(f"Akshare Minutes requires compression in {supported_compressions}, got {compression}")
 
-        print(f"Warning: AkshareProvider: Unsupported timeframe {timeframe}. Defaulting to 'daily'.")
-        return 'daily'
+        # 不支持的周期必须失败，让责任链回退，不能把日线冒充为其它周期写入缓存。
+        raise ValueError(f"AkshareProvider: Unsupported timeframe {timeframe}")
 
     def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
                  timeframe: str = 'Days', compression: int = 1) -> pd.DataFrame:
@@ -97,9 +96,9 @@ class AkshareDataProvider(BaseDataProvider):
                 print(f"Akshare: Detected ETF/fund symbol '{ak_symbol}'. Using 'fund_etf_hist_em'.")
                 # fund_etf_hist_em 不支持 period 参数, 这是一个限制
                 if period != 'daily':
-                    print(
-                        f"Warning: Akshare 'fund_etf_hist_em' does not support non-daily periods. Fetching daily data.")
-                    api_params['period'] = 'daily'
+                    # 不能用日线冒充周/月线写入缓存；返回 None 让责任链回退。
+                    print(f"Akshare 'fund_etf_hist_em' path only supports daily; skipping {timeframe}.")
+                    return None
                 df = ak.fund_etf_hist_em(**api_params)
 
             if df is None or df.empty:

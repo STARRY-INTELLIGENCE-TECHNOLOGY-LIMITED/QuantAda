@@ -18,7 +18,7 @@
 - 至少包含 1 条相关单测或语法检查
 5. 输出变更文件与关键行号。
 6. 若涉及下单状态机，必须明确校验是否误用了旧机制（`deferred/buffered` 队列）。
-7. 若涉及实盘引擎启动/调度，必须校验“拉数据前隔夜委托清理”链路是否正常（`KEEP_OVERNIGHT_ORDERS`、`get_pending_orders.id`、`cancel_pending_order`、5 次重试后告警）。
+7. 若涉及实盘引擎启动/调度，必须校验“拉数据前隔夜委托清理”链路是否正常（`KEEP_OVERNIGHT_ORDERS`、`get_pending_orders.id`、`cancel_pending_order`、按 `created_at` 只撤隔夜单、5 次重试后告警）。
 8. 若 schedule 与订单回调共享单线程 SDK 事件循环，必须确认调仓等待没有同步阻塞 SDK 回调线程；实盘运行应在单个短生命周期工作线程中执行，回测/优化不得创建该工作线程。
 9. 若涉及调仓执行、pending 订单、现金/持仓对账，必须同时验证实盘/回测分离：实盘尽量以柜台现实和短生命周期健康标记自愈；回测必须按计划同步成交，不进入实时 pending 查询、卖单等待、现金结算等待或 broker 同步。
 

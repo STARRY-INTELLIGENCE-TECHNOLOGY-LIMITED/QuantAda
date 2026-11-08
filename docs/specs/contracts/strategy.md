@@ -26,7 +26,7 @@
 3. 只允许缓存由行情数据和参数决定的指标结果，例如 MA、ROC、趋势分、布尔信号序列。
 4. 不允许缓存现金、持仓、订单、目标标的、拒单重试、跨 K 买入意图或任何 broker 现实状态。
 5. 实盘不得依赖该缓存维持正确性；缺少缓存时策略行为必须保持一致。
-6. 优化器指标缓存是有界缓存，允许按 LRU 淘汰旧序列；策略正确性不得依赖缓存命中。
+6. 优化器指标缓存是有界缓存，允许按 LRU 淘汰旧序列；策略正确性不得依赖缓存命中。`register_indicator()` 的快速查询字典按序列内容指纹作键，命中后还要核对缓存中保留的序列内容，不得用可被 GC 复用的 `id()` 作为身份。`get_cached_indicator_series()` 键中的 `id(dataframe)` 只作分桶，缓存项附带源 DataFrame 弱引用，仅当弱引用仍指向当前对象时命中，且不强持有整表。
 7. 缓存实现细节属于 `common/indicator_cache.py`；`BaseStrategy` 只保留 `register_indicator()`、`get_indicator()` 等稳定策略 API 入口。
 8. 实盘引擎会原地替换 `data.p.dataname`。只在 `init()` 预计算的指标序列会在后续 live refresh 后过期；必须在 `next()` 按当前 DataFrame 重算，或按行情内容失效缓存。
 
@@ -43,6 +43,7 @@
 2. `target_symbols` 传 `data` 对象列表，不传 symbol 字符串。
 3. `top_k` 代表目标持仓槽位数。若解析后的目标多于 `top_k`，按传入顺序截断并告警，避免按 `capital/top_k` 给额外标的超配。
 4. 需要不等权目标时，应改用 `order_target_percent/value`。
+5. 回测 `order_target_percent/value` 把同一根 K 线内预计卖出回笼的现金按 `(1-滑点)(1-佣金)` 折算后再用于买单定量，买入侧另按 `(1+滑点)(1+佣金)` 预留成本；回笼现金若按毛额计入，满仓换仓的买单会被 Margin 拒绝并整体推迟一根 K 线，系统性低估高换手参数。
 
 ## 7. 调仓时点门控
 1. `execute_rebalance()` 使用统一的调仓时点入口 `rebalance_when`。
@@ -106,12 +107,12 @@ for data, row, meta, quote in iter_option_rows(self.broker, current_dt, {"PUT"})
 4. `resolve_valuation_anchor()` 可读取行情 DataFrame 中的历史 V/W 列，也可读取 `data.p.dataname.attrs['valuation_snapshots']` 中按 ticker 提供的标准快照表。回退到滞后滚动中位数必须由策略显式启用，并把来源标成 `lagged_median_proxy`；该代理不等同于基本面估值。
 5. 策略应在交易信号中保留实际使用的 `asof`、`method`、`confidence`、`source_id` 和来源类型，便于审计及对照不同估值模型。
 
-## 12. 双向期权池与显式物理交割回测
+## 12. 双向期权池与期权到期结算回测
 1. 双向轮动声明 `option_universe = ("PUT", "CALL")`，参数使用 `put_min_delta/put_max_delta/call_min_delta/call_max_delta`。方向参数必须完整且符号合法；发现时两侧各保留中心 Delta 锚点，边界和锚点进入缓存身份。当前优化器仅按固定参数展开池，不能假定搜索自动加载固定边界以外的合约。
-2. 策略声明 `option_settlement = "physical"` 才启用日线物理交割。已有股票和 PCS 策略不改变行为；实盘不执行历史交割模拟。
+2. 策略声明 `option_settlement = "physical"` 才启用日线物理交割。未声明时，只要回测含期权 feed，Broker 默认在到期时按内在价值现金结算期权腿（不交割正股），使到期盈亏进入已平仓交易与期权尾部统计；纯股票回测不启用。实盘不执行历史交割/结算模拟。
 3. 机械记账集中在 `backtest/option_settlement.py`，策略不保存现金、虚拟仓位或等待指派队列。
-4. 仅支持完整 `Days`/compression=1；截止日线 `Day:HH:MM[:SS]` 不是正式收盘价，必须拒绝与物理交割组合。到期日正股收盘价决定价内价外，按执行价转移现金和股票，期权归零。缺到期日价格、标的或足额担保时明确失败，不用次日价格代替。
-5. 交割通过引擎原生成交通知更新持仓、归因和净值，避免重复入账，回测结束日在到期日时也结算。交割转移不加交易佣金/滑点；普通订单仍走原有成本路径。
+4. 仅支持完整 `Days`/compression=1；截止日线 `Day:HH:MM[:SS]` 不是正式收盘价，必须拒绝与物理交割组合。到期日正股收盘价决定价内价外。同一根 K 到期的全部腿先按净额校验担保（ITM Put Spread 的指派与保护腿行权相互抵消，不得逐腿误判担保不足），再统一记账：期权按内在价值平仓、正股按结算价净额交割，现金与按执行价交割一致，指派/行权盈亏归属期权交易（成交记录带 `settlement_event`），供期权尾部统计使用。缺到期日价格、标的或足额担保时明确失败，不用次日价格代替。
+5. 交割通过引擎原生成交通知更新持仓、归因和净值，避免重复入账，回测结束日在到期日时也结算。默认现金结算复用同一路径与时点（`settle_expired_options`）：事件为 `ASSIGNED_CASH`/`EXERCISED_CASH`/`EXPIRED_OTM` 且带 `settlement="cash"`；结算价取到期日及之前最后一个有效正股收盘，与 `_quantada_mark` 估值同口径（该标记只供 Broker 估值：数据流 close 线读标记，因此回测 `order_target_percent/value` 在期权数据流当日没有可执行原始报价时必须拒单并给出 `invalid_price`，不得按沿用的旧标记价成交；显式 `submit_option_order` 仍以调用方传入的有效报价为准）；日线（含截止日线）在到期 K 结算，日内周期在到期日后首根 K 结算；不做现金或正股担保校验（现金结算不动正股，原有空头正股不阻断结算），缺标的 feed 或价格时跳过并保留标记估值，不中断回测。物理交割的正股担保只拒绝交割本身造成的新增空头：交割后股数低于 min(交割前股数, 0) 才失败。交割转移不加交易佣金/滑点；普通订单仍走原有成本路径。
 6. 该模型不模拟提前指派、放弃行权、盘后价格、分红现金流、行权费用或拆股调整合约；不能当成完整美式期权结算模型。支持 `dividend_calendar` 的 Wheel 策略可用已公告分红在除息前最后一个正股交易日比较每股分红与 Call 时间价值，阻止新开或买平高指派风险短 Call；这只是风险缓解，不等于指派仿真或清算对账。
 7. 轮动按券商股票/期权持仓重新判阶段，不能推断股票来源；所有在途与缺报价持仓占用底层名额，已有股票卖 Call 不占第二个名额。卖 Call 必须足额股票覆盖，退出不受开仓 Delta/IVP/OI 过滤。
 8. 卖方候选开仓必须有未交叉的实际 Bid/Ask；多头买入可使用有效 Ask 单边盘口，但不能把 Last 填为 Ask。`quote_snapshot()` 保留 Last 作为成交参考，但不得填充缺失盘口。若 Provider 提供报价量且对应可执行一侧为零，该盘口不可执行。ThetaData 日线期权通过历史 Quote 接口取收盘前快照；缺 quote 时不应用 EOD OHLC 伪造 Bid/Ask。

@@ -27,3 +27,32 @@ def dependency_install_hint(package_name: str, error=None) -> str:
     if error is not None:
         message += f" 原始错误: {error}"
     return message
+
+
+def order_created_before(created_at, before):
+    """判断在途委托是否创建于 before 之前（隔夜清理边界）。
+
+    返回 True/False；创建时间缺失、无法解析或无法比较时返回 None，由调用方按“未知”处理。
+    带时区与无时区时间比较时，无时区一侧按带时区一侧的时区解释：适配器给出的时间戳和调度 now 都是市场时钟，
+    不能用运行机器的本地时区，否则非市场时区的主机会把当日委托误判为隔夜单。
+    """
+    if created_at is None or before is None:
+        return None
+    import pandas as pd
+
+    try:
+        created = pd.Timestamp(created_at)
+        boundary = pd.Timestamp(before)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if pd.isna(created) or pd.isna(boundary):
+        return None
+    try:
+        if (created.tzinfo is None) != (boundary.tzinfo is None):
+            if created.tzinfo is None:
+                created = created.tz_localize(boundary.tzinfo)
+            else:
+                boundary = boundary.tz_localize(created.tzinfo)
+        return bool(created < boundary)
+    except Exception:
+        return None

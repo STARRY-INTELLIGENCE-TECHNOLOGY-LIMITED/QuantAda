@@ -6,6 +6,7 @@ import json
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -139,7 +140,7 @@ def test_web_gm_token_fields_compose_into_config(tmp_path):
 
 
 def test_web_service_generates_custom_command(tmp_path):
-    service = CommandCenterService(tmp_path)
+    service = CommandCenterService(tmp_path, allow_request_executable=True)
     result = service.generate(
         {
             "strategy": "strategies.example",
@@ -509,7 +510,6 @@ def test_web_service_executes_and_polls_output(tmp_path):
     started = service.execute(
         {
             "strategy": "strategies.example",
-            "variables": {"PYTHON_EXECUTABLE": sys.executable},
         }
     )
     run_id = started["run_id"]
@@ -529,7 +529,7 @@ def test_web_service_stop_only_targets_active_run(tmp_path):
     (tmp_path / "run.py").write_text("print('done')\n", encoding="utf-8")
     service = CommandCenterService(tmp_path)
     first = service.execute(
-        {"strategy": "strategies.example", "variables": {"PYTHON_EXECUTABLE": sys.executable}}
+        {"strategy": "strategies.example"}
     )
     deadline = time.monotonic() + 10
     while service.run_snapshot(first["run_id"])["running"] and time.monotonic() < deadline:
@@ -538,7 +538,7 @@ def test_web_service_stop_only_targets_active_run(tmp_path):
 
     (tmp_path / "run.py").write_text("import time; time.sleep(30)\n", encoding="utf-8")
     second = service.execute(
-        {"strategy": "strategies.example", "variables": {"PYTHON_EXECUTABLE": sys.executable}}
+        {"strategy": "strategies.example"}
     )
     assert service.stop(first["run_id"]) is False
     assert service.stop(second["run_id"]) is True
@@ -775,3 +775,57 @@ def test_saved_profile_drops_force_schedule_and_legacy_file(tmp_path):
     profile["options"]["force_schedule"] = True
     service.profile_store.path.write_text(json.dumps(payload), encoding="utf-8")
     assert "force_schedule" not in service.profile_store.list()[0].options
+
+
+def test_web_service_rejects_request_executable_and_loader_variables(tmp_path):
+    service = CommandCenterService(tmp_path)
+    for name in ("PYTHON_EXECUTABLE", "PYTHONPATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"):
+        with pytest.raises(ValueError, match="--dangerously-ui-executable"):
+            service.generate({"strategy": "strategies.example", "variables": {name: "/bin/sh"}})
+    # 普通业务变量仍可由表单覆盖。
+    result = service.generate({"strategy": "strategies.example", "variables": {"GM_TOKEN": "t"}})
+    assert result["argv"][0] == sys.executable
+
+
+def _raw_request(base, path, *, method="GET", headers=None, body=None):
+    request = urllib.request.Request(base + path, data=body, headers=headers or {}, method=method)
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+@pytest.mark.parametrize("dangerous", [False, True])
+def test_web_api_blocks_cross_site_and_rebinding_unless_dangerous(tmp_path, dangerous):
+    server = serve(tmp_path, port=0, open_browser=False, dangerously_ui_executable=dangerous)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    port = server.server_address[1]
+    base = f"http://127.0.0.1:{port}"
+    body = json.dumps({"strategy": "strategies.example"}).encode()
+    json_headers = {"Content-Type": "application/json"}
+    blocked = 200 if dangerous else 403
+    try:
+        # 同源页面请求始终允许。
+        assert _raw_request(
+            base, "/api/command", method="POST", body=body,
+            headers={**json_headers, "Origin": base},
+        ) == 200
+        # 恶意网站跨站 POST、text/plain 简单请求、DNS 重绑定域名、公网 IP Host。
+        assert _raw_request(
+            base, "/api/command", method="POST", body=body,
+            headers={**json_headers, "Origin": "https://evil.example"},
+        ) == blocked
+        assert _raw_request(
+            base, "/api/command", method="POST", body=body,
+            headers={"Content-Type": "text/plain"},
+        ) == blocked
+        assert _raw_request(base, "/api/state", headers={"Host": f"evil.example:{port}"}) == blocked
+        assert _raw_request(base, "/api/state", headers={"Host": f"8.8.8.8:{port}"}) == blocked
+        # 内网 IP 直连仍可用（保持 --ui_ip 内网使用方式）。
+        assert _raw_request(base, "/api/state", headers={"Host": f"192.168.1.20:{port}"}) == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
