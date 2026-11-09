@@ -10,6 +10,24 @@
 本项目旨在对抗市面上普遍存在的“过拟合”与“造神”风气，通过严谨的工程架构与数学逻辑，让量化交易回归敬畏市场、技术为本的初心。
 核心思路是通过适配器把策略、数据源、风控和券商执行解耦，保持执行链路清晰、可审计、可恢复。
 
+## 核心特点
+
+| 特点 | 说明 |
+| --- | --- |
+| **一套策略，三种运行** | 同一份策略代码可用于回测、Optuna 参数优化和实盘/仿真。`run.py` 负责模式分流；回测与优化保持同步、非阻塞，只有实盘才轮询、对账并在有界预算内等待。 |
+| **适配器解耦** | 策略、选股器、风控、数据源、券商各自独立扩展。券商支持 GM、IBKR、Futu；数据源责任链覆盖 Tushare、Tiingo、AkShare、EODHD、ThetaData、GM、Futu、IBKR 与 CSV 缓存，另有 SEC、财报、利率、OCC、CBOE 辅助源。 |
+| **实盘可恢复** | 账户与订单状态以券商返回为准，不持久化交易意图；断连、拒单、数据失败优先重连、重试、对账和报警。先卖后买，被拒买单同一根 K 线降档重试，A 股 T+1 按可卖数量，隔夜挂单默认自动清理（`KEEP_OVERNIGHT_ORDERS` 可保留）。 |
+| **保守的回测口径** | 佣金与滑点同时计入成交和买力预留；支持信号收盘成交（`close`）与次日开盘成交（`next_open`）；行情缓存带数据源与复权口径标记，不会混用。 |
+| **期权支持** | 样例覆盖买开、现金担保短 Put、Covered Call、原子 Put Credit Spread；`option_universe` 自动展开期权链；回测到期默认按内在价值现金结算，声明 `option_settlement="physical"` 可做实物交割。 |
+| **优化与验证** | Optuna 搜索、训练/测试分窗、多结束日期独立 Study、按完整训练参数生成稳定身份的任务续传。 |
+| **开发体验** | Web 命令工作台、本地 MCP 回测 Server，以及 `docs/specs/` 规范与 `agent_prompts/` 模板，便于 AI 辅助二次开发。 |
+
+## 架构
+
+![QuantAda 架构](https://github.com/SUTFutureCoder/QuantAda/blob/main/.sample_pictures/architecture_zh.png?raw=true)
+
+图中重点展示 `run.py` 的模式分流、`Backtester` / `LiveTrader` / `Optimizer` 的职责边界，以及策略扩展、数据责任链、调仓计划与订单执行、券商适配和运行期通知之间的关系。实盘路径包含有界执行预算、柜台状态对账和进程级 heartbeat 自愈；回测与优化保持同步、非阻塞执行。
+
 ## 快速开始
 
 ### 1) 安装
@@ -51,7 +69,7 @@ DB_URL = "sqlite:///quantada_logs.db"
 | `configs/providers.py` | `TUSHARE_TOKEN`、`SXSC_TUSHARE_TOKEN`、`TIINGO_TOKEN`、`THETADATA_TOKEN`、`EODHD_API_TOKEN`、`SEC_USER_AGENT`、`OCC_ACTIONS_URL/PATH`、`EARNINGS_ARCHIVE_PATH`、`DATA_PROVIDER_COMPOSITIONS`、`DATA_PROVIDER_ALIASES` | 历史行情、估值、调整合约、点时财报与可配置组合 |
 | `configs/futu.py` | `FUTU_HOST`、`FUTU_PORT`、`FUTU_RSA_KEY_PATH`、账户/交易键、`FUTU_BROKER_ENVIRONMENTS` | 富途 OpenD 行情与官方交易连接；RSA 路径为空时使用明文协议；常规配置通过 `FUTU_TRADE_PASSWORD_ENV` 或 `FUTU_TRADE_PASSWORD_MD5_ENV` 引用外部环境变量，私有工作台方案可单独保存本机解锁凭据 |
 | `configs/alarms.py` | `ALARMS_ENABLED`、`DINGTALK_WEBHOOK`、`DINGTALK_SECRET`、`WECOM_WEBHOOK`、`ALARM_LEVEL` | 报警通道 |
-| `configs/gm.py` | `GM_TOKEN`、`GM_BROKER_ENVIRONMENTS` | GM Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['gm_broker']`） |
+| `configs/gm.py` | `GM_TOKEN`、`GM_PRICE_ADJUSTMENT`、`GM_BROKER_ENVIRONMENTS` | GM Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['gm_broker']`）；`GM_PRICE_ADJUSTMENT` 控制历史行情复权口径（1 前复权默认、0 原始价格、2 后复权） |
 | `configs/ibkr.py` | `IBKR_HOST`、`IBKR_PORT`、`IBKR_CLIENT_ID`、`IBKR_ORDER_ACCOUNT`、`IB_BROKER_ENVIRONMENTS` | IBKR Broker/连接环境（运行时显示为 `BROKER_ENVIRONMENTS['ib_broker']`） |
 | `configs/options.py` | `OPTION_RISK_WATCHDOG_*` | 实盘期权风险 Watchdog 的安全阈值 |
 
@@ -79,19 +97,10 @@ Futu 配置页可编辑账户 ID、账户索引和账户现金币种，期权/�
 
 仓库内置命令目录只包含脱敏示例；本机私有策略索引和连接默认值可放在 Git 忽略的 `.data/command_center/private_catalog.json`，启动工作台时会优先合并该文件。也可用 `QUANTADA_PRIVATE_CATALOG` 指定其它路径。
 
-默认仅监听 `127.0.0.1`；也可使用 `--ui_ip 0.0.0.0`（或其它明确地址）显式暴露到网络。工作台面向内部使用，当前会话中的 Token、Webhook、账户配置及 Futu 解锁凭据均按原样展示，请勿将监听地址暴露到不受信任网络。
+默认仅监听 `127.0.0.1`。工作台没有认证且能启动子进程，因此默认只接受来自 `localhost` 或本机/内网 IP 的同源请求：跨站请求、以域名作为 Host（防 DNS 重绑定）、公网 IP 访问和非 JSON 的 POST 都会返回 403，请求也不能通过变量指定 `PYTHON_EXECUTABLE` 或 `PYTHON*`/`LD_*`/`DYLD_*`。因此用 `--ui_ip 0.0.0.0` 暴露后，请用内网 IP 访问，不要用主机名。当前会话中的 Token、Webhook、账户配置及 Futu 解锁凭据仍按原样展示，请勿暴露到不受信任网络。仅在调试时可加 `--dangerously-ui-executable` 关闭上述校验，此时任何能访问该端口的人都能在本机执行命令。
 
-Futu 期权 Credit Spread 使用券商原子组合接口；若当前 OpenD 仿真环境返回“不支持组合期权”，框架会安全拒绝，不会拆分成裸腿。需要同时使用历史 IV/IVP 与实时盘口时，可将 `--data_source` 设置为 `theta+futu` 并选择命令工作台的 `theta_futu_global` 配置档案：通用 `OverlayDataProvider` 负责组合流程，Theta/Futu 适配规则由 `HybridDataProvider` 注入；期权历史来自 ThetaData，正股历史用 Futu 未复权价格与期权行权价对齐，实盘当前行由 Futu 快照合并，回测路径不会访问 Futu。声明了 `option_universe` 的期权策略可用正股/ETF 池自动展开历史或当前期权链，不必把到期合约写死在 `--symbols`。私有命令工作台也支持将 Futu 解锁口令保存到 Git 忽略的本机方案文件；内网工作台会按原样显示当前命令与凭据。完整提前指派同步仍需券商提供明确清算事件字段。
+Futu / ThetaData / SEC / CBOE / EODHD 的 Provider 组合与研究数据用法见 [数据源组合与研究数据指南](docs/guides/data_sources.md)。
 
-Futu 还可向期权 Wheel 提供带公告日的分红事件。实盘 Covered Call 使用当前完整券商事实；历史回测只有版本化 PIT 归档才使用分红前置判断，Futu 当前 corporate-actions 不会被宣称为历史 as-of。策略只使用早于决策日的公告；除息前最后一个交易日若每股分红高于 Call 时间价值，会阻止新开或买平对应短 Call。ThetaData 日线 OHLC 会另取 15:59--16:00 ET 历史 NBBO 并缓存报价量和源时间戳；无有效双边报价时不以 Last 代替，候选不开仓。该分红规则缓解提前指派风险，但不替代券商清算事件，也不构成完整美式期权回测。
-
-Provider 组合在 `configs/providers.py` 的 `DATA_PROVIDER_COMPOSITIONS` 中声明。每项配置指定历史 Provider、实时 Provider 和 `package.module:factory`；新增组合只需实现自己的适配器工厂并注册配置，不需修改 DataManager 或工作台。核心 alias `theta_futu_sec` 只加载行情和 SEC V/W；`theta_futu_research` 才追加点时财报和 Treasury 利率；`us_options_research` 只追加 CBOE。OCC 调整文件和全天 NBBO 都通过显式研究接口调用，避免普通训练放大网络和缓存成本。ETF 或 SEC 不支持的主体应使用 `theta_futu_cboe`，因为显式加入 `sec` 会在无估值快照时阻断价格代理。
-
-CBOE 官方日频指数 CSV 由 `cboe` Provider 按代码读取，例如 `US.VIX`、`US.VIX3M`、`US.VVIX` 和 `US.SKEW`；完整代码、字段语义和 `close-only` 指数限制见 [`docs/specs/contracts/cboe_provider.md`](docs/specs/contracts/cboe_provider.md)。
-
-Futu 历史 K 线配额不可用时，可用 `eodhd_theta_sec` 继续历史 Wheel 研究：EODHD 提供 US 股票 EOD 与声明日分红，ThetaData 提供期权历史链/报价，SEC 提供 filing-date V。先在 `requirements.txt` 解除可选 `eodhd` 行，再安装依赖，并通过环境变量 `EODHD_API_TOKEN` 注入令牌；EODHD 只支持股票/ETF 的日、周、月周期，不提供期权链或实时快照。完整契约见 [`docs/specs/contracts/eodhd_provider.md`](docs/specs/contracts/eodhd_provider.md)。
-
-美国普通股点时基本面估值可选使用 `sec` 辅助源，例如 `--data_source=theta+futu,sec`：SEC Company Facts 提供已披露的 10-K/10-Q 现金流、资本支出和稀释股数，框架按 filing 日期重建 TTM FCFE 并计算 V，策略再按显式 `w_multiple` 计算 W。SEC 原始 JSON 与合并后的行情估值列均有缓存；估值超过 200 天会失效。使用前须在 `SEC_USER_AGENT` 中提供应用标识和真实联系邮箱；ETF、金融公司或基本面字段不足时没有该估值，不会自动用股票价格代理替代。
 ### 4) 基础回测示例
 
 ```bash
@@ -128,6 +137,8 @@ python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta -
 python run.py sample_auto_rebalance_strategy --symbols=US.SPY,US.QQQ,US.SMH --execution_price=next_open --no_plot
 ```
 
+行情缓存的每一行带数据源与复权口径标记（`_price_basis`），换数据源或复权口径（例如 `GM_PRICE_ADJUSTMENT`）不会误用旧缓存；没有该标记的旧缓存首次运行会重新拉取。新请求区间与已有缓存不相交时，缓存会被整体替换而不是拼接，因为不同复权基准的价格无法安全拼接。
+
 ### 6) 参数优化（Optuna）
 
 ```bash
@@ -156,13 +167,7 @@ python run.py StrategyA,StrategyB --opt_params "{'StrategyA': {'p1': {'type': 'i
 python run.py --train_resume
 ```
 
-优化任务会按完整训练参数生成稳定身份 hash；相同训练重复执行会安全续传或提示已有任务，不同参数会使用独立 Journal，不会因为旧任务仍在运行而误判重复。
-
-任务按最近更新时间倒序，每页 10 个；`n` / `p` 翻页，`g 3` 跳到第 3 页。输入序号后先查看原始命令，再输入 `y` 确认恢复，`b` 返回列表，`q` 退出。菜单和日志为英文：`1 / y: confirm resume`、`l: view log`。Web 工作台提供相同分页及命令详情，点击 `Resume selected task` 确认。
-列表会标明训练状态 `Finished` 或 `Incomplete`。只看与该任务匹配的终端日志末尾展示段：Journal 文件名必须一致；日志若写了窗口或快照，也必须一致。同一 Journal 里有多个任务、而日志没有窗口和快照时，不把该日志判给每一个任务。分析开始标记之后出现结束标记，且结束标记后不是空摘要，才算 `Finished`；空摘要会跳过。否则为 `Incomplete`。`Incomplete` 仍可续传。
-选中任务后可输入 `l` 查看该任务匹配的最新终端日志，不会打开另一个任务的日志，默认停在末尾。`n` / `p` 翻页，`h` / `e` / `m` 跳到首页、末尾和中间，`s` 跳到分析展示段，`g 3` 跳到第 3 页，`b` 返回详情。Web 工作台的 `View log` 提供相同翻页。Trial 进度在同一行显示 `Trial 369/2160 ETA 6h12m`。
-跨日恢复优先使用固定的数据、选股结果和期权池快照。只有保存了完整训练元数据的任务才允许续传。详情页提供可复制的“使用最新行情手动重新训练”命令：移除旧 Study 绑定并追加 `--refresh`，重新选股、取数和训练；未显式指定的日期按启动时推断，显式日期可手动调整。
-缺少有限网格签名或其它必要元数据的任务不进入续传列表，也不计入新训练预算；需要继续训练时请使用新的 Study 名称或 Journal。当前 Study 的 Trial 编号与 Journal trial_id 一致。
+相同训练重复执行会安全续传或提示已有任务（身份由完整训练参数生成的稳定 hash 决定），Web 工作台提供相同的分页与日志查看。任务列表、状态判定、日志翻页和跨日恢复规则见 [优化任务续传指南](docs/guides/training_resume.md)。
 
 ### 7) 连接实盘/仿真
 
@@ -208,16 +213,19 @@ python run.py my_strategies.my_cool_strategy --selection=my_selectors.my_selecto
 
 MCP Server 以启动它的本机用户权限执行子进程，没有认证或多用户隔离，只连接可信的本地 MCP Host，不要作为网络服务暴露。配置、Tasks TTL 和示例见 [`mcp_backtest_server/README.md`](mcp_backtest_server/README.md)，正式契约见 [`docs/specs/contracts/mcp_backtest_server.md`](docs/specs/contracts/mcp_backtest_server.md)。
 
-## 核心设计（简版）
+## 延伸阅读
+
+- [数据源组合与研究数据指南](docs/guides/data_sources.md)：Futu / Theta / SEC / CBOE / EODHD 组合、点时基本面、期权分红规则
+- [优化任务续传指南](docs/guides/training_resume.md)：任务列表、状态判定、日志翻页、跨日恢复
+- [`docs/specs/`](docs/specs/README.md)：正式规范层，含架构原则、实盘运行语义和各扩展点契约
+- [`mcp_backtest_server/README.md`](mcp_backtest_server/README.md)：MCP 回测 Server 配置与示例
+
+## 设计原则
 
 - 无状态优先：账户与订单状态以券商返回为准，避免本地状态漂移。
 - 自愈优先：断连、拒单、数据失败优先恢复与降级，不轻易中断。
 - 最小改动：优先局部修复，避免状态机膨胀。
 - 执行纪律：统一遵循先卖后买、失败告警、可审计日志链路。
-
-![QuantAda 架构](https://github.com/SUTFutureCoder/QuantAda/blob/main/.sample_pictures/architecture_zh.png?raw=true)
-
-图中重点展示 `run.py` 的模式分流、`Backtester` / `LiveTrader` / `Optimizer` 的职责边界，以及策略扩展、数据责任链、调仓计划与订单执行、券商适配和运行期通知之间的关系。实盘路径包含有界执行预算、柜台状态对账和进程级 heartbeat 自愈；回测与优化保持同步、非阻塞执行。
 
 ## AI与二次开发入口
 

@@ -3549,6 +3549,57 @@ def test_live_engine_supports_multi_risk_chain_without_fail_open(monkeypatch):
     assert sell_orders, "风控触发后应实际发出 SELL 平仓单。"
 
 
+@pytest.mark.parametrize("risk_names", ["BrokenRisk", "NoopRisk,BrokenRisk"])
+def test_live_engine_refuses_to_start_when_a_requested_risk_control_fails_to_load(monkeypatch, risk_names):
+    """请求的风控加载失败属于定义期错误：启动期失败并报警，不能降级为缺少风控继续实盘。"""
+    import live_trader.engine as engine_module
+
+    class NoopRisk(BaseRiskControl):
+        def check(self, data):
+            return None
+
+    class BrokenRisk(BaseRiskControl):
+        def __init__(self, broker, params=None):
+            raise ValueError("bad risk parameter")
+
+        def check(self, data):
+            return None
+
+    pushed = []
+
+    def _resolver(class_name, paths):
+        return {
+            "DummyHeartbeatStrategy": DummyHeartbeatStrategy,
+            "NoopRisk": NoopRisk,
+            "BrokenRisk": BrokenRisk,
+        }[class_name]
+
+    monkeypatch.setattr(
+        engine_module.LiveTrader,
+        "_load_adapter_classes",
+        lambda self, platform: (MockEngineBroker, DummyDataProvider),
+    )
+    monkeypatch.setattr(engine_module, "get_class_from_name", _resolver)
+    monkeypatch.setattr(
+        engine_module.AlarmManager, "push_text",
+        lambda self, text, level="INFO", **kwargs: pushed.append((level, text)),
+    )
+
+    engine = LiveTrader({
+        "strategy_name": "DummyHeartbeatStrategy",
+        "platform": "mock_engine",
+        "symbols": ["SHSE.600000"],
+        "cash": 100000.0,
+        "params": {},
+        "risk": risk_names,
+        "risk_params": {},
+    })
+
+    with pytest.raises(RuntimeError, match="BrokenRisk: bad risk parameter"):
+        engine.init(MockContext(now=datetime(2026, 2, 17, 10, 30, 0)))
+    assert any(level == "ERROR" and "BrokenRisk" in text for level, text in pushed)
+
+
 def test_launch_live_applies_alarm_context_and_suppresses_transient_restart(monkeypatch):
     """
     启动器报警窗口优先级:

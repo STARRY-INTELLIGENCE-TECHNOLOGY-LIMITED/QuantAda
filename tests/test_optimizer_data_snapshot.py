@@ -12,6 +12,7 @@ from optimizer.data_snapshot import load_training_snapshot, save_training_snapsh
 from optimizer.runtime import OptimizationJob
 from common.runtime_command import format_cli_command
 from common.terminal_log import OPTIMIZER_AI_ANALYSIS_START_MARKER
+from stock_selectors.base_selector import BaseSelector
 
 
 class SnapshotStrategy:
@@ -20,7 +21,7 @@ class SnapshotStrategy:
     option_universe = ("PUT",)
 
 
-class SnapshotSelector:
+class SnapshotSelector(BaseSelector):
     """可变化的选股结果，用于验证恢复时不会重新运行。"""
 
     symbols = ["AAA"]

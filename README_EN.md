@@ -8,6 +8,24 @@ An elegant, extensible, live-trading-ready quantitative trading framework for de
 
 QuantAda pushes back against the overfitting and guru culture common in quantitative trading. It brings the focus back to disciplined engineering, sound mathematical reasoning, and respect for markets. Its central idea is to decouple strategies, data providers, risk controls, and broker execution through adapters, keeping execution paths clear, auditable, and recoverable.
 
+## Highlights
+
+| Feature | Description |
+| --- | --- |
+| **One strategy, three modes** | The same strategy code runs in backtests, Optuna optimization, and live/simulated trading. `run.py` routes the mode; backtests and optimization stay synchronous and non-blocking, while only the live path polls, reconciles, and waits within a bounded budget. |
+| **Adapter-based decoupling** | Strategies, selectors, risk controls, data providers, and brokers extend independently. Brokers: GM, IBKR, Futu. The data-provider chain covers Tushare, Tiingo, AkShare, EODHD, ThetaData, GM, Futu, IBKR, and a CSV cache, plus SEC, earnings, rates, OCC, and CBOE auxiliary sources. |
+| **Recoverable live trading** | Broker-reported state is the source of truth and trade intent is never persisted. Disconnects, rejected orders, and data failures trigger reconnect, retry, reconciliation, and alarms. Sell before buy; a rejected buy is retried at a reduced size on the same bar; China A-shares use sellable (T+1) quantity; overnight pending orders are cleaned up by default (`KEEP_OVERNIGHT_ORDERS` keeps them). |
+| **Conservative backtest accounting** | Commission and slippage are included in both fills and buying-power reservation; execution at the signal close (`close`) or the next open (`next_open`); cached market data is tagged with its source and price adjustment so bases are never mixed. |
+| **Options** | Samples for long options, cash-secured short put, covered call, and atomic put credit spread; `option_universe` expands option chains; backtests cash-settle expired options at intrinsic value by default, or physically settle with `option_settlement="physical"`. |
+| **Optimization and validation** | Optuna search, separate train/test windows, independent Studies per end date, and resumable tasks with a stable identity derived from the full training configuration. |
+| **Developer experience** | A Web Command Center, a local MCP backtest server, and `docs/specs/` plus `agent_prompts/` for AI-assisted development. |
+
+## Architecture
+
+![QuantAda Architecture](https://github.com/SUTFutureCoder/QuantAda/blob/main/.sample_pictures/architecture_en.png?raw=true)
+
+The diagram focuses on mode routing through `run.py`, the responsibility boundaries among `Backtester`, `LiveTrader`, and `Optimizer`, and the relationships between extension contracts, the data-provider chain, rebalancing and order execution, broker adapters, and runtime services. The live path includes a bounded execution budget, broker-state reconciliation, and process-level heartbeat recovery; backtests and optimization remain synchronous and non-blocking.
+
 ## Quick Start
 
 ### 1. Install
@@ -49,7 +67,7 @@ Configuration is split by responsibility. `config.py` lists the `configs` submod
 | `configs/providers.py` | `TUSHARE_TOKEN`, `SXSC_TUSHARE_TOKEN`, `TIINGO_TOKEN`, `THETADATA_TOKEN`, `EODHD_API_TOKEN`, `SEC_USER_AGENT`, `OCC_ACTIONS_URL/PATH`, `EARNINGS_ARCHIVE_PATH`, `DATA_PROVIDER_COMPOSITIONS`, `DATA_PROVIDER_ALIASES` | Historical providers, valuation, contract adjustments, point-in-time earnings, and compositions |
 | `configs/futu.py` | `FUTU_HOST`, `FUTU_PORT`, `FUTU_RSA_KEY_PATH`, account/trading keys, `FUTU_BROKER_ENVIRONMENTS` | Futu OpenD quote and official trading connection; an empty RSA path means plaintext protocol; normal config references unlock credentials through `FUTU_TRADE_PASSWORD_ENV` or `FUTU_TRADE_PASSWORD_MD5_ENV`, while private Command Center profiles may store a local credential |
 | `configs/alarms.py` | `ALARMS_ENABLED`, `DINGTALK_WEBHOOK`, `DINGTALK_SECRET`, `WECOM_WEBHOOK`, `ALARM_LEVEL` | Alarm channels |
-| `configs/gm.py` | `GM_TOKEN`, `GM_BROKER_ENVIRONMENTS` | GM broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['gm_broker']`) |
+| `configs/gm.py` | `GM_TOKEN`, `GM_PRICE_ADJUSTMENT`, `GM_BROKER_ENVIRONMENTS` | GM broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['gm_broker']`); `GM_PRICE_ADJUSTMENT` selects the historical price adjustment (1 forward-adjusted default, 0 raw, 2 backward-adjusted) |
 | `configs/ibkr.py` | `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_ORDER_ACCOUNT`, `IB_BROKER_ENVIRONMENTS` | IBKR broker/connection environments (exposed at runtime as `BROKER_ENVIRONMENTS['ib_broker']`) |
 | `configs/options.py` | `OPTION_RISK_WATCHDOG_*` | Live option risk watchdog safety thresholds |
 
@@ -70,19 +88,10 @@ The Futu section also exposes account ID, account index, and account cash curren
 
 The repository catalog contains sanitized examples only. Put private strategy indexes and connection defaults in the Git-ignored `.data/command_center/private_catalog.json`; the Command Center merges it with priority at startup. `QUANTADA_PRIVATE_CATALOG` can point to another private JSON file.
 
-The default bind address is `127.0.0.1`. The UI is intended for trusted internal use and displays current session variables, including Futu unlock credentials; only specify `--ui_ip` when you explicitly want to expose another interface.
+The default bind address is `127.0.0.1`. The UI has no authentication and can launch child processes, so by default it only accepts same-origin requests from `localhost` or a loopback/private/link-local IP. Cross-site requests, hostname `Host` headers (DNS rebinding), public IPs, and non-JSON POSTs receive HTTP 403, and requests cannot set `PYTHON_EXECUTABLE` or `PYTHON*`/`LD_*`/`DYLD_*` variables. After exposing it with `--ui_ip 0.0.0.0`, open it by private IP address rather than hostname. Current session variables, including Futu unlock credentials, are still displayed as-is, so never expose it to an untrusted network. For debugging only, `--dangerously-ui-executable` disables these checks; anyone who can reach the port can then run commands on your machine.
 
-Futu option credit spreads use the broker's atomic combo-order API. If the current OpenD simulation environment rejects combo options, QuantAda fails closed and does not split the order into naked legs. Use `--data_source=theta+futu` with the Command Center `theta_futu_global` profile when historical IV/IVP should come from ThetaData and the current live row from Futu; the generic `OverlayDataProvider` owns composition while `HybridDataProvider` supplies Theta/Futu-specific mapping. Hybrid underlying history uses Futu's unadjusted prices so stock values match Theta option strikes; standalone Futu history keeps its QFQ default. Option strategies that set `option_universe` can expand an underlying pool into historical or live option contracts instead of hard-coding expiries in `--symbols`. Backtests do not call Futu. The private Command Center may also store a Futu unlock password in the Git-ignored local profile store; trusted internal command previews show current values as-is. Explicit assignment reconciliation still requires broker clearing-event fields.
+Futu / ThetaData / SEC / CBOE / EODHD provider compositions and research data are covered in the [Data Source Compositions and Research Data Guide](docs/guides/data_sources_EN.md).
 
-Futu can also provide dividend events with publication dates for Wheel strategies. Live Covered Calls may use the current complete broker fact; historical backtests use pre-ex-date dividend logic only when a versioned point-in-time archive is available. Futu's current corporate-actions snapshot is not claimed as historical as-of data. Covered Calls use only events published before the decision date; on the last underlying session before an ex-date, a dividend larger than the Call's extrinsic value blocks a new short Call or triggers a buy-to-close. Daily ThetaData OHLC is enriched with a separate 15:59–16:00 ET historical NBBO query, including quote sizes and source timestamp; missing two-sided quotes are never replaced with Last for new entries. This reduces early-assignment risk but does not replace broker clearing events or model full American-option assignment.
-
-Provider compositions are declared in `configs/providers.py` under `DATA_PROVIDER_COMPOSITIONS`. The core `theta_futu_sec` alias loads only market data and SEC V/W; `theta_futu_research` adds point-in-time earnings and Treasury rates; `us_options_research` adds CBOE. OCC adjustment files and full-session NBBO remain explicit research calls, so ordinary training does not expand network or cache cost. For ETFs or issuers without SEC valuation, use `theta_futu_cboe`; explicitly adding `sec` blocks the price proxy when no SEC snapshot exists.
-
-Cboe's official daily index CSVs are available through the `cboe` Provider by symbol, such as `US.VIX`, `US.VIX3M`, `US.VVIX`, and `US.SKEW`. The complete code list, field semantics, and `close-only` limitations are documented in [`docs/specs/contracts/cboe_provider.md`](docs/specs/contracts/cboe_provider.md).
-
-If Futu historical-kline quota is unavailable, use `eodhd_theta_sec` for historical Wheel research: EODHD supplies US equity EOD data and declaration-date dividends, ThetaData supplies historical option chains/quotes, and SEC supplies filing-date V. Uncomment the optional `eodhd` line in `requirements.txt`, install requirements, and inject `EODHD_API_TOKEN` through the environment. EODHD supports stock/ETF daily, weekly, and monthly bars only; it does not provide option chains or live quotes. See [`docs/specs/contracts/eodhd_provider.md`](docs/specs/contracts/eodhd_provider.md).
-
-Point-in-time fundamentals for eligible U.S. common stocks can be added with the `sec` auxiliary source, for example `--data_source=theta+futu,sec`. SEC Company Facts supplies filed 10-K/10-Q cash flows, capital expenditures, and diluted shares; QuantAda rebuilds TTM FCFE by filing date and computes V, while the strategy derives W using its explicit `w_multiple`. Raw SEC JSON and enriched market-cache columns are cached; estimates expire after 200 days. Set `SEC_USER_AGENT` to an application identifier and a real contact email before requesting SEC data. ETFs, financial companies, and issuers without sufficient facts have no SEC valuation; the source does not substitute a price proxy.
 ### 4. Basic Backtest
 
 ```bash
@@ -119,6 +128,8 @@ python run.py sample_macd_cross_strategy --symbols=US.AAPL --data_source=theta -
 python run.py sample_auto_rebalance_strategy --symbols=US.SPY,US.QQQ,US.SMH --execution_price=next_open --no_plot
 ```
 
+Cached rows are tagged with their data source and price adjustment (`_price_basis`), so a different source or adjustment (for example `GM_PRICE_ADJUSTMENT`) never reuses an old cache; caches written before this tag are refetched once. When a new request does not overlap the cached range, the cache is replaced rather than spliced, because prices on different adjustment bases cannot be joined safely.
+
 ### 6. Parameter Optimization (Optuna)
 
 ```bash
@@ -147,13 +158,7 @@ Choose a previous training task interactively and resume its saved configuration
 python run.py --train_resume
 ```
 
-Optimization tasks use a stable identity hash derived from the complete training configuration. Repeating the same training resumes safely or reports that it is already running; changing parameters creates an independent Journal instead of being rejected by an unrelated running task.
-
-Tasks are listed by most recent update, ten per page. Use `n` / `p` to browse or `g 3` to jump to page 3. Select a task to inspect its original command, then enter `y` to confirm, `b` to return, or `q` to exit. The web workspace provides the same pagination and command details; click **Resume selected task** to confirm.
-The list also shows training status from the display section at the end of the matching terminal log. The journal filename must match; a window or snapshot written on the log must match the task too. A log with neither discriminator is not applied to every task that shares one journal file. Markers do not finish a task when the suffix is an empty crash summary, such as no metric result or both metrics and trials completed being zero; those logs are skipped. A missing end marker means incomplete. Incomplete tasks can still be resumed.
-After selecting a task, enter `l` to page through that task's matching terminal log. It does not open another task's log, and it opens at the end. Use `n` / `p` to move, `h` / `e` / `m` to jump to the first, last, or middle page, `s` for the analysis section, `g 3` for page 3, and `b` to return. The web workspace **View log** button provides the same paging.
-Resume prefers the saved data, selection, option universe, and train/test snapshot across dates. Only tasks with complete training metadata can be resumed. The details provide a copyable fresh-data command that removes study bindings and adds `--refresh` to rerun selection, fetch data, and train independently. Omitted dates are inferred at launch; explicit dates can be edited manually.
-Tasks without finite-grid metadata or other required metadata are omitted from the resume list and are not counted toward a new budget. Start a new Study name or Journal for a fresh run. Current Study trial numbers match the Journal trial_id.
+Repeating the same training resumes safely or points to the existing task (identity is a stable hash of the full training configuration), and the Web Command Center offers the same paging and log view. The task list, status rules, log paging, and cross-day resume behavior are in the [Optimization Task Resume Guide](docs/guides/training_resume_EN.md).
 
 ### 7. Connect to Live Trading or Simulation
 
@@ -199,16 +204,19 @@ The repository includes a local stdio backtest MCP server: `python -m mcp_backte
 
 The MCP server runs child processes with the local user's permissions and has no authentication or per-user isolation. Connect only a trusted local MCP host; do not expose it as a network service. Configuration, task TTL, and examples are documented in [`mcp_backtest_server/README.md`](mcp_backtest_server/README.md), with the formal contract in [`docs/specs/contracts/mcp_backtest_server.md`](docs/specs/contracts/mcp_backtest_server.md).
 
-## Core Design
+## Further Reading
+
+- [Data Source Compositions and Research Data Guide](docs/guides/data_sources_EN.md): Futu / Theta / SEC / CBOE / EODHD compositions, point-in-time fundamentals, option dividend rules
+- [Optimization Task Resume Guide](docs/guides/training_resume_EN.md): task list, status rules, log paging, cross-day resume
+- [`docs/specs/`](docs/specs/README.md): the formal specification layer (architecture principles, live runtime semantics, extension contracts)
+- [`mcp_backtest_server/README.md`](mcp_backtest_server/README.md): MCP backtest server configuration and examples
+
+## Design Principles
 
 - Stateless first: broker-reported account and order state is the source of truth, preventing local state drift.
 - Self-healing first: connection loss, rejected orders, and data failures trigger recovery and degradation paths before termination.
 - Minimal change first: prefer targeted fixes and avoid unnecessary state-machine growth.
 - Execution discipline: consistently sell before buying, alert on failures, and preserve an auditable log trail.
-
-![QuantAda Architecture](https://github.com/SUTFutureCoder/QuantAda/blob/main/.sample_pictures/architecture_en.png?raw=true)
-
-The diagram focuses on mode routing through `run.py`, the responsibility boundaries among `Backtester`, `LiveTrader`, and `Optimizer`, and the relationships between extension contracts, the data-provider chain, rebalancing and order execution, broker adapters, and runtime services. The live path includes a bounded execution budget, broker-state reconciliation, and process-level heartbeat recovery; backtests and optimization remain synchronous and non-blocking.
 
 ## AI and Extension Development
 

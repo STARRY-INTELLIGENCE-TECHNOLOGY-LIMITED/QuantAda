@@ -33,9 +33,9 @@ def test_turbo_keeps_account_rank_when_drawdown_or_trades_are_weak():
 
 def test_turbo_below_thresholds_matches_unpenalized_formula():
     stats = _base_stats()
-    # 复合年化 (1.6 ** 0.5 - 1) * 100 * 2 + 60/10 + 10 bonus
+    # 复合年化 * 2 + 胜率 0.60 平滑奖励 + 盈亏比 2.5 平滑奖励；回撤 10% 与 40 笔均无降权
     compound = ((1.6 ** 0.5) - 1.0) * 100.0
-    assert evaluate(stats) == pytest.approx(compound * 2.0 + 6.0 + 10.0)
+    assert evaluate(stats) == pytest.approx(compound * 2.0 + 5.0 * (0.20 / 0.30) + 5.0 * 0.75)
 
 
 def test_turbo_uses_compound_annual_return():

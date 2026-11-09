@@ -102,7 +102,101 @@ def window_key(metrics_payload):
     )
 
 
-def print_yearly_validation_rows(baseline_payloads, report_payloads):
+def classify_sample_window(start, end, train_range):
+    """
+    判断报告窗口与训练期的关系，返回 (类别, 文本)。
+
+    类别为 in/partial/out/before/unknown；只有整体晚于训练期结束的窗口才算样本外。
+    """
+    start, end = normalize_metric_date(start), normalize_metric_date(end)
+    train_start = normalize_metric_date((train_range or (None, None))[0])
+    train_end = normalize_metric_date((train_range or (None, None))[1])
+    try:
+        w_start, w_end = pd.to_datetime(start), pd.to_datetime(end)
+        t_start, t_end = pd.to_datetime(train_start), pd.to_datetime(train_end)
+        if pd.isna(w_start) or pd.isna(w_end) or pd.isna(t_start) or pd.isna(t_end):
+            raise ValueError("invalid date")
+    except Exception:
+        return "unknown", "归属未知"
+    if w_start > t_end:
+        return "out", "样本外"
+    if w_end < t_start:
+        return "before", "训练期前(非样本外)"
+    if w_start >= t_start and w_end <= t_end:
+        return "in", "样本内(完全)"
+    days = max((w_end - w_start).days + 1, 1)
+    overlap = (min(w_end, t_end) - max(w_start, t_start)).days + 1
+    return "partial", f"样本内(重叠{max(overlap, 0) / days:.0%})"
+
+
+def _stress_change(base, stressed):
+    """成本加压相对变化；基准缺失或为 0 时返回 N/A。"""
+    try:
+        base, stressed = float(base), float(stressed)
+        if base == 0 or base != base or stressed != stressed:
+            return "N/A"
+        return f"{(stressed - base) / abs(base):+.0%}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def print_sample_scope_line(label, payload, train_range):
+    """打印单个窗口的样本归属一行说明。"""
+    start, end = window_key(payload)
+    if not (start and end):
+        return
+    print(f"  [{label}] 窗口 {start}->{end}: {classify_sample_window(start, end, train_range)[1]}")
+
+
+def print_cost_stress_rows(final_reports):
+    """打印 MainEval 成本加压回测与基准成本的对照；只用于报告，不影响最优参数选择。"""
+    printed = False
+    for report in final_reports or []:
+        stress = report.get('cost_stress_backtest')
+        if not stress:
+            continue
+        if not printed:
+            print("MainEval 成本加压回测 (Cost Stress: 佣金与滑点翻倍；基数为 0 时取下限，仅报告)")
+            printed = True
+        label = format_metric_label(report)
+        if stress.get('error'):
+            print(f"  [{label}] 成本加压回测失败: {stress['error']}")
+            continue
+        base = report.get('main_eval_backtest') or report.get('recent_backtest') or {}
+        base_fmt = format_recent_backtest_metrics(base)
+        stress_fmt = format_recent_backtest_metrics(stress)
+        print(
+            f"  [{label}] 佣金 {stress.get('base_commission', 0):g}->{stress.get('commission', 0):g} "
+            f"滑点 {stress.get('base_slippage', 0):g}->{stress.get('slippage', 0):g}"
+        )
+        for name, key in (
+            ("年化收益", "annual_return"), ("Sharpe", "sharpe_ratio"),
+            ("回撤", "max_drawdown"), ("交易数", "total_trades"),
+        ):
+            print(
+                f"    {name}: {base_fmt[key]} -> {stress_fmt[key]} "
+                f"(相对变化 {_stress_change(base.get(key), stress.get(key))})"
+            )
+    return printed
+
+
+def print_sample_scope_summary(windows, train_range):
+    """汇总所有已报告窗口中真正样本外的个数，避免把样本内统计误读为验证。"""
+    unique = {(normalize_metric_date(s), normalize_metric_date(e)) for s, e in windows if s and e}
+    if not unique:
+        return
+    out_count = sum(classify_sample_window(s, e, train_range)[0] == "out" for s, e in unique)
+    train_text = (
+        f"{normalize_metric_date(train_range[0])}->{normalize_metric_date(train_range[1])}"
+        if train_range and all(train_range) else "未知"
+    )
+    print(
+        f"样本归属汇总: 共 {len(unique)} 个报告窗口，其中 {out_count} 个完全位于训练期({train_text})结束之后，"
+        f"属于真正样本外；其余窗口含训练期数据，其统计量是样本内表现，不能当作验证。"
+    )
+
+
+def print_yearly_validation_rows(baseline_payloads, report_payloads, train_range=None):
     rows_by_window = {}
 
     for payload in baseline_payloads or []:
@@ -121,22 +215,23 @@ def print_yearly_validation_rows(baseline_payloads, report_payloads):
         return False
 
     header_yearly = (
-        f"| {'窗口 (Window)':<21} | {'指标 (Metric)':<30} | {'年化收益':<10} | {'回撤':<10} | "
-        f"{'Calmar':<8} | {'Sharpe':<8} | {'交易数':<8} | {'胜率':<10} | {'PF':<8} |"
+        f"| {'窗口 (Window)':<21} | {'样本归属':<16} | {'指标 (Metric)':<30} | {'年化收益':<10} | "
+        f"{'回撤':<10} | {'Calmar':<8} | {'Sharpe':<8} | {'交易数':<8} | {'胜率':<10} | {'PF':<8} |"
     )
     yearly_width = len(header_yearly)
     print("-" * yearly_width)
-    print("年度固定窗口回测结果 (Yearly Fixed-Window Validation, Reused In-Memory Data)")
+    print("年度固定窗口回测结果 (Yearly Fixed-Window Backtest, Reused In-Memory Data; 仅样本外行可作验证)")
     print("-" * yearly_width)
     print(header_yearly)
     print("-" * yearly_width)
 
     for key in sorted(rows_by_window):
         window_text = f"{key[0]}->{key[1]}"
+        scope_text = classify_sample_window(key[0], key[1], train_range)[1]
         for label, payload in rows_by_window[key]:
             fmt = format_recent_backtest_metrics(payload or {})
             print(
-                f"| {window_text:<21} | {str(label)[:30]:<30} | "
+                f"| {window_text:<21} | {scope_text:<16} | {str(label)[:30]:<30} | "
                 f"{fmt['annual_return']:<10} | {fmt['max_drawdown']:<10} | "
                 f"{fmt['calmar_ratio']:<8} | {fmt['sharpe_ratio']:<8} | "
                 f"{fmt['total_trades']:<8} | {fmt['win_rate']:<10} | {fmt['profit_factor']:<8} |"
@@ -271,6 +366,7 @@ def print_optimizer_ai_summary(
     baseline_elapsed_hours=None,
     test_set_requested=False,
     test_section_title=None,
+    train_range=None,
 ):
     print(OPTIMIZER_AI_ANALYSIS_START_MARKER)
     print("Original launch command" + (":" if original_exact else " (reconstructed from saved settings):"))
@@ -308,6 +404,16 @@ def print_optimizer_ai_summary(
             log_payload=report.get('log_file', 'N/A'),
         )
 
+    scope_windows = []
+    main_payloads = [("当前基准", baseline_report)] if explicit_params_passed else []
+    main_payloads += [
+        (format_metric_label(r), r.get('main_eval_backtest') or r.get('recent_backtest')) for r in final_reports
+    ]
+    for label, payload in main_payloads:
+        print_sample_scope_line(f"{label} MainEval", payload, train_range)
+        scope_windows.append(window_key(payload))
+    print_cost_stress_rows(final_reports)
+
     if test_set_requested:
         test_title = test_section_title or "测试集回测结果 (Out-of-Sample Test Set)"
         print("-" * table_width)
@@ -336,9 +442,18 @@ def print_optimizer_ai_summary(
                 log_payload=report.get('log_file', 'N/A'),
             )
 
+        for label, payload in (
+            ([("当前基准", baseline_test_report)] if explicit_params_passed else [])
+            + [(format_metric_label(r), r.get('test_backtest')) for r in final_reports]
+        ):
+            print_sample_scope_line(f"{label} TestSet", payload, train_range)
+            scope_windows.append(window_key(payload))
         print("-" * table_width + "\n")
 
-    print_yearly_validation_rows(baseline_yearly_reports, final_reports)
+    print_yearly_validation_rows(baseline_yearly_reports, final_reports, train_range)
+    scope_windows += [window_key(p) for p in baseline_yearly_reports or []]
+    scope_windows += [window_key(p) for r in final_reports for p in r.get('yearly_backtests') or []]
+    print_sample_scope_summary(scope_windows, train_range)
     print_trade_attribution_sections(
         final_reports=final_reports,
         explicit_params_passed=explicit_params_passed,

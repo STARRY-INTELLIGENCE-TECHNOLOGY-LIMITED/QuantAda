@@ -10,9 +10,14 @@ from statistics import median
 
 
 _HARD_MDD_LIMIT = 20.0
+_BEYOND_LIMIT_SLOPE = 6.0
 _SOFT_MDD_START = 8.0
 _MDD_ALERT_LEVEL = 12.0
 _MIN_SAMPLE_TRADES = 8
+
+
+# 评分公式或量纲变化时递增；Study 记录该版本，版本不同的旧 Study 不续传，避免新旧分数混在一起。
+METRIC_VERSION = 2
 
 
 def _finite(value, default=0.0):
@@ -22,6 +27,17 @@ def _finite(value, default=0.0):
     except (TypeError, ValueError):
         return float(default)
     return number if math.isfinite(number) else float(default)
+
+
+def _saturate(value, default):
+    """NaN 和异常值使用默认值，正负无穷饱和为 ±1e9，避免极端输入被当成中性值。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if math.isnan(number):
+        return float(default)
+    return min(max(number, -1e9), 1e9)
 
 
 def _clip(value, lower, upper):
@@ -75,7 +91,10 @@ def _compound_annual_return_pct(total_return_pct, years):
         return -100.0
     if years <= 0.0:
         return 0.0
-    annual_return = (1.0 + total_return) ** (1.0 / years) - 1.0
+    try:
+        annual_return = (1.0 + total_return) ** (1.0 / years) - 1.0
+    except OverflowError:
+        return 100.0
     if not math.isfinite(annual_return):
         return 0.0
     return annual_return * 100.0
@@ -114,11 +133,11 @@ def evaluate(stats, strat=None, args=None) -> float:
     if not isinstance(stats, dict):
         stats = {}
 
-    total_return_pct = _finite(stats.get("total_return_pct"), 0.0)
+    total_return_pct = _saturate(stats.get("total_return_pct"), 0.0)
     years = max(_finite(stats.get("years"), 1.0), 0.25)
     annual_return_pct = _compound_annual_return_pct(total_return_pct, years)
 
-    mdd = abs(_finite(stats.get("mdd"), 20.0))
+    mdd = abs(_saturate(stats.get("mdd"), 20.0))
     sharpe = _finite(stats.get("sharpe"), 0.0)
     sortino = _optional_number(stats, "sortino", "sortino_ratio")
     risk_ratio = sharpe if sortino is None else sortino
@@ -193,7 +212,7 @@ def evaluate(stats, strat=None, args=None) -> float:
     if years < 1.0:
         score -= 8.0 * (1.0 - years)
 
-    if mdd > _HARD_MDD_LIMIT:
-        score = -100.0 - 2.0 * (mdd - _HARD_MDD_LIMIT)
+    # 回撤超过 20% 后斜率陡增（每点 6 分），取代原先跳到 -100 的硬门槛，保持连续且单调。
+    score -= _BEYOND_LIMIT_SLOPE * max(0.0, mdd - _HARD_MDD_LIMIT)
 
     return float(score) if math.isfinite(score) else -100.0

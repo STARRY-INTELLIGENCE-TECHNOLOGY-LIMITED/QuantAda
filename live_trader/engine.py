@@ -57,9 +57,28 @@ class _RiskControlChain:
     任一子风控触发 SELL 即返回 SELL。
     """
 
-    def __init__(self, controls):
+    def __init__(self, controls, on_failure=None):
         self.controls = list(controls or [])
         self.exit_triggered = set()
+        # 首次失败回调（如推送 ERROR 报警）；按 (控制类, 方法) 去重，逐 bar 重复失败只写日志。
+        self._on_failure = on_failure
+        self._reported_failures = set()
+
+    def _report_failure(self, control, method, exc):
+        name = control.__class__.__name__
+        broker = getattr(control, 'broker', None)
+        msg = f"[Risk Chain] {name}.{method} failed: {exc}"
+        if broker and hasattr(broker, 'log'):
+            broker.log(msg)
+        else:
+            print(msg)
+        key = (name, method)
+        if self._on_failure and key not in self._reported_failures:
+            self._reported_failures.add(key)
+            try:
+                self._on_failure(f"{msg} (首次失败报警，后续重复失败仅记录日志；该风控实际未生效)")
+            except Exception as alarm_err:
+                print(f"[Risk Chain] failed to push risk failure alarm: {alarm_err}")
 
     def check(self, data):
         for control in self.controls:
@@ -67,12 +86,7 @@ class _RiskControlChain:
                 if control.check(data) == 'SELL':
                     return 'SELL'
             except Exception as e:
-                broker = getattr(control, 'broker', None)
-                msg = f"[Risk Chain] {control.__class__.__name__}.check failed: {e}"
-                if broker and hasattr(broker, 'log'):
-                    broker.log(msg)
-                else:
-                    print(msg)
+                self._report_failure(control, 'check', e)
         return None
 
     def notify_order(self, order):
@@ -80,12 +94,7 @@ class _RiskControlChain:
             try:
                 control.notify_order(order)
             except Exception as e:
-                broker = getattr(control, 'broker', None)
-                msg = f"[Risk Chain] {control.__class__.__name__}.notify_order failed: {e}"
-                if broker and hasattr(broker, 'log'):
-                    broker.log(msg)
-                else:
-                    print(msg)
+                self._report_failure(control, 'notify_order', e)
 
     def mark_exit_trigger(self, symbol: str):
         self.exit_triggered.add(symbol)
@@ -451,19 +460,26 @@ class LiveTrader:
                     failed_controls.append((single_name, e))
                     print(f"Warning: Failed to load risk control '{single_name}'. Error: {e}")
 
+            # 风控是定义期配置：请求了却加载失败，不能降级成「少一个风控甚至无风控」继续实盘，启动期直接失败并报警。
+            if failed_controls:
+                failed_text = '; '.join(f"{name}: {error}" for name, error in failed_controls)
+                message = f"[Engine] 请求的风控加载失败，拒绝在缺少风控的情况下启动: {failed_text}"
+                self.alarm_manager.push_text(message, level='ERROR')
+                raise RuntimeError(message)
+
             if len(loaded_controls) == 1:
                 self.risk_control = loaded_controls[0]
                 print(f"[Engine] Risk Control loaded successfully: {loaded_controls[0].__class__.__name__}")
             elif len(loaded_controls) > 1:
-                self.risk_control = _RiskControlChain(loaded_controls)
+                self.risk_control = _RiskControlChain(
+                    loaded_controls,
+                    on_failure=lambda msg: self.alarm_manager.push_text(msg, level='ERROR'),
+                )
                 loaded_names = [ctrl.__class__.__name__ for ctrl in loaded_controls]
                 print(f"[Engine] Risk Control chain loaded successfully: {', '.join(loaded_names)}")
             else:
                 self.risk_control = None
 
-            if failed_controls and self.risk_control:
-                failed_names = [name for name, _ in failed_controls]
-                print(f"[Engine Warning] Some risk controls failed to load: {failed_names}")
 
         self._start_option_risk_watchdog()
 

@@ -24,8 +24,8 @@ def test_evaluate_applies_consistency_penalty_from_stats():
     score = evaluate(stats)
 
     compound = ((1.6 ** 0.5) - 1.0) * 100.0
-    # 基础分：复合年化 * 2 + 60/10 + 10 bonus；月度胜率 20% 再扣 5 分。
-    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0 - 5.0)
+    # 基础分：复合年化 * 2 + 胜率/盈亏比平滑奖励；月度胜率 20% 再扣 5 分。
+    assert score == pytest.approx(compound * 2.0 + 5.0 * (0.20 / 0.30) + 5.0 * 0.75 - 5.0)
 
 
 def test_evaluate_normalizes_percentage_monthly_win_rate():
@@ -35,7 +35,7 @@ def test_evaluate_normalizes_percentage_monthly_win_rate():
     score = evaluate(stats)
 
     compound = ((1.6 ** 0.5) - 1.0) * 100.0
-    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0 - 5.0)
+    assert score == pytest.approx(compound * 2.0 + 5.0 * (0.20 / 0.30) + 5.0 * 0.75 - 5.0)
 
 
 def test_evaluate_treats_non_finite_monthly_win_rate_as_zero():
@@ -45,7 +45,7 @@ def test_evaluate_treats_non_finite_monthly_win_rate_as_zero():
     score = evaluate(stats)
 
     compound = ((1.6 ** 0.5) - 1.0) * 100.0
-    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0 - 10.0)
+    assert score == pytest.approx(compound * 2.0 + 5.0 * (0.20 / 0.30) + 5.0 * 0.75 - 10.0)
 
 
 def test_evaluate_keeps_account_rank_when_drawdown_or_trades_are_weak():
@@ -88,4 +88,4 @@ def test_evaluate_falls_back_to_monthly_analyzer_when_stat_missing():
     score = evaluate(stats, strat=strat)
 
     compound = ((1.6 ** 0.5) - 1.0) * 100.0
-    assert score == pytest.approx(compound * 2.0 + 6.0 + 10.0)
+    assert score == pytest.approx(compound * 2.0 + 5.0 * (0.20 / 0.30) + 5.0 * 0.75)

@@ -6,6 +6,10 @@
 1. 优先恢复、重试、对账、降级、报警，而不是轻易中断。
 2. 单次运行错误应尽量安全退出当前 bar / schedule，并允许后续继续运行。
 3. 新设计不得削弱现有的断连恢复、缺数恢复、拒单降级、隔夜单清理、告警链路。
+4. 自愈只适用于运行期失败（网络、SDK、行情、柜台、单次 bar 异常）。定义期/配置错误（非法枚举值、不存在的方法或属性、类不是对应基类的非抽象子类、风控行为选择参数拼写错误）运行前即可确定，必须在构造/注册/调用入口快速失败，不得被宽泛 `except Exception` 吞成“无数据”或仅写日志。 实盘 `--risk` 请求的风控只要有一个加载失败，`LiveTrader.init` 必须报警并抛出 RuntimeError 拒绝启动，不得降级为缺少风控或无风控继续交易。
+5. 配置类错误使用 `data_providers.base_provider.ProviderConfigError`；`DataManager` 责任链遇到它必须直接抛出，不回退下一个 Provider，数据/网络类异常仍照常回退。Provider 对“数据源不支持某周期/标的”的返回 `None` 或抛错回退不受影响。
+6. 风控链（`_RiskControlChain`）仍逐个捕获子风控异常以免一个坏风控阻断其他风控和退出，但每个 (风控类, 方法) 首次失败必须推送 ERROR 报警（回测无报警通道，仍需日志），之后重复失败只写日志。回测 `Backtester._check_risk_controls` 不吞风控异常，直接中断回测。
+7. `tests/test_architecture_method_references.py` 静态扫描 `risk_controls/`、`stock_selectors/`、`strategies/` 中 `self._xxx(...)` 调用必须解析到类或基类成员；确需动态注入的成员登记到测试内 `DYNAMIC_ALLOWLIST` 并写明原因。
 
 ## 2. 优先保持无状态
 1. 券商现实状态是账户、持仓、在途订单的源头事实。

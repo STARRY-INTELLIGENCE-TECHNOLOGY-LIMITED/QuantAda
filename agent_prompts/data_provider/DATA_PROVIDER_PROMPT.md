@@ -33,7 +33,7 @@ def get_data(self, symbol: str, start_date: str = None, end_date: str = None,
 2. 尽量不要在 provider 内写业务策略逻辑，只做“数据获取+标准化”。
 3. 如需缓存，遵循 `DataManager` 的缓存流程，不在此处重复造轮子。
 4. 日期入参兼容 `YYYYMMDD` 与标准时间字符串。
-5. 日内场景要正确处理 `timeframe='Minutes'|'Seconds'` 和 `compression`；时间参数保留到秒，避免把秒/分钟级增量请求扩成整年明细。日内 K 线索引使用结束时刻（开始时刻标记的源需在 Provider 内加一个周期）；纯日期结束边界表示整天。不支持的 `timeframe/compression` 返回 `None`，不得用日线冒充其它周期。如 Provider 的复权口径可配置，提供 `price_adjustment()` 供 DataManager 写入缓存口径。
+5. 日内场景要正确处理 `timeframe='Minutes'|'Seconds'` 和 `compression`；时间参数保留到秒，避免把秒/分钟级增量请求扩成整年明细。日内 K 线索引使用结束时刻（开始时刻标记的源需在 Provider 内加一个周期）；纯日期结束边界表示整天。不支持的 `timeframe/compression` 返回 `None`，不得用日线冒充其它周期。配置或参数本身非法（如枚举配置值越界）属于定义期错误，必须在宽泛 `try/except` 之外抛出 `ProviderConfigError`（`data_providers.base_provider`），DataManager 责任链不会回退吞掉它；网络/SDK/数据失败仍返回 `None` 让链回退（GM 的 `GM_PRICE_ADJUSTMENT` 非 0/1/2 即按此处理）。如 Provider 的复权口径可配置，提供 `price_adjustment()` 供 DataManager 写入缓存口径。
 5a. 框架支持 `timeframe='Day:HH:MM[:SS]'`（也接受 `Days:` 别名）：DataManager 会请求 `Minutes/1`，cutoff 为整 5 分钟时可使用原生 `Minutes/5` 并按本地交易日聚合至 cutoff，包含 cutoff K 线；默认 `Days` 仍使用完整日线。Provider 返回分钟数据时不得混入 cutoff 之后的 K 线，未出现行情的交易日不得补空 K 线。请求起止覆盖偏差超过 3 个自然日时 DataManager 必须拒绝，截止日线缓存必须覆盖完整请求窗口。
 5b. AkShare 分钟场景必须调用 `stock_zh_a_hist_min_em`/`fund_etf_hist_min_em`；若服务端只返回最近窗口，Provider/DataManager 必须标记或拒绝不完整历史，不能静默回测。
 6. SDK/网络请求必须使用有限超时；秒级请求的单次超时应明显短于周期。瞬时失败默认总尝试 5 次，作为模块常量而非配置项。外汇/币市等 24x7 数据不得强制使用常规交易时段过滤。

@@ -19,7 +19,7 @@ except Exception as e:
     print(dependency_install_hint('gm', e))
     history = set_token = current = set_serv_addr = set_option = None
 
-from .base_provider import BaseDataProvider, REQUEST_ATTEMPTS
+from .base_provider import BaseDataProvider, ProviderConfigError, REQUEST_ATTEMPTS
 import config
 
 
@@ -37,12 +37,13 @@ class GmDataProvider(BaseDataProvider):
     @staticmethod
     def price_adjustment():
         """读取并校验 GM 历史行情复权口径；DataManager 也用它区分缓存价格口径。"""
+        raw = getattr(config, 'GM_PRICE_ADJUSTMENT', 1)
         try:
-            adjustment = int(getattr(config, 'GM_PRICE_ADJUSTMENT', 1))
+            adjustment = int(raw)
         except (TypeError, ValueError, OverflowError):
-            adjustment = 1
+            adjustment = None
         if adjustment not in {0, 1, 2}:
-            raise ValueError('GM_PRICE_ADJUSTMENT must be 0, 1 or 2')
+            raise ProviderConfigError(f'GM_PRICE_ADJUSTMENT must be 0, 1 or 2, got {raw!r}')
         return adjustment
 
     def __init__(self, token=None):
@@ -91,10 +92,12 @@ class GmDataProvider(BaseDataProvider):
 
         if not self.token:
             return None
-        
+
+        # 复权口径是配置错误，必须在宽泛 try 之外校验，避免被当成“无数据”。
+        price_adjustment = self.price_adjustment()
+
         try:
             freq = self._map_frequency(timeframe, compression)
-            price_adjustment = self.price_adjustment()
 
             # 1. 获取历史数据
             if end_date is None:

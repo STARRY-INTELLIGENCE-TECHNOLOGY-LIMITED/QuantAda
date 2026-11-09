@@ -14,7 +14,7 @@ import pandas as pd
 import optuna
 from optuna.samplers import GridSampler, TPESampler
 
-from optimizer.journal_metadata import batch_journal_path, finished_trial_count, read_study_metadata, related_journal_paths, study_identity, training_identity_hash
+from optimizer.journal_metadata import batch_journal_path, finished_trial_count, metric_version_matches, read_study_metadata, related_journal_paths, study_identity, training_identity_hash
 from optimizer.search_policy import (
     decode_axis_layers,
     decode_block_keys,
@@ -272,7 +272,10 @@ def select_resume_studies(source_studies, metrics, requested_name):
             switched = True
     matched = []
     for metric in metrics:
-        options = [study for study in groups[chosen_key] if study["attrs"].get("metric") == metric]
+        options = [
+            study for study in groups[chosen_key]
+            if study["attrs"].get("metric") == metric and metric_version_matches(study["attrs"], metric)
+        ]
         if not options:
             continue
         matched.append(max(options, key=lambda study: (
@@ -372,6 +375,14 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
             # 快照锚点只负责定位同批指标；指标不符不能进入候选，否则会把旧名称复用给新指标。
             if metric not in metrics:
                 continue
+            # 评分公式版本不同的旧 Study 不能续传，否则新旧两套分数会混进同一个 Study 和 best_params。
+            if not metric_version_matches(attrs, metric):
+                if requested_name and study["name"] == requested_name:
+                    raise ValueError(
+                        f"Study {study['name']} was scored with a different version of metric {metric}; "
+                        "use a new --study_name or Journal."
+                    )
+                continue
             # 显式 Journal 内按已完成数选择，不能因快照或名称前缀漏掉已探索更多的 Study。
             if not requested_journal:
                 if anchored_snapshot:
@@ -432,7 +443,7 @@ def resolve_study_plan(args, fixed_params, opt_params_def, risk_params, metrics,
                     or not attrs.get("_optimizer_grid_signature")
                 ):
                     continue
-                if attrs.get("metric") not in metrics:
+                if attrs.get("metric") not in metrics or not metric_version_matches(attrs, attrs.get("metric")):
                     continue
                 required = set(identity) - ({"symbols"} if identity["selection"] else set())
                 compatible = (

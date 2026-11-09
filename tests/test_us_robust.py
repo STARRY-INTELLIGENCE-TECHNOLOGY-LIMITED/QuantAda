@@ -1,3 +1,4 @@
+import pytest
 import math
 from types import SimpleNamespace
 
@@ -93,11 +94,14 @@ def test_evaluate_penalizes_short_horizon_when_annual_return_is_equal():
     assert evaluate(short_stats) < evaluate(long_stats)
 
 
-def test_evaluate_applies_hard_drawdown_guard():
-    stats = _base_stats()
-    stats["mdd"] = 25.0
+def test_evaluate_applies_steep_drawdown_slope_beyond_limit():
+    at_limit = _base_stats()
+    at_limit["mdd"] = 20.0
+    beyond = _base_stats()
+    beyond["mdd"] = 25.0
 
-    assert evaluate(stats) < -100.0
+    # 超过 20% 后每个回撤点额外扣 6 分，且在边界处连续，不再跳到固定 -100。
+    assert evaluate(beyond) == pytest.approx(evaluate(at_limit) - 0.5 * 5.0 - 1.25 * 5.0 - 6.0 * 5.0)
 
 
 def test_evaluate_handles_missing_and_nonfinite_fields():

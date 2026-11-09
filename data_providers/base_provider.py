@@ -7,6 +7,10 @@ import pandas as pd
 REQUEST_ATTEMPTS = 5
 
 
+class ProviderConfigError(ValueError):
+    """Provider 配置或调用参数非法（定义期错误）；责任链不得吞掉它回退到下一个数据源。"""
+
+
 class BaseDataProvider(ABC):
     """
     数据提供者的抽象基类

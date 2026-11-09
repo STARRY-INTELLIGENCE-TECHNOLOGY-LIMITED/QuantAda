@@ -11,7 +11,7 @@ import pandas as pd
 
 import config
 from common.data_paths import resolve_data_path, share_data_file
-from .base_provider import BaseDataProvider
+from .base_provider import BaseDataProvider, ProviderConfigError
 from .compositions import build_provider_composition
 from .csv_provider import PRICE_BASIS_COLUMN, CsvDataProvider
 from .thetadata_provider import ENRICHMENT_INCOMPLETE_COLUMN, enrichment_retry_needed
@@ -1436,6 +1436,9 @@ class DataManager:
                             )
 
                     return df
+            except ProviderConfigError:
+                # 配置错误不是数据源故障，回退到下一个源只会掩盖问题。
+                raise
             except Exception as e:
                 print(f"Error in {provider_name}: {e}")
                 continue

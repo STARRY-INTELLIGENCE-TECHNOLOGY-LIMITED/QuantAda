@@ -29,6 +29,7 @@ def check(self, data) -> str:
 3. 参数必须通过类属性 `params = {...}` 暴露，并使用 `self.p.xxx` 读取。
 4. 需处理数据不足场景，避免在 warm-up 阶段误触发。
 5. 日志要可读，避免高频重复输出。
+5a. 选择行为的枚举型参数（如 `method`）必须在 `__init__` 中校验并对非法值抛 `ValueError`，不要等到首根 bar 才被风控链日志吞掉；类内所有 `self._xxx()` 调用必须有对应定义（架构测试会静态检查）。加载器会校验类是 `BaseRiskControl` 的非抽象子类。
 6. 股票百分比止损不能直接用于期权。期权亏损按权利金差、数量和乘数折成现金；百分比只作用于结构已定义最大亏损。裸短 Call 必须有现金上限。参考 `risk_controls.sample_option_loss_budget`。
 
 ## 输出格式

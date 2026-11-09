@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import os
 import re
 
@@ -23,7 +24,24 @@ def pascal_to_snake(name: str) -> str:
     return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
 
 
-def get_class_from_name(name_string: str, search_paths: list):
+def _validate_plugin_class(cls, name_string, search_paths):
+    """注册期校验风控/选股器类：必须是对应基类的非抽象子类，错误在加载时暴露而不是首根 bar。"""
+    paths = set(search_paths or ())
+    if 'risk_controls' in paths:
+        from risk_controls.base_risk_control import BaseRiskControl as base
+    elif 'stock_selectors' in paths:
+        from stock_selectors.base_selector import BaseSelector as base
+    else:
+        return cls
+    if not (inspect.isclass(cls) and issubclass(cls, base)):
+        raise TypeError(f"'{name_string}' resolved to {cls!r}, which is not a subclass of {base.__name__}")
+    if inspect.isabstract(cls):
+        missing = sorted(cls.__abstractmethods__)
+        raise TypeError(f"{cls.__name__} does not implement abstract methods of {base.__name__}: {missing}")
+    return cls
+
+
+def _resolve_class(name_string: str, search_paths: list):
     """
     根据给定的名称字符串（文件名或类名）动态导入类。
 
@@ -103,6 +121,12 @@ def get_class_from_name(name_string: str, search_paths: list):
         f"Could not find class '{class_name}' from module '{module_name}' "
         f"derived from input '{name_string}' in any of the search paths: {search_paths}"
     )
+
+
+def get_class_from_name(name_string: str, search_paths: list):
+    """解析类名并对风控/选股器做注册期基类校验，详见 _resolve_class。"""
+    cls = _resolve_class(name_string, search_paths)
+    return _validate_plugin_class(cls, name_string, search_paths)
 
 
 def parse_period_string(period_str):

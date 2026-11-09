@@ -973,3 +973,60 @@ def test_saved_snapshot_with_obvious_hole_refuses_before_training(monkeypatch, t
     assert code == 1
     assert "Refusing to start" in output
     assert "AVGO 19/20" in output
+
+
+def test_metric_version_reads_declaration_and_defaults_to_one():
+    from optimizer.journal_metadata import metric_version
+
+    assert metric_version("mix_score_turbo") == 2
+    assert metric_version("option_carry_robust") == 1  # 未声明版本的评分按 1 处理
+    assert metric_version("return") == 1  # 非 metrics 包内的名称无法导入，同样按 1 处理
+    assert metric_version("missing_pkg.missing_metric") == 1
+
+
+def test_study_scored_by_older_metric_version_is_not_resumed(tmp_path):
+    """评分公式升级后，缺少版本记录的旧 Study 不能续传，否则新旧两套分数会混进同一个 best_params。"""
+    path = tmp_path / "optuna_legacy.log"
+    args = _args(metric="mix_score_turbo")
+    name = "2Y_12M_mix_score_turbo_US_TR20230923-20250922_TE20250923-20260923_RUN20260923-092823_99999999"
+    _write_study(path, name, args, metric="mix_score_turbo")
+
+    plan = _plan(args, tmp_path)
+
+    assert plan["matched"] == []
+    assert plan["studies"]["mix_score_turbo"] != name
+
+
+def test_study_with_current_metric_version_is_resumed(tmp_path):
+    path = tmp_path / "optuna_current.log"
+    args = _args(metric="mix_score_turbo")
+    name = "2Y_12M_mix_score_turbo_US_TR20230923-20250922_TE20250923-20260923_RUN20260923-092823_99999999"
+    study = _write_study(path, name, args, metric="mix_score_turbo")
+    study.set_user_attr("_optimizer_metric_version", 2)
+
+    plan = _plan(args, tmp_path)
+
+    assert plan["studies"]["mix_score_turbo"] == name
+    assert len(plan["matched"]) == 1
+
+
+def test_study_without_version_record_still_resumes_for_unversioned_metric(tmp_path):
+    """未声明 METRIC_VERSION 的评分（含私有评分）行为不变：旧 Study 缺记录按 1 匹配。"""
+    path = tmp_path / "optuna_unversioned.log"
+    args = _args(metric="option_carry_robust")
+    name = "2Y_12M_option_carry_robust_US_TR20230923-20250922_TE20250923-20260923_RUN20260923-092823_99999999"
+    _write_study(path, name, args, metric="option_carry_robust")
+
+    plan = _plan(args, tmp_path)
+
+    assert plan["studies"]["option_carry_robust"] == name
+
+
+def test_explicit_study_name_of_older_metric_version_is_rejected(tmp_path):
+    path = tmp_path / "optuna_stale.log"
+    name = "stale_turbo_study"
+    args = _args(metric="mix_score_turbo", study_name=name, study_journal=str(path))
+    _write_study(path, name, args, metric="mix_score_turbo")
+
+    with pytest.raises(ValueError, match="different version of metric"):
+        _plan(args, tmp_path)

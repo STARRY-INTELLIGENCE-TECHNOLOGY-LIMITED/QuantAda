@@ -3,6 +3,7 @@
 from array import array
 import ast
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -50,6 +51,25 @@ def study_identity(values):
     else:
         result["symbols"] = [item.strip() for item in str(result["symbols"] or "").split(",") if item.strip()]
     return result
+
+
+def metric_version(metric_arg):
+    """读取评分模块声明的 METRIC_VERSION，未声明或无法导入时按 1 处理。"""
+    text = str(metric_arg or "").strip()
+    module_path = text.rsplit(".", 1)[0] if "." in text else f"metrics.{text}"
+    try:
+        return int(getattr(importlib.import_module(module_path), "METRIC_VERSION", 1))
+    except Exception:
+        return 1
+
+
+def metric_version_matches(attrs, metric_arg):
+    """Study 记录的评分版本是否等于当前评分版本；旧 Study 缺记录按 1 处理。"""
+    try:
+        recorded = int(attrs.get("_optimizer_metric_version", 1))
+    except (TypeError, ValueError):
+        recorded = 1
+    return recorded == metric_version(metric_arg)
 
 
 def training_identity_hash(values):

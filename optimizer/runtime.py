@@ -59,7 +59,7 @@ from optimizer.study_resume import (
     resolve_study_plan,
     study_run_lock,
 )
-from optimizer.journal_metadata import finished_trial_count, isolate_study_journal, training_identity_hash
+from optimizer.journal_metadata import finished_trial_count, isolate_study_journal, metric_version, training_identity_hash
 from optimizer.dashboard_view import (
     begin_dashboard_log_scope,
     build_dashboard_storage,
@@ -168,6 +168,9 @@ except ImportError:
 
 # 以 metric_arg 为键缓存函数指针，避免多指标串用同一个函数。
 # key 格式: "{default_pkg}:{metric_arg}"
+# 成本加压回测：佣金与滑点翻倍；基数为 0（翻倍无意义）时取这两个下限，见 spec 第 4 节。
+COST_STRESS_COMMISSION_FLOOR = 0.0005
+COST_STRESS_SLIPPAGE_FLOOR = 0.0005
 _METRIC_FUNC_CACHE = {}
 _FORK_SHARED_WORKER_PAYLOAD = None
 
@@ -853,6 +856,7 @@ def _run_optimizer_mode_impl(
                     baseline_elapsed_hours=baseline_elapsed_hours,
                     test_set_requested=test_set_requested,
                     test_section_title=test_section_title,
+                    train_range=getattr(bootstrap_job, "train_range", None),
                 )
             summary_text = summary_buffer.getvalue()
             print(summary_text, end="")
@@ -3139,7 +3143,9 @@ class OptimizationJob:
             "final_portfolio": perf.get("final_portfolio"),
         }
 
-    def _run_backtest_on_datas(self, datas, final_params, start_date, end_date, verbose=False):
+    def _run_backtest_on_datas(
+        self, datas, final_params, start_date, end_date, verbose=False, commission=None, slippage=None
+    ):
         bt_instance = Backtester(
             datas=datas,
             strategy_class=self.strategy_class,
@@ -3147,8 +3153,8 @@ class OptimizationJob:
             start_date=start_date,
             end_date=end_date,
             cash=self.args.cash,
-            commission=self.args.commission,
-            slippage=self.args.slippage,
+            commission=self.args.commission if commission is None else commission,
+            slippage=self.args.slippage if slippage is None else slippage,
             risk_control_classes=self.risk_control_classes,
             risk_control_params=self.risk_params,
             timeframe=self.args.timeframe,
@@ -3315,6 +3321,43 @@ class OptimizationJob:
             print(f"[Optimizer] Warning: Main evaluation backtest failed: {e}")
             return None
 
+        return metrics
+
+    def _run_cost_stress_backtest(self, final_params):
+        """
+        训练后在 MainEval 窗口复跑一次成本加压回测：佣金与滑点翻倍，基数为 0 时取下限。
+
+        只用于报告，不参与目标函数；复用 MainEval 已对齐的窗口数据，不额外取数。失败返回带 error 的字典。
+        """
+        base_commission = float(self.args.commission or 0.0)
+        base_slippage = float(self.args.slippage or 0.0)
+        commission = 2.0 * base_commission if base_commission > 0 else COST_STRESS_COMMISSION_FLOOR
+        slippage = 2.0 * base_slippage if base_slippage > 0 else COST_STRESS_SLIPPAGE_FLOOR
+        try:
+            eval_start, eval_end = self._infer_main_eval_window()
+            print("-" * 60)
+            print(
+                f"Running Cost-Stress Backtest: {eval_start} to {eval_end} "
+                f"commission {base_commission:g}->{commission:g} slippage {base_slippage:g}->{slippage:g}"
+            )
+            print("-" * 60)
+            datas = self._fetch_datas_for_window(eval_start, eval_end)
+            if not datas:
+                raise RuntimeError("no valid data")
+            metrics = self._run_backtest_on_datas(
+                datas, final_params, eval_start, eval_end, verbose=False,
+                commission=commission, slippage=slippage,
+            )
+            if not metrics:
+                raise RuntimeError("metrics unavailable")
+        except Exception as e:
+            print(f"[Optimizer] Warning: Cost-stress backtest failed: {e}")
+            return {"error": str(e)}
+        metrics.pop("trade_micro_attribution_report", None)
+        metrics.update(
+            commission=commission, slippage=slippage,
+            base_commission=base_commission, base_slippage=base_slippage,
+        )
         return metrics
 
     def _run_test_set_backtest(self, final_params, verbose=False):
@@ -3578,6 +3621,9 @@ class OptimizationJob:
             study.set_user_attr("opt_params", dict(self.opt_params_def or {}))
             study.set_user_attr("risk_params", dict(getattr(self, "risk_params", None) or {}))
             study.set_user_attr("_optimizer_identity_hash", training_identity_hash(identity_values))
+            # 记录评分公式版本；已有记录的 Study 保持原值，版本不符的旧 Study 在续传匹配阶段已被排除。
+            if "_optimizer_metric_version" not in study.user_attrs:
+                study.set_user_attr("_optimizer_metric_version", metric_version(self.args.metric))
             # 保留当前调度进程身份，便于新命令识别 Windows 主进程退出后仍运行的 worker。
             study.set_user_attr("_optimizer_owner", f"optimizer_RUN{datetime.datetime.now():%Y%m%d-%H%M%S}_{os.getpid()}")
             requested_metrics = list(getattr(self, "_requested_metrics", [self.args.metric]))
@@ -4433,6 +4479,7 @@ class OptimizationJob:
 
         main_eval_metrics = self._run_main_eval_backtest(final_params)
         yearly_metrics = self._run_yearly_validation_backtests(final_params)
+        cost_stress_metrics = self._run_cost_stress_backtest(final_params) if main_eval_metrics else None
 
         print("\n" + "=" * 60)
         print(" SUMMARY OF BEST CONFIGURATION")
@@ -4475,6 +4522,7 @@ class OptimizationJob:
             "recent_backtest": main_eval_metrics,
             "test_backtest": test_metrics,
             "yearly_backtests": yearly_metrics,
+            "cost_stress_backtest": cost_stress_metrics,
             "search_audit": search_audit_report,
         }
         trained_hours = training_elapsed_hours(study.trials)

@@ -1379,10 +1379,10 @@ class SignalLoggingBroker(bt.brokers.BackBroker):
             return super()._try_exec_market(order, popen, phigh, plow)
 
         lot_size = normalize_quantity_step(getattr(config, "LOT_SIZE", 1))
-        cash_tolerance = max(1e-8, available_cash * 1e-12)
-        cash_budget = max(0.0, available_cash - cash_tolerance)
+        # 刚好花完全部现金的订单（如零成本整数价）不能被浮点容差少买一手；
+        # 初值略放宽相对 1e-12，随后由下方精确的 cash_required <= available_cash 循环兜底。
         affordable_size = align_quantity_down(
-            min(requested_size, cash_budget / unit_cash),
+            min(requested_size, available_cash / unit_cash * (1 + 1e-12)),
             lot_size,
         )
         while affordable_size > 0:

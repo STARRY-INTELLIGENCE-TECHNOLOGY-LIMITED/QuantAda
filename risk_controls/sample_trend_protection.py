@@ -28,6 +28,16 @@ class SampleTrendProtection(BaseRiskControl):
         'strict_slope': False  # (仅 ma 模式) 是否要求均线本身必须向上
     }
 
+    _METHODS = ('ma', 'trend_score')
+
+    def __init__(self, broker, params=None):
+        super().__init__(broker, params)
+        # 行为选择型参数在构造期校验，拼写错误不能拖到首根 bar 才被日志吞掉。
+        if self.p.method not in self._METHODS:
+            raise ValueError(f"SampleTrendProtection method must be one of {self._METHODS}, got {self.p.method!r}")
+        if int(self.p.period) < 2:
+            raise ValueError(f"SampleTrendProtection period must be >= 2, got {self.p.period!r}")
+
     def check(self, data) -> str:
         # 1. 准备数据
         # 获取该标的截至当前的所有收盘价 (Backtrader中 len(data) 为当前已处理bar数)
@@ -45,7 +55,7 @@ class SampleTrendProtection(BaseRiskControl):
 
         if self.p.method == 'ma':
             signal = self._check_ma(close)
-        elif self.p.method == 'trend_score':
+        else:
             signal = self._check_trend_score(close)
 
         return signal
