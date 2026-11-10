@@ -8,7 +8,7 @@
 3. 终端日志目录为解析后的 `DATA_PATH/optimizer`。相对路径锚定 `run.py` 同级；绝对路径只使用指定目录。创建该目录和自定义数据目录时尽量设为 `0o777`。
 4. `.data/optuna` 仅用于 Optuna journal/dashboard 数据，不承担终端输出归档职责。
 5. 如果后台队列满，允许丢弃日志片段并在日志文件中记录丢弃计数；不允许因此阻塞 trial 计算。
-6. Optuna 的 Trial 完成、剪枝和失败日志在同一行改写，不另起一行。行首显示 `Metric {本轮序号}/{本轮总数} {当前指标} | Trial {编号}/{目标预算} ETA ... | Total Trial {整批完成数}/{整批目标数} ETA ... | Finished/Pruned/Failed ...`，前半段是当前指标进度，后两段是本次命令所有指标的累计进度和原始状态。单指标显示 `1/1`；序号来自本次命令的指标顺序，不能混入历史 Study 的指标。当前 Trial 分母是当前指标的目标预算（含网格上限），整批目标数按指标数量乘以该预算计算。`Best is trial` 保持原样。
+6. Optuna 的 Trial 完成、剪枝和失败日志在同一行改写，不另起一行。行首显示 `Metric {本轮序号}/{本轮总数} {当前指标} | Trial {编号}/{目标预算} ETA ... | Total Trial {整批完成数}/{整批目标数} ETA ... | Finished/Pruned/Failed ...`，前半段是当前指标进度，后两段是本次命令所有指标的累计进度和原始状态。单指标显示 `1/1`；序号来自本次命令的指标顺序，不能混入历史 Study 的指标。`--end_date` 去重后有多个窗口时，指标标签追加 `End date {n}/{all}`，例如 `Metric 1/2 mix_score_turbo End date 2/3`；单个窗口保持原样。窗口序号只经 Job 属性传递，不写入 `args`，避免改变 Study 指纹而破坏续传；`Total Trial` 仍只统计当前 End date 内的所有指标，不跨窗口累计，因为后续窗口的自适应预算在前一窗口结束前未知。当前 Trial 分母是当前指标的目标预算（含网格上限），整批目标数按指标数量乘以该预算计算。`Best is trial` 保持原样。
 7. ETA 估计本次命令剩余全部 metric 的优化 trial：当前指标剩余额度加上后续每个指标的目标预算，扣除各自已完成的 COMPLETE/PRUNED。按当前指标本轮的墙钟速度外推；切换指标后重置速度，不把历史已完成数计入速度。FAIL 不计入完成或速度；多进程共用父进程起点和一个共享计数。不足 1 秒或尚无计入完成时显示 `ETA unavailable`，整批剩余为 0 时显示 `finishing`，其余显示 `ETA 6h12m` 这种英文时长。此估计不包含指标间验证报告耗时。不修改 Journal trial_id，不新增配置开关。
 8. 后台 Dashboard 不得改动进程级 optuna logger 级别。只过滤 Dashboard 线程自身的 Optuna 日志；训练线程的 Trial 完成、剪枝和失败日志必须继续输出，并仍按第 6 条在同一行改写。重复启动不得叠加过滤器，Dashboard 退出后必须卸下该过滤。
 

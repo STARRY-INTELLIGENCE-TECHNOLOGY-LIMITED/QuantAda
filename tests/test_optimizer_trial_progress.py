@@ -346,3 +346,16 @@ def test_progress_eta_reuses_training_parallel_warmup():
     assert progress_eta(1, 100, 0.0, 40.0, parallel_workers=4) == "ETA warming up (1/4 workers)"
     assert progress_eta(4, 100, 0.0, 40.0, parallel_workers=4) == "ETA 16m"
 
+
+
+def test_metric_label_adds_end_date_position_only_for_multiple_end_dates():
+    counter = TrialFinishCounter()
+    single = make_trial_progress(10, 0, counter, metric_name="mix_score_turbo", metrics=["mix_score_turbo", "sharpe"])
+    multi = make_trial_progress(
+        10, 0, counter, metric_name="mix_score_turbo", metrics=["mix_score_turbo", "sharpe"],
+        end_date_position=(2, 3),
+    )
+
+    assert single["metric_label"] == "Metric 1/2 mix_score_turbo"
+    assert multi["metric_label"] == "Metric 1/2 mix_score_turbo End date 2/3"
+    assert multi["total_target_trials"] == single["total_target_trials"] == 10

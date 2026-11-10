@@ -260,6 +260,7 @@ def test_run_optimizer_mode_expands_end_date_windows(monkeypatch, tmp_path):
                 "argv": kwargs["original_argv_override"],
                 "window": kwargs["requested_window"],
                 "suppress_dashboard": kwargs["suppress_dashboard"],
+                "end_date_position": kwargs["end_date_position"],
             }
         )
         return 0
@@ -302,6 +303,7 @@ def test_run_optimizer_mode_expands_end_date_windows(monkeypatch, tmp_path):
         (None, "20250930"),
     ]
     assert all(item["suppress_dashboard"] is True for item in calls)
+    assert [item["end_date_position"] for item in calls] == [(1, 2), (2, 2)]
     assert calls[0]["argv"][calls[0]["argv"].index("--end_date") + 1] == "20240930"
     assert calls[1]["argv"][calls[1]["argv"].index("--end_date") + 1] == "20250930"
     assert len(opened) == 1

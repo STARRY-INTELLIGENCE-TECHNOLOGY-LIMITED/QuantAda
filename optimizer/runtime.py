@@ -458,6 +458,10 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                             (original_start_date, end_date)
                             if multi_end_date else original_window
                         ),
+                        end_date_position=(
+                            (end_dates.index(end_date) + 1, len(end_dates))
+                            if multi_end_date and len(end_dates) > 1 else None
+                        ),
                     )
                 statuses.append(status)
             except KeyboardInterrupt:
@@ -528,7 +532,7 @@ def infer_omitted_backtest_window(args):
 def _run_optimizer_mode_impl(
     args, fixed_params, risk_params, symbol_list, run_scope,
     result_file=None, result_label=None, original_argv_override=None,
-    suppress_dashboard=False, requested_window=None,
+    suppress_dashboard=False, requested_window=None, end_date_position=None,
 ):
     """
     运行优化模式主流程（从 run.py 下沉的编排逻辑）。
@@ -761,6 +765,7 @@ def _run_optimizer_mode_impl(
             # 此 Job 位于本轮 Journal 进程锁内，允许回收上次中断的试验状态。
             job._resume_exclusive = True
             job._requested_metrics = metrics_list
+            job._end_date_position = end_date_position
             job._future_metric_finished_counts = tuple(
                 matched_finished.get(metric, 0) for metric in metrics_list[idx:]
             )
@@ -1872,6 +1877,7 @@ class OptimizationJob:
                             parallel_workers=worker_count,
                             metric_name=self.args.metric,
                             metrics=getattr(self, "_requested_metrics", None),
+                            end_date_position=getattr(self, "_end_date_position", None),
                             future_finished_counts=getattr(self, "_future_metric_finished_counts", ()),
                             total_target_trials=getattr(self, "_total_target_trials", None),
                             total_finished_before=getattr(self, "_total_finished_before", 0),
@@ -3869,6 +3875,7 @@ class OptimizationJob:
             progress = make_trial_progress(
                 progress_target, finished_before, counter, parallel_workers=resolved_workers,
                 metric_name=self.args.metric, metrics=getattr(self, "_requested_metrics", None),
+                end_date_position=getattr(self, "_end_date_position", None),
                 future_finished_counts=getattr(self, "_future_metric_finished_counts", ()),
                 total_target_trials=getattr(self, "_total_target_trials", None),
                 total_finished_before=getattr(self, "_total_finished_before", 0),

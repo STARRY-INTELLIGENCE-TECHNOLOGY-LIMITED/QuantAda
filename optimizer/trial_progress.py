@@ -264,15 +264,20 @@ def metric_remaining_label(target_trials, finished_before, counted, started_at, 
 def make_trial_progress(
     target_trials, finished_before, counter, started_at=None, parallel_workers=1,
     metric_name=None, metrics=None, future_finished_counts=(),
-    total_target_trials=None, total_finished_before=0,
+    total_target_trials=None, total_finished_before=0, end_date_position=None,
 ):
-    """组装当前指标和整批指标共用的进度状态。"""
+    """组装当前指标和整批指标共用的进度状态。
+
+    end_date_position 为 (当前序号, 总数)，仅在多个 End date 滚动训练时传入。
+    """
     metric_label = None
     if metric_name is not None:
         requested_metrics = list(metrics) if metrics else [metric_name]
         if metric_name not in requested_metrics:
             requested_metrics = [metric_name]
         metric_label = f"Metric {requested_metrics.index(metric_name) + 1}/{len(requested_metrics)} {metric_name}"
+        if end_date_position:
+            metric_label += f" End date {end_date_position[0]}/{end_date_position[1]}"
     return {
         "target_trials": int(target_trials),
         "finished_before": max(0, int(finished_before)),
