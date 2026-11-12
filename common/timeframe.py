@@ -1,5 +1,7 @@
 """定时日 K 的语法及与数据源无关的 OHLCV 聚合。"""
 
+from __future__ import annotations
+
 from datetime import time
 import re
 

@@ -471,9 +471,10 @@ def run_optimizer_mode(args, fixed_params, risk_params, symbol_list):
                 traceback.print_exc()
                 statuses.append(1)
         if total_combinations > 1 and result_file:
-            print(f"[Optimizer] Opening combined AI analysis result file: {result_file}")
-            if not open_optimizer_result_file(result_file):
-                print(f"[Optimizer] Could not open the result file automatically: {result_file}")
+            if open_optimizer_result_file(result_file):
+                print(f"[Optimizer] Opened combined AI analysis result file: {result_file}")
+            else:
+                print(f"[Optimizer] Combined AI analysis result file (not opened automatically): {result_file}")
         return 0 if statuses and all(status == 0 for status in statuses) else 1
     except Exception:
         print("\n[Optimizer] Fatal exception captured in optimizer mode:")

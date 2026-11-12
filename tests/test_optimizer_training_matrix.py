@@ -50,3 +50,23 @@ def test_strategy_keyed_opt_params_support_full_name_and_class_name():
         },
     }
     assert set(resolve_opt_params(space, "strategies.example.StrategyB", StrategyB)) == {"p3", "p5"}
+
+
+def test_result_file_is_not_opened_in_test_mode(tmp_path, monkeypatch):
+    """测试模式下不得启动记事本等外部编辑器。"""
+    import subprocess
+
+    import optimizer.result_file as result_file
+
+    launched = []
+    monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: launched.append(args))
+    monkeypatch.setenv("QUANTADA_TEST_MODE", "1")
+    path = tmp_path / "result.txt"
+    path.write_text("x", encoding="utf-8")
+
+    assert result_file.open_optimizer_result_file(str(path)) is False
+    assert launched == []
+
+    monkeypatch.delenv("QUANTADA_TEST_MODE")
+    assert result_file.open_optimizer_result_file(str(path)) is True
+    assert len(launched) == 1

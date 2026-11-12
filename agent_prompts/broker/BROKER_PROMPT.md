@@ -31,7 +31,7 @@
 ### 1. 资产与持仓查询
 - `getvalue(self) -> float`: 获取当前账户总权益（Net Liquidation Value）。可调用父类的 `self._get_portfolio_nav()` 或直接调用券商 API 获取。
 - `_fetch_real_cash(self) -> float`: 实时向柜台请求当前可用于开新仓的真实购买力（现金）。如券商口径不含在途冻结，需在适配器层补充扣减逻辑。
-- **GM 最低佣金预留**: GM 实盘 BUY 的资金预检查、虚拟占资和拒单退款必须按保护价名义金额加手续费估算。当前已核实的每笔最低佣金为 5 元，即单笔成本为 `名义金额 + max(名义金额 × 佣金率, 5 元)`；基础层拆单后按每个实际子单分别计费，回测保持原有口径。详见 `docs/specs/contracts/live_adapter.md` 第 2 节第 8 条。
+- 最低佣金预留: 中国A股市场 实盘 BUY 的资金预检查、虚拟占资和拒单退款必须按保护价名义金额加手续费估算。当前已核实的每笔最低佣金为 5 元，即单笔成本为 `名义金额 + max(名义金额 × 佣金率, 5 元)`；基础层拆单后按每个实际子单分别计费，回测保持原有口径。详见 `docs/specs/contracts/live_adapter.md` 第 2 节第 8 条。
 - `get_position(self, data)`: 获取指定标的持仓。必须返回一个拥有 `.size` (持仓数量，可为整数或小数) 和 `.price` (成本价) 属性的对象（可使用 `SimpleNamespace` 模拟）。若市场有可卖限制，建议同时暴露 `.sellable`。若 SDK 在同一事件线程串行执行 schedule 和订单/持仓回调，实盘实现必须在当前 run 的 SELL 等待期间使用同步柜台查询，不能读取被 schedule 阻塞的旧 context 缓存；查询失败必须暴露为不可信状态，不能当作零持仓。基类会让持仓/可卖仓位查询异常失败关闭，adapter 不应依赖异常被静默转换为零仓。
 - `get_sellable_position(self, data)`（建议覆盖）: 返回当前真实可卖仓位；若不覆盖，基类会退化为 `size`。
 - `get_current_price(self, data) -> float`: 获取指定标的实时盘口价或最新快照价。若获取失败、断流或停牌，必须安全返回 `0.0`，严禁抛出异常。

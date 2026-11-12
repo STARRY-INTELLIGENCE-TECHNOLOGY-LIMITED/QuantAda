@@ -31,8 +31,13 @@ def append_optimizer_result(path, text):
 
 
 def open_optimizer_result_file(path):
-    """使用固定的系统文本编辑器打开结果，避免出现打开方式选择窗口。"""
+    """使用固定的系统文本编辑器打开结果，避免出现打开方式选择窗口。
+
+    测试模式（QUANTADA_TEST_MODE）下不启动任何外部程序，避免每次跑测试都弹出编辑器窗口。
+    """
     if not path:
+        return False
+    if str(os.environ.get("QUANTADA_TEST_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}:
         return False
     try:
         if os.name == "nt":

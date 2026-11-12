@@ -120,6 +120,15 @@ When user asks for rapid code generation or new module scaffolding, agents must 
 3. Always run targeted tests first, then run broader regression when feasible.
 4. Report what was validated and what was not validated.
 
+## 5.5) Python 版本兼容（硬性要求）
+生产服务器可能运行 Python 3.9 等低版本；开发机和 CI 可以更高，但仓库内全部代码（含 tests）必须能在 3.9 上导入和运行。高版本写法在开发机上不会报错，只会在服务器启动时崩溃（例如 `def f() -> time | None` 让 run.py 导入即抛 TypeError）。
+1. 注解中使用 `X | Y` / `X | None` 的文件，必须在文件开头（模块 docstring 之后）写 `from __future__ import annotations`；否则改用 `Optional[X]` / `Union[X, Y]`。
+2. 运行时求值的位置不得使用 `X | Y`：`isinstance`/`issubclass` 用元组，类型别名赋值、`cast`、`typing.get_type_hints` 依赖的注解用 `Union`/`Optional`。
+3. 禁止 3.10+ 语法：`match`/`case`、带括号的多重 `with (...)`。
+4. 禁止 3.10+ 标准库：`zip(strict=)`、`@dataclass(slots=/kw_only=)`、`itertools.pairwise`、`int.bit_count()`、`typing` 中的 `ParamSpec`/`TypeAlias`/`Concatenate`/`TypeGuard`/`Self`/`Never`/`LiteralString`/`Required`/`NotRequired`/`Unpack`、`datetime.UTC`、`tomllib`、`ExceptionGroup`/`except*`、`asyncio.TaskGroup`/`asyncio.timeout`。需要时用 `typing_extensions` 或手写等价实现。
+5. 3.9 已支持、可以使用：内置泛型注解（`list[str]`、`dict[str, int]`）、`zoneinfo`、`str.removeprefix/removesuffix`、`dict` 合并运算 `|`。
+6. `tests/test_python39_compat.py` 用 AST 扫描强制执行上述规则；新增违规会让 CI 失败。若需要新的 3.10+ 依赖或写法，必须先由人确认服务器升级，再同时修改本节与该测试。
+
 ## 6) Communication Style for Agents
 - Be concise, direct, and pragmatic.
 - Prioritize actionable outcomes over long theory.

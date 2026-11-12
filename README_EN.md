@@ -30,7 +30,7 @@ The diagram focuses on mode routing through `run.py`, the responsibility boundar
 
 ### 1. Install
 
-Requires Python 3.12.
+Python 3.12 is recommended for development.
 
 ```bash
 git clone https://github.com/SUTFutureCoder/QuantAda.git

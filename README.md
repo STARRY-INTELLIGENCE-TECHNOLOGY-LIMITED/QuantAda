@@ -32,7 +32,7 @@
 
 ### 1) 安装
 
-运行环境为 Python 3.12。
+开发推荐 Python 3.12，代码已兼容 Python 3.9。
 
 ```bash
 git clone https://github.com/SUTFutureCoder/QuantAda.git
