@@ -268,6 +268,100 @@ def test_gm_get_cash_does_not_double_count_frozen_orders(monkeypatch):
     assert broker.get_cash() == pytest.approx(8000.0)
 
 
+def _gm_cash_broker(monkeypatch, snapshot):
+    import live_trader.adapters.gm_broker as gm_module
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(gm_module, "context", None, raising=False)
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(**snapshot), raising=False)
+    return gm_module.GmBrokerAdapter(context=MagicMock())
+
+
+def test_gm_get_cash_does_not_double_count_filled_buys_within_a_run(monkeypatch):
+    """回放 2026-11-11 掘金模拟盘实测：买单已成交但成交回调未处理，柜台 available 已实扣、order_frozen 为 0。
+
+    每笔 518880 买 100 股，本地占资 828.78，柜台实扣 832.60（含 5 元最低佣金）；柜台快照滞后一笔成交。
+    """
+    snapshot = {"available": 3955.70, "order_frozen": 0.0, "nav": 869358.50}
+    broker = _gm_cash_broker(monkeypatch, snapshot)
+
+    assert broker.get_cash() == pytest.approx(3955.70)  # 占资为 0：记录基准
+
+    broker._virtual_spent_cash = 833.78  # 买单 1 已提交，按最低佣金预留
+    assert broker.get_cash() == pytest.approx(3955.70 - 833.78)
+
+    broker._virtual_spent_cash = 1667.56  # 买单 2 已提交，柜台只体现了买单 1
+    snapshot.update(available=3123.10)
+    # 预留覆盖柜台实扣后，已完成订单的实际扣款不会侵蚀另一笔订单的预留。
+    assert broker.get_cash() == pytest.approx(3123.10 - (1667.56 - 832.60))
+
+    snapshot.update(available=2290.50)  # 两笔买单都已体现
+    assert broker.get_cash() == pytest.approx(2290.50 - (1667.56 - 1665.20))
+
+
+def test_gm_cash_baseline_is_retaken_after_reservations_are_released(monkeypatch):
+    snapshot = {"available": 10000.0, "order_frozen": 0.0}
+    broker = _gm_cash_broker(monkeypatch, snapshot)
+    assert broker.get_cash() == pytest.approx(10000.0)
+
+    broker._virtual_spent_cash = 2000.0
+    snapshot.update(available=8000.0)
+    assert broker.get_cash() == pytest.approx(8000.0)
+
+    # 成交回调释放占资后，下一轮从新的柜台事实重新取基准，不沿用上一轮的基准。
+    broker._virtual_spent_cash = 0.0
+    snapshot.update(available=7000.0)  # 期间账户还有其它变动
+    assert broker.get_cash() == pytest.approx(7000.0)
+    broker._virtual_spent_cash = 500.0  # 新买单未体现
+    assert broker.get_cash() == pytest.approx(6500.0)
+
+
+def test_gm_cash_sell_proceeds_keep_the_estimate_conservative(monkeypatch):
+    snapshot = {"available": 10000.0, "order_frozen": 0.0}
+    broker = _gm_cash_broker(monkeypatch, snapshot)
+    broker.get_cash()
+
+    broker._virtual_spent_cash = 2000.0
+    # 买单 2000 已体现，同时卖出回款 1500 也到账：柜台 available = 10000 - 2000 + 1500。
+    snapshot.update(available=9500.0)
+    # 已体现被低估为 500，只会多扣，不会多给。
+    assert broker.get_cash() == pytest.approx(9500.0 - 1500.0)
+    assert broker.get_cash() <= 9500.0
+
+
+def test_gm_cash_baseline_is_retaken_despite_float_residue_after_refunds(monkeypatch):
+    """多笔预留/退款按不同顺序加减会残留约 1e-12 的正数，不能让旧基准跨轮沿用。"""
+    snapshot = {"available": 10000.0, "order_frozen": 0.0}
+    broker = _gm_cash_broker(monkeypatch, snapshot)
+    broker.get_cash()  # 基准 10000
+
+    reservations = [833.78, 3273.24, 399.7184, 1657.56]
+    for amount in reservations:
+        broker._virtual_spent_cash += amount
+    for amount in reversed(reservations):
+        broker._virtual_spent_cash = max(0.0, broker._virtual_spent_cash - amount)
+    residue = broker._virtual_spent_cash
+    assert 0.0 < residue < 1e-9  # 确认确实复现了浮点残差
+
+    # 本轮全部成交、回调已释放：柜台现金下降到 6000。
+    snapshot.update(available=6000.0)
+    assert broker.get_cash() == pytest.approx(6000.0)
+    # 下一轮新预留 1000 尚未体现：必须按新基准 6000 扣减，不能把旧差额 4000 当成「已体现」。
+    broker._virtual_spent_cash = residue + 1000.0
+    assert broker.get_cash() == pytest.approx(5000.0)
+
+
+def test_gm_buy_sizing_uses_reflected_cash_not_double_counted(monkeypatch):
+    """下单定量（_submit_order 资金预检查）与 get_cash 使用同一口径。"""
+    snapshot = {"available": 3955.70, "order_frozen": 0.0}
+    broker = _gm_cash_broker(monkeypatch, snapshot)
+    broker.get_cash()
+    broker._virtual_spent_cash = 1667.56
+    snapshot.update(available=2290.50)
+
+    assert broker._spendable_cash() == pytest.approx(2290.50 - (1667.56 - 1665.20))
+
+
 # ---------- #7 隔夜清理只撤创建于当日之前的委托 ----------
 
 def test_order_created_before_handles_unknown_and_timezones():

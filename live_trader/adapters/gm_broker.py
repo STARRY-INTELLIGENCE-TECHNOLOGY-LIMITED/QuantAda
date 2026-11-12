@@ -336,6 +336,10 @@ class GmOrderProxy(BaseOrderProxy):
 class GmBrokerAdapter(BaseLiveBroker):
     """掘金平台交易执行器（GM session 绑定单一账户）。"""
     _DEFAULT_LIVE_SLIPPAGE = 0.0001
+    # 实盘买单按单笔最低佣金预留资金；模拟盘实测每笔至少收 5 元，偏保守只会少买不会超买。
+    _MIN_LIVE_BUY_COMMISSION = 5.0
+    # 占资多笔加减后会留下约 1e-12 的浮点残差；低于该值视为已归零，否则现金基准永远不会重取。
+    _CASH_BASELINE_EPSILON = 1e-6
 
     def __init__(self, context, cash_override=None, commission_override=None, slippage_override=None):
         _require_gm_api()
@@ -727,14 +731,25 @@ class GmBrokerAdapter(BaseLiveBroker):
         return available
 
     def _spendable_cash(self):
-        """GM available 已扣除挂单冻结资金；本地虚拟占资只扣除柜台尚未冻结的部分，避免双重扣减。
+        """GM available 已扣除挂单冻结与已成交买单；本地虚拟占资只扣除柜台尚未体现的部分，避免双重扣减。
 
-        回调或柜台冻结滞后时，max(0, 虚拟占资 - order_frozen) 仍保留未冻结部分的保守扣减。
-        快照缺少 order_frozen 时无法区分，回退为完整扣减虚拟占资。
+        掘金在调度回调内不处理成交回调，本地占资要到下一次回调才释放，而柜台 available 在冻结或成交时已实扣；
+        模拟盘实测两笔买单成交后，旧口径会把同一笔钱再扣一次，排在后面的标的被少买或跳过。
+        本地占资为 0 时记录柜台 available 作为基准；占资期间柜台已体现的部分 = max(0, 基准 - 当前 available)，
+        只扣 max(0, 占资 - 已体现)。基准随占资归零自动重取，不跨越占资生命周期，不持久化。
+        卖出回款会抬高 available、让已体现部分偏小，结果只会更保守；外部委托压低 available 时可能偏宽，
+        柜台拒单后走原有降档路径。缺基准时回退为 order_frozen 口径，快照也缺该字段时完整扣减。
         """
         available = float(self._fetch_real_cash())
         virtual_spent = float(getattr(self, '_virtual_spent_cash', 0.0) or 0.0)
-        if virtual_spent > 0:
+        if virtual_spent <= self._CASH_BASELINE_EPSILON:
+            self._gm_cash_baseline = available
+            return max(0.0, available)
+        baseline = getattr(self, '_gm_cash_baseline', None)
+        if baseline is not None and math.isfinite(baseline):
+            reflected = max(0.0, baseline - available)
+            virtual_spent = max(0.0, virtual_spent - reflected)
+        else:
             cash = self._fetch_cash_snapshot()
             raw_frozen = cash.get('order_frozen') if isinstance(cash, dict) else getattr(cash, 'order_frozen', None)
             try:
@@ -963,7 +978,6 @@ class GmBrokerAdapter(BaseLiveBroker):
                 cost_multiplier = 1.0 + commission
             else:
                 cost_multiplier = self.safety_multiplier
-            estimated_cost = volume * freeze_price * cost_multiplier
 
             if freeze_price <= 0:
                 self._runtime_log(
@@ -971,13 +985,37 @@ class GmBrokerAdapter(BaseLiveBroker):
                 )
                 return None
 
+            def _estimate_buy_cost(order_volume):
+                notional = order_volume * freeze_price
+                if self.is_live:
+                    return notional + max(
+                        notional * commission,
+                        self._MIN_LIVE_BUY_COMMISSION,
+                    )
+                return notional * cost_multiplier
+
+            estimated_cost = _estimate_buy_cost(volume)
+
             if estimated_cost > available_cash:
                 old_volume = volume
                 lot_size = self.get_order_lot_size(data)
-                volume = align_quantity_down(
-                    available_cash / (freeze_price * cost_multiplier),
-                    lot_size,
-                )
+                if self.is_live:
+                    percentage_fee_limit = available_cash / (freeze_price * cost_multiplier)
+                    minimum_fee_limit = max(
+                        0.0,
+                        available_cash - self._MIN_LIVE_BUY_COMMISSION,
+                    ) / freeze_price
+                    volume = align_quantity_down(
+                        min(percentage_fee_limit, minimum_fee_limit),
+                        lot_size,
+                    )
+                    while volume >= lot_size and _estimate_buy_cost(volume) > available_cash:
+                        volume = align_quantity_down(volume - lot_size, lot_size)
+                else:
+                    volume = align_quantity_down(
+                        available_cash / (freeze_price * cost_multiplier),
+                        lot_size,
+                    )
                 min_volume = lot_size
                 if volume < min_volume:
                     self._last_order_target_skip_reason = 'insufficient_cash_for_min_lot'
@@ -1017,7 +1055,7 @@ class GmBrokerAdapter(BaseLiveBroker):
             if submitted_volume <= 0:
                 submitted_volume = positive_quantity(volume)
             if side == 'BUY':
-                proxy.reserved_cash = submitted_volume * freeze_price * cost_multiplier
+                proxy.reserved_cash = _estimate_buy_cost(submitted_volume)
                 proxy.cash_price = freeze_price
                 proxy.cash_cost_multiplier = cost_multiplier
             return proxy

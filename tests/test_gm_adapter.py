@@ -368,7 +368,47 @@ def test_gm_shse_market_buy_uses_best_ask_as_protection_price(monkeypatch):
     assert proxy is not None
     assert order_calls[0]["order_type"] == mock_gm_api.OrderType_Market
     assert order_calls[0]["price"] == pytest.approx(9.2509)
-    assert proxy.reserved_cash == pytest.approx(1000 * 9.2509 * 1.0003)
+    assert proxy.reserved_cash == pytest.approx(1000 * 9.2509 + 5.0)
+
+
+def test_gm_live_buy_cash_fit_and_reservation_include_minimum_commission(monkeypatch):
+    """实盘买单按保护价名义金额加单笔最低佣金预留资金。"""
+    import live_trader.adapters.gm_broker as gm_module
+
+    order_calls = []
+    monkeypatch.setattr(gm_module, "OrderType_Market", mock_gm_api.OrderType_Market, raising=False)
+    monkeypatch.setattr(gm_module, "current", lambda symbols: [{"price": 8.287, "quotes": []}])
+    monkeypatch.setattr(gm_module, "get_cash", lambda: SimpleNamespace(available=0.0, nav=0.0))
+
+    def _fake_order_volume(**kwargs):
+        order_calls.append(kwargs)
+        order = DummyGMOrder(status=mock_gm_api.OrderStatus_New, side=kwargs["side"])
+        order.volume = kwargs["volume"]
+        order.cl_ord_id = f"GM_MIN_FEE_{len(order_calls)}"
+        return [order]
+
+    monkeypatch.setattr(gm_module, "order_volume", _fake_order_volume)
+
+    broker = GmBrokerAdapter(
+        context=MagicMock(),
+        slippage_override=0.0001,
+        commission_override=0.0003,
+    )
+    broker.is_live = True
+    cash = {"value": 832.60}
+    monkeypatch.setattr(broker, "_fetch_real_cash", lambda: cash["value"])
+
+    data = SimpleNamespace(_name="SHSE.518880")
+    assert broker._submit_order(data, 100, "BUY", 8.287) is None
+    assert order_calls == [], "低于保护价名义金额加最低佣金时不得提交最小一手。"
+
+    cash["value"] = 833.80
+    proxy = broker._submit_order(data, 100, "BUY", 8.287)
+
+    assert proxy is not None
+    assert order_calls[-1]["volume"] == 100
+    assert order_calls[-1]["price"] == pytest.approx(8.2878)
+    assert proxy.reserved_cash == pytest.approx(833.78)
 
 
 def test_gm_szse_market_buy_uses_best_ask_as_protection_price(monkeypatch):
@@ -407,7 +447,7 @@ def test_gm_szse_market_buy_uses_best_ask_as_protection_price(monkeypatch):
     assert proxy is not None
     assert order_calls[0]["order_type"] == mock_gm_api.OrderType_Market
     assert order_calls[0]["price"] == pytest.approx(10.051)
-    assert proxy.reserved_cash == pytest.approx(1000 * 10.051 * 1.0003)
+    assert proxy.reserved_cash == pytest.approx(1000 * 10.051 + 5.0)
 
 
 def test_gm_submit_order_backtest_market_mode(monkeypatch):
@@ -502,7 +542,7 @@ def test_gm_secondary_downsize_updates_active_buy_and_virtual_ledger(monkeypatch
 
     assert [item["shares"] for item in broker._active_buys.values()] == [900]
 
-    expected_ledger = 900 * 10.1 * (1.0 + 0.0003)
+    expected_ledger = 900 * 10.1 + 5.0
     assert broker._virtual_spent_cash == pytest.approx(expected_ledger), (
         "虚拟账本占资应基于真实受理数量计算。"
     )
